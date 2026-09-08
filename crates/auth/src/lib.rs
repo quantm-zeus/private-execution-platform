@@ -8,6 +8,8 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+use passkey::VerifiedPasskeyAuthentication;
+
 const CHALLENGE_BYTES: usize = 32;
 const TOKEN_BYTES: usize = 32;
 
@@ -245,6 +247,10 @@ impl AuthState {
         }
         record.consumed = true;
         verifier.verify(&record.challenge, assertion, rp_id, origin)?;
+        self.mint_session(now_ms)
+    }
+
+    fn mint_session(&mut self, now_ms: i64) -> Result<AuthenticatedSession, AuthError> {
         let expires_at_ms = now_ms
             .checked_add(self.session_ttl_ms)
             .ok_or(AuthError::InvalidTtl)?;
@@ -255,6 +261,15 @@ impl AuthState {
         };
         self.sessions.insert(session.id.clone(), session.clone());
         Ok(session)
+    }
+
+    pub fn create_session_from_verified(
+        &mut self,
+        verified: VerifiedPasskeyAuthentication,
+        now_ms: i64,
+    ) -> Result<AuthenticatedSession, AuthError> {
+        verified.consume();
+        self.mint_session(now_ms)
     }
 
     pub fn validate_session(

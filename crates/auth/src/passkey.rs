@@ -67,6 +67,20 @@ impl fmt::Debug for AuthenticationAttempt {
     }
 }
 
+pub struct VerifiedPasskeyAuthentication {
+    _private: (),
+}
+
+impl fmt::Debug for VerifiedPasskeyAuthentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("VerifiedPasskeyAuthentication([REDACTED])")
+    }
+}
+
+impl VerifiedPasskeyAuthentication {
+    pub(crate) fn consume(self) {}
+}
+
 pub struct WebAuthnPasskeyAuthenticator {
     webauthn: Webauthn,
     store: Arc<dyn PasskeyCredentialStore>,
@@ -112,19 +126,22 @@ impl WebAuthnPasskeyAuthenticator {
         &self,
         attempt: AuthenticationAttempt,
         credential: &PublicKeyCredential,
-    ) -> Result<AuthenticationResult, AuthError> {
+    ) -> Result<VerifiedPasskeyAuthentication, AuthError> {
         let result = self
             .webauthn
             .finish_passkey_authentication(credential, &attempt.state)
             .map_err(|_| AuthError::VerificationFailed)?;
         self.store.apply_authentication_result(&result)?;
-        Ok(result)
+        Ok(VerifiedPasskeyAuthentication { _private: () })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AuthState;
+    use webauthn_authenticator_rs::{prelude::WebauthnAuthenticator, softpasskey::SoftPasskey};
+    use webauthn_rs::prelude::Uuid;
 
     #[test]
     fn invalid_origin_and_empty_store_fail_closed() {
@@ -161,5 +178,46 @@ mod tests {
             WebAuthnPasskeyAuthenticator::new("other.example", "https://example.com", store),
             Err(AuthError::InvalidBinding)
         ));
+    }
+
+    #[test]
+    fn real_softpasskey_cryptographic_roundtrip_returns_sealed_capability() -> Result<(), AuthError>
+    {
+        let origin = Url::parse("https://example.com").unwrap();
+        let registration_server = WebauthnBuilder::new("example.com", &origin)
+            .and_then(WebauthnBuilder::build)
+            .unwrap();
+        let (creation, registration_state) = registration_server
+            .start_passkey_registration(Uuid::new_v4(), "owner", "Owner", None)
+            .unwrap();
+        let mut client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let registration = client.do_registration(origin.clone(), creation).unwrap();
+        let passkey = registration_server
+            .finish_passkey_registration(&registration, &registration_state)
+            .unwrap();
+
+        let store: Arc<dyn PasskeyCredentialStore> =
+            Arc::new(InMemoryPasskeyCredentialStore::new(vec![passkey]));
+        let authenticator =
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap();
+        let (request, attempt) = authenticator.start_authentication().unwrap();
+        let credential = client.do_authentication(origin, request).unwrap();
+        let verified = authenticator
+            .finish_authentication(attempt, &credential)
+            .unwrap();
+        assert_eq!(
+            format!("{verified:?}"),
+            "VerifiedPasskeyAuthentication([REDACTED])"
+        );
+
+        let mut auth_state = AuthState::new(60_000, 60_000, 60_000)?;
+        let session = auth_state.create_session_from_verified(verified, 1_000)?;
+        assert_eq!(session.expires_at_ms(), 61_000);
+        auth_state.validate_session(session.id(), 60_999)?;
+        assert_eq!(
+            auth_state.validate_session(session.id(), 61_000),
+            Err(AuthError::SessionExpired)
+        );
+        Ok(())
     }
 }
