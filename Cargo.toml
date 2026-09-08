@@ -7,7 +7,12 @@ members = [
     "crates/crypto-envelope",
     "crates/storage",
     "crates/telemetry",
+    "crates/auth",
+    "crates/policy",
+    "crates/privy",
     "apps/edge-gateway",
+    "apps/private-api",
+    "apps/trading-core",
 ]
 
 [workspace.package]
@@ -25,6 +30,9 @@ chain-types = { path = "crates/chain-types" }
 crypto-envelope = { path = "crates/crypto-envelope" }
 storage = { path = "crates/storage" }
 telemetry = { path = "crates/telemetry" }
+auth = { path = "crates/auth" }
+policy = { path = "crates/policy" }
+privy = { path = "crates/privy" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

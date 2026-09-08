@@ -1,0 +1,11 @@
+[package]
+name = "trading-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+policy.workspace = true
+privy.workspace = true
