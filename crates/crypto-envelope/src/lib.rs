@@ -47,6 +47,8 @@ pub enum CryptoError {
     EncryptFailed,
     #[error("decryption failed: authentication tag mismatch or AAD tampering")]
     DecryptFailed,
+    #[error("key identifier does not match established session")]
+    KeyIdMismatch,
     #[error("secure random number generator unavailable")]
     RngUnavailable,
     #[error("ciphertext is too short to contain an authentication tag")]
