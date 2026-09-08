@@ -203,6 +203,7 @@ impl OrderStatus {
             (self, next),
             (Created, Active)
                 | (Created, Cancelled)
+                | (Created, Expired)
                 | (Active, TriggerCandidate)
                 | (Active, Cancelled)
                 | (Active, Expired)
@@ -214,14 +215,17 @@ impl OrderStatus {
                 | (Quoting, Active)
                 | (Quoting, FailedRetryable)
                 | (Quoting, Cancelled)
+                | (Quoting, Expired)
                 | (Simulating, Executing)
                 | (Simulating, Active)
                 | (Simulating, FailedRetryable)
                 | (Simulating, Cancelled)
+                | (Simulating, Expired)
                 | (Executing, PartiallyFilled)
                 | (Executing, Filled)
                 | (Executing, FailedRetryable)
                 | (Executing, FailedFinal)
+                | (Executing, Expired)
                 | (PartiallyFilled, Active)
                 | (PartiallyFilled, TriggerCandidate)
                 | (PartiallyFilled, Executing)
@@ -232,6 +236,7 @@ impl OrderStatus {
                 | (FailedRetryable, TriggerCandidate)
                 | (FailedRetryable, FailedFinal)
                 | (FailedRetryable, Cancelled)
+                | (FailedRetryable, Expired)
         )
     }
 }
@@ -1132,5 +1137,62 @@ mod tests {
             address: " ".to_string(),
         };
         assert_eq!(obs.validate(), Err(DomainError::ChainMismatch));
+    }
+    #[test]
+    fn expiry_gated_states_transition_directly_to_expired() {
+        for status in [
+            OrderStatus::Created,
+            OrderStatus::Active,
+            OrderStatus::TriggerCandidate,
+            OrderStatus::Quoting,
+            OrderStatus::Simulating,
+            OrderStatus::PartiallyFilled,
+            OrderStatus::FailedRetryable,
+        ] {
+            assert!(
+                status.can_transition_to(OrderStatus::Expired),
+                "{status:?} must expire directly"
+            );
+        }
+    }
+
+    #[test]
+    fn executing_remains_valid_after_expiry_and_may_expire_after_failure() {
+        let mut order = limit_order(&asset("USDC"), &asset("TOKEN"));
+        order.status = OrderStatus::Executing;
+        assert_eq!(order.validate(2_000), Ok(()));
+        assert!(order.validate(3_000).is_ok());
+        assert!(OrderStatus::Executing.can_transition_to(OrderStatus::Expired));
+        assert!(OrderStatus::Executing.can_transition_to(OrderStatus::FailedRetryable));
+
+        order.status = OrderStatus::FailedRetryable;
+        assert_eq!(order.validate(3_000), Err(DomainError::Expired));
+        assert!(order.status.can_transition_to(OrderStatus::Expired));
+        order.status = OrderStatus::Expired;
+        assert!(order.validate(3_000).is_ok());
+    }
+
+    #[test]
+    fn terminal_states_cannot_expire_or_resurrect() {
+        for status in [
+            OrderStatus::Filled,
+            OrderStatus::Cancelled,
+            OrderStatus::FailedFinal,
+            OrderStatus::Expired,
+        ] {
+            assert!(!status.can_transition_to(OrderStatus::Expired));
+        }
+        for next in [
+            OrderStatus::Created,
+            OrderStatus::Active,
+            OrderStatus::TriggerCandidate,
+            OrderStatus::Quoting,
+            OrderStatus::Simulating,
+            OrderStatus::Executing,
+            OrderStatus::PartiallyFilled,
+            OrderStatus::FailedRetryable,
+        ] {
+            assert!(!OrderStatus::Expired.can_transition_to(next));
+        }
     }
 }
