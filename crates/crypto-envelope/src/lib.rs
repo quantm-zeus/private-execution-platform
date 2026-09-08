@@ -615,20 +615,17 @@ mod tests {
         for sequence in 2..=50u64 {
             window.accept(sequence).expect("fill");
         }
-        // Jump far enough that delta >= 64 clears the old bits.
-        window.accept(1 + 64).expect("jump of exactly 64 accepted");
-        // Sequence 1 is now offset 64 from highest=65: stale.
+
+        // Current highest is 50; advance by delta >= 64 to 114.
+        window.accept(114).expect("delta-64 jump accepted");
+        // Sequence 1 is now offset 113 from the new high-water mark: stale.
         assert!(matches!(
             window.accept(1),
             Err(CryptoError::StaleSequence(1))
         ));
-        // Only 65 is marked after the jump: pre-jump sequences within 63 of
-        // it lose their seen-state and re-accept as out-of-order gaps (this
-        // is the documented trade-off of a 64-entry window with delta-reset).
-        window.accept(65).expect_err("first re-accept of 64");
-        // Delta < 64 after the jump: near offsets are tracked, not reset.
-        window.accept(80).expect("delta 15");
-        window.accept(70).expect("unseen offset 10 accepted");
+        // Only 114 is marked after the reset, so this previously unseen
+        // sequence within the new window is accepted exactly once.
+        window.accept(70).expect("unseen offset 44 accepted");
         assert!(matches!(
             window.accept(70),
             Err(CryptoError::ReplayDetected(70))
@@ -695,6 +692,8 @@ mod tests {
     fn receive_session_valid_replay_out_of_order_and_stale() {
         let mut send = SendSession::with_test_key();
         let mut receive = ReceiveSession::new(SessionKey::from_bytes([7u8; SESSION_KEY_LEN]));
+
+        // Seal monotonically; deliver out of order as 1 -> 70 -> 40.
         let first = send.seal(TEST_KID, 1, b"first").expect("seal 1");
         let mid = send.seal(TEST_KID, 40, b"out-of-order").expect("seal 40");
         let later = send.seal(TEST_KID, 70, b"later").expect("seal 70");
@@ -708,7 +707,15 @@ mod tests {
             Err(CryptoError::ReplayDetected(1))
         ));
 
-        // Exact out-of-order acceptance within 63 of the high-water mark.
+        // This advances the high-water mark to 70.
+        assert_eq!(receive.receive(&later).expect("later"), b"later");
+        assert!(matches!(
+            receive.receive(&later),
+            Err(CryptoError::ReplayDetected(70))
+        ));
+
+        // 40 is offset 30 below the new high-water mark and was never seen;
+        // it must be accepted exactly once.
         assert_eq!(
             receive.receive(&mid).expect("out-of-order"),
             b"out-of-order"
@@ -718,8 +725,7 @@ mod tests {
             Err(CryptoError::ReplayDetected(40))
         ));
 
-        assert_eq!(receive.receive(&later).expect("later"), b"later");
-        // 1 is now offset 69 and outside the 64-frame window.
+        // Sequence 1 is offset 69 from high-water mark 70 and is stale.
         assert!(matches!(
             receive.receive(&first),
             Err(CryptoError::StaleSequence(1))
@@ -756,18 +762,27 @@ mod tests {
     }
 
     #[test]
-    fn receive_zero_sequence_rejected_after_auth_can_be_avoided_by_auth_first() {
+    fn receive_zero_sequence_rejection_does_not_poison_replay_state() {
         let mut send = SendSession::with_test_key();
         let mut receive = ReceiveSession::new(SessionKey::from_bytes([7u8; SESSION_KEY_LEN]));
         let env = send.seal(TEST_KID, 1, b"x").expect("seal");
+
+        // Structural zero-sequence rejection happens before replay checks;
+        // for this tampered envelope AEAD also fails, so this assertion does
+        // not claim that AEAD authentication occurred first.
         let mut zero = env.clone();
         zero.sequence = 0;
-        // AEAD binds the sequence, so changing it fails before replay checks.
         assert!(matches!(
             receive.receive(&zero),
             Err(CryptoError::InvalidSequence(0))
         ));
+
+        // The rejected zero packet must not advance or poison replay state.
         assert_eq!(receive.receive(&env).expect("still fresh"), b"x");
+        assert!(matches!(
+            receive.receive(&env),
+            Err(CryptoError::ReplayDetected(1))
+        ));
     }
 
     #[test]
