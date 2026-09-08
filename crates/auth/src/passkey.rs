@@ -5,16 +5,16 @@ use std::{fmt, sync::Arc};
 #[cfg(test)]
 use std::sync::Mutex;
 
-use webauthn_rs::prelude::{
-    PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse, Url, Webauthn,
-    WebauthnBuilder,
-};
-#[cfg(any(test, feature = "private-test-support"))]
-use webauthn_rs::prelude::Uuid;
 #[cfg(any(test, feature = "private-test-support"))]
 use webauthn_authenticator_rs::prelude::WebauthnAuthenticator;
 #[cfg(any(test, feature = "private-test-support"))]
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+#[cfg(any(test, feature = "private-test-support"))]
+use webauthn_rs::prelude::Uuid;
+use webauthn_rs::prelude::{
+    PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse, Url, Webauthn,
+    WebauthnBuilder,
+};
 
 use crate::{AuthError, AuthenticationResult, Passkey};
 
@@ -181,6 +181,13 @@ pub fn __private_test_uuid() -> Uuid {
 pub fn __private_test_client(falsify_uv: bool) -> WebauthnAuthenticator<SoftPasskey> {
     WebauthnAuthenticator::new(SoftPasskey::new(falsify_uv))
 }
+
+/// Concrete client type returned by [`__private_test_client`], for test code that
+/// must retain the same authenticator instance across a ceremony.
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+#[allow(non_camel_case_types)]
+pub type __private_test_client_type = WebauthnAuthenticator<SoftPasskey>;
 
 #[doc(hidden)]
 #[cfg(any(test, feature = "private-test-support"))]

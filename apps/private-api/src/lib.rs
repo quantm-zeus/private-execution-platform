@@ -312,14 +312,7 @@ async fn verify_challenge(
     };
     let credential: PublicKeyCredential = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
-        Err(e) => {
-            #[cfg(test)]
-            {
-                panic!("credential parse failed: {e}");
-            }
-            #[cfg(not(test))]
-            return generic_error(StatusCode::BAD_REQUEST);
-        }
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
     };
     let pending = {
         let mut transport = match state.transport.lock() {
@@ -330,9 +323,6 @@ async fn verify_challenge(
         transport.pending.remove(challenge_token)
     };
     let Some(pending) = pending else {
-        #[cfg(test)]
-        panic!("no pending for token {challenge_token}");
-        #[cfg(not(test))]
         return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
     };
     if pending.expires_at_ms <= now {
@@ -345,13 +335,7 @@ async fn verify_challenge(
         .finish_authentication(pending.attempt, &credential)
     {
         Ok(v) => v,
-        Err(e) => {
-            #[cfg(test)]
-            panic!("finish failed: {e}");
-            #[cfg(not(test))]
-            let _ = e;
-            return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
-        }
+        Err(_) => return clear_challenge(generic_error(StatusCode::UNAUTHORIZED)),
     };
     let mut auth = match state.auth.lock() {
         Ok(v) => v,
@@ -546,7 +530,6 @@ impl From<AuthError> for PrivateApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::*;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -608,33 +591,8 @@ mod tests {
         }
     }
 
-    const LEGACY_CONTENT_TYPE: &str = "application/octet-stream";
-
     struct LegacyAcceptStore {
         passkey: Mutex<Passkey>,
-    }
-
-    impl LegacyAcceptStore {
-        fn new() -> Self {
-            let origin = auth::passkey::__private_test_origin();
-            let mut server = auth::passkey::__private_test_server(&origin);
-            let (creation, state) = server
-                .start_passkey_registration(
-                    auth::passkey::__private_test_uuid(),
-                    "owner",
-                    "Owner",
-                    None,
-                )
-                .unwrap();
-            let mut client = auth::passkey::__private_test_client(false);
-            let registration = client.do_registration(origin.clone(), creation).unwrap();
-            let passkey = server
-                .finish_passkey_registration(&registration, &state)
-                .unwrap();
-            Self {
-                passkey: Mutex::new(passkey),
-            }
-        }
     }
 
     impl PasskeyCredentialStore for LegacyAcceptStore {
@@ -642,7 +600,10 @@ mod tests {
             Ok(vec![self.passkey.lock().unwrap().clone()])
         }
 
-        fn apply_authentication_result(&self, result: &AuthenticationResult) -> Result<(), AuthError> {
+        fn apply_authentication_result(
+            &self,
+            result: &AuthenticationResult,
+        ) -> Result<(), AuthError> {
             self.passkey
                 .lock()
                 .unwrap()
@@ -652,23 +613,49 @@ mod tests {
         }
     }
 
-    fn test_state(clock: Arc<FixedClock>) -> PrivateApiState {
-        PrivateApiState::with_test_dependencies(config(), Some(legacy_authenticator()), clock)
+    fn test_state(clock: Arc<FixedClock>) -> (PrivateApiState, TestRegistrationClient) {
+        let (authenticator, client) = legacy_authenticator();
+        let state =
+            PrivateApiState::with_test_dependencies(config(), Some(authenticator), clock).unwrap();
+        (state, client)
+    }
+
+    /// The client whose SoftPasskey token store matches the passkey registered in the
+    /// test store. Authentication challenges must be answered by this client.
+    type TestRegistrationClient = std::sync::Mutex<auth::passkey::__private_test_client_type>;
+
+    fn legacy_authenticator() -> (Arc<WebAuthnPasskeyAuthenticator>, TestRegistrationClient) {
+        let origin = auth::passkey::__private_test_origin();
+        let server = auth::passkey::__private_test_server(&origin);
+        let (creation, reg_state) = server
+            .start_passkey_registration(
+                auth::passkey::__private_test_uuid(),
+                "owner",
+                "Owner",
+                None,
+            )
+            .unwrap();
+        // The registration client is retained so its SoftPasskey token store holds the
+        // registered credential; a fresh client would have no matching token for the
+        // challenge allow-list and fail the ceremony with Internal.
+        let registration_client = std::sync::Mutex::new(auth::passkey::__private_test_client(true));
+        let registration = registration_client
+            .lock()
             .unwrap()
-    }
-
-    fn legacy_authenticator() -> Arc<WebAuthnPasskeyAuthenticator> {
-        let store: Arc<dyn PasskeyCredentialStore> = Arc::new(LegacyAcceptStore::new());
-        Arc::new(
+            .do_registration(origin.clone(), creation)
+            .unwrap();
+        let passkey = server
+            .finish_passkey_registration(&registration, &reg_state)
+            .unwrap();
+        let store: Arc<dyn PasskeyCredentialStore> = Arc::new(LegacyAcceptStore {
+            passkey: Mutex::new(passkey),
+        });
+        let authenticator = Arc::new(
             WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap(),
-        )
+        );
+        (authenticator, registration_client)
     }
 
-    fn verify_fixed_challenge(
-        state: &mut AuthState,
-    ) -> Result<auth::PasskeyChallenge, AuthError> {
-        state.issue_challenge("example.com", "https://example.com", 1_000)
-    }
     async fn begin(app: Router) -> (String, auth::RequestChallengeResponse) {
         let response = app
             .oneshot(
@@ -715,7 +702,8 @@ mod tests {
     #[tokio::test]
     async fn challenge_is_json_and_cookie_is_secure() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let (cookie, body) = begin(router(test_state(clock))).await;
+        let (state, _client) = test_state(clock);
+        let (cookie, body) = begin(router(state)).await;
         let _options = body;
         assert!(cookie.starts_with(CHALLENGE_COOKIE_NAME));
         let full = secure_cookie(CHALLENGE_COOKIE_NAME, "x", 10);
@@ -727,13 +715,14 @@ mod tests {
     #[tokio::test]
     async fn successful_verify_mints_http_only_session_and_session_validates() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
+        let (state, client) = test_state(clock);
         let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(
-            auth::passkey::__private_test_origin_url(),
-            options,
-        ).unwrap();
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
         let body = serde_json::to_vec(&credential).unwrap();
         let response = router(state.clone())
             .oneshot(
@@ -774,11 +763,17 @@ mod tests {
     #[tokio::test]
     async fn failed_assertion_consumes_transport_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
-        let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
-        let body = serde_json::to_vec(&credential).unwrap();
+        let (state, client) = test_state(clock);
+        let (challenge_cookie, _options) = begin(router(state.clone())).await;
+        // Sign a DIFFERENT server challenge; submitting it here must fail crypto
+        // and consume the pending attempt for this cookie.
+        let (_, other_options) = begin(router(state.clone())).await;
+        let wrong_credential = {
+            let mut client = client.lock().unwrap();
+            client.do_authentication(auth::passkey::__private_test_origin_url(), other_options)
+        }
+        .unwrap();
+        let body = serde_json::to_vec(&wrong_credential).unwrap();
         let make = || {
             Request::builder()
                 .method("POST")
@@ -805,13 +800,14 @@ mod tests {
     #[tokio::test]
     async fn expired_session_cookie_is_rejected() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock.clone());
+        let (state, client) = test_state(clock.clone());
         let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(
-            auth::passkey::__private_test_origin_url(),
-            options,
-        ).unwrap();
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
         let body = serde_json::to_vec(&credential).unwrap();
         let response = router(state.clone())
             .oneshot(
@@ -852,10 +848,14 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_challenge_cookies_fail_closed_without_consuming_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
+        let (state, client) = test_state(clock);
         let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
         let body = serde_json::to_vec(&credential).unwrap();
 
         let duplicate_value =
@@ -925,7 +925,7 @@ mod tests {
     #[tokio::test]
     async fn auth_responses_are_no_store_and_stale_cookies_are_cleared() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
+        let (state, _client) = test_state(clock);
         let challenge = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -948,7 +948,9 @@ mod tests {
                     .uri("/internal/auth/verify")
                     .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                     .header(header::COOKIE, format!("{CHALLENGE_COOKIE_NAME}=deadbeef"))
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        r#"{"id":"x","rawId":"eA","type":"public-key","response":{"authenticatorData":"eA","clientDataJSON":"eA","signature":"eA"}}"#
+                    ))
                     .unwrap(),
             )
             .await
@@ -998,42 +1000,53 @@ mod tests {
     #[tokio::test]
     async fn malformed_verify_does_not_consume_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
+        let (state, client) = test_state(clock);
         let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
-        let body = serde_json::to_vec(&credential).unwrap();
-        let make = |body: &'static str| {
-            Request::builder()
-                .method("POST")
-                .uri("/internal/auth/verify")
-                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
-                .header(header::COOKIE, challenge_cookie.clone())
-                .body(Body::from(body))
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
                 .unwrap()
         };
+        let body = serde_json::to_vec(&credential).unwrap();
+        let malformed = Request::builder()
+            .method("POST")
+            .uri("/internal/auth/verify")
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(header::COOKIE, challenge_cookie.clone())
+            .body(Body::from(r#"{"id":not-json}"#))
+            .unwrap();
         assert_eq!(
             router(state.clone())
-                .oneshot(make(""))
+                .oneshot(malformed)
                 .await
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
         );
-        let response = router(state)
-            .oneshot(make("valid-assertion"))
-            .await
+        // The malformed attempt must not have consumed the pending challenge.
+        let valid = Request::builder()
+            .method("POST")
+            .uri("/internal/auth/verify")
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(header::COOKIE, challenge_cookie.clone())
+            .body(Body::from(body))
             .unwrap();
+        let response = router(state).oneshot(valid).await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
     async fn same_challenge_cookie_single_use_across_verify_attempts() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state = test_state(clock);
+        let (state, client) = test_state(clock);
         let (challenge_cookie, options) = begin(router(state.clone())).await;
-        let mut client = auth::passkey::__private_test_client(false);
-        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
         let body = serde_json::to_vec(&credential).unwrap();
         let make = || {
             Request::builder()
@@ -1057,5 +1070,4 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
     }
-
 }
