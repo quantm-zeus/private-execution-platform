@@ -584,6 +584,12 @@ name = "private-api"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "axum",
+ "getrandom 0.2.17",
+ "http-body-util",
+ "tokio",
+ "tower",
+ "zeroize",
 ]
 
 [[package]]
