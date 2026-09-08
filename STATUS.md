@@ -12,3 +12,6 @@ Cross-scope root changes require maintainer review. Existing fomo-mcp/gmgn-mcp r
 
 ## Next
 After W1-W3 integrate: fomo-service reuse, gmgn-service/provider-broker, then local market-state workers.
+
+## Known deferrals
+- Protobuf/gRPC contract generation (proto/contracts) is deferred to an isolated follow-up task; requires protoc toolchain and is outside this W1 commit scope.
