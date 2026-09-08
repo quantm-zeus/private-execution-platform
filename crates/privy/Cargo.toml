@@ -7,3 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+domain.workspace = true
+policy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chain-types.workspace = true
+market-types.workspace = true
+tokio.workspace = true

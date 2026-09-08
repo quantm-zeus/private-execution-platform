@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "trading-core"
+path = "src/main.rs"
+
 [dependencies]
+domain.workspace = true
 policy.workspace = true
 privy.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chain-types.workspace = true
+market-types.workspace = true
+tokio.workspace = true
