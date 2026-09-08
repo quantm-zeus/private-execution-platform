@@ -64,6 +64,11 @@ dependencies = [
 [[package]]
 name = "chain-types"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "cipher"
@@ -124,6 +129,13 @@ dependencies = [
 [[package]]
 name = "domain"
 version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "market-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "edge-gateway"
@@ -185,6 +197,12 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "market-types"
 version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "memchr"
