@@ -57,6 +57,22 @@ impl PasskeyCredentialStore for InMemoryPasskeyCredentialStore {
     }
 }
 
+#[cfg(test)]
+struct FailingResultStore {
+    passkey: Passkey,
+}
+
+#[cfg(test)]
+impl PasskeyCredentialStore for FailingResultStore {
+    fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
+        Ok(vec![self.passkey.clone()])
+    }
+
+    fn apply_authentication_result(&self, _: &AuthenticationResult) -> Result<(), AuthError> {
+        Err(AuthError::VerificationFailed)
+    }
+}
+
 pub struct AuthenticationAttempt {
     state: PasskeyAuthentication,
 }
@@ -78,7 +94,7 @@ impl fmt::Debug for VerifiedPasskeyAuthentication {
 }
 
 impl VerifiedPasskeyAuthentication {
-    pub(crate) fn consume(self) {}
+    pub(super) fn consume(self) {}
 }
 
 pub struct WebAuthnPasskeyAuthenticator {
@@ -219,5 +235,31 @@ mod tests {
             Err(AuthError::SessionExpired)
         );
         Ok(())
+    }
+
+    #[test]
+    fn failed_store_application_mints_no_verified_capability_or_session() {
+        let origin = Url::parse("https://example.com").unwrap();
+        let registration_server = WebauthnBuilder::new("example.com", &origin)
+            .and_then(WebauthnBuilder::build)
+            .unwrap();
+        let (creation, registration_state) = registration_server
+            .start_passkey_registration(Uuid::new_v4(), "owner", "Owner", None)
+            .unwrap();
+        let mut client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let registration = client.do_registration(origin.clone(), creation).unwrap();
+        let passkey = registration_server
+            .finish_passkey_registration(&registration, &registration_state)
+            .unwrap();
+
+        let store: Arc<dyn PasskeyCredentialStore> = Arc::new(FailingResultStore { passkey });
+        let authenticator =
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap();
+        let (request, attempt) = authenticator.start_authentication().unwrap();
+        let credential = client.do_authentication(origin, request).unwrap();
+        assert!(matches!(
+            authenticator.finish_authentication(attempt, &credential),
+            Err(AuthError::VerificationFailed)
+        ));
     }
 }
