@@ -11,6 +11,8 @@ members = [
     "crates/policy",
     "crates/privy",
     "apps/edge-gateway",
+    "crates/rpc-contracts",
+    "crates/service-identity",
     "apps/private-api",
     "apps/trading-core",
 ]
@@ -49,6 +51,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # web
 axum = "0.8"
+
+# internal RPC
+prost = "=0.14.4"
+tonic = { version = "=0.14.5", features = ["transport", "tls-ring"] }
+tonic-prost = "=0.14.5"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 

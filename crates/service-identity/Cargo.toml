@@ -1,0 +1,17 @@
+[package]
+name = "service-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tonic = { workspace = true }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+rcgen = "=0.14.5"
+time = "=0.3.45"
+tempfile = "3"
