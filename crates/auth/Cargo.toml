@@ -10,3 +10,5 @@ repository.workspace = true
 getrandom = "0.2"
 thiserror.workspace = true
 zeroize = { version = "1", features = ["derive"] }
+webauthn-rs = "=0.5.2"
+openssl = { version = "=0.10.81", features = ["vendored"] }

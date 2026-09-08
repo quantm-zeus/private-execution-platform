@@ -1,5 +1,7 @@
 //! Authentication and private-workspace authorization boundary.
 
+pub mod passkey;
+
 use std::collections::HashMap;
 use std::fmt;
 
