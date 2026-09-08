@@ -311,9 +311,21 @@ impl LimitOrder {
                 return Err(DomainError::InvalidMinFill);
             }
         }
-        // Open states must live within the order window. An Expired status must not
-        // validate before its own expiry timestamp.
-        if executable && self.expires_at_ms <= now_ms {
+        // Open states must live within the order window. Executing is an in-flight
+        // attempt: it may legitimately remain valid after expires_at_ms crosses once
+        // the attempt has been signed/submitted. An Expired status must not validate
+        // before its own expiry timestamp.
+        let expiry_gated = matches!(
+            self.status,
+            OrderStatus::Created
+                | OrderStatus::Active
+                | OrderStatus::TriggerCandidate
+                | OrderStatus::Quoting
+                | OrderStatus::Simulating
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::FailedRetryable
+        );
+        if expiry_gated && self.expires_at_ms <= now_ms {
             return Err(DomainError::Expired);
         }
         if self.status == OrderStatus::Expired && self.expires_at_ms > now_ms {
@@ -1050,10 +1062,25 @@ mod tests {
             OrderStatus::TriggerCandidate,
             OrderStatus::Quoting,
             OrderStatus::Simulating,
-            OrderStatus::Executing,
             OrderStatus::PartiallyFilled,
             OrderStatus::FailedRetryable,
         ] {
+            let mut order = limit_order(&token_in, &token_out);
+            order.status = status;
+            assert_eq!(order.validate(2_000), Err(DomainError::Expired));
+        }
+    }
+
+    #[test]
+    fn executing_may_validate_after_expiry_but_gated_states_cannot() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        let mut executing = limit_order(&token_in, &token_out);
+        executing.status = OrderStatus::Executing;
+        assert!(executing.validate(2_000).is_ok());
+        assert!(executing.validate(2_500).is_ok());
+
+        for status in [OrderStatus::Active, OrderStatus::FailedRetryable] {
             let mut order = limit_order(&token_in, &token_out);
             order.status = status;
             assert_eq!(order.validate(2_000), Err(DomainError::Expired));
