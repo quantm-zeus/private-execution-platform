@@ -9,3 +9,13 @@ repository.workspace = true
 [[bin]]
 name = "edge-gateway"
 path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
