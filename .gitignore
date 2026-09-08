@@ -4,3 +4,13 @@
 !.env.example
 *.log
 .DS_Store
+edge-gateway
+private-api
+trading-core
+node_modules/
+web/public/.output/
+web/public/.solidjs/
+web/public/dist/
+web/workspace/dist/
+web/workspace-artifact/
+

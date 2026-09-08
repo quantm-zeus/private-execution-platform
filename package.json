@@ -1,0 +1,16 @@
+{
+  "name": "private-execution-web",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "build:public": "pnpm --filter @evergreen/public build",
+    "build:workspace": "pnpm --filter @evergreen/workspace build",
+    "typecheck": "pnpm -r typecheck",
+    "build:workspace:encrypted": "node scripts/build-workspace-encrypted.mjs",
+    "verify:web-boundary": "node scripts/verify-web-boundary.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.2",
+    "@types/node": "26.5.0"
+  }
+}
