@@ -315,6 +315,12 @@ impl LimitOrder {
             if self.min_fill.is_zero() || self.min_fill > self.remaining_input {
                 return Err(DomainError::InvalidMinFill);
             }
+            // An all-or-nothing order must remain fillable only in full. For
+            // historical terminal states min_fill records prior configuration,
+            // and Filled has no remaining input, so neither needs equality.
+            if !self.allow_partial_fill && self.min_fill != self.remaining_input {
+                return Err(DomainError::NonPartialFillMismatch);
+            }
         }
         // Open states must live within the order window. Executing is an in-flight
         // attempt: it may legitimately remain valid after expires_at_ms crosses once
@@ -524,6 +530,8 @@ pub enum DomainError {
     InvalidRemainingInput,
     #[error("minimum fill must be non-zero and not exceed remaining input")]
     InvalidMinFill,
+    #[error("all-or-nothing order requires min_fill to equal remaining input")]
+    NonPartialFillMismatch,
     #[error("max total cost asset must equal token_in")]
     MaxTotalCostAssetMismatch,
     #[error("route must contain at least one leg")]
@@ -793,6 +801,75 @@ mod tests {
         order.remaining_input = AtomicAmount::ZERO;
         order.min_fill = AtomicAmount::ZERO;
         assert!(order.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn all_or_nothing_active_requires_full_remaining_min_fill() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        let mut order = limit_order(&token_in, &token_out);
+        order.allow_partial_fill = false;
+        order.min_fill = AtomicAmount::new(999);
+        assert_eq!(
+            order.validate(1_000),
+            Err(DomainError::NonPartialFillMismatch)
+        );
+        order.min_fill = AtomicAmount::new(1_000);
+        assert!(order.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn all_or_nothing_retry_and_executing_require_full_remaining_min_fill() {
+        for status in [OrderStatus::FailedRetryable, OrderStatus::Executing] {
+            let mut order = limit_order(&asset("USDC"), &asset("TOKEN"));
+            order.status = status;
+            order.allow_partial_fill = false;
+            order.min_fill = AtomicAmount::new(999);
+            assert_eq!(
+                order.validate(1_000),
+                Err(DomainError::NonPartialFillMismatch),
+                "status {status:?}"
+            );
+            order.min_fill = AtomicAmount::new(1_000);
+            assert!(order.validate(1_000).is_ok(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn partial_orders_may_have_smaller_min_fill() {
+        let mut order = limit_order(&asset("USDC"), &asset("TOKEN"));
+        order.allow_partial_fill = true;
+        order.min_fill = AtomicAmount::new(1);
+        assert!(order.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn historical_orders_need_not_match_all_or_nothing_configuration() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        for status in [OrderStatus::Filled, OrderStatus::Cancelled] {
+            let mut order = limit_order(&token_in, &token_out);
+            order.status = status;
+            order.allow_partial_fill = false;
+            order.min_fill = AtomicAmount::new(1);
+            if status == OrderStatus::Filled {
+                order.remaining_input = AtomicAmount::ZERO;
+                order.min_fill = AtomicAmount::ZERO;
+            }
+            assert!(order.validate(1_000).is_ok(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn limit_order_serde_round_trips_fill_policy() {
+        let mut order = limit_order(&asset("USDC"), &asset("TOKEN"));
+        order.allow_partial_fill = false;
+        order.min_fill = AtomicAmount::new(1_000);
+        order.validate(1_000).unwrap();
+        let encoded = serde_json::to_string(&order).unwrap();
+        let decoded: LimitOrder = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, order);
+        assert!(decoded.validate(1_000).is_ok());
     }
 
     #[test]
