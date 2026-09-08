@@ -360,6 +360,70 @@ mod tests {
     }
 
     #[test]
+    fn private_key_reader_rejects_missing_empty_and_oversize() {
+        let (dir, config) = fixture();
+        let original_key = config.private_key_path.clone();
+
+        let missing = dir.path().join("missing-secret-name.pem");
+        assert_eq!(
+            read_private_key(&missing).unwrap_err(),
+            ServiceIdentityError::FileUnavailable(IdentityFileRole::PrivateKey)
+        );
+
+        let empty = dir.path().join("empty-secret.pem");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            read_private_key(&empty).unwrap_err(),
+            ServiceIdentityError::FileEmpty(IdentityFileRole::PrivateKey)
+        );
+
+        let huge = dir.path().join("huge-secret.pem");
+        fs::write(&huge, vec![b'x'; MAX_IDENTITY_FILE_BYTES + 1]).unwrap();
+        assert_eq!(
+            read_private_key(&huge).unwrap_err(),
+            ServiceIdentityError::FileTooLarge(IdentityFileRole::PrivateKey)
+        );
+
+        let errors = [
+            read_private_key(&missing).unwrap_err().to_string(),
+            read_private_key(&empty).unwrap_err().to_string(),
+            read_private_key(&huge).unwrap_err().to_string(),
+        ];
+        assert_eq!(
+            errors,
+            [
+                "private key file unavailable".to_string(),
+                "private key file is empty".to_string(),
+                "private key file exceeds size limit".to_string(),
+            ]
+        );
+        let leaked = [original_key.to_string_lossy(), dir.path().to_string_lossy()];
+        for path in leaked {
+            for error in &errors {
+                assert!(!error.contains(&*path));
+            }
+        }
+        assert!(!errors[2].contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn ca_reader_rejects_oversize() {
+        let (dir, mut config) = fixture();
+        let huge_ca = dir.path().join("huge-ca.pem");
+        let pem = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+        fs::write(
+            &huge_ca,
+            pem.repeat((MAX_IDENTITY_FILE_BYTES / pem.len()) + 1),
+        )
+        .unwrap();
+        config.ca_path = huge_ca;
+        assert_eq!(
+            load_server_tls_config(&config).unwrap_err(),
+            ServiceIdentityError::FileTooLarge(IdentityFileRole::Ca)
+        );
+    }
+
+    #[test]
     fn debug_and_errors_do_not_expose_paths_or_key_material() {
         let (_dir, config) = fixture();
         let debug = format!("{config:?}");

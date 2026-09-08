@@ -23,6 +23,11 @@ pub fn validate_payload(payload: &[u8]) -> Result<(), PayloadError> {
     Ok(())
 }
 
+/// Validates a single bidirectional stream frame.
+pub fn validate_stream_frame(frame: &StreamFrame) -> Result<(), PayloadError> {
+    validate_payload(&frame.ciphertext)
+}
+
 /// Validates a unary relay request, including route presence.
 pub fn validate_relay_request(request: &RelayRequest) -> Result<(), RequestError> {
     match Route::try_from(request.route) {
@@ -89,6 +94,22 @@ mod tests {
         assert!(validate_payload(&vec![0u8; MAX_PAYLOAD_BYTES]).is_ok());
         assert_eq!(
             validate_payload(&vec![0u8; MAX_PAYLOAD_BYTES + 1]),
+            Err(PayloadError::TooLarge)
+        );
+    }
+
+    fn frame(size: usize) -> StreamFrame {
+        StreamFrame {
+            ciphertext: vec![0xA5; size],
+        }
+    }
+
+    #[test]
+    fn stream_frame_bounds_are_fail_closed() {
+        assert_eq!(validate_stream_frame(&frame(0)), Err(PayloadError::Empty));
+        assert!(validate_stream_frame(&frame(MAX_PAYLOAD_BYTES)).is_ok());
+        assert_eq!(
+            validate_stream_frame(&frame(MAX_PAYLOAD_BYTES + 1)),
             Err(PayloadError::TooLarge)
         );
     }
