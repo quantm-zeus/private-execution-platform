@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package evergreen.opaque.v1;
+
+// Deliberately opaque internal relay contract.
+// No application semantics are represented here. Callers exchange ciphertext only.
+enum Route {
+  ROUTE_UNSPECIFIED = 0;
+  ROUTE_BOOTSTRAP = 1;
+  ROUTE_SYNC = 2;
+  ROUTE_BLOB = 3;
+}
+
+message RelayRequest {
+  Route route = 1;
+  bytes ciphertext = 2;
+}
+
+message RelayResponse {
+  bytes ciphertext = 1;
+}
+
+message StreamFrame {
+  bytes ciphertext = 1;
+}
+
+// Unary relay endpoint for bounded ciphertext envelopes.
+service RelayService {
+  rpc Relay(RelayRequest) returns (RelayResponse);
+}
+
+// Bidirectional ciphertext stream. Frame boundaries carry no semantic meaning.
+service RelayStreamService {
+  rpc Stream(stream StreamFrame) returns (stream StreamFrame);
+}
