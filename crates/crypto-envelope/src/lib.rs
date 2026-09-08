@@ -12,6 +12,9 @@ use getrandom::getrandom;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[path = "hpke.rs"]
+pub mod hpke;
+
 pub const SESSION_KEY_LEN: usize = 32;
 pub const KID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 12;
