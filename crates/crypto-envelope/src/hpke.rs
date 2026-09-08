@@ -5,7 +5,7 @@
 //! the HPKE exporter and constructs the existing `SendSession`/`ReceiveSession`
 //! pair for each side. All key material is RAM-only and zeroized.
 
-use crate::{ReceiveSession, SendSession, SessionKey, KID_LEN};
+use crate::{CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, KID_LEN};
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::SeedableRng,
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable,
@@ -53,7 +53,11 @@ pub struct HpkePublicKey(pub [u8; 32]);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HpkeEncapsulatedKey(pub [u8; 32]);
 
-/// Handshake wire descriptor: version, suite, recipient public key.
+/// Handshake wire descriptor: version, suite, key id and recipient public key.
+///
+/// HPKE Base mode does not authenticate the initiator. The offer itself must
+/// be delivered with integrity by the authenticated bootstrap/session channel;
+/// accepting an attacker-substituted offer would permit a normal MITM key swap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HpkeHandshakeOffer {
     pub version: u8,
@@ -68,13 +72,19 @@ impl HpkeHandshakeOffer {
     pub fn generate(kid: [u8; KID_LEN]) -> Result<(Self, HpkeRecipientKeyPair), HpkeSetupError> {
         let mut rng = fresh_rng()?;
         let (private, public) = <X25519HkdfSha256 as KemTrait>::gen_keypair_with_rng(&mut rng);
+        let public_bytes: [u8; 32] = public.to_bytes().into();
         let offer = Self {
             version: HPKE_VERSION,
             suite_id: HPKE_SUITE_ID,
             kid,
-            recipient_public_key: HpkePublicKey(public.to_bytes().into()),
+            recipient_public_key: HpkePublicKey(public_bytes),
         };
-        Ok((offer, HpkeRecipientKeyPair { _private: private }))
+        let keypair = HpkeRecipientKeyPair {
+            _private: private,
+            kid,
+            recipient_public_key: HpkePublicKey(public_bytes),
+        };
+        Ok((offer, keypair))
     }
 
     /// Structural validation for a received offer.
@@ -88,10 +98,22 @@ impl HpkeHandshakeOffer {
     }
 }
 
+fn canonical_handshake_info(offer: &HpkeHandshakeOffer) -> Vec<u8> {
+    let mut info = Vec::with_capacity(HANDSHAKE_INFO.len() + 1 + 2 + KID_LEN + 32);
+    info.extend_from_slice(HANDSHAKE_INFO);
+    info.push(offer.version);
+    info.extend_from_slice(&offer.suite_id.to_be_bytes());
+    info.extend_from_slice(&offer.kid);
+    info.extend_from_slice(&offer.recipient_public_key.0);
+    info
+}
+
 /// RAM-only recipient keypair. Deliberately provides no serialization or
 /// byte-level export path; it can only be consumed by receiver setup.
 pub struct HpkeRecipientKeyPair {
     _private: <X25519HkdfSha256 as KemTrait>::PrivateKey,
+    kid: [u8; KID_LEN],
+    recipient_public_key: HpkePublicKey,
 }
 
 impl std::fmt::Debug for HpkeRecipientKeyPair {
@@ -104,8 +126,26 @@ impl std::fmt::Debug for HpkeRecipientKeyPair {
 ///
 /// Sends under c2s, receives under s2c.
 pub struct HpkeInitiatorSession {
-    pub send: SendSession,
-    pub receive: ReceiveSession,
+    kid: [u8; KID_LEN],
+    send: SendSession,
+    receive: ReceiveSession,
+}
+
+impl HpkeInitiatorSession {
+    pub fn kid(&self) -> [u8; KID_LEN] {
+        self.kid
+    }
+
+    pub fn seal(&mut self, sequence: u64, plaintext: &[u8]) -> Result<Envelope, CryptoError> {
+        self.send.seal(self.kid, sequence, plaintext)
+    }
+
+    pub fn receive(&mut self, envelope: &Envelope) -> Result<Vec<u8>, CryptoError> {
+        if envelope.kid != self.kid {
+            return Err(CryptoError::KeyIdMismatch);
+        }
+        self.receive.receive(envelope)
+    }
 }
 
 impl std::fmt::Debug for HpkeInitiatorSession {
@@ -121,8 +161,26 @@ impl std::fmt::Debug for HpkeInitiatorSession {
 ///
 /// Sends under s2c, receives under c2s.
 pub struct HpkeResponderSession {
-    pub send: SendSession,
-    pub receive: ReceiveSession,
+    kid: [u8; KID_LEN],
+    send: SendSession,
+    receive: ReceiveSession,
+}
+
+impl HpkeResponderSession {
+    pub fn kid(&self) -> [u8; KID_LEN] {
+        self.kid
+    }
+
+    pub fn seal(&mut self, sequence: u64, plaintext: &[u8]) -> Result<Envelope, CryptoError> {
+        self.send.seal(self.kid, sequence, plaintext)
+    }
+
+    pub fn receive(&mut self, envelope: &Envelope) -> Result<Vec<u8>, CryptoError> {
+        if envelope.kid != self.kid {
+            return Err(CryptoError::KeyIdMismatch);
+        }
+        self.receive.receive(envelope)
+    }
 }
 
 impl std::fmt::Debug for HpkeResponderSession {
@@ -168,12 +226,13 @@ pub fn initiator_establish(
         <X25519HkdfSha256 as KemTrait>::PublicKey::from_bytes(&offer.recipient_public_key.0)
             .map_err(|_| HpkeSetupError::MalformedPublicKey)?;
 
+    let info = canonical_handshake_info(offer);
     let mut rng = fresh_rng()?;
     let (encapped, ctx) = hpke::setup_sender_with_rng::<
         ChaCha20Poly1305,
         HkdfSha256,
         X25519HkdfSha256,
-    >(&OpModeS::Base, &recipient_pk, HANDSHAKE_INFO, &mut rng)
+    >(&OpModeS::Base, &recipient_pk, &info, &mut rng)
     .map_err(|_| HpkeSetupError::EstablishmentFailed)?;
 
     let material = ExportedMaterial::from_ctx(|label, out| ctx.export(label, out))?;
@@ -181,6 +240,7 @@ pub fn initiator_establish(
     Ok((
         wire,
         HpkeInitiatorSession {
+            kid: offer.kid,
             send: SendSession::new(material.c2s)
                 .map_err(|_| HpkeSetupError::EstablishmentFailed)?,
             receive: ReceiveSession::new(material.s2c),
@@ -192,22 +252,28 @@ pub fn initiator_establish(
 /// private key, exports the same two direction keys, and builds mirrored
 /// sessions.
 pub fn responder_establish(
+    offer: &HpkeHandshakeOffer,
     keypair: &HpkeRecipientKeyPair,
     encapsulated: &HpkeEncapsulatedKey,
 ) -> Result<HpkeResponderSession, HpkeSetupError> {
+    offer.validate()?;
+    if keypair.kid != offer.kid || keypair.recipient_public_key != offer.recipient_public_key {
+        return Err(HpkeSetupError::EstablishmentFailed);
+    }
     let encapped = <X25519HkdfSha256 as KemTrait>::EncappedKey::from_bytes(&encapsulated.0)
         .map_err(|_| HpkeSetupError::MalformedEncapsulatedKey)?;
-
+    let info = canonical_handshake_info(offer);
     let ctx = hpke::setup_receiver::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
         &OpModeR::Base,
         &keypair._private,
         &encapped,
-        HANDSHAKE_INFO,
+        &info,
     )
     .map_err(|_| HpkeSetupError::EstablishmentFailed)?;
 
     let material = ExportedMaterial::from_ctx(|label, out| ctx.export(label, out))?;
     Ok(HpkeResponderSession {
+        kid: offer.kid,
         send: SendSession::new(material.s2c).map_err(|_| HpkeSetupError::EstablishmentFailed)?,
         receive: ReceiveSession::new(material.c2s),
     })
@@ -216,23 +282,14 @@ pub fn responder_establish(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Envelope, SESSION_KEY_LEN};
+    use crate::SESSION_KEY_LEN;
 
-    fn establish() -> (HpkeInitiatorSession, HpkeResponderSession, Envelope) {
+    fn establish() -> (HpkeInitiatorSession, HpkeResponderSession) {
         let kid = [7u8; KID_LEN];
         let (offer, keypair) = HpkeHandshakeOffer::generate(kid).expect("offer");
         let (encapsulated, initiator) = initiator_establish(&offer).expect("initiator");
-        let responder = responder_establish(&keypair, &encapsulated).expect("responder");
-        (
-            initiator,
-            responder,
-            Envelope {
-                kid,
-                nonce: [0u8; crate::NONCE_LEN],
-                sequence: 0,
-                ciphertext: Vec::new(),
-            },
-        )
+        let responder = responder_establish(&offer, &keypair, &encapsulated).expect("responder");
+        (initiator, responder)
     }
 
     #[test]
@@ -253,64 +310,128 @@ mod tests {
 
     #[test]
     fn handshake_roundtrip_and_directional_exchange() {
-        let (mut init, mut resp, _dummy) = establish();
+        let (mut init, mut resp) = establish();
 
         // c2s: initiator sends, responder receives.
-        let c2s_env = init.send.seal([7u8; KID_LEN], 1, b"c2s").expect("c2s seal");
-        assert_eq!(resp.receive.receive(&c2s_env).expect("c2s open"), b"c2s");
+        let c2s_env = init.seal(1, b"c2s").expect("c2s seal");
+        assert_eq!(resp.receive(&c2s_env).expect("c2s open"), b"c2s");
 
         // s2c: responder sends, initiator receives.
-        let s2c_env = resp.send.seal([7u8; KID_LEN], 1, b"s2c").expect("s2c seal");
-        assert_eq!(init.receive.receive(&s2c_env).expect("s2c open"), b"s2c");
+        let s2c_env = resp.seal(1, b"s2c").expect("s2c seal");
+        assert_eq!(init.receive(&s2c_env).expect("s2c open"), b"s2c");
     }
 
     #[test]
     fn opposite_direction_keys_are_separate() {
-        let (mut init, mut resp, _dummy) = establish();
+        let (mut init, mut resp) = establish();
 
         // c2s ciphertext must not open under the initiator's receive key
         // (which holds s2c material) — proving key separation without
         // exposing bytes.
-        let c2s_env = init.send.seal([7u8; KID_LEN], 1, b"cross").expect("seal");
+        let c2s_env = init.seal(1, b"cross").expect("seal");
         assert!(matches!(
-            init.receive.receive(&c2s_env),
+            init.receive(&c2s_env),
             Err(crate::CryptoError::DecryptFailed)
         ));
 
         // Likewise s2c under the responder's c2s receive key.
-        let s2c_env = resp.send.seal([7u8; KID_LEN], 1, b"cross").expect("seal");
+        let s2c_env = resp.seal(1, b"cross").expect("seal");
         assert!(matches!(
-            resp.receive.receive(&s2c_env),
+            resp.receive(&s2c_env),
             Err(crate::CryptoError::DecryptFailed)
         ));
     }
 
     #[test]
     fn replay_and_tamper_still_rejected_after_handshake() {
-        let (mut init, mut resp, _dummy) = establish();
-        let env = init.send.seal([7u8; KID_LEN], 1, b"msg").expect("seal");
-        assert_eq!(resp.receive.receive(&env).expect("open"), b"msg");
+        let (mut init, mut resp) = establish();
+        let env = init.seal(1, b"msg").expect("seal");
+        assert_eq!(resp.receive(&env).expect("open"), b"msg");
         assert!(matches!(
-            resp.receive.receive(&env),
+            resp.receive(&env),
             Err(crate::CryptoError::ReplayDetected(1))
         ));
 
         let mut tampered = env.clone();
         tampered.ciphertext[0] ^= 1;
         assert!(matches!(
-            resp.receive.receive(&tampered),
+            resp.receive(&tampered),
             Err(crate::CryptoError::DecryptFailed)
         ));
     }
 
     #[test]
+    fn bound_kid_is_automatic_and_mismatch_does_not_poison_replay() {
+        let (mut init, mut resp) = establish();
+        let expected_kid = [7u8; KID_LEN];
+        assert_eq!(init.kid(), expected_kid);
+        assert_eq!(resp.kid(), expected_kid);
+        let env = init.seal(1, b"bound").expect("seal");
+        assert_eq!(env.kid, expected_kid);
+
+        let mut wrong = env.clone();
+        wrong.kid[0] ^= 1;
+        assert!(matches!(
+            resp.receive(&wrong),
+            Err(CryptoError::KeyIdMismatch)
+        ));
+        assert_eq!(resp.receive(&env).expect("fresh original"), b"bound");
+    }
+
+    #[test]
+    fn responder_rejects_offer_metadata_mismatch() {
+        let (offer, keypair) = HpkeHandshakeOffer::generate([3u8; KID_LEN]).expect("offer");
+        let (enc, _init) = initiator_establish(&offer).expect("init");
+
+        let mut wrong_kid = offer.clone();
+        wrong_kid.kid[0] ^= 1;
+        assert!(matches!(
+            responder_establish(&wrong_kid, &keypair, &enc),
+            Err(HpkeSetupError::EstablishmentFailed)
+        ));
+
+        let (other_offer, _other_keypair) =
+            HpkeHandshakeOffer::generate([9u8; KID_LEN]).expect("other offer");
+        let mut wrong_public = offer.clone();
+        wrong_public.recipient_public_key = other_offer.recipient_public_key;
+        assert!(matches!(
+            responder_establish(&wrong_public, &keypair, &enc),
+            Err(HpkeSetupError::EstablishmentFailed)
+        ));
+    }
+
+    #[test]
+    fn canonical_handshake_info_binds_offer_metadata() {
+        let (offer, _keypair) = HpkeHandshakeOffer::generate([4u8; KID_LEN]).expect("offer");
+        let baseline = canonical_handshake_info(&offer);
+
+        let mut kid = offer.clone();
+        kid.kid[0] ^= 1;
+        assert_ne!(baseline, canonical_handshake_info(&kid));
+
+        let mut version = offer.clone();
+        version.version = version.version.wrapping_add(1);
+        assert_ne!(baseline, canonical_handshake_info(&version));
+
+        let mut suite = offer.clone();
+        suite.suite_id = suite.suite_id.wrapping_add(1);
+        assert_ne!(baseline, canonical_handshake_info(&suite));
+
+        let (other, _other_keypair) =
+            HpkeHandshakeOffer::generate([5u8; KID_LEN]).expect("other offer");
+        let mut public = offer.clone();
+        public.recipient_public_key = other.recipient_public_key;
+        assert_ne!(baseline, canonical_handshake_info(&public));
+    }
+
+    #[test]
     fn low_order_encapsulated_key_rejected() {
-        let (_offer, keypair) = HpkeHandshakeOffer::generate([1u8; KID_LEN]).expect("offer");
+        let (offer, keypair) = HpkeHandshakeOffer::generate([1u8; KID_LEN]).expect("offer");
         // X25519 deserializes any 32-byte value; the all-zero encapsulated key
         // yields the all-zero DH result, which HPKE rejects during setup.
         let bad = HpkeEncapsulatedKey([0u8; 32]);
         assert!(matches!(
-            responder_establish(&keypair, &bad),
+            responder_establish(&offer, &keypair, &bad),
             Err(HpkeSetupError::EstablishmentFailed)
         ));
     }
@@ -345,7 +466,7 @@ mod tests {
     fn debug_output_contains_no_secret_material() {
         let (offer, keypair) = HpkeHandshakeOffer::generate([1u8; KID_LEN]).expect("offer");
         let (enc, init) = initiator_establish(&offer).expect("init");
-        let resp = responder_establish(&keypair, &enc).expect("resp");
+        let resp = responder_establish(&offer, &keypair, &enc).expect("resp");
 
         let dbg = format!("{keypair:?}\n{init:?}\n{resp:?}");
         assert!(dbg.contains("[REDACTED]"));
