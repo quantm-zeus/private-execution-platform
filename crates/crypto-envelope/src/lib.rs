@@ -68,13 +68,17 @@ pub struct Envelope {
 pub struct SessionKey([u8; SESSION_KEY_LEN]);
 
 impl SessionKey {
-    pub fn from_bytes(bytes: [u8; SESSION_KEY_LEN]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; SESSION_KEY_LEN]) -> Self {
         Self(bytes)
     }
 
-    pub fn random() -> Result<Self, CryptoError> {
+    #[cfg(test)]
+    pub(crate) fn random() -> Result<Self, CryptoError> {
         let mut key = [0u8; SESSION_KEY_LEN];
-        getrandom(&mut key).map_err(|_| CryptoError::RngUnavailable)?;
+        if getrandom(&mut key).is_err() {
+            key.zeroize();
+            return Err(CryptoError::RngUnavailable);
+        }
         Ok(Self(key))
     }
 
@@ -213,7 +217,7 @@ pub struct SendSession {
 }
 
 impl SendSession {
-    pub fn new(key: SessionKey) -> Result<Self, CryptoError> {
+    pub(crate) fn new(key: SessionKey) -> Result<Self, CryptoError> {
         Ok(Self {
             cipher: SessionCipher::new(key)?,
         })
@@ -255,7 +259,7 @@ pub struct ReceiveSession {
 }
 
 impl ReceiveSession {
-    pub fn new(key: SessionKey) -> Self {
+    pub(crate) fn new(key: SessionKey) -> Self {
         Self {
             key,
             replay: ReplayWindow::new(),
