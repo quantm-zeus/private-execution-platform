@@ -145,21 +145,18 @@ impl ExportedMaterial {
     fn from_ctx(
         export: impl Fn(&[u8], &mut [u8]) -> Result<(), hpke::HpkeError>,
     ) -> Result<Self, HpkeSetupError> {
-        let mut c2s = [0u8; 32];
-        let mut s2c = [0u8; 32];
-        export(EXPORTER_C2S, &mut c2s).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
-        export(EXPORTER_S2C, &mut s2c).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
-        let material = Self {
-            c2s: SessionKey::from_bytes(c2s),
-            s2c: SessionKey::from_bytes(s2c),
-        };
-        c2s.zeroize();
-        s2c.zeroize();
-        Ok(material)
+        let mut c2s = Zeroizing::new([0u8; 32]);
+        let mut s2c = Zeroizing::new([0u8; 32]);
+        export(EXPORTER_C2S, &mut c2s[..]).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
+        export(EXPORTER_S2C, &mut s2c[..]).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
+        Ok(Self {
+            c2s: SessionKey::from_bytes(*c2s),
+            s2c: SessionKey::from_bytes(*s2c),
+        })
     }
 }
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Initiator side: uses the recipient's public key, encapsulates, exports the
 /// two direction keys, and builds direction-correct sessions.
@@ -236,6 +233,22 @@ mod tests {
                 ciphertext: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn exporter_second_failure_returns_opaque_error() {
+        let calls = std::cell::Cell::new(0u8);
+        let result = ExportedMaterial::from_ctx(|label, out| {
+            calls.set(calls.get() + 1);
+            if label == EXPORTER_C2S {
+                out.fill(0xA5);
+                Ok(())
+            } else {
+                Err(hpke::HpkeError::ValidationError)
+            }
+        });
+        assert_eq!(calls.get(), 2);
+        assert!(matches!(result, Err(HpkeSetupError::EstablishmentFailed)));
     }
 
     #[test]
