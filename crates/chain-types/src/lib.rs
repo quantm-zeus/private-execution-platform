@@ -32,10 +32,18 @@ pub struct AssetId {
 
 impl AssetId {
     pub fn new(chain: ChainId, address: impl Into<String>) -> Result<Self, ChainTypeError> {
-        chain.validate()?;
         let address = address.into();
-        ensure_asset_address(&address)?;
-        Ok(Self { chain, address })
+        let asset = Self { chain, address };
+        asset.validate()?;
+        Ok(asset)
+    }
+
+    /// Validates directly-constructed assets so they cannot bypass blank address
+    /// or blank custom-chain identifier checks.
+    pub fn validate(&self) -> Result<(), ChainTypeError> {
+        self.chain.validate()?;
+        ensure_asset_address(&self.address)?;
+        Ok(())
     }
 }
 
@@ -82,6 +90,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_asset_construction_with_blank_address_is_rejected() {
+        let asset = AssetId {
+            chain: ChainId::Base,
+            address: "  ".to_string(),
+        };
+        assert_eq!(asset.validate(), Err(ChainTypeError::EmptyAssetAddress));
+    }
+
+    #[test]
+    fn direct_asset_construction_with_blank_custom_chain_is_rejected() {
+        let asset = AssetId {
+            chain: ChainId::Other(String::new()),
+            address: "0xabc".to_string(),
+        };
+        assert_eq!(asset.validate(), Err(ChainTypeError::EmptyChainId));
+    }
+
+    #[test]
+    fn direct_asset_construction_with_valid_fields_passes() {
+        let asset = AssetId {
+            chain: ChainId::Other("custom".to_string()),
+            address: "0xabc".to_string(),
+        };
+        assert!(asset.validate().is_ok());
+    }
 
     #[test]
     fn asset_id_round_trips() {

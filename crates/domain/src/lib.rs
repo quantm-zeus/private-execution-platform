@@ -142,6 +142,12 @@ impl TradeIntent {
         self.chain
             .validate()
             .map_err(|_| DomainError::ChainMismatch)?;
+        self.token_in
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
+        self.token_out
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
         if self.amount.is_zero() {
             return Err(DomainError::ZeroTradeAmount);
         }
@@ -254,6 +260,15 @@ impl LimitOrder {
         self.id.validate()?;
         self.owner.validate()?;
         self.wallet_ref.validate()?;
+        self.chain
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
+        self.token_in
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
+        self.token_out
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
         if self.token_in.chain != self.chain || self.token_out.chain != self.chain {
             return Err(DomainError::ChainMismatch);
         }
@@ -266,32 +281,43 @@ impl LimitOrder {
         if self.max_input.asset != self.token_in {
             return Err(DomainError::InputAssetMismatch);
         }
-        // Filled orders must have consumed all input; executable states must retain some.
-        let filled = self.status == OrderStatus::Filled;
-        if filled {
-            if !self.remaining_input.is_zero() {
-                return Err(DomainError::InvalidRemainingInput);
-            }
-        } else {
-            if self.remaining_input.is_zero() || self.remaining_input > self.max_input.amount {
-                return Err(DomainError::InvalidRemainingInput);
-            }
+        // remaining_input must never exceed max_input, in any state.
+        if self.remaining_input > self.max_input.amount {
+            return Err(DomainError::InvalidRemainingInput);
         }
-        // Min fill: zero remaining means no more fills can occur, so it's unconstrained.
-        if !filled && (self.min_fill.is_zero() || self.min_fill > self.remaining_input) {
-            return Err(DomainError::InvalidMinFill);
-        }
-        // Only open/executable states are time-gated; terminal states (Filled, Cancelled,
-        // Expired, FailedFinal) do not need future expiry.
-        let terminal = matches!(
+        // States that can still execute or retry must retain spendable input and a
+        // viable min_fill. Historical terminal states (Cancelled, Expired, FailedFinal)
+        // are exempt; Filled must have consumed all input.
+        let executable = matches!(
             self.status,
-            OrderStatus::Filled
-                | OrderStatus::Cancelled
-                | OrderStatus::Expired
-                | OrderStatus::FailedFinal
+            OrderStatus::Created
+                | OrderStatus::Active
+                | OrderStatus::TriggerCandidate
+                | OrderStatus::Quoting
+                | OrderStatus::Simulating
+                | OrderStatus::Executing
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::FailedRetryable
         );
-        if !terminal && self.expires_at_ms <= now_ms {
+        let filled = self.status == OrderStatus::Filled;
+        if filled && !self.remaining_input.is_zero() {
+            return Err(DomainError::InvalidRemainingInput);
+        }
+        if executable {
+            if self.remaining_input.is_zero() {
+                return Err(DomainError::InvalidRemainingInput);
+            }
+            if self.min_fill.is_zero() || self.min_fill > self.remaining_input {
+                return Err(DomainError::InvalidMinFill);
+            }
+        }
+        // Open states must live within the order window. An Expired status must not
+        // validate before its own expiry timestamp.
+        if executable && self.expires_at_ms <= now_ms {
             return Err(DomainError::Expired);
+        }
+        if self.status == OrderStatus::Expired && self.expires_at_ms > now_ms {
+            return Err(DomainError::ExpiredStatusBeforeWindow);
         }
         let expected = match self.side {
             TradeSide::Buy => (&self.token_in, &self.token_out),
@@ -373,6 +399,12 @@ impl RouteLeg {
         if self.venue.trim().is_empty() || self.pool_ref.trim().is_empty() {
             return Err(DomainError::EmptyRouteRef);
         }
+        self.token_in
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
+        self.token_out
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
         if self.token_in == self.token_out {
             return Err(DomainError::SameAssetPair);
         }
@@ -410,6 +442,9 @@ impl RoutePlan {
 
 impl TaxObservation {
     pub fn validate(&self) -> Result<(), DomainError> {
+        self.token
+            .validate()
+            .map_err(|_| DomainError::ChainMismatch)?;
         if self.token.chain != self.chain {
             return Err(DomainError::ChainMismatch);
         }
@@ -462,6 +497,8 @@ pub enum DomainError {
     LimitPriceAssetMismatch,
     #[error("intent/order is expired")]
     Expired,
+    #[error("expired status cannot precede its own expiry timestamp")]
+    ExpiredStatusBeforeWindow,
     #[error("max total cost must be non-zero when provided")]
     InvalidMaxTotalCost,
     #[error("max input asset must equal token_in")]
@@ -879,14 +916,12 @@ mod tests {
     #[test]
     fn tax_observation_invalid_wallet_is_rejected() {
         let mut obs = tax_observation();
-        // Construct a wallet ref with blank content via raw deserialization bypass.
-        // WalletRef::new rejects blanks, but validate() on the stored value must also catch them.
-        // We'll use a valid wallet_ref and confirm the validation path succeeds.
-        obs.wallet_ref = WalletRef::new("wallet-1").unwrap();
-        assert!(obs.validate().is_ok());
-        // Verify new() rejects blanks to ensure stored wallet_ref is always valid.
+        // Tests are a child module, so the private tuple field is visible here.
+        // Construct an invalid WalletRef directly to prove validate() rejects it
+        // even when encapsulated construction was bypassed.
+        obs.wallet_ref = WalletRef(" ".to_string());
         assert_eq!(
-            WalletRef::new(" "),
+            obs.validate(),
             Err(DomainError::EmptyIdentifier("wallet_ref"))
         );
     }
@@ -930,5 +965,145 @@ mod tests {
         bad.provider = "gmgn".to_string();
         bad.computed_at_ms = 2_000;
         assert_eq!(bad.validate(), Err(DomainError::InvalidObservationWindow));
+    }
+
+    #[test]
+    fn terminal_states_are_representable_with_zero_or_small_remaining() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        for status in [
+            OrderStatus::Cancelled,
+            OrderStatus::Expired,
+            OrderStatus::FailedFinal,
+        ] {
+            let mut order = limit_order(&token_in, &token_out);
+            order.status = status;
+            order.remaining_input = AtomicAmount::ZERO;
+            order.min_fill = AtomicAmount::ZERO;
+            if status == OrderStatus::Expired {
+                assert_eq!(
+                    order.validate(1_000),
+                    Err(DomainError::ExpiredStatusBeforeWindow)
+                );
+            } else {
+                assert!(order.validate(1_000).is_ok(), "status {status:?}");
+            }
+            order.remaining_input = AtomicAmount::new(10);
+            order.min_fill = AtomicAmount::new(100);
+            if status == OrderStatus::Expired {
+                assert_eq!(
+                    order.validate(1_000),
+                    Err(DomainError::ExpiredStatusBeforeWindow)
+                );
+            } else {
+                assert!(order.validate(1_000).is_ok(), "status {status:?}");
+            }
+            order.remaining_input = AtomicAmount::new(2_000);
+            assert_eq!(
+                order.validate(1_000),
+                Err(DomainError::InvalidRemainingInput)
+            );
+        }
+    }
+
+    #[test]
+    fn executable_states_require_positive_remaining_and_viable_min_fill() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        for status in [
+            OrderStatus::Created,
+            OrderStatus::Active,
+            OrderStatus::TriggerCandidate,
+            OrderStatus::Quoting,
+            OrderStatus::Simulating,
+            OrderStatus::Executing,
+            OrderStatus::PartiallyFilled,
+            OrderStatus::FailedRetryable,
+        ] {
+            let mut order = limit_order(&token_in, &token_out);
+            order.status = status;
+            order.min_fill = AtomicAmount::new(100);
+            order.remaining_input = AtomicAmount::ZERO;
+            assert_eq!(
+                order.validate(1_000),
+                Err(DomainError::InvalidRemainingInput),
+                "status {status:?}"
+            );
+            order.remaining_input = AtomicAmount::new(50);
+            assert_eq!(
+                order.validate(1_000),
+                Err(DomainError::InvalidMinFill),
+                "status {status:?}"
+            );
+            order.remaining_input = AtomicAmount::new(100);
+            assert!(order.validate(1_000).is_ok(), "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn open_states_must_not_validate_after_expiry() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        for status in [
+            OrderStatus::Created,
+            OrderStatus::Active,
+            OrderStatus::TriggerCandidate,
+            OrderStatus::Quoting,
+            OrderStatus::Simulating,
+            OrderStatus::Executing,
+            OrderStatus::PartiallyFilled,
+            OrderStatus::FailedRetryable,
+        ] {
+            let mut order = limit_order(&token_in, &token_out);
+            order.status = status;
+            assert_eq!(order.validate(2_000), Err(DomainError::Expired));
+        }
+    }
+
+    #[test]
+    fn expired_status_must_not_validate_before_expiry() {
+        let token_in = asset("USDC");
+        let token_out = asset("TOKEN");
+        let mut order = limit_order(&token_in, &token_out);
+        order.status = OrderStatus::Expired;
+        assert_eq!(
+            order.validate(999),
+            Err(DomainError::ExpiredStatusBeforeWindow)
+        );
+        assert!(order.validate(2_000).is_ok());
+    }
+
+    #[test]
+    fn direct_asset_construction_with_invalid_fields_is_rejected() {
+        let blank_address = AssetId {
+            chain: ChainId::Base,
+            address: "  ".to_string(),
+        };
+        let mut intent = intent(OrderType::Market);
+        intent.token_in = blank_address;
+        assert_eq!(intent.validate(1_000), Err(DomainError::ChainMismatch));
+
+        let mut order = limit_order(&asset("USDC"), &asset("TOKEN"));
+        order.token_out = AssetId {
+            chain: ChainId::Other(String::new()),
+            address: "tok".to_string(),
+        };
+        assert_eq!(order.validate(1_000), Err(DomainError::ChainMismatch));
+
+        let a = asset("USDC");
+        let b = asset("TOKEN");
+        let mut plan = route_plan(&[(&a, &b, 1_000, 500)], &b);
+        plan.legs[0].token_out = AssetId {
+            chain: ChainId::Base,
+            address: String::new(),
+        };
+        assert_eq!(plan.validate(), Err(DomainError::ChainMismatch));
+
+        let mut obs = tax_observation();
+        obs.token = AssetId {
+            chain: ChainId::Base,
+            address: " ".to_string(),
+        };
+        assert_eq!(obs.validate(), Err(DomainError::ChainMismatch));
     }
 }
