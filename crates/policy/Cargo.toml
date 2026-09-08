@@ -7,3 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chain-types.workspace = true
+domain.workspace = true
+market-types.workspace = true
+thiserror.workspace = true
