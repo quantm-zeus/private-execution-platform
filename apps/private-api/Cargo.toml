@@ -6,5 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "private-api"
+path = "src/main.rs"
+
 [dependencies]
 auth.workspace = true
+axum.workspace = true
+getrandom = "0.2"
+tokio.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
