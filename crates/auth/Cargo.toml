@@ -6,7 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+private-test-support = ["dep:webauthn-authenticator-rs"]
+
 [dependencies]
 getrandom = "0.2"
 thiserror.workspace = true
 zeroize = { version = "1", features = ["derive"] }
+webauthn-rs = "=0.5.2"
+webauthn-authenticator-rs = { version = "=0.5.2", features = ["softpasskey"], optional = true }
+openssl = { version = "=0.10.81", features = ["vendored"] }
+
+[dev-dependencies]
+webauthn-authenticator-rs = { version = "=0.5.2", features = ["softpasskey"] }
