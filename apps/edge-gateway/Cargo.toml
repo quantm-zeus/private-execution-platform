@@ -12,10 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "net"] }
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
+futures-util = "0.3"
 http-body-util = "0.1"
+tokio-tungstenite = "0.29"
