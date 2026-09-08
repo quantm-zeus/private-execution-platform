@@ -298,10 +298,6 @@ async fn verify_challenge(
     if content_type(&headers) != Some(CONTENT_TYPE) {
         return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
-    let now = match state.clock.now_ms() {
-        Ok(v) => v,
-        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
-    };
     let challenge_token = match cookie_value(&headers, CHALLENGE_COOKIE_NAME) {
         Ok(Some(value)) => value,
         Ok(None) | Err(_) => return generic_error(StatusCode::UNAUTHORIZED),
@@ -313,6 +309,12 @@ async fn verify_challenge(
     let credential: PublicKeyCredential = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    // Re-read the clock after the body is fully consumed: a slow-rolled request must
+    // not extend the effective validity of the pending attempt beyond its TTL.
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
     let pending = {
         let mut transport = match state.transport.lock() {
@@ -692,6 +694,24 @@ mod tests {
                     .method("POST")
                     .uri("/internal/auth/challenge")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn production_verify_is_unavailable() {
+        let state = PrivateApiState::production(config()).unwrap();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{CHALLENGE_COOKIE_NAME}=x"))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await

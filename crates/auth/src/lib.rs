@@ -51,7 +51,11 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], AuthError> {
 pub struct PasskeyChallenge {
     id: ChallengeId,
     challenge: [u8; CHALLENGE_BYTES],
+    // Only consumed by the legacy cfg(test) verifier path today; kept so the
+    // raw-challenge record remains self-describing until that path is deleted.
+    #[allow(dead_code)]
     expected_rp_id: String,
+    #[allow(dead_code)]
     expected_origin: String,
     issued_at_ms: i64,
     expires_at_ms: i64,
@@ -90,6 +94,9 @@ impl fmt::Debug for PasskeyChallenge {
     }
 }
 
+/// Deprecated transitional verifier surface. Test-only: real sessions must be minted
+/// through `create_session_from_verified` after a genuine WebAuthn ceremony.
+#[cfg(test)]
 pub trait PasskeyVerifier: Send + Sync {
     fn verify(
         &self,
@@ -100,9 +107,11 @@ pub trait PasskeyVerifier: Send + Sync {
     ) -> Result<(), AuthError>;
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct UnavailableVerifier;
 
+#[cfg(test)]
 impl PasskeyVerifier for UnavailableVerifier {
     fn verify(
         &self,
@@ -221,6 +230,7 @@ impl AuthState {
         Ok(challenge)
     }
 
+    #[cfg(test)]
     pub fn verify_challenge(
         &mut self,
         id: &ChallengeId,
