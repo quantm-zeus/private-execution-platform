@@ -1365,6 +1365,7 @@ dependencies = [
  "axum",
  "getrandom 0.2.17",
  "http-body-util",
+ "serde_json",
  "tokio",
  "tower",
  "zeroize",

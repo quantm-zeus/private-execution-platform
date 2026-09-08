@@ -6,11 +6,17 @@ use std::{fmt, sync::Arc};
 use std::sync::Mutex;
 
 use webauthn_rs::prelude::{
-    AuthenticationResult, Passkey, PasskeyAuthentication, PublicKeyCredential,
-    RequestChallengeResponse, Url, Webauthn, WebauthnBuilder,
+    PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse, Url, Webauthn,
+    WebauthnBuilder,
 };
+#[cfg(any(test, feature = "private-test-support"))]
+use webauthn_rs::prelude::Uuid;
+#[cfg(any(test, feature = "private-test-support"))]
+use webauthn_authenticator_rs::prelude::WebauthnAuthenticator;
+#[cfg(any(test, feature = "private-test-support"))]
+use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
-use crate::AuthError;
+use crate::{AuthError, AuthenticationResult, Passkey};
 
 pub trait PasskeyCredentialStore: Send + Sync {
     fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError>;
@@ -150,6 +156,38 @@ impl WebAuthnPasskeyAuthenticator {
         self.store.apply_authentication_result(&result)?;
         Ok(VerifiedPasskeyAuthentication { _private: () })
     }
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_origin() -> Url {
+    Url::parse("https://example.com").unwrap()
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_origin_url() -> Url {
+    Url::parse("https://example.com").unwrap()
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_uuid() -> Uuid {
+    Uuid::new_v4()
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_client(falsify_uv: bool) -> WebauthnAuthenticator<SoftPasskey> {
+    WebauthnAuthenticator::new(SoftPasskey::new(falsify_uv))
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_server(origin: &Url) -> Webauthn {
+    WebauthnBuilder::new("example.com", origin)
+        .and_then(WebauthnBuilder::build)
+        .unwrap()
 }
 
 #[cfg(test)]

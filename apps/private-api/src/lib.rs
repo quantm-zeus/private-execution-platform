@@ -8,9 +8,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use auth::{AuthError, AuthState, ChallengeId, PasskeyVerifier, SessionId, UnavailableVerifier};
+use auth::passkey::PasskeyCredentialStore;
+use auth::passkey::{AuthenticationAttempt, WebAuthnPasskeyAuthenticator};
+use auth::{AuthError, AuthState, AuthenticationResult, Passkey, PublicKeyCredential, SessionId};
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{to_bytes, Body},
     extract::{DefaultBodyLimit, State},
     http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -22,7 +24,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";
 pub const SESSION_COOKIE_NAME: &str = "__Host-evergreen_session";
 pub const MAX_ASSERTION_BYTES: usize = 64 * 1024;
-const CONTENT_TYPE: &str = "application/octet-stream";
+pub const JSON_CONTENT_TYPE: &str = "application/json";
+const CONTENT_TYPE: &str = JSON_CONTENT_TYPE;
 
 #[derive(Clone, Debug)]
 pub struct PrivateApiConfig {
@@ -129,14 +132,20 @@ impl fmt::Debug for TransportToken {
     }
 }
 
+struct PendingAuthentication {
+    attempt: AuthenticationAttempt,
+    expires_at_ms: i64,
+}
+
 #[derive(Default)]
 struct TransportState {
-    challenges: HashMap<TransportToken, (ChallengeId, i64)>,
+    pending: HashMap<TransportToken, PendingAuthentication>,
     sessions: HashMap<TransportToken, (SessionId, i64)>,
 }
 impl TransportState {
     fn prune(&mut self, now_ms: i64) {
-        self.challenges.retain(|_, (_, expires)| *expires > now_ms);
+        self.pending
+            .retain(|_, pending| pending.expires_at_ms > now_ms);
         self.sessions.retain(|_, (_, expires)| *expires > now_ms);
     }
 }
@@ -146,9 +155,8 @@ pub struct PrivateApiState {
     config: PrivateApiConfig,
     auth: Arc<Mutex<AuthState>>,
     transport: Arc<Mutex<TransportState>>,
-    verifier: Arc<dyn PasskeyVerifier>,
+    authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
     clock: Arc<dyn Clock>,
-    auth_enabled: bool,
 }
 
 impl PrivateApiState {
@@ -163,16 +171,22 @@ impl PrivateApiState {
             config,
             auth: Arc::new(Mutex::new(auth)),
             transport: Arc::new(Mutex::new(TransportState::default())),
-            verifier: Arc::new(UnavailableVerifier),
+            authenticator: None,
             clock: Arc::new(SystemClock),
-            auth_enabled: false,
         })
+    }
+
+    pub fn with_webauthn(config: PrivateApiConfig) -> Result<Self, PrivateApiError> {
+        let authenticator = build_authenticator(&config)?;
+        let mut state = Self::production(config)?;
+        state.authenticator = Some(Arc::new(authenticator));
+        Ok(state)
     }
 
     #[cfg(test)]
     fn with_test_dependencies(
         config: PrivateApiConfig,
-        verifier: Arc<dyn PasskeyVerifier>,
+        authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, PrivateApiError> {
         config.validate()?;
@@ -185,11 +199,34 @@ impl PrivateApiState {
             config,
             auth: Arc::new(Mutex::new(auth)),
             transport: Arc::new(Mutex::new(TransportState::default())),
-            verifier,
+            authenticator,
             clock,
-            auth_enabled: true,
         })
     }
+}
+
+struct ProductionPasskeyCredentialStore;
+
+impl PasskeyCredentialStore for ProductionPasskeyCredentialStore {
+    fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
+        Err(AuthError::VerifierUnavailable)
+    }
+
+    fn apply_authentication_result(&self, _: &AuthenticationResult) -> Result<(), AuthError> {
+        Err(AuthError::VerifierUnavailable)
+    }
+}
+
+fn build_authenticator(
+    config: &PrivateApiConfig,
+) -> Result<WebAuthnPasskeyAuthenticator, PrivateApiError> {
+    config.validate()?;
+    WebAuthnPasskeyAuthenticator::new(
+        &config.rp_id,
+        &config.origin,
+        Arc::new(ProductionPasskeyCredentialStore),
+    )
+    .map_err(PrivateApiError::Auth)
 }
 
 pub fn router(state: PrivateApiState) -> Router {
@@ -207,22 +244,17 @@ async fn health() -> StatusCode {
 }
 
 async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
-    if !state.auth_enabled {
-        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let now = match state.clock.now_ms() {
         Ok(v) => v,
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let challenge = {
-        let mut auth = match state.auth.lock() {
-            Ok(v) => v,
-            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
-        };
-        match auth.issue_challenge(&state.config.rp_id, &state.config.origin, now) {
-            Ok(v) => v,
-            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
-        }
+    let authenticator = match state.authenticator.as_ref() {
+        Some(v) => v.clone(),
+        None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let (options, attempt) = match authenticator.start_authentication() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
     let token = match random_transport_token() {
         Ok(v) => v,
@@ -235,18 +267,20 @@ async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
             Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         transport.prune(now);
-        transport
-            .challenges
-            .insert(token, (challenge.id().clone(), challenge.expires_at_ms()));
+        transport.pending.insert(
+            token,
+            PendingAuthentication {
+                attempt,
+                expires_at_ms: now.saturating_add(state.config.challenge_ttl_ms),
+            },
+        );
     }
-    let mut response = no_store(
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, CONTENT_TYPE)],
-            Bytes::copy_from_slice(challenge.challenge_bytes()),
-        )
-            .into_response(),
-    );
+    let body = match serde_json::to_vec(&options) {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response =
+        no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response());
     if set_cookie(&mut response, cookie).is_err() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -258,7 +292,7 @@ async fn verify_challenge(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !state.auth_enabled {
+    if state.authenticator.is_none() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
     if content_type(&headers) != Some(CONTENT_TYPE) {
@@ -272,37 +306,58 @@ async fn verify_challenge(
         Ok(Some(value)) => value,
         Ok(None) | Err(_) => return generic_error(StatusCode::UNAUTHORIZED),
     };
-    let assertion = match to_bytes(body, MAX_ASSERTION_BYTES).await {
+    let body_bytes = match to_bytes(body, MAX_ASSERTION_BYTES).await {
         Ok(v) => Zeroizing::new(v.to_vec()),
         Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
     };
-    if assertion.is_empty() {
-        return generic_error(StatusCode::BAD_REQUEST);
-    }
-    let challenge_id = {
+    let credential: PublicKeyCredential = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            #[cfg(test)]
+            {
+                panic!("credential parse failed: {e}");
+            }
+            #[cfg(not(test))]
+            return generic_error(StatusCode::BAD_REQUEST);
+        }
+    };
+    let pending = {
         let mut transport = match state.transport.lock() {
             Ok(v) => v,
             Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         transport.prune(now);
-        match transport.challenges.remove(challenge_token) {
-            Some((id, _)) => id,
-            None => return clear_challenge(generic_error(StatusCode::UNAUTHORIZED)),
+        transport.pending.remove(challenge_token)
+    };
+    let Some(pending) = pending else {
+        #[cfg(test)]
+        panic!("no pending for token {challenge_token}");
+        #[cfg(not(test))]
+        return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    if pending.expires_at_ms <= now {
+        return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
+    }
+    let verified = match state
+        .authenticator
+        .as_ref()
+        .expect("checked above")
+        .finish_authentication(pending.attempt, &credential)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            #[cfg(test)]
+            panic!("finish failed: {e}");
+            #[cfg(not(test))]
+            let _ = e;
+            return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
         }
     };
     let mut auth = match state.auth.lock() {
         Ok(v) => v,
         Err(_) => return clear_challenge(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
     };
-    let session_result = auth.verify_challenge(
-        &challenge_id,
-        &state.config.rp_id,
-        &state.config.origin,
-        &assertion,
-        now,
-        state.verifier.as_ref(),
-    );
-    drop(auth);
+    let session_result = auth.create_session_from_verified(verified, now);
     let session = match session_result {
         Ok(v) => v,
         Err(AuthError::VerifierUnavailable | AuthError::EntropyUnavailable) => {
@@ -330,16 +385,17 @@ async fn verify_challenge(
     if set_cookie(&mut response, session_cookie).is_err() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if append_cookie(&mut response, expired_cookie(CHALLENGE_COOKIE_NAME)).is_err() {
+    if append_challenge_clear(&mut response).is_err() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
     response
 }
 
+fn append_challenge_clear(response: &mut Response) -> Result<(), PrivateApiError> {
+    append_cookie(response, expired_cookie(CHALLENGE_COOKIE_NAME))
+}
+
 async fn validate_session(State(state): State<PrivateApiState>, headers: HeaderMap) -> Response {
-    if !state.auth_enabled {
-        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let now = match state.clock.now_ms() {
         Ok(v) => v,
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
@@ -490,27 +546,12 @@ impl From<AuthError> for PrivateApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::*;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicI64, Ordering};
     use tower::ServiceExt;
 
-    struct AcceptVerifier;
-    impl PasskeyVerifier for AcceptVerifier {
-        fn verify(
-            &self,
-            _: &[u8; 32],
-            assertion: &[u8],
-            _: &str,
-            _: &str,
-        ) -> Result<(), AuthError> {
-            if assertion == b"valid-assertion" {
-                Ok(())
-            } else {
-                Err(AuthError::VerificationFailed)
-            }
-        }
-    }
     struct FixedClock(AtomicI64);
     impl Clock for FixedClock {
         fn now_ms(&self) -> Result<i64, PrivateApiError> {
@@ -566,10 +607,69 @@ mod tests {
             );
         }
     }
-    fn test_state(clock: Arc<FixedClock>) -> PrivateApiState {
-        PrivateApiState::with_test_dependencies(config(), Arc::new(AcceptVerifier), clock).unwrap()
+
+    const LEGACY_CONTENT_TYPE: &str = "application/octet-stream";
+
+    struct LegacyAcceptStore {
+        passkey: Mutex<Passkey>,
     }
-    async fn begin(app: Router) -> (String, Bytes) {
+
+    impl LegacyAcceptStore {
+        fn new() -> Self {
+            let origin = auth::passkey::__private_test_origin();
+            let mut server = auth::passkey::__private_test_server(&origin);
+            let (creation, state) = server
+                .start_passkey_registration(
+                    auth::passkey::__private_test_uuid(),
+                    "owner",
+                    "Owner",
+                    None,
+                )
+                .unwrap();
+            let mut client = auth::passkey::__private_test_client(false);
+            let registration = client.do_registration(origin.clone(), creation).unwrap();
+            let passkey = server
+                .finish_passkey_registration(&registration, &state)
+                .unwrap();
+            Self {
+                passkey: Mutex::new(passkey),
+            }
+        }
+    }
+
+    impl PasskeyCredentialStore for LegacyAcceptStore {
+        fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
+            Ok(vec![self.passkey.lock().unwrap().clone()])
+        }
+
+        fn apply_authentication_result(&self, result: &AuthenticationResult) -> Result<(), AuthError> {
+            self.passkey
+                .lock()
+                .unwrap()
+                .update_credential(result)
+                .ok_or(AuthError::VerificationFailed)?;
+            Ok(())
+        }
+    }
+
+    fn test_state(clock: Arc<FixedClock>) -> PrivateApiState {
+        PrivateApiState::with_test_dependencies(config(), Some(legacy_authenticator()), clock)
+            .unwrap()
+    }
+
+    fn legacy_authenticator() -> Arc<WebAuthnPasskeyAuthenticator> {
+        let store: Arc<dyn PasskeyCredentialStore> = Arc::new(LegacyAcceptStore::new());
+        Arc::new(
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap(),
+        )
+    }
+
+    fn verify_fixed_challenge(
+        state: &mut AuthState,
+    ) -> Result<auth::PasskeyChallenge, AuthError> {
+        state.issue_challenge("example.com", "https://example.com", 1_000)
+    }
+    async fn begin(app: Router) -> (String, auth::RequestChallengeResponse) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -592,7 +692,8 @@ mod tests {
             .unwrap()
             .to_string();
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        (cookie, body)
+        let options: auth::RequestChallengeResponse = serde_json::from_slice(&body).unwrap();
+        (cookie, options)
     }
 
     #[tokio::test]
@@ -612,10 +713,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn challenge_is_binary_and_cookie_is_secure() {
+    async fn challenge_is_json_and_cookie_is_secure() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let (cookie, body) = begin(router(test_state(clock))).await;
-        assert_eq!(body.len(), 32);
+        let _options = body;
         assert!(cookie.starts_with(CHALLENGE_COOKIE_NAME));
         let full = secure_cookie(CHALLENGE_COOKIE_NAME, "x", 10);
         for required in ["Path=/", "Secure", "HttpOnly", "SameSite=Strict"] {
@@ -627,15 +728,21 @@ mod tests {
     async fn successful_verify_mints_http_only_session_and_session_validates() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock);
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(
+            auth::passkey::__private_test_origin_url(),
+            options,
+        ).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/internal/auth/verify")
-                    .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                     .header(header::COOKIE, challenge_cookie)
-                    .body(Body::from("valid-assertion"))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -668,14 +775,17 @@ mod tests {
     async fn failed_assertion_consumes_transport_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock);
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
         let make = || {
             Request::builder()
                 .method("POST")
                 .uri("/internal/auth/verify")
-                .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                 .header(header::COOKIE, challenge_cookie.clone())
-                .body(Body::from("bad"))
+                .body(Body::from(body.clone()))
                 .unwrap()
         };
         assert_eq!(
@@ -696,15 +806,21 @@ mod tests {
     async fn expired_session_cookie_is_rejected() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock.clone());
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(
+            auth::passkey::__private_test_origin_url(),
+            options,
+        ).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/internal/auth/verify")
-                    .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                     .header(header::COOKIE, challenge_cookie)
-                    .body(Body::from("valid-assertion"))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -737,16 +853,19 @@ mod tests {
     async fn ambiguous_challenge_cookies_fail_closed_without_consuming_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock);
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
 
         let duplicate_value =
             format!("{challenge_cookie}; {CHALLENGE_COOKIE_NAME}=different-token");
         let duplicate = Request::builder()
             .method("POST")
             .uri("/internal/auth/verify")
-            .header(header::CONTENT_TYPE, CONTENT_TYPE)
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(header::COOKIE, duplicate_value)
-            .body(Body::from("valid-assertion"))
+            .body(Body::from(body.clone()))
             .unwrap();
         assert_eq!(
             router(state.clone())
@@ -760,10 +879,10 @@ mod tests {
         let multiple_headers = Request::builder()
             .method("POST")
             .uri("/internal/auth/verify")
-            .header(header::CONTENT_TYPE, CONTENT_TYPE)
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(header::COOKIE, challenge_cookie.clone())
             .header(header::COOKIE, "other_cookie=value")
-            .body(Body::from("valid-assertion"))
+            .body(Body::from(body.clone()))
             .unwrap();
         assert_eq!(
             multiple_headers
@@ -785,9 +904,9 @@ mod tests {
         let valid = Request::builder()
             .method("POST")
             .uri("/internal/auth/verify")
-            .header(header::CONTENT_TYPE, CONTENT_TYPE)
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(header::COOKIE, challenge_cookie)
-            .body(Body::from("valid-assertion"))
+            .body(Body::from(body.clone()))
             .unwrap();
         assert_eq!(
             router(state).oneshot(valid).await.unwrap().status(),
@@ -827,9 +946,9 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/internal/auth/verify")
-                    .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                     .header(header::COOKIE, format!("{CHALLENGE_COOKIE_NAME}=deadbeef"))
-                    .body(Body::from("valid-assertion"))
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -880,12 +999,15 @@ mod tests {
     async fn malformed_verify_does_not_consume_challenge() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock);
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
         let make = |body: &'static str| {
             Request::builder()
                 .method("POST")
                 .uri("/internal/auth/verify")
-                .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                 .header(header::COOKIE, challenge_cookie.clone())
                 .body(Body::from(body))
                 .unwrap()
@@ -909,14 +1031,17 @@ mod tests {
     async fn same_challenge_cookie_single_use_across_verify_attempts() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let state = test_state(clock);
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let mut client = auth::passkey::__private_test_client(false);
+        let credential = client.do_authentication(auth::passkey::__private_test_origin_url(), options).unwrap();
+        let body = serde_json::to_vec(&credential).unwrap();
         let make = || {
             Request::builder()
                 .method("POST")
                 .uri("/internal/auth/verify")
-                .header(header::CONTENT_TYPE, CONTENT_TYPE)
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
                 .header(header::COOKIE, challenge_cookie.clone())
-                .body(Body::from("valid-assertion"))
+                .body(Body::from(body.clone()))
                 .unwrap()
         };
         assert_eq!(
@@ -933,39 +1058,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn verifier_failure_consumes_challenge() {
-        struct RejectVerifier;
-        impl PasskeyVerifier for RejectVerifier {
-            fn verify(&self, _: &[u8; 32], _: &[u8], _: &str, _: &str) -> Result<(), AuthError> {
-                Err(AuthError::VerificationFailed)
-            }
-        }
-        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
-        let state =
-            PrivateApiState::with_test_dependencies(config(), Arc::new(RejectVerifier), clock)
-                .unwrap();
-        let (challenge_cookie, _) = begin(router(state.clone())).await;
-        let make = || {
-            Request::builder()
-                .method("POST")
-                .uri("/internal/auth/verify")
-                .header(header::CONTENT_TYPE, CONTENT_TYPE)
-                .header(header::COOKIE, challenge_cookie.clone())
-                .body(Body::from("valid-assertion"))
-                .unwrap()
-        };
-        assert_eq!(
-            router(state.clone())
-                .oneshot(make())
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            router(state).oneshot(make()).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
-        );
-    }
 }

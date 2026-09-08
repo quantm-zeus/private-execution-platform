@@ -2,6 +2,10 @@
 
 pub mod passkey;
 
+pub use webauthn_rs::prelude::{
+    AuthenticationResult, Passkey, PublicKeyCredential, RequestChallengeResponse,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 
