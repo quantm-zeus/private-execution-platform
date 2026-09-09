@@ -14,7 +14,6 @@ use zeroize::Zeroize;
 
 use passkey::VerifiedPasskeyAuthentication;
 
-const CHALLENGE_BYTES: usize = 32;
 const TOKEN_BYTES: usize = 32;
 
 macro_rules! opaque_id {
@@ -34,7 +33,6 @@ macro_rules! opaque_id {
     };
 }
 
-opaque_id!(ChallengeId);
 opaque_id!(SessionId);
 opaque_id!(ArtifactGrantId);
 
@@ -45,83 +43,6 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], AuthError> {
         return Err(AuthError::EntropyUnavailable);
     }
     Ok(bytes)
-}
-
-#[derive(Clone)]
-pub struct PasskeyChallenge {
-    id: ChallengeId,
-    challenge: [u8; CHALLENGE_BYTES],
-    // Only consumed by the legacy cfg(test) verifier path today; kept so the
-    // raw-challenge record remains self-describing until that path is deleted.
-    #[allow(dead_code)]
-    expected_rp_id: String,
-    #[allow(dead_code)]
-    expected_origin: String,
-    issued_at_ms: i64,
-    expires_at_ms: i64,
-    consumed: bool,
-}
-
-impl PasskeyChallenge {
-    pub fn id(&self) -> &ChallengeId {
-        &self.id
-    }
-    pub fn challenge_bytes(&self) -> &[u8; CHALLENGE_BYTES] {
-        &self.challenge
-    }
-    pub fn expires_at_ms(&self) -> i64 {
-        self.expires_at_ms
-    }
-}
-
-impl Drop for PasskeyChallenge {
-    fn drop(&mut self) {
-        self.challenge.zeroize();
-    }
-}
-
-impl fmt::Debug for PasskeyChallenge {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PasskeyChallenge")
-            .field("id", &self.id)
-            .field("challenge", &"[REDACTED]")
-            .field("expected_rp_id", &"[REDACTED]")
-            .field("expected_origin", &"[REDACTED]")
-            .field("issued_at_ms", &self.issued_at_ms)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .field("consumed", &self.consumed)
-            .finish()
-    }
-}
-
-/// Deprecated transitional verifier surface. Test-only: real sessions must be minted
-/// through `create_session_from_verified` after a genuine WebAuthn ceremony.
-#[cfg(test)]
-pub trait PasskeyVerifier: Send + Sync {
-    fn verify(
-        &self,
-        challenge: &[u8; CHALLENGE_BYTES],
-        assertion: &[u8],
-        rp_id: &str,
-        origin: &str,
-    ) -> Result<(), AuthError>;
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub struct UnavailableVerifier;
-
-#[cfg(test)]
-impl PasskeyVerifier for UnavailableVerifier {
-    fn verify(
-        &self,
-        _: &[u8; CHALLENGE_BYTES],
-        _: &[u8],
-        _: &str,
-        _: &str,
-    ) -> Result<(), AuthError> {
-        Err(AuthError::VerifierUnavailable)
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -175,10 +96,8 @@ impl fmt::Debug for ArtifactGrant {
 }
 
 pub struct AuthState {
-    challenge_ttl_ms: i64,
     session_ttl_ms: i64,
     grant_ttl_ms: i64,
-    challenges: HashMap<ChallengeId, PasskeyChallenge>,
     sessions: HashMap<SessionId, AuthenticatedSession>,
     grants: HashMap<ArtifactGrantId, ArtifactGrant>,
 }
@@ -189,79 +108,17 @@ impl AuthState {
         session_ttl_ms: i64,
         grant_ttl_ms: i64,
     ) -> Result<Self, AuthError> {
+        // `challenge_ttl_ms` is retained as a validated input for API compatibility;
+        // challenge issuance now lives entirely in the WebAuthn ceremony (passkey.rs).
         if challenge_ttl_ms <= 0 || session_ttl_ms <= 0 || grant_ttl_ms <= 0 {
             return Err(AuthError::InvalidTtl);
         }
         Ok(Self {
-            challenge_ttl_ms,
             session_ttl_ms,
             grant_ttl_ms,
-            challenges: HashMap::new(),
             sessions: HashMap::new(),
             grants: HashMap::new(),
         })
-    }
-
-    pub fn issue_challenge(
-        &mut self,
-        rp_id: impl Into<String>,
-        origin: impl Into<String>,
-        now_ms: i64,
-    ) -> Result<PasskeyChallenge, AuthError> {
-        let rp_id = rp_id.into();
-        let origin = origin.into();
-        if rp_id.trim().is_empty() || origin.trim().is_empty() {
-            return Err(AuthError::InvalidBinding);
-        }
-        let expires_at_ms = now_ms
-            .checked_add(self.challenge_ttl_ms)
-            .ok_or(AuthError::InvalidTtl)?;
-        let challenge = PasskeyChallenge {
-            id: ChallengeId::random()?,
-            challenge: random_bytes()?,
-            expected_rp_id: rp_id,
-            expected_origin: origin,
-            issued_at_ms: now_ms,
-            expires_at_ms,
-            consumed: false,
-        };
-        self.challenges
-            .insert(challenge.id.clone(), challenge.clone());
-        Ok(challenge)
-    }
-
-    #[cfg(test)]
-    pub fn verify_challenge(
-        &mut self,
-        id: &ChallengeId,
-        rp_id: &str,
-        origin: &str,
-        assertion: &[u8],
-        now_ms: i64,
-        verifier: &dyn PasskeyVerifier,
-    ) -> Result<AuthenticatedSession, AuthError> {
-        let record = self
-            .challenges
-            .get_mut(id)
-            .ok_or(AuthError::ChallengeNotFound)?;
-        if record.consumed {
-            return Err(AuthError::ChallengeConsumed);
-        }
-        if now_ms < record.issued_at_ms {
-            return Err(AuthError::InvalidTimestamp);
-        }
-        if now_ms >= record.expires_at_ms {
-            return Err(AuthError::ChallengeExpired);
-        }
-        if record.expected_rp_id != rp_id {
-            return Err(AuthError::RpIdMismatch);
-        }
-        if record.expected_origin != origin {
-            return Err(AuthError::OriginMismatch);
-        }
-        record.consumed = true;
-        verifier.verify(&record.challenge, assertion, rp_id, origin)?;
-        self.mint_session(now_ms)
     }
 
     fn mint_session(&mut self, now_ms: i64) -> Result<AuthenticatedSession, AuthError> {
@@ -349,18 +206,8 @@ pub enum AuthError {
     InvalidTtl,
     #[error("invalid authentication binding")]
     InvalidBinding,
-    #[error("challenge not found")]
-    ChallengeNotFound,
-    #[error("challenge already consumed")]
-    ChallengeConsumed,
     #[error("timestamp precedes issued time")]
     InvalidTimestamp,
-    #[error("challenge expired")]
-    ChallengeExpired,
-    #[error("relying-party id mismatch")]
-    RpIdMismatch,
-    #[error("origin mismatch")]
-    OriginMismatch,
     #[error("passkey verifier unavailable")]
     VerifierUnavailable,
     #[error("passkey verification failed")]
@@ -381,179 +228,50 @@ pub enum AuthError {
 mod tests {
     use super::*;
 
-    pub(super) struct AcceptVerifier;
-    impl PasskeyVerifier for AcceptVerifier {
-        fn verify(
-            &self,
-            _: &[u8; CHALLENGE_BYTES],
-            _: &[u8],
-            _: &str,
-            _: &str,
-        ) -> Result<(), AuthError> {
-            Ok(())
-        }
-    }
-    pub(super) struct RejectVerifier;
-    impl PasskeyVerifier for RejectVerifier {
-        fn verify(
-            &self,
-            _: &[u8; CHALLENGE_BYTES],
-            _: &[u8],
-            _: &str,
-            _: &str,
-        ) -> Result<(), AuthError> {
-            Err(AuthError::VerificationFailed)
-        }
-    }
     fn state() -> AuthState {
         AuthState::new(100, 200, 50).unwrap()
     }
 
-    #[test]
-    fn challenge_has_entropy_and_redacted_debug() {
-        let mut s = state();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 10)
-            .unwrap();
-        assert_eq!(c.challenge_bytes().len(), 32);
-        assert!(c.challenge_bytes().iter().any(|b| *b != 0));
-        let dbg = format!("{c:?}");
-        assert!(dbg.contains("[REDACTED]"));
-        assert!(!dbg.contains("https://example.com"));
+    /// Mints a genuine `VerifiedPasskeyAuthentication` through a real SoftPasskey
+    /// registration + authentication ceremony, using the crate's test-only helpers.
+    /// The deleted legacy raw-challenge verifier tests are covered by passkey.rs
+    /// binding/fail-closed tests and the private-api HTTP ceremony tests.
+    pub(super) fn genuine_verified() -> Result<VerifiedPasskeyAuthentication, AuthError> {
+        use crate::passkey::{
+            __private_test_client, __private_test_origin, __private_test_server,
+            __private_test_uuid, InMemoryPasskeyCredentialStore, WebAuthnPasskeyAuthenticator,
+        };
+        use std::sync::Arc;
+
+        let origin = __private_test_origin();
+        let server = __private_test_server(&origin);
+        let (creation, reg_state) = server
+            .start_passkey_registration(__private_test_uuid(), "owner", "Owner", None)
+            .map_err(|_| AuthError::VerificationFailed)?;
+        let mut client = __private_test_client(true);
+        let registration = client
+            .do_registration(origin.clone(), creation)
+            .map_err(|_| AuthError::VerificationFailed)?;
+        let passkey = server
+            .finish_passkey_registration(&registration, &reg_state)
+            .map_err(|_| AuthError::VerificationFailed)?;
+
+        let store: Arc<dyn crate::passkey::PasskeyCredentialStore> =
+            Arc::new(InMemoryPasskeyCredentialStore::new(vec![passkey]));
+        let authenticator =
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store)?;
+        let (request, attempt) = authenticator.start_authentication()?;
+        let credential = client
+            .do_authentication(origin, request)
+            .map_err(|_| AuthError::VerificationFailed)?;
+        authenticator.finish_authentication(attempt, &credential)
     }
 
     #[test]
-    fn wrong_binding_and_expiry_reject() {
+    fn real_ceremony_mints_session_and_enforces_expiry() {
         let mut s = state();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "wrong",
-                "https://example.com",
-                b"a",
-                1,
-                &AcceptVerifier
-            ),
-            Err(AuthError::RpIdMismatch)
-        );
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://wrong",
-                b"a",
-                1,
-                &AcceptVerifier
-            ),
-            Err(AuthError::OriginMismatch)
-        );
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                100,
-                &AcceptVerifier
-            ),
-            Err(AuthError::ChallengeExpired)
-        );
-    }
-
-    #[test]
-    fn verifier_failure_consumes_challenge_and_mints_no_session() {
-        let mut s = state();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"bad",
-                1,
-                &RejectVerifier
-            ),
-            Err(AuthError::VerificationFailed)
-        );
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"good",
-                2,
-                &AcceptVerifier
-            ),
-            Err(AuthError::ChallengeConsumed)
-        );
-    }
-
-    #[test]
-    fn unavailable_verifier_denies_and_replay_after_success_fails() {
-        let mut denied = state();
-        let c = denied
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        assert_eq!(
-            denied.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                1,
-                &UnavailableVerifier
-            ),
-            Err(AuthError::VerifierUnavailable)
-        );
-
-        let mut ok = state();
-        let c = ok
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        let _session = ok
-            .verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                1,
-                &AcceptVerifier,
-            )
-            .unwrap();
-        assert_eq!(
-            ok.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                2,
-                &AcceptVerifier
-            ),
-            Err(AuthError::ChallengeConsumed)
-        );
-    }
-
-    #[test]
-    fn session_and_grant_expiry_are_enforced() {
-        let mut s = state();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        let session = s
-            .verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                1,
-                &AcceptVerifier,
-            )
-            .unwrap();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
         assert!(s.validate_session(session.id(), 200).is_ok());
         assert_eq!(
             s.validate_session(session.id(), 201),
@@ -561,19 +279,8 @@ mod tests {
         );
 
         let mut s = state();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        let session = s
-            .verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                1,
-                &AcceptVerifier,
-            )
-            .unwrap();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
         let grant = s.issue_artifact_grant(session.id(), 2).unwrap();
         assert!(s
             .validate_artifact_grant(grant.id(), session.id(), 51)
@@ -588,44 +295,14 @@ mod tests {
 
 #[cfg(test)]
 mod security_tests {
-    use super::tests::AcceptVerifier;
+    use super::tests::genuine_verified;
     use super::*;
-
-    #[test]
-    fn challenge_rejects_time_before_issue() {
-        let mut s = AuthState::new(100, 200, 50).unwrap();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 10)
-            .unwrap();
-        assert_eq!(
-            s.verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                9,
-                &AcceptVerifier
-            ),
-            Err(AuthError::InvalidTimestamp)
-        );
-    }
 
     #[test]
     fn session_and_grant_reject_time_before_issue() {
         let mut s = AuthState::new(100, 200, 50).unwrap();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        let session = s
-            .verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                10,
-                &AcceptVerifier,
-            )
-            .unwrap();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 10).unwrap();
         let grant = s.issue_artifact_grant(session.id(), 10).unwrap();
         assert_eq!(
             s.validate_session(session.id(), 9),
@@ -640,23 +317,10 @@ mod security_tests {
     #[test]
     fn secret_ids_are_not_exposed_by_serialization_or_bytes_api() {
         let mut s = AuthState::new(100, 200, 50).unwrap();
-        let c = s
-            .issue_challenge("example.com", "https://example.com", 0)
-            .unwrap();
-        let session = s
-            .verify_challenge(
-                c.id(),
-                "example.com",
-                "https://example.com",
-                b"a",
-                1,
-                &AcceptVerifier,
-            )
-            .unwrap();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
         let grant = s.issue_artifact_grant(session.id(), 2).unwrap();
-        let dbg = format!("{c:?}{session:?}{grant:?}");
-        assert!(!dbg.contains("challenge_bytes"));
+        let dbg = format!("{session:?}{grant:?}");
         assert!(dbg.contains("[REDACTED]"));
-        assert!(format!("{c:?}").contains("[REDACTED]"));
     }
 }
