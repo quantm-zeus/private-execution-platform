@@ -15,6 +15,10 @@ use zeroize::Zeroize;
 use passkey::VerifiedPasskeyAuthentication;
 
 const TOKEN_BYTES: usize = 32;
+/// Bounded live-grant budget (MEDIUM-1 fix). Grants are TTL-pruned on every
+/// mint; beyond this many simultaneously live grants, issue_artifact_grant
+/// fails with VerifierUnavailable (HTTP 503) instead of growing memory.
+const MAX_LIVE_ARTIFACT_GRANTS: usize = 1024;
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -106,6 +110,9 @@ pub struct AuthState {
     grant_ttl_ms: i64,
     sessions: HashMap<SessionId, AuthenticatedSession>,
     grants: HashMap<ArtifactGrantId, ArtifactGrant>,
+    /// Upper bound on live grants so a minting loop cannot grow this ledger
+    /// without bound (MEDIUM-1 fix: bounded per-process grant budget).
+    max_live_grants: usize,
 }
 
 impl AuthState {
@@ -124,6 +131,7 @@ impl AuthState {
             grant_ttl_ms,
             sessions: HashMap::new(),
             grants: HashMap::new(),
+            max_live_grants: MAX_LIVE_ARTIFACT_GRANTS,
         })
     }
 
@@ -170,6 +178,13 @@ impl AuthState {
         now_ms: i64,
     ) -> Result<ArtifactGrant, AuthError> {
         self.validate_session(session_id, now_ms)?;
+        // Drop expired grants first so steady-state minting cannot exhaust the
+        // bounded ledger; then refuse beyond the live-grant budget (503-class
+        // failure at the HTTP layer, matching VerifierUnavailable semantics).
+        self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
+        if self.grants.len() >= self.max_live_grants {
+            return Err(AuthError::VerifierUnavailable);
+        }
         let expires_at_ms = now_ms
             .checked_add(self.grant_ttl_ms)
             .ok_or(AuthError::InvalidTtl)?;
@@ -296,6 +311,23 @@ mod tests {
             Err(AuthError::GrantExpired)
         );
         assert!(format!("{session:?}{grant:?}").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn grant_ledger_is_bounded_and_ttl_pruned() {
+        let mut s = state();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
+        // Fill the bounded budget; further mints fail closed without growing.
+        for _ in 0..MAX_LIVE_ARTIFACT_GRANTS {
+            s.issue_artifact_grant(session.id(), 2).unwrap();
+        }
+        assert_eq!(
+            s.issue_artifact_grant(session.id(), 2),
+            Err(AuthError::VerifierUnavailable)
+        );
+        // Time passes the 50 ms grant TTL: all grants prune, budget recovers.
+        s.issue_artifact_grant(session.id(), 53).unwrap();
     }
 }
 

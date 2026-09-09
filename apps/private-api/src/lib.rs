@@ -651,7 +651,7 @@ async fn deliver_artifact(
         Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
     };
     let response_body = encode_envelope(&envelope);
-    clear_grant(no_store(
+    let mut response = no_store(
         (
             StatusCode::OK,
             [(
@@ -661,7 +661,14 @@ async fn deliver_artifact(
             response_body,
         )
             .into_response(),
-    ))
+    );
+    // Defense in depth: opaque artifact bytes must never be sniffed into a
+    // renderable type by any intermediary or browser.
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    clear_grant(response)
 }
 
 fn content_type(headers: &HeaderMap) -> Option<&str> {
@@ -1716,6 +1723,13 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
         // Grant cookie must be cleared on success (single-use delivery).
         let cleared_grant = response
             .headers()
@@ -1792,5 +1806,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn artifact_grant_rejects_cross_session_cookie_pairing() {
+        // Session A + grant B (minted under session B): binding must fail even
+        // though both cookies are individually live.
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let state = state.with_artifact_loader(Arc::new(|| Ok(b"opaque-ciphertext".to_vec())));
+        let (session_a, _grant_a, _id_a, _offer_a) =
+            establish_session_and_grant(&state, &client).await;
+        let (_session_b, grant_b, id_b, (kid_b, pk_b)) =
+            establish_session_and_grant(&state, &client).await;
+        let (encapsulated, _initiator) = establish_initiator(&kid_b, &pk_b);
+        let body = serde_json::json!({
+            "grant_id": id_b,
+            "kid": kid_b,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_a}; {grant_b}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn expired_artifact_grant_is_rejected_and_cookie_cleared() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock.clone());
+        let state = state.with_artifact_loader(Arc::new(|| Ok(b"opaque-ciphertext".to_vec())));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        // Advance the clock past artifact_grant_ttl_ms (30_000): prune drops the
+        // pending grant before any crypto runs; response must be 401 with the
+        // grant cookie cleared.
+        clock.0.store(1_000 + 30_000, Ordering::SeqCst);
+        let (encapsulated, _initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cleared = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|v| {
+                v.to_str()
+                    .map(|s| s.starts_with(ARTIFACT_GRANT_COOKIE_NAME) && s.contains("Max-Age=0"))
+                    .unwrap_or(false)
+            });
+        assert!(cleared, "expired grant cookie must be cleared");
     }
 }
