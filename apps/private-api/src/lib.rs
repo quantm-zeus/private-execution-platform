@@ -1090,4 +1090,43 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
     }
+
+    #[tokio::test]
+    async fn expired_pending_challenge_is_rejected_without_creating_session() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock.clone());
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        // Advance the clock past challenge_ttl_ms (60_000): the pending attempt is
+        // now expired, and prune must drop it before any verification happens.
+        clock.0.store(1_000 + 60_000, Ordering::SeqCst);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let minted_session = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(SESSION_COOKIE_NAME).then_some(())
+            })
+            .is_some();
+        assert!(!minted_session);
+    }
 }
