@@ -1,0 +1,18 @@
+[package]
+name = "rpc-mtls-proof"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rpc-contracts = { workspace = true }
+service-identity = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tokio-stream = "0.1"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = { version = "=0.14.5", features = ["x509-parser"] }
+tempfile = "3"

@@ -13,6 +13,7 @@ members = [
     "apps/edge-gateway",
     "crates/rpc-contracts",
     "crates/service-identity",
+    "crates/rpc-mtls-proof",
     "apps/private-api",
     "apps/trading-core",
 ]
@@ -27,6 +28,9 @@ repository = "https://github.com/quantm-zeus/private-execution-platform"
 [workspace.dependencies]
 # internal crates
 domain = { path = "crates/domain" }
+rpc-contracts = { path = "crates/rpc-contracts" }
+service-identity = { path = "crates/service-identity" }
+rpc-mtls-proof = { path = "crates/rpc-mtls-proof" }
 market-types = { path = "crates/market-types" }
 chain-types = { path = "crates/chain-types" }
 crypto-envelope = { path = "crates/crypto-envelope" }
