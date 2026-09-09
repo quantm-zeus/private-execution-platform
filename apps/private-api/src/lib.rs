@@ -138,18 +138,97 @@ impl fmt::Debug for TransportToken {
 struct PendingAuthentication {
     attempt: AuthenticationAttempt,
     expires_at_ms: i64,
+    /// Issuing peer (edge-asserted client identity). Tracked so the
+    /// pending-challenge budget can be enforced per peer.
+    peer: PeerKey,
+}
+
+/// Unauthenticated peer identity for the challenge-issuance budget.
+///
+/// The edge asserts the originating client with the `X-Evergreen-Peer`
+/// header (private-api is loopback-only and reachable exclusively through
+/// our edge in Phase 0). Absent or malformed headers fall back to the
+/// single shared [`PeerKey::UNATTRIBUTED`] bucket, which is itself
+/// bounded: unattributable traffic can never grow `pending` without
+/// bound and can never crowd out an identified peer.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PeerKey(Option<String>);
+
+impl PeerKey {
+    /// Shared fallback bucket for absent/malformed peer attribution.
+    fn unattributed() -> Self {
+        Self(None)
+    }
+}
+
+impl fmt::Debug for PeerKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("PeerKey([ATTRIBUTED])"),
+            None => f.write_str("PeerKey(UNATTRIBUTED)"),
+        }
+    }
+}
+
+/// Bounded pending-challenge budget per peer (P0-7). Challenges are
+/// TTL-pruned on every issuance/consumption path; a peer (or the shared
+/// unattributed bucket) at this many simultaneously pending challenges
+/// gets a deterministic 429 instead of growing server memory.
+const MAX_PENDING_CHALLENGES_PER_PEER: usize = 8;
+
+/// Validates an edge-asserted peer identity: bounded length and a strict
+/// opaque charset so it can never carry header-injection or control
+/// semantics. The value is an identifier only — never logged.
+fn valid_peer_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// Extracts the issuing peer from request headers, falling back to the
+/// shared unattributed bucket when the edge did not assert a valid one.
+fn peer_from_headers(headers: &HeaderMap) -> PeerKey {
+    const PEER_HEADER: &str = "x-evergreen-peer";
+    headers
+        .get(PEER_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| valid_peer_key(value))
+        .map(|value| PeerKey(Some(value.to_owned())))
+        .unwrap_or_else(PeerKey::unattributed)
 }
 
 #[derive(Default)]
 struct TransportState {
     pending: HashMap<TransportToken, PendingAuthentication>,
+    /// Live pending-challenge count per peer, kept in lockstep with
+    /// `pending` (insert/remove/prune are the only mutations of either).
+    pending_counts: HashMap<PeerKey, usize>,
     sessions: HashMap<TransportToken, (SessionId, i64)>,
     grants: HashMap<TransportToken, PendingArtifactGrant>,
 }
 impl TransportState {
+    fn release_peer(&mut self, peer: &PeerKey) {
+        if let Some(count) = self.pending_counts.get_mut(peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_counts.remove(peer);
+            }
+        }
+    }
     fn prune(&mut self, now_ms: i64) {
-        self.pending
-            .retain(|_, pending| pending.expires_at_ms > now_ms);
+        let stale: Vec<TransportToken> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.expires_at_ms <= now_ms)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in stale {
+            if let Some(pending) = self.pending.remove(&token) {
+                self.release_peer(&pending.peer);
+            }
+        }
         self.sessions.retain(|_, (_, expires)| *expires > now_ms);
         self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
     }
@@ -263,7 +342,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
+async fn issue_challenge(State(state): State<PrivateApiState>, headers: HeaderMap) -> Response {
     let now = match state.clock.now_ms() {
         Ok(v) => v,
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
@@ -272,6 +351,7 @@ async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
         Some(v) => v.clone(),
         None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
+    let peer = peer_from_headers(&headers);
     let (options, attempt) = match authenticator.start_authentication() {
         Ok(v) => v,
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
@@ -287,13 +367,28 @@ async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
             Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         transport.prune(now);
-        transport.pending.insert(
-            token,
-            PendingAuthentication {
-                attempt,
-                expires_at_ms: now.saturating_add(state.config.challenge_ttl_ms),
-            },
-        );
+        // Per-peer pending budget: deterministic 429 when this peer (or the
+        // shared unattributed bucket) already holds the maximum. The
+        // challenge generated above is discarded; nothing was stored, so
+        // the failed request consumed no budget.
+        let live = transport.pending_counts.get(&peer).copied().unwrap_or(0);
+        if live >= MAX_PENDING_CHALLENGES_PER_PEER {
+            return too_many_requests();
+        }
+        let inserted = transport
+            .pending
+            .insert(
+                token,
+                PendingAuthentication {
+                    attempt,
+                    expires_at_ms: now.saturating_add(state.config.challenge_ttl_ms),
+                    peer: peer.clone(),
+                },
+            )
+            .is_none();
+        if inserted {
+            *transport.pending_counts.entry(peer).or_insert(0) += 1;
+        }
     }
     let body = match serde_json::to_vec(&options) {
         Ok(v) => v,
@@ -342,7 +437,13 @@ async fn verify_challenge(
             Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         transport.prune(now);
-        transport.pending.remove(challenge_token)
+        // Consumption releases the peer's budget slot immediately, whether
+        // the attempt then verifies or not: the pending record is gone.
+        let removed = transport.pending.remove(challenge_token);
+        if let Some(pending) = &removed {
+            transport.release_peer(&pending.peer);
+        }
+        removed
     };
     let Some(pending) = pending else {
         return clear_challenge(generic_error(StatusCode::UNAUTHORIZED));
@@ -781,6 +882,21 @@ fn clear_session(mut response: Response) -> Response {
 }
 fn generic_error(status: StatusCode) -> Response {
     no_store((status, "request unavailable").into_response())
+}
+
+/// Deterministic budget response (P0-7): peer exhausted its bounded
+/// pending-challenge allowance. Carries Retry-After so well-behaved
+/// clients back off until challenges can expire, and nothing about the
+/// peer or its pending count is disclosed.
+fn too_many_requests() -> Response {
+    no_store(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "60")],
+            "request unavailable",
+        )
+            .into_response(),
+    )
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1504,6 +1620,260 @@ mod tests {
             })
             .is_some();
         assert!(!minted_session);
+    }
+
+    // ---- P0-7 challenge-issuance budget tests ----
+
+    const PEER_A: &str = "peer-a.internal";
+    const PEER_B: &str = "peer-b.internal";
+
+    /// Issues one challenge for `peer` and returns the response status.
+    async fn challenge_for(app: Router, peer: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/internal/auth/challenge");
+        if let Some(peer) = peer {
+            request = request.header("X-Evergreen-Peer", peer);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn same_peer_exhaustion_returns_deterministic_429() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        for _ in 0..MAX_PENDING_CHALLENGES_PER_PEER {
+            assert_eq!(
+                challenge_for(router(state.clone()), Some(PEER_A)).await,
+                StatusCode::OK
+            );
+        }
+        // The (MAX+1)th concurrent challenge for the same peer is refused
+        // deterministically and carries Retry-After.
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/challenge")
+                    .header("X-Evergreen-Peer", PEER_A)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        // Further requests keep failing closed at the cap (no drift).
+        assert_eq!(
+            challenge_for(router(state), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn peers_are_independently_bounded() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        // Peer A saturates its budget...
+        for _ in 0..MAX_PENDING_CHALLENGES_PER_PEER {
+            assert_eq!(
+                challenge_for(router(state.clone()), Some(PEER_A)).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            challenge_for(router(state.clone()), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // ...without touching peer B's fresh budget.
+        assert_eq!(
+            challenge_for(router(state.clone()), Some(PEER_B)).await,
+            StatusCode::OK
+        );
+        // And the unattributed shared bucket is separate from both.
+        assert_eq!(
+            challenge_for(router(state.clone()), None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            challenge_for(router(state), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_recovers_after_challenge_is_consumed() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        // Mint one challenge BEFORE saturating so we hold a completable
+        // ceremony for this peer.
+        let (challenge_cookie, options) = {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/auth/challenge")
+                        .header("X-Evergreen-Peer", PEER_A)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_string();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let options: auth::RequestChallengeResponse = serde_json::from_slice(&body).unwrap();
+            (cookie, options)
+        };
+        // Saturate the remaining budget.
+        for _ in 0..(MAX_PENDING_CHALLENGES_PER_PEER - 1) {
+            assert_eq!(
+                challenge_for(router(state.clone()), Some(PEER_A)).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            challenge_for(router(state.clone()), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Complete the ceremony: consumption releases the slot even though
+        // nothing expired.
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // The consumed challenge's slot is free again.
+        assert_eq!(
+            challenge_for(router(state), Some(PEER_A)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_recovers_after_ttl_expiry() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock.clone());
+        for _ in 0..MAX_PENDING_CHALLENGES_PER_PEER {
+            assert_eq!(
+                challenge_for(router(state.clone()), Some(PEER_A)).await,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            challenge_for(router(state.clone()), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Advance past challenge_ttl_ms: prune drops every expired pending
+        // challenge and the peer's budget recovers fully (all 8 released).
+        clock.0.store(1_000 + 60_000, Ordering::SeqCst);
+        for _ in 0..MAX_PENDING_CHALLENGES_PER_PEER {
+            assert_eq!(
+                challenge_for(router(state.clone()), Some(PEER_A)).await,
+                StatusCode::OK
+            );
+        }
+        // The refreshed budget is bounded exactly as before.
+        assert_eq!(
+            challenge_for(router(state), Some(PEER_A)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn unattributed_and_malformed_peers_share_one_bounded_bucket() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        // Malformed identities (over-length or disallowed charset) must
+        // fall back to the shared unattributed bucket, never become
+        // distinct unlimited keys. Byte-level garbage (newlines etc.) is
+        // rejected by HTTP itself and cannot reach the handler; here we
+        // exercise the shapes that arrive legally but violate the policy.
+        let malformed: [String; 3] = [
+            "a".repeat(65),
+            "peer;internal".to_string(),
+            "peer internal".to_string(),
+        ];
+        // Fill the shared (unattributed) bucket.
+        for _ in 0..MAX_PENDING_CHALLENGES_PER_PEER {
+            assert_eq!(
+                challenge_for(router(state.clone()), None).await,
+                StatusCode::OK
+            );
+        }
+        // Malformed peers resolve to the same exhausted bucket -> 429.
+        for peer in &malformed {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/auth/challenge")
+                        .header("X-Evergreen-Peer", peer.as_str())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        // An identified peer remains unaffected.
+        assert_eq!(
+            challenge_for(router(state), Some(PEER_A)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_challenges_at_the_cap_allow_exactly_the_budget() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        // Fire 3x the budget concurrently for one peer; exactly
+        // MAX_PENDING_CHALLENGES_PER_PEER may succeed under the mutex.
+        let total = MAX_PENDING_CHALLENGES_PER_PEER * 3;
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                challenge_for(router(state), Some(PEER_A)).await
+            }));
+        }
+        let mut ok = 0usize;
+        let mut too_many = 0usize;
+        for handle in handles {
+            match handle.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::TOO_MANY_REQUESTS => too_many += 1,
+                other => panic!("unexpected status at the cap: {other}"),
+            }
+        }
+        assert_eq!(ok, MAX_PENDING_CHALLENGES_PER_PEER);
+        assert_eq!(too_many, total - MAX_PENDING_CHALLENGES_PER_PEER);
     }
 
     // ---- P0-4 artifact delivery tests ----
