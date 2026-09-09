@@ -383,6 +383,14 @@ async fn verify_challenge(
         .finish_authentication(pending.attempt, &credential)
     {
         Ok(v) => v,
+        // Taxonomy (P0-8): credential-store unavailability AFTER successful
+        // WebAuthn crypto is a backend condition (503), while crypto/verify
+        // failure is an ordinary auth failure (401). Both clear the
+        // consumed challenge: the pending attempt was already removed from
+        // the transport map above, so the challenge is single-use either way.
+        Err(AuthError::VerifierUnavailable) => {
+            return clear_challenge(generic_error(StatusCode::SERVICE_UNAVAILABLE))
+        }
         Err(_) => return clear_challenge(generic_error(StatusCode::UNAUTHORIZED)),
     };
     let mut auth = match state.auth.lock() {
@@ -1032,11 +1040,64 @@ mod tests {
         }
     }
 
+    /// Store whose crypto accepts but whose persistence layer is DOWN.
+    /// Used to prove the P0-8 taxonomy: successful WebAuthn crypto followed
+    /// by store unavailability must surface as 503 (backend condition),
+    /// never 401 (auth failure).
+    struct UnavailableApplyStore {
+        passkey: Mutex<Passkey>,
+    }
+
+    impl PasskeyCredentialStore for UnavailableApplyStore {
+        fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
+            Ok(vec![self.passkey.lock().unwrap().clone()])
+        }
+
+        fn apply_authentication_result(&self, _: &AuthenticationResult) -> Result<(), AuthError> {
+            Err(AuthError::VerifierUnavailable)
+        }
+    }
+
     fn test_state(clock: Arc<FixedClock>) -> (PrivateApiState, TestRegistrationClient) {
         let (authenticator, client) = legacy_authenticator();
         let state =
             PrivateApiState::with_test_dependencies(config(), Some(authenticator), clock).unwrap();
         (state, client)
+    }
+
+    /// Same ceremony wiring as [`test_state`] but backed by
+    /// [`UnavailableApplyStore`]: crypto succeeds, persistence is down.
+    fn test_state_store_unavailable(
+        clock: Arc<FixedClock>,
+    ) -> (PrivateApiState, TestRegistrationClient) {
+        let origin = auth::passkey::__private_test_origin();
+        let server = auth::passkey::__private_test_server(&origin);
+        let (creation, reg_state) = server
+            .start_passkey_registration(
+                auth::passkey::__private_test_uuid(),
+                "owner",
+                "Owner",
+                None,
+            )
+            .unwrap();
+        let registration_client = std::sync::Mutex::new(auth::passkey::__private_test_client(true));
+        let registration = registration_client
+            .lock()
+            .unwrap()
+            .do_registration(origin.clone(), creation)
+            .unwrap();
+        let passkey = server
+            .finish_passkey_registration(&registration, &reg_state)
+            .unwrap();
+        let store: Arc<dyn PasskeyCredentialStore> = Arc::new(UnavailableApplyStore {
+            passkey: Mutex::new(passkey),
+        });
+        let authenticator = Arc::new(
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap(),
+        );
+        let state =
+            PrivateApiState::with_test_dependencies(config(), Some(authenticator), clock).unwrap();
+        (state, registration_client)
     }
 
     /// The client whose SoftPasskey token store matches the passkey registered in the
@@ -1545,6 +1606,147 @@ mod tests {
             })
             .is_some();
         assert!(!minted_session);
+    }
+
+    // ---- P0-8 store-error taxonomy tests ----
+
+    #[tokio::test]
+    async fn successful_crypto_with_unavailable_store_returns_503_and_consumes_challenge() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state_store_unavailable(clock);
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let body = serde_json::to_vec(&credential).unwrap();
+        let make = || {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/auth/verify")
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                .header(header::COOKIE, challenge_cookie.clone())
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+        // WebAuthn crypto SUCCEEDS, then the credential store is down:
+        // the documented taxonomy says backend condition => 503, and the
+        // challenge is consumed exactly as on any other post-crypto path.
+        let response = router(state.clone()).oneshot(make()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(is_challenge_cleared(&response));
+        // No session may exist on a 503 path.
+        assert!(response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .all(|v| {
+                v.to_str()
+                    .map(|s| !s.starts_with(SESSION_COOKIE_NAME))
+                    .unwrap_or(true)
+            }));
+        // Replay of the same challenge is rejected: single-use held.
+        assert_eq!(
+            router(state).oneshot(make()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_crypto_still_returns_401_and_consumes_challenge() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let (challenge_cookie, _options) = begin(router(state.clone())).await;
+        // Sign a DIFFERENT server challenge: crypto fails => 401, and the
+        // pending attempt is consumed (existing documented policy).
+        let (_, other_options) = begin(router(state.clone())).await;
+        let wrong_credential = {
+            let mut client = client.lock().unwrap();
+            client.do_authentication(auth::passkey::__private_test_origin_url(), other_options)
+        }
+        .unwrap();
+        let body = serde_json::to_vec(&wrong_credential).unwrap();
+        let make = || {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/auth/verify")
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                .header(header::COOKIE, challenge_cookie.clone())
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+        assert_eq!(
+            router(state.clone())
+                .oneshot(make())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            router(state).oneshot(make()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_body_still_401s_without_consuming_challenge() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state_store_unavailable(clock.clone());
+        // Sign a REAL assertion for this ceremony first, then submit it
+        // malformed: the malformed try must not consume the challenge.
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let body = serde_json::to_vec(&credential).unwrap();
+        let malformed = Request::builder()
+            .method("POST")
+            .uri("/internal/auth/verify")
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(header::COOKIE, challenge_cookie.clone())
+            .body(Body::from(r#"{"id":not-json}"#))
+            .unwrap();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(malformed)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        // The same challenge is still live: the well-formed retry now
+        // reaches the (unavailable) store and must 503, proving the
+        // taxonomy and the non-consumption policy compose.
+        let valid = Request::builder()
+            .method("POST")
+            .uri("/internal/auth/verify")
+            .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(header::COOKIE, challenge_cookie)
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            router(state).oneshot(valid).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Whether the response clears the challenge cookie (Max-Age=0 form).
+    fn is_challenge_cleared(response: &axum::response::Response) -> bool {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|v| {
+                v.to_str()
+                    .map(|s| s.starts_with(CHALLENGE_COOKIE_NAME) && s.contains("Max-Age=0"))
+                    .unwrap_or(false)
+            })
     }
 
     // ---- P0-7 challenge-issuance budget tests ----
