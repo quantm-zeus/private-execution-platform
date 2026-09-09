@@ -26,7 +26,8 @@ struct TestPki {
     server: IdentityFiles,
     good_client: IdentityFiles,
     cross_ca_client: IdentityFiles,
-    no_client_eku_client: IdentityFiles,
+    server_auth_only_client: IdentityFiles,
+    no_eku_client: IdentityFiles,
 }
 
 struct IdentityFiles {
@@ -104,7 +105,16 @@ fn build_test_pki() -> TestPki {
         "client-good.internal.proof",
         &[ExtendedKeyUsagePurpose::ClientAuth],
     );
-    let no_client_eku_client = leaf("client-noeku.internal.proof", &[]);
+    // EKU characterization identities:
+    // - serverAuth-only EKU: a WRONG EKU for client authentication; the
+    //   pinned stack rejects it (see the fail-closed test).
+    // - no EKU extension at all: RFC 5280 "unrestricted"; accepted by the
+    //   pinned stack (characterized, standard PKI semantics).
+    let server_auth_only_client = leaf(
+        "client-serverauth-only.internal.proof",
+        &[ExtendedKeyUsagePurpose::ServerAuth],
+    );
+    let no_eku_client = leaf("client-noeku.internal.proof", &[]);
 
     // A second, untrusted CA used to issue the cross-CA client identity.
     let cross_key = KeyPair::generate().expect("cross ca key");
@@ -145,7 +155,8 @@ fn build_test_pki() -> TestPki {
         server,
         good_client,
         cross_ca_client,
-        no_client_eku_client,
+        server_auth_only_client,
+        no_eku_client,
     }
 }
 
@@ -342,32 +353,54 @@ async fn missing_client_certificate_is_rejected() {
 }
 
 #[tokio::test]
-async fn client_without_clientauth_eku_is_rejected() {
+async fn client_with_serverauth_only_eku_is_rejected() {
+    // Fail-closed wrong-EKU case: a client leaf signed by the TRUSTED CA but
+    // carrying only the serverAuth EKU (a "wrong EKU" for client
+    // authentication) is rejected by the pinned tonic/rustls stack with a
+    // fatal TLS alert. This proves the stack does enforce client-certificate
+    // EKU against a wrong value, in addition to CA validation.
     let pki = build_test_pki();
     let server = spawn_mtls_server(&pki).await;
     let result = connect_and_relay(
         &pki,
         server.server_addr,
-        &pki.no_client_eku_client,
+        &pki.server_auth_only_client,
         SERVER_DNS,
         b"x",
     )
     .await;
-    // A CA-signed cert lacking the clientAuth EKU must not authenticate as a
-    // client. Whether rustls enforces EKU on the server side can vary; if it
-    // does not, this assertion documents the observed behavior honestly — so
-    // we require EITHER a transport failure OR (if accepted) that the server
-    // still only ever sees ciphertext. Accepted-connection semantics are
-    // re-asserted below in the config-level test.
-    if result.is_ok() {
-        // Documented deviation: rustls server does not enforce client EKU by
-        // default in this tonic version. The identity still chains to the
-        // trusted CA. This is acceptable ONLY because service-identity config
-        // remains the enforcement point for DNS/CA pinning; see review notes.
-        let _ = server.shutdown.send(());
-        server.handle.await.expect("server task");
-        return;
-    }
+    assert!(
+        result.is_err(),
+        "serverAuth-only EKU client must fail closed: {result:?}"
+    );
+    let _ = server.shutdown.send(());
+    server.handle.await.expect("server task");
+}
+
+#[tokio::test]
+async fn client_without_eku_extension_is_accepted_as_unrestricted() {
+    // Characterization of RFC 5280 unrestricted semantics (NOT an
+    // authorization bypass claim and NOT a wrong-EKU failure): a CA-signed
+    // client leaf with NO EKU extension at all is "unrestricted" per
+    // RFC 5280 and is accepted by the pinned stack. This pins the observed
+    // behavior so the security claims of this crate stay honest: acceptance
+    // here is standard PKI semantics for absent EKU, not a policy decision
+    // of this codebase.
+    let pki = build_test_pki();
+    let server = spawn_mtls_server(&pki).await;
+    let result = connect_and_relay(
+        &pki,
+        server.server_addr,
+        &pki.no_eku_client,
+        SERVER_DNS,
+        b"x",
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "no-EKU-extension (RFC 5280 unrestricted) client accepted-ness changed: {result:?} — \
+         re-characterize and update crate docs before relying on either behavior"
+    );
     let _ = server.shutdown.send(());
     server.handle.await.expect("server task");
 }
