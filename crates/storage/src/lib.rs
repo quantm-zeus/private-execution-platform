@@ -273,6 +273,7 @@ pub trait EventBus: Send + Sync {
     async fn health(&self) -> HealthProbe;
 }
 
+pub mod nats;
 pub mod pg;
 
 #[cfg(test)]

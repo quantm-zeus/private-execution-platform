@@ -11,18 +11,27 @@ path = "src/lib.rs"
 
 [features]
 postgres-integration = []
+nats-integration = []
 
 [[test]]
 name = "pg_store_integration"
 path = "tests/pg_store_integration.rs"
 required-features = ["postgres-integration"]
 
+[[test]]
+name = "nats_eventbus_integration"
+path = "tests/nats_eventbus_integration.rs"
+required-features = ["nats-integration"]
+
 [dependencies]
+async-nats = "0.46.0"
 async-trait.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 
 [dev-dependencies]
+futures-util = "0.3"
 serde_json.workspace = true
