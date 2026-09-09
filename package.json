@@ -7,7 +7,8 @@
     "build:workspace": "pnpm --filter @evergreen/workspace build",
     "typecheck": "pnpm -r typecheck",
     "build:workspace:encrypted": "node scripts/build-workspace-encrypted.mjs",
-    "verify:web-boundary": "node scripts/verify-web-boundary.mjs"
+    "verify:web-boundary": "node scripts/verify-web-boundary.mjs",
+    "verify:workspace-bootstrap": "node scripts/verify-workspace-bootstrap.mjs"
   },
   "devDependencies": {
     "typescript": "5.9.2",
