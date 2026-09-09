@@ -314,7 +314,9 @@ fn edge_response(error: EdgeError) -> Response {
         EdgeError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         EdgeError::InvalidConfiguration => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, "request unavailable").into_response()
+    let mut response = (status, "request unavailable").into_response();
+    apply_opaque_response_headers(&mut response);
+    response
 }
 
 #[cfg(test)]
@@ -807,6 +809,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let headers = response.headers();
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"request unavailable");
     }
