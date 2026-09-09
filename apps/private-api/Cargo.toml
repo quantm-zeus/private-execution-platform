@@ -15,12 +15,17 @@ auth.workspace = true
 axum.workspace = true
 crypto-envelope.workspace = true
 getrandom = "0.2"
+rpc-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+service-identity.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 auth = { workspace = true, features = ["private-test-support"] }
 http-body-util = "0.1"
+rcgen = { version = "=0.14.5", features = ["x509-parser"] }
+tempfile = "3"
 tower = { workspace = true, features = ["util"] }

@@ -319,6 +319,8 @@ fn edge_response(error: EdgeError) -> Response {
     response
 }
 
+pub mod private_relay;
+
 #[cfg(test)]
 mod tests {
     use super::*;

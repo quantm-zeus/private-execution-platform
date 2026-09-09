@@ -903,6 +903,8 @@ impl From<AuthError> for PrivateApiError {
     }
 }
 
+pub mod relay;
+
 #[cfg(test)]
 mod tests {
     use super::*;

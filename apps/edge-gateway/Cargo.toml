@@ -13,11 +13,19 @@ path = "src/main.rs"
 [dependencies]
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rpc-contracts.workspace = true
+service-identity.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "net"] }
+tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
 futures-util = "0.3"
 http-body-util = "0.1"
+private-api = { path = "../private-api" }
+rcgen = { version = "=0.14.5", features = ["x509-parser"] }
+tempfile = "3"
+tokio-stream = "0.1"
 tokio-tungstenite = "0.29"
