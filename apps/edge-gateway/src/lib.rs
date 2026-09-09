@@ -9,7 +9,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Request, State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -271,15 +271,39 @@ async fn protected(
     };
 
     match state.relay.relay(route, body).await {
-        Ok(bytes) if bytes.len() <= state.max_body_bytes => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, OPAQUE_CONTENT_TYPE)],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) if bytes.len() <= state.max_body_bytes => {
+            let mut response = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, OPAQUE_CONTENT_TYPE)],
+                bytes,
+            )
+                .into_response();
+            apply_opaque_response_headers(&mut response);
+            response
+        }
         Ok(_) => edge_response(EdgeError::PayloadTooLarge),
         Err(error) => edge_response(error),
     }
+}
+
+/// Hardening headers for opaque payloads. The edge cannot know payload semantics,
+/// so it refuses to let any renderer interpret them: no caching, no rendering in
+/// any embedding context, no content-type sniffing, no referrer leakage.
+fn apply_opaque_response_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
 }
 
 fn edge_response(error: EdgeError) -> Response {
@@ -796,5 +820,44 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn opaque_relay_response_carries_hardening_headers() {
+        let state = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1024,
+        )
+        .unwrap();
+        let response = router(state)
+            .oneshot(request("/v1/blob", b"ciphertext", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "opaque artifacts must never be cached"
+        );
+        assert_eq!(
+            headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+            "opaque payload must not be renderable or embeddable"
+        );
+        assert_eq!(
+            headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff"
+        );
+        assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            OPAQUE_CONTENT_TYPE
+        );
     }
 }

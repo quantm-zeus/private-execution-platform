@@ -24,6 +24,12 @@ macro_rules! opaque_id {
             fn random() -> Result<Self, AuthError> {
                 Ok(Self(random_bytes()?))
             }
+            /// Reference to the raw id bytes. Opaque ids are bearer references
+            /// the legitimate holder already knows; exposing a borrow (never a
+            /// copy or serialization) lets transports echo them back.
+            pub fn as_bytes(&self) -> &[u8; TOKEN_BYTES] {
+                &self.0
+            }
         }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

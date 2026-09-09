@@ -10,7 +10,10 @@ use std::{
 
 use auth::passkey::PasskeyCredentialStore;
 use auth::passkey::{AuthenticationAttempt, WebAuthnPasskeyAuthenticator};
-use auth::{AuthError, AuthState, AuthenticationResult, Passkey, PublicKeyCredential, SessionId};
+use auth::{
+    ArtifactGrantId, AuthError, AuthState, AuthenticationResult, Passkey, PublicKeyCredential,
+    SessionId,
+};
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, State},
@@ -111,7 +114,7 @@ impl Clock for SystemClock {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Hash, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 struct TransportToken(String);
 
 impl TransportToken {
@@ -141,14 +144,18 @@ struct PendingAuthentication {
 struct TransportState {
     pending: HashMap<TransportToken, PendingAuthentication>,
     sessions: HashMap<TransportToken, (SessionId, i64)>,
+    grants: HashMap<TransportToken, PendingArtifactGrant>,
 }
 impl TransportState {
     fn prune(&mut self, now_ms: i64) {
         self.pending
             .retain(|_, pending| pending.expires_at_ms > now_ms);
         self.sessions.retain(|_, (_, expires)| *expires > now_ms);
+        self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
     }
 }
+
+type ArtifactLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct PrivateApiState {
@@ -157,6 +164,7 @@ pub struct PrivateApiState {
     transport: Arc<Mutex<TransportState>>,
     authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
     clock: Arc<dyn Clock>,
+    artifact_loader: ArtifactLoader,
 }
 
 impl PrivateApiState {
@@ -173,6 +181,7 @@ impl PrivateApiState {
             transport: Arc::new(Mutex::new(TransportState::default())),
             authenticator: None,
             clock: Arc::new(SystemClock),
+            artifact_loader: Arc::new(load_workspace_artifact),
         })
     }
 
@@ -201,7 +210,14 @@ impl PrivateApiState {
             transport: Arc::new(Mutex::new(TransportState::default())),
             authenticator,
             clock,
+            artifact_loader: Arc::new(load_workspace_artifact),
         })
+    }
+
+    #[cfg(test)]
+    fn with_artifact_loader(mut self, loader: ArtifactLoader) -> Self {
+        self.artifact_loader = loader;
+        self
     }
 }
 
@@ -235,7 +251,11 @@ pub fn router(state: PrivateApiState) -> Router {
         .route("/internal/auth/challenge", post(issue_challenge))
         .route("/internal/auth/verify", post(verify_challenge))
         .route("/internal/auth/session", get(validate_session))
-        .layer(DefaultBodyLimit::max(MAX_ASSERTION_BYTES))
+        .route("/internal/artifact/grant", post(issue_artifact_grant))
+        .route("/internal/artifact", post(deliver_artifact))
+        .layer(DefaultBodyLimit::max(
+            MAX_ASSERTION_BYTES.max(MAX_OFFER_BYTES),
+        ))
         .with_state(state)
 }
 
@@ -381,6 +401,11 @@ fn append_challenge_clear(response: &mut Response) -> Result<(), PrivateApiError
     append_cookie(response, expired_cookie(CHALLENGE_COOKIE_NAME))
 }
 
+fn clear_grant(mut response: Response) -> Response {
+    let _ = append_cookie(&mut response, expired_cookie(ARTIFACT_GRANT_COOKIE_NAME));
+    response
+}
+
 async fn validate_session(State(state): State<PrivateApiState>, headers: HeaderMap) -> Response {
     let now = match state.clock.now_ms() {
         Ok(v) => v,
@@ -410,6 +435,233 @@ async fn validate_session(State(state): State<PrivateApiState>, headers: HeaderM
     } else {
         clear_session(generic_error(StatusCode::UNAUTHORIZED))
     }
+}
+
+const ARTIFACT_GRANT_COOKIE_NAME: &str = "__Host-evergreen_grant";
+const MAX_OFFER_BYTES: usize = 4096;
+/// Envelope overhead for a delivered artifact: kid (16) + nonce (12) + sequence (8).
+const ENVELOPE_OVERHEAD_BYTES: usize = 36;
+const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+pub const ARTIFACT_DELIVERY_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Request body for `/internal/artifact`: the client's HPKE handshake answer,
+/// all fields base64 (standard alphabet, padded).
+#[derive(serde::Deserialize)]
+struct ArtifactDeliveryRequest {
+    grant_id: String,
+    kid: String,
+    encapsulated_key: String,
+}
+
+/// Public wire half of the server's per-grant ephemeral HPKE offer. The private
+/// keypair stays in RAM inside the pending grant and is dropped at first use.
+#[derive(serde::Serialize)]
+struct ArtifactGrantResponse {
+    grant_id: String,
+    kid: String,
+    recipient_public_key: String,
+    expires_in_ms: i64,
+}
+
+/// A pending artifact grant plus its server-generated ephemeral responder
+/// keypair. The keypair exists only between grant issuance and single-use
+/// delivery; it is never serialized or logged.
+struct PendingArtifactGrant {
+    grant_id: ArtifactGrantId,
+    session_id: SessionId,
+    expires_at_ms: i64,
+    offer: crypto_envelope::hpke::HpkeHandshakeOffer,
+    keypair: crypto_envelope::hpke::HpkeRecipientKeyPair,
+}
+
+async fn issue_artifact_grant(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let expires_at_ms = now.saturating_add(state.config.artifact_grant_ttl_ms);
+    let grant = {
+        let mut auth = match state.auth.lock() {
+            Ok(auth) => auth,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        match auth.issue_artifact_grant(&session_id, now) {
+            Ok(grant) => grant,
+            Err(AuthError::VerifierUnavailable | AuthError::EntropyUnavailable) => {
+                return generic_error(StatusCode::SERVICE_UNAVAILABLE)
+            }
+            Err(_) => return generic_error(StatusCode::UNAUTHORIZED),
+        }
+    };
+    let token = match random_transport_token() {
+        Ok(token) => token,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    // Per-grant ephemeral responder keypair. The offer half is published to the
+    // authenticated client in this response (ADR 0001: the offer must ride the
+    // authenticated session channel); the private half never leaves RAM.
+    let kid = match random_kid() {
+        Ok(kid) => kid,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let (offer, keypair) = match crypto_envelope::hpke::HpkeHandshakeOffer::generate(kid) {
+        Ok(result) => result,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    {
+        let mut transport = match state.transport.lock() {
+            Ok(transport) => transport,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        transport.prune(now);
+        transport.grants.insert(
+            token.clone(),
+            PendingArtifactGrant {
+                grant_id: grant.id().clone(),
+                session_id,
+                expires_at_ms,
+                offer: offer.clone(),
+                keypair,
+            },
+        );
+    }
+    let body = match serde_json::to_vec(&ArtifactGrantResponse {
+        grant_id: hex_encode(grant.id().as_bytes()),
+        kid: base64_encode(&offer.kid),
+        recipient_public_key: base64_encode(&offer.recipient_public_key.0),
+        expires_in_ms: state.config.artifact_grant_ttl_ms,
+    }) {
+        Ok(body) => body,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let cookie = secure_cookie(
+        ARTIFACT_GRANT_COOKIE_NAME,
+        token.as_str(),
+        max_age_seconds(state.config.artifact_grant_ttl_ms),
+    );
+    let mut response =
+        no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response());
+    if set_cookie(&mut response, cookie).is_err() {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    response
+}
+
+/// Loads the sealed workspace artifact, if configured and readable. Absence is a
+/// fail-closed 503 at delivery time, never an error surfaced to logs with content.
+fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
+    let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    if path.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    std::fs::read(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+async fn deliver_artifact(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let grant_token = match cookie_value(&headers, ARTIFACT_GRANT_COOKIE_NAME) {
+        Ok(Some(value)) => TransportToken(value.to_string()),
+        Ok(None) | Err(_) => return generic_error(StatusCode::UNAUTHORIZED),
+    };
+    let session_token = match cookie_value(&headers, SESSION_COOKIE_NAME) {
+        Ok(Some(value)) => TransportToken(value.to_string()),
+        Ok(None) | Err(_) => return clear_session(generic_error(StatusCode::UNAUTHORIZED)),
+    };
+    let body_bytes = match to_bytes(body, MAX_OFFER_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: ArtifactDeliveryRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    // Grant and session cookies must both be present and unambiguous; the grant
+    // is consumed on first successful validation regardless of crypto outcome
+    // beyond this point (matching challenge consumption semantics).
+    let pending_grant = {
+        let mut transport = match state.transport.lock() {
+            Ok(transport) => transport,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        transport.prune(now);
+        let Some(grant) = transport.grants.remove(&grant_token) else {
+            return clear_grant(generic_error(StatusCode::UNAUTHORIZED));
+        };
+        if grant.expires_at_ms <= now {
+            return clear_grant(generic_error(StatusCode::UNAUTHORIZED));
+        }
+        match transport.sessions.get(&session_token) {
+            Some((bound_session, session_expires))
+                if *bound_session == grant.session_id && *session_expires > now => {}
+            _ => return clear_grant(clear_session(generic_error(StatusCode::UNAUTHORIZED))),
+        }
+        grant
+    };
+    if hex_encode(pending_grant.grant_id.as_bytes()) != request.grant_id {
+        return clear_grant(clear_session(generic_error(StatusCode::UNAUTHORIZED)));
+    }
+    let artifact = match (state.artifact_loader)() {
+        Ok(artifact) => artifact,
+        Err(status) => return clear_grant(generic_error(status)),
+    };
+    if artifact.len() > MAX_ARTIFACT_BYTES.saturating_sub(ENVELOPE_OVERHEAD_BYTES) {
+        return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    let encapsulated = match decode_encapsulated_key(&request) {
+        Ok(encapsulated) => encapsulated,
+        Err(_) => return clear_grant(generic_error(StatusCode::BAD_REQUEST)),
+    };
+    // Establish against the offer published at grant time; the request must
+    // echo the same kid. Server private key material lives only in this grant
+    // and is dropped after this single use.
+    if base64_encode(&pending_grant.offer.kid) != request.kid {
+        return clear_grant(generic_error(StatusCode::UNAUTHORIZED));
+    }
+    let mut session = match crypto_envelope::hpke::responder_establish(
+        &pending_grant.offer,
+        &pending_grant.keypair,
+        &encapsulated,
+    ) {
+        Ok(session) => session,
+        Err(_) => return clear_grant(generic_error(StatusCode::UNAUTHORIZED)),
+    };
+    let envelope = match session.seal(1, &artifact) {
+        Ok(envelope) => envelope,
+        Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    let response_body = encode_envelope(&envelope);
+    clear_grant(no_store(
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(ARTIFACT_DELIVERY_CONTENT_TYPE),
+            )],
+            response_body,
+        )
+            .into_response(),
+    ))
 }
 
 fn content_type(headers: &HeaderMap) -> Option<&str> {
@@ -445,6 +697,15 @@ fn cookie_value<'a>(
         }
     }
     Ok(found)
+}
+
+fn random_kid() -> Result<[u8; 16], PrivateApiError> {
+    let mut kid = [0u8; 16];
+    if getrandom::getrandom(&mut kid).is_err() {
+        kid.zeroize();
+        return Err(PrivateApiError::EntropyUnavailable);
+    }
+    Ok(kid)
 }
 
 fn random_transport_token() -> Result<TransportToken, PrivateApiError> {
@@ -513,6 +774,112 @@ fn clear_session(mut response: Response) -> Response {
 }
 fn generic_error(status: StatusCode) -> Response {
     no_store((status, "request unavailable").into_response())
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(triple >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[triple as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn base64_decode_lenient(input: &str, expected_len: usize) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some((byte - b'A') as u32),
+            b'a'..=b'z' => Some((byte - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((byte - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(expected_len);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        if byte == b'=' || byte == b'\n' || byte == b'\r' {
+            continue;
+        }
+        let v = value(byte)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    if out.len() != expected_len {
+        return None;
+    }
+    Some(out)
+}
+
+/// Resolves the transport-token cookie to a live SessionId. Returns None on any
+/// ambiguity; the caller decides whether to also clear cookies.
+fn session_id_from_headers(
+    state: &PrivateApiState,
+    headers: &HeaderMap,
+    now: i64,
+) -> Option<SessionId> {
+    let token = cookie_value(headers, SESSION_COOKIE_NAME).ok()??;
+    let mut transport = state.transport.lock().ok()?;
+    transport.prune(now);
+    let (session_id, expires_at_ms) = transport.sessions.get(token)?.clone();
+    if expires_at_ms <= now {
+        return None;
+    }
+    Some(session_id)
+}
+
+fn decode_encapsulated_key(
+    request: &ArtifactDeliveryRequest,
+) -> Result<crypto_envelope::hpke::HpkeEncapsulatedKey, ()> {
+    let encapsulated_raw = base64_decode_lenient(&request.encapsulated_key, 32).ok_or(())?;
+    // All-zero X25519 points are rejected during HPKE setup; still, refuse the
+    // degenerate value here to fail closed before touching key material.
+    if encapsulated_raw.iter().all(|&b| b == 0) {
+        return Err(());
+    }
+    Ok(crypto_envelope::hpke::HpkeEncapsulatedKey(
+        encapsulated_raw.try_into().map_err(|_| ())?,
+    ))
+}
+
+fn encode_envelope(envelope: &crypto_envelope::Envelope) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + 12 + 8 + envelope.ciphertext.len());
+    out.extend_from_slice(&envelope.kid);
+    out.extend_from_slice(&envelope.nonce);
+    out.extend_from_slice(&envelope.sequence.to_be_bytes());
+    out.extend_from_slice(&envelope.ciphertext);
+    out
 }
 
 #[derive(Debug)]
@@ -1128,5 +1495,302 @@ mod tests {
             })
             .is_some();
         assert!(!minted_session);
+    }
+
+    // ---- P0-4 artifact delivery tests ----
+
+    /// Full ceremony helper: verify -> session cookie -> grant cookie + grant id.
+    /// Builds the client-side initiator half against the server's published
+    /// per-grant offer (base64 kid + recipient public key).
+    fn establish_initiator(
+        server_kid: &str,
+        server_pk: &str,
+    ) -> (
+        crypto_envelope::hpke::HpkeEncapsulatedKey,
+        crypto_envelope::hpke::HpkeInitiatorSession,
+    ) {
+        let kid_raw = base64::decode::<16>(server_kid);
+        let pk_raw = base64::decode::<32>(server_pk);
+        let offer = crypto_envelope::hpke::HpkeHandshakeOffer {
+            version: crypto_envelope::hpke::HPKE_VERSION,
+            suite_id: crypto_envelope::hpke::HPKE_SUITE_ID,
+            kid: kid_raw,
+            recipient_public_key: crypto_envelope::hpke::HpkePublicKey(pk_raw),
+        };
+        crypto_envelope::hpke::initiator_establish(&offer).unwrap()
+    }
+
+    mod base64 {
+        pub(super) fn decode<const N: usize>(input: &str) -> [u8; N] {
+            fn value(byte: u8) -> u32 {
+                match byte {
+                    b'A'..=b'Z' => (byte - b'A') as u32,
+                    b'a'..=b'z' => (byte - b'a' + 26) as u32,
+                    b'0'..=b'9' => (byte - b'0' + 52) as u32,
+                    b'+' => 62,
+                    b'/' => 63,
+                    _ => unreachable!(),
+                }
+            }
+            let mut out = [0u8; N];
+            let mut acc: u32 = 0;
+            let mut bits = 0u32;
+            let mut idx = 0;
+            for byte in input.bytes() {
+                if byte == b'=' {
+                    continue;
+                }
+                acc = (acc << 6) | value(byte);
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    out[idx] = ((acc >> bits) & 0xff) as u8;
+                    idx += 1;
+                }
+            }
+            assert_eq!(idx, N);
+            out
+        }
+    }
+
+    async fn establish_session_and_grant(
+        state: &PrivateApiState,
+        client: &TestRegistrationClient,
+    ) -> (String, String, String, (String, String)) {
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let session_cookie = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(SESSION_COOKIE_NAME)
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let grant_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact/grant")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+        let grant_cookie = grant_response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(ARTIFACT_GRANT_COOKIE_NAME)
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let body = grant_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let grant_id = parsed["grant_id"].as_str().unwrap().to_string();
+        let kid = parsed["kid"].as_str().unwrap().to_string();
+        let recipient_public_key = parsed["recipient_public_key"].as_str().unwrap().to_string();
+        (
+            session_cookie,
+            grant_cookie,
+            grant_id,
+            (kid, recipient_public_key),
+        )
+    }
+
+    fn base64(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+            if chunk.len() > 1 {
+                out.push(ALPHABET[(triple >> 6) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(ALPHABET[triple as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_fails_closed_without_artifact_file() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let state = state.with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        // Artifact source unavailable: delivery must fail closed (503) and
+        // consume the grant cookie.
+        let (encapsulated, _initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_end_to_end_roundtrip_and_single_use() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        let artifact_bytes = vec![0xABu8; 4096];
+        let artifact_copy = artifact_bytes.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+
+        let (encapsulated, mut initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        // Grant cookie must be cleared on success (single-use delivery).
+        let cleared_grant = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|v| {
+                v.to_str()
+                    .map(|s| s.starts_with(ARTIFACT_GRANT_COOKIE_NAME) && s.contains("Max-Age=0"))
+                    .unwrap_or(false)
+            });
+        assert!(cleared_grant, "grant cookie must be cleared after delivery");
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.len() > 16 + 12 + 8);
+        let (kid_bytes, nonce_bytes, seq_bytes, ciphertext) =
+            { (&body[..16], &body[16..28], &body[28..36], &body[36..]) };
+        let _ = (kid_bytes, nonce_bytes);
+        let mut sequence = [0u8; 8];
+        sequence.copy_from_slice(seq_bytes);
+        assert_eq!(u64::from_be_bytes(sequence), 1);
+        let kid_bytes: [u8; 16] = kid_bytes.try_into().unwrap();
+        let envelope = crypto_envelope::Envelope {
+            kid: kid_bytes,
+            nonce: nonce_bytes.try_into().unwrap(),
+            sequence: u64::from_be_bytes(sequence),
+            ciphertext: ciphertext.to_vec(),
+        };
+        let plaintext = initiator.receive(&envelope).unwrap();
+        assert_eq!(plaintext, artifact_bytes);
+    }
+
+    #[tokio::test]
+    async fn artifact_grant_is_single_use_and_session_bound() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let state = state.with_artifact_loader(Arc::new(|| Ok(b"opaque-ciphertext".to_vec())));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+
+        let (encapsulated, _initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let make = |cookie: String| {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/artifact")
+                .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                .header(header::COOKIE, cookie)
+                .body(Body::from(serde_json::to_vec(&body).unwrap().clone()))
+                .unwrap()
+        };
+        let first = router(state.clone())
+            .oneshot(make(format!("{session_cookie}; {grant_cookie}")))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // Replay with the same grant cookie: consumed -> unauthorized.
+        let replay = router(state.clone())
+            .oneshot(make(format!("{session_cookie}; {grant_cookie}")))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        // A grant minted under a different session must not validate against
+        // this session's cookies: mint a fresh grant, then verify with only the
+        // session cookie missing -> unauthorized.
+        let (_s2, grant_cookie2, _grant2, _offer2) =
+            establish_session_and_grant(&state, &client).await;
+        let no_session = router(state.clone())
+            .oneshot(make(grant_cookie2))
+            .await
+            .unwrap();
+        assert_eq!(no_session.status(), StatusCode::UNAUTHORIZED);
     }
 }

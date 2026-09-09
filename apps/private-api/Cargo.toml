@@ -13,7 +13,9 @@ path = "src/main.rs"
 [dependencies]
 auth.workspace = true
 axum.workspace = true
+crypto-envelope.workspace = true
 getrandom = "0.2"
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zeroize = { version = "1", features = ["derive"] }

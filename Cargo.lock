@@ -1363,8 +1363,10 @@ version = "0.1.0"
 dependencies = [
  "auth",
  "axum",
+ "crypto-envelope",
  "getrandom 0.2.17",
  "http-body-util",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
