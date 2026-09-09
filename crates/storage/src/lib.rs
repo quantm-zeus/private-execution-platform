@@ -241,7 +241,7 @@ pub enum StorageValidationError {
     InvalidCreatedBucket,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum StorageError {
     #[error("storage unavailable")]
     Unavailable,
@@ -272,6 +272,8 @@ pub trait EventBus: Send + Sync {
     async fn publish(&self, event: InternalEventEnvelope) -> Result<(), StorageError>;
     async fn health(&self) -> HealthProbe;
 }
+
+pub mod pg;
 
 #[cfg(test)]
 mod tests {

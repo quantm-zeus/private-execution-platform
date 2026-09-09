@@ -9,10 +9,20 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+postgres-integration = []
+
+[[test]]
+name = "pg_store_integration"
+path = "tests/pg_store_integration.rs"
+required-features = ["postgres-integration"]
+
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 
 [dev-dependencies]
 serde_json.workspace = true
