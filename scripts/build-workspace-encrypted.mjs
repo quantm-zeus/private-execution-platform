@@ -8,20 +8,25 @@ import {
   sealPackage,
 } from "./workspace-artifact.mjs";
 
-const dist = resolve("web/workspace/dist");
+const dist = resolve("web/workspace-payload/dist");
 const outDir = resolve("web/workspace-artifact");
 const outFile = resolve(outDir, "blob.bin");
 
 let publicKey;
 let kid;
 try {
+  if (process.env.WORKSPACE_ARTIFACT_KEY_B64) {
+    throw new Error(
+      "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; artifact sealing requires canonical 32-byte WORKSPACE_PUBLIC_KEY_B64",
+    );
+  }
   publicKey = artifactPublicKeyFromEnv();
   kid = artifactKidFromEnv();
 
-  const build = spawnSync("pnpm", ["--filter", "@evergreen/workspace", "build"], {
+  const build = spawnSync("pnpm", ["--filter", "@evergreen/workspace-payload", "build"], {
     stdio: "inherit",
   });
-  if (build.status !== 0) throw new Error("workspace build failed");
+  if (build.status !== 0) throw new Error("workspace payload build failed");
 
   const packed = await packDirectory(dist);
   const artifact = await sealPackage(packed, publicKey, kid);

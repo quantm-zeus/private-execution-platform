@@ -4,8 +4,11 @@
   "packageManager": "pnpm@11.22.0",
   "scripts": {
     "build:public": "pnpm --filter @evergreen/public build",
-    "build:workspace": "pnpm --filter @evergreen/workspace build",
+    "build:workspace-shell": "pnpm --filter @evergreen/workspace-shell build",
+    "build:workspace-payload": "pnpm --filter @evergreen/workspace-payload build",
+    "build:workspace": "pnpm --filter @evergreen/workspace-payload build",
     "typecheck": "pnpm -r typecheck",
+    "build:crypto-wasm-bindings": "node scripts/build-crypto-wasm-bindings.mjs",
     "build:workspace:encrypted": "node scripts/build-workspace-encrypted.mjs",
     "verify:web-boundary": "node scripts/verify-web-boundary.mjs"
   },

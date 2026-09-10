@@ -10,6 +10,11 @@ import {
 } from "./workspace-artifact.mjs";
 
 export async function decryptArtifactFile(path, env = process.env) {
+  if (env.WORKSPACE_ARTIFACT_KEY_B64) {
+    throw new Error(
+      "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; artifact decryption requires client-held WORKSPACE_UNLOCK_SECRET_B64 and canonical WORKSPACE_ARTIFACT_KID_B64",
+    );
+  }
   const secret = unlockSecretFromEnv(env);
   const kid = artifactKidFromEnv(env);
   try {

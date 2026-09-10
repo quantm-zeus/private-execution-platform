@@ -37,6 +37,11 @@ export function artifactPublicKeyFromEnv(env = process.env) {
 }
 
 export function artifactKidFromEnv(env = process.env) {
+  if (env.WORKSPACE_ARTIFACT_KEY_B64) {
+    throw new Error(
+      "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; artifact sealing requires canonical 32-byte WORKSPACE_PUBLIC_KEY_B64",
+    );
+  }
   const raw = env.WORKSPACE_ARTIFACT_KID_B64;
   if (!raw) {
     throw new Error("workspace kid unavailable or missing: WORKSPACE_ARTIFACT_KID_B64 required");
@@ -55,6 +60,9 @@ export function artifactKidFromEnv(env = process.env) {
 }
 
 export function unlockSecretFromEnv(env = process.env) {
+  if (env.WORKSPACE_ARTIFACT_KEY_B64) {
+    throw new Error("WORKSPACE_ARTIFACT_KEY_B64 is forbidden");
+  }
   const raw = env.WORKSPACE_UNLOCK_SECRET_B64;
   if (typeof raw !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(raw)) {
     throw new Error("workspace unlock secret unavailable or invalid base64");
