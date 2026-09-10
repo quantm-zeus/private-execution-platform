@@ -1,0 +1,34 @@
+{
+  "context": {
+    "source_family": "evm",
+    "source_label": "evm-synthetic-primary",
+    "finality": "finalized",
+    "slot_or_block": 19500100,
+    "observed_at_ms": 1700000000000
+  },
+  "target": {
+    "target_type": "pool",
+    "target_id": {
+      "chain": {
+        "kind": "ethereum"
+      },
+      "address": "0x3333333333333333333333333333333333333333"
+    }
+  },
+  "payload": {
+    "payload_type": "order_book_snapshot",
+    "sequence": 100,
+    "bids": [
+      {
+        "price": 2500.0,
+        "quantity": 10.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 2510.0,
+        "quantity": 15.0
+      }
+    ]
+  }
+}
