@@ -157,14 +157,14 @@ pub struct GmgnKlineRequest {
     pub from: Option<i64>,
     pub to: Option<i64>,
 }
+/// Validated parameters for a GMGN Kline request: `(chain, address, resolution, from, to)`.
+pub type ValidatedKlineParams = (String, String, String, Option<i64>, Option<i64>);
 
 impl GmgnKlineRequest {
     pub const ALLOWED_RESOLUTIONS: &'static [&'static str] =
         &["30s", "1m", "5m", "15m", "1h", "4h", "1d"];
 
-    pub fn validate(
-        &self,
-    ) -> Result<(String, String, String, Option<i64>, Option<i64>), McpAdapterError> {
+    pub fn validate(&self) -> Result<ValidatedKlineParams, McpAdapterError> {
         let chain = validate_chain(&self.chain)?;
         let address = validate_address_str(&self.address)?;
         let res = self.resolution.trim();

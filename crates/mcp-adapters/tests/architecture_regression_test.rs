@@ -67,10 +67,7 @@ fn test_no_hardcoded_upstream_endpoints_in_source() {
 #[test]
 fn test_fail_closed_trading_disabled_invariant() {
     // Fail-closed global trading invariant
-    assert!(
-        !mcp_adapters::TRADING_ENABLED,
-        "TRADING_ENABLED must be false"
-    );
+    const { assert!(!mcp_adapters::TRADING_ENABLED) };
 }
 
 #[test]
