@@ -1210,6 +1210,128 @@ mod tests {
         }
     }
 
+    /// P0-9 INFO follow-up: assert the security flags on the ACTUAL
+    /// Set-Cookie headers the endpoints emit, not only on the builder
+    /// helper's output. Every cookie this service mints (challenge,
+    /// session, artifact grant) must carry the full fail-closed flag set.
+    async fn assert_set_cookie_flags(response: &axum::response::Response, cookie_name: &str) {
+        let raw = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(cookie_name).then(|| s.to_string())
+            })
+            .unwrap_or_else(|| panic!("no Set-Cookie for {cookie_name}"));
+        assert!(raw.contains("Path=/"), "missing Path=/ in {raw:?}");
+        assert!(raw.contains("Secure"), "missing Secure in {raw:?}");
+        assert!(raw.contains("HttpOnly"), "missing HttpOnly in {raw:?}");
+        assert!(
+            raw.contains("SameSite=Strict"),
+            "missing SameSite=Strict in {raw:?}"
+        );
+        assert!(
+            raw.contains("Max-Age="),
+            "missing Max-Age (no session cookies) in {raw:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn challenge_set_cookie_header_carries_all_security_flags() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_set_cookie_flags(&response, CHALLENGE_COOKIE_NAME).await;
+    }
+
+    #[tokio::test]
+    async fn session_set_cookie_header_carries_all_security_flags() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_set_cookie_flags(&response, SESSION_COOKIE_NAME).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_grant_set_cookie_header_carries_all_security_flags() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let verify_response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify_response.status(), StatusCode::NO_CONTENT);
+        let session_cookie = verify_response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(SESSION_COOKIE_NAME)
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let grant_response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact/grant")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_response.status(), StatusCode::OK);
+        assert_set_cookie_flags(&grant_response, ARTIFACT_GRANT_COOKIE_NAME).await;
+    }
+
     #[tokio::test]
     async fn successful_verify_mints_http_only_session_and_session_validates() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));

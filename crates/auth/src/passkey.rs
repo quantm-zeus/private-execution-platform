@@ -1,4 +1,29 @@
 //! Real WebAuthn passkey authentication boundary.
+//!
+//! # Credential-store contract (P0-9 documentation follow-up)
+//!
+//! Implementors of [`PasskeyCredentialStore`] hold credential material
+//! (`Passkey` records, credential ids, counters) and MUST observe two
+//! rules:
+//!
+//! 1. **Never log.** Store implementations must not log credential ids,
+//!    public-key material, counters, passkey records, or error payloads
+//!    that embed them. Errors are already opaque `AuthError` values;
+//!    forward them without decoration. No administrative path in Phase 0
+//!    should ever need credential data in a log line.
+//! 2. **Never expose via `Debug`.** `Passkey` and credential-bearing
+//!    types are third-party (webauthn-rs) values; do not wrap, clone, or
+//!    re-derive `Debug`/`Display` implementations for them that could
+//!    interpolate credential material. Redact at the boundary: types this
+//!    crate defines around credential data implement `Debug` with
+//!    `[REDACTED]`-style output, and store authors must preserve that
+//!    discipline.
+//!
+//! Availability semantics: a store that cannot persist right now returns
+//! [`AuthError::VerifierUnavailable`] (HTTP 503 territory), while a store
+//! that answers but rejects the credential returns
+//! [`AuthError::VerificationFailed`] (HTTP 401 territory). Implementors
+//! must not conflate the two — the HTTP taxonomy depends on it.
 
 use std::{fmt, sync::Arc};
 

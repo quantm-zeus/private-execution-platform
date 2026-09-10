@@ -157,6 +157,28 @@ impl AuthState {
         self.mint_session(now_ms)
     }
 
+    /// Session identity binding expectations (P0-9 documentation
+    /// follow-up) for `create_session_from_verified`.
+    ///
+    /// Today a session is an opaque [`SessionId`] minted after a
+    /// successful WebAuthn ceremony and stored only inside this process's
+    /// [`AuthState`]; the HTTP layer binds it to a single random transport
+    /// token (cookie). With exactly one credential store this is
+    /// unambiguous.
+    ///
+    /// When Phase 0+ introduces additional credential stores (e.g. a
+    /// Postgres-backed store alongside the in-process one), the session
+    /// MUST be bound to the authenticated identity — the credential id /
+    /// user handle proven by the ceremony — rather than to the store
+    /// instance that happened to verify it. Concretely:
+    ///
+    /// - `VerifiedPasskeyAuthentication` must carry (or be extended with)
+    ///   the credential identity so the session records *who* verified,
+    ///   not just *that* verification succeeded.
+    /// - Session lookup must resolve by that identity so a store swap or
+    ///   a second store cannot mint a parallel, unlinked session family.
+    /// - Single-use, TTL, and fail-closed defaults are unchanged by this
+    ///   binding; it only constrains future store plumbing.
     pub fn validate_session(
         &self,
         id: &SessionId,
