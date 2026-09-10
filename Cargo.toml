@@ -17,6 +17,7 @@ members = [
     "crates/rpc-mtls-proof",
     "apps/private-api",
     "apps/trading-core",
+    "crates/mcp-adapters",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ telemetry = { path = "crates/telemetry" }
 auth = { path = "crates/auth" }
 policy = { path = "crates/policy" }
 privy = { path = "crates/privy" }
+mcp-adapters = { path = "crates/mcp-adapters" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
