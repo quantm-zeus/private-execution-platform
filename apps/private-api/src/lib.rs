@@ -1215,25 +1215,35 @@ mod tests {
     /// helper's output. Every cookie this service mints (challenge,
     /// session, artifact grant) must carry the full fail-closed flag set.
     async fn assert_set_cookie_flags(response: &axum::response::Response, cookie_name: &str) {
+        let cookie_prefix = format!("{cookie_name}=");
         let raw = response
             .headers()
             .get_all(header::SET_COOKIE)
             .iter()
             .find_map(|v| {
                 let s = v.to_str().ok()?;
-                s.starts_with(cookie_name).then(|| s.to_string())
+                s.starts_with(&cookie_prefix).then(|| s.to_string())
             })
             .unwrap_or_else(|| panic!("no Set-Cookie for {cookie_name}"));
-        assert!(raw.contains("Path=/"), "missing Path=/ in {raw:?}");
-        assert!(raw.contains("Secure"), "missing Secure in {raw:?}");
-        assert!(raw.contains("HttpOnly"), "missing HttpOnly in {raw:?}");
+        assert!(
+            raw.contains("Path=/"),
+            "missing Path=/ on Set-Cookie for {cookie_name}"
+        );
+        assert!(
+            raw.contains("Secure"),
+            "missing Secure on Set-Cookie for {cookie_name}"
+        );
+        assert!(
+            raw.contains("HttpOnly"),
+            "missing HttpOnly on Set-Cookie for {cookie_name}"
+        );
         assert!(
             raw.contains("SameSite=Strict"),
-            "missing SameSite=Strict in {raw:?}"
+            "missing SameSite=Strict on Set-Cookie for {cookie_name}"
         );
         assert!(
             raw.contains("Max-Age="),
-            "missing Max-Age (no session cookies) in {raw:?}"
+            "missing Max-Age (no session cookies) on Set-Cookie for {cookie_name}"
         );
     }
 
@@ -1312,7 +1322,7 @@ mod tests {
             .iter()
             .find_map(|v| {
                 let s = v.to_str().ok()?;
-                s.starts_with(SESSION_COOKIE_NAME)
+                s.starts_with(&format!("{SESSION_COOKIE_NAME}="))
                     .then(|| s.split(';').next().unwrap().to_string())
             })
             .unwrap();
