@@ -89,4 +89,12 @@ fn test_no_generic_string_tool_call_api() {
         !transport_rs.contains("pub arguments: Value"),
         "McpToolCall must not expose public mutable fields"
     );
+    assert!(
+        !transport_rs.contains("pub fn try_from_untrusted"),
+        "McpToolCall must not expose a public generic/untrusted constructor"
+    );
+    assert!(
+        !transport_rs.contains("pub fn new("),
+        "McpToolCall must not expose a public constructor (only typed adapters may construct calls)"
+    );
 }

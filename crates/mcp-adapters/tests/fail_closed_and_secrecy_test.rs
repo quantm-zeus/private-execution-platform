@@ -167,8 +167,8 @@ async fn test_oversized_response_rejected_fail_closed() {
     );
 }
 
-#[test]
-fn test_zero_secret_and_payload_leakage_regression() {
+#[tokio::test]
+async fn test_zero_secret_and_payload_leakage_regression() {
     let secret_token = "bearer-secret-token-xyz-12345";
     let internal_endpoint = "https://internal-cluster.local:8443/mcp/stream";
     let raw_payload = "{\"private_wallet_key\":\"0x123456789abcdef\"}";
@@ -228,20 +228,40 @@ fn test_zero_secret_and_payload_leakage_regression() {
         );
     }
 
-    // Verify McpToolCall debug representation redacts arguments
-    let call = McpToolCall::try_from_untrusted(
-        McpServiceId::Fomo,
-        "fomo_search_tokens",
-        json!({ "secret": secret_token, "data": raw_payload }),
-    )
-    .expect("fomo_search_tokens is allowlisted");
+    // Verify McpToolCall debug representation redacts arguments via public typed adapter call
+    #[derive(Default)]
+    struct CapturingTransport {
+        captured_call: std::sync::Mutex<Option<McpToolCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpTransport for CapturingTransport {
+        async fn call_tool(&self, call: McpToolCall) -> Result<McpToolResponse, McpTransportError> {
+            *self.captured_call.lock().unwrap() = Some(call);
+            Ok(McpToolResponse::success(json!({
+                "data": {"result": "ok"},
+                "warnings": []
+            })))
+        }
+    }
+
+    let capturing_transport = Arc::new(CapturingTransport::default());
+    let adapter = FomoAdapter::new(capturing_transport.clone());
+    let _ = adapter
+        .search_tokens(FomoSearchTokensRequest {
+            query: "SENSITIVE_SEARCH_QUERY".to_string(),
+        })
+        .await;
+
+    let call = capturing_transport
+        .captured_call
+        .lock()
+        .unwrap()
+        .take()
+        .expect("tool call must be captured");
     let call_debug = format!("{call:?}");
     assert!(
-        !call_debug.contains(secret_token),
-        "ToolCall Debug leaked arguments"
-    );
-    assert!(
-        !call_debug.contains(raw_payload),
+        !call_debug.contains("SENSITIVE_SEARCH_QUERY"),
         "ToolCall Debug leaked arguments"
     );
     assert!(

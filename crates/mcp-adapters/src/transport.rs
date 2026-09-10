@@ -69,18 +69,6 @@ impl McpToolCall {
         }
     }
 
-    /// Attempts to construct a tool call by validating an untrusted tool name against the allowlist.
-    ///
-    /// Fails closed if the tool name is unsupported, a mutation/probe operation, or unmapped.
-    pub fn try_from_untrusted(
-        service: McpServiceId,
-        tool_name: &str,
-        arguments: Value,
-    ) -> Result<Self, McpAdapterError> {
-        let tool = AllowedTool::try_from_name(service, tool_name)?;
-        Ok(Self::new(tool, arguments))
-    }
-
     /// Read-only accessor for the service identity.
     pub fn service(&self) -> McpServiceId {
         self.service

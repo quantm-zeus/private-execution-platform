@@ -335,44 +335,129 @@ fn test_allowlist_blocks_unsupported_documented_tools_in_first_slice() {
     }
 }
 
-#[test]
-fn test_unsupported_names_cannot_enter_call_construction_path() {
-    use serde_json::json;
+#[tokio::test]
+async fn test_public_adapter_methods_reject_invalid_inputs_before_transport() {
+    let transport = Arc::new(FailOnCallTransport::default());
+    let fomo = FomoAdapter::new(transport.clone());
+    let gmgn = GmgnAdapter::new(transport.clone());
 
-    // Direct construction of McpToolCall from an untrusted name must fail closed
-    let disallowed_attempts = [
-        (McpServiceId::Gmgn, "gmgn_diagnostics"),
-        (McpServiceId::Gmgn, "gmgn_trade"),
-        (McpServiceId::Gmgn, "gmgn_buy_token"),
-        (McpServiceId::Fomo, "fomo_resolve_wallet"),
-        (McpServiceId::Fomo, "fomo_sign_tx"),
-        (McpServiceId::Fomo, "fomo_auth_status"),
-    ];
+    // 1. fomo_search_tokens
+    let err = fomo
+        .search_tokens(FomoSearchTokensRequest { query: "".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "query" });
 
-    for (service, tool) in disallowed_attempts {
-        let res = McpToolCall::try_from_untrusted(service, tool, json!({}));
-        assert_eq!(
-            res,
-            Err(McpAdapterError::DisallowedOperation),
-            "disallowed tool '{tool}' must fail closed before call construction"
-        );
-    }
+    // 2. fomo_get_token
+    let err = fomo
+        .get_token(FomoGetTokenRequest {
+            network_id: 0,
+            token_address: "not_an_address".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        McpAdapterError::InvalidArgument {
+            field: "network_id"
+        }
+    );
 
-    let unsupported_attempts = [
-        (McpServiceId::Fomo, "fomo_search_users"),
-        (McpServiceId::Fomo, "fomo_get_profile"),
-        (McpServiceId::Gmgn, "gmgn_smart_money"),
-        (McpServiceId::Gmgn, "gmgn_kol"),
-        (McpServiceId::Gmgn, "arbitrary_custom_tool"),
-        (McpServiceId::Fomo, "gmgn_trending"),
-        (McpServiceId::Gmgn, "fomo_search_tokens"),
-    ];
+    // 3. fomo_get_trending_tokens
+    let err = fomo
+        .get_trending_tokens(FomoTrendingTokensRequest {
+            list: "invalidList".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "list" });
 
-    for (service, tool) in unsupported_attempts {
-        let res = McpToolCall::try_from_untrusted(service, tool, json!({}));
-        assert!(
-            matches!(res, Err(McpAdapterError::UnsupportedTool { .. })),
-            "unsupported tool '{tool}' must fail closed before call construction"
-        );
-    }
+    // 4. fomo_get_recent_events
+    let err = fomo
+        .get_recent_events(FomoRecentEventsRequest {
+            since_minutes: Some(0),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        McpAdapterError::InvalidArgument {
+            field: "since_minutes"
+        }
+    );
+
+    // 5. gmgn_trending
+    let err = gmgn
+        .trending(GmgnTrendingRequest {
+            chain: "invalid_chain".into(),
+            interval: "1h".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "chain" });
+
+    // 6. gmgn_search
+    let err = gmgn
+        .search(GmgnSearchRequest {
+            query: "".into(),
+            chain: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "query" });
+
+    // 7. gmgn_token_info
+    let err = gmgn
+        .token_info(GmgnTokenRequest {
+            chain: "sol".into(),
+            address: "bad/address".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "address" });
+
+    // 8. gmgn_token_security
+    let err = gmgn
+        .token_security(GmgnTokenRequest {
+            chain: "fake".into(),
+            address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "chain" });
+
+    // 9. gmgn_top_holders
+    let err = gmgn
+        .top_holders(GmgnTopHoldersRequest {
+            chain: "sol".into(),
+            address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".into(),
+            limit: 0,
+            order_by: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, McpAdapterError::InvalidArgument { field: "limit" });
+
+    // 10. gmgn_kline
+    let err = gmgn
+        .kline(GmgnKlineRequest {
+            chain: "sol".into(),
+            address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".into(),
+            resolution: "invalid_res".into(),
+            from: None,
+            to: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        McpAdapterError::InvalidArgument {
+            field: "resolution"
+        }
+    );
+
+    // In every single case, transport was never invoked
+    assert_eq!(*transport.calls.lock().unwrap(), 0);
 }
