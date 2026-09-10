@@ -115,4 +115,27 @@ pub enum MarketTypeError {
     EmptyBin(i32),
     #[error("bin reserve side violation for bin {bin_id} relative to active bin {active_bin_id}")]
     BinReserveSideViolation { bin_id: i32, active_bin_id: i32 },
+
+    // --- Feed boundary & mapper errors ---
+    #[error("source label must not be empty")]
+    EmptySourceLabel,
+    #[error("source label length {len} exceeds maximum {max}")]
+    SourceLabelTooLong { len: usize, max: usize },
+    #[error("invalid source label: {0}")]
+    InvalidSourceLabel(&'static str),
+    #[error("source chain family {source_family} does not match target chain {target_chain}")]
+    SourceChainFamilyMismatch {
+        source_family: &'static str,
+        target_chain: &'static str,
+    },
+    #[error("sequence overlap detected: start {start} <= current {current} < end {end}")]
+    SequenceOverlap { start: u64, end: u64, current: u64 },
+    #[error("stale sequence: received {sequence} <= current {current}")]
+    StaleSequence { sequence: u64, current: u64 },
+    #[error("duplicate sequence: {0}")]
+    DuplicateSequence(u64),
+    #[error("unsupported feed payload for target: {0}")]
+    UnsupportedPayloadForTarget(&'static str),
+    #[error("injected source error: {0}")]
+    InjectedSourceError(&'static str),
 }

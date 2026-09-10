@@ -1,8 +1,10 @@
 //! Lossless canonical market data contracts and local pool state types.
 
 pub mod error;
+pub mod feed;
 pub mod freshness;
 pub mod identity;
+pub mod mapper;
 pub mod ohlcv;
 pub mod orderbook;
 pub mod pool;
@@ -10,12 +12,19 @@ pub mod primitives;
 pub mod sequence;
 
 pub use error::MarketTypeError;
+pub use feed::{
+    CanonicalFeedEnvelope, CanonicalFeedPayload, ChainFamily, FeedFinality, FeedObservationContext,
+    FeedSourceLabel, InjectedFeedSource, MarketFeedSource, RawBinState, RawCandle, RawClmmState,
+    RawClmmTick, RawCpmmState, RawDepthDelta, RawDepthLevel, RawDepthSnapshot, RawFeedEnvelope,
+    RawFeedPayload, RawLiquidityBin, RawPoolKindState, RawPoolState, MAX_SOURCE_LABEL_LEN,
+};
 pub use freshness::{
     evaluate_freshness, FreshnessPolicy, FreshnessStatus, SafeFreshnessMeta,
     DEFAULT_MAX_FUTURE_SKEW_MS, DEFAULT_MAX_STALENESS_MS, MAX_POLICY_FUTURE_SKEW_MS,
     MAX_POLICY_STALENESS_MS, MIN_POLICY_STALENESS_MS,
 };
 pub use identity::{FeedTarget, InstrumentId, PoolId};
+pub use mapper::CanonicalMarketFeedMapper;
 pub use ohlcv::{Candle, CandleTimeframe, MAX_CANDLE_WINDOW_MS};
 pub use orderbook::{
     DepthDelta, DepthLevel, DepthSnapshot, NormalizedPrice, NormalizedQuantity, OrderBookDepth,
@@ -1508,5 +1517,956 @@ mod tests {
         let snap_json = serde_json::to_string(&depth_snap).unwrap();
         let decoded_snap: DepthSnapshot = serde_json::from_str(&snap_json).unwrap();
         assert_eq!(decoded_snap, depth_snap);
+    }
+
+    // --- AGY P21 Slice A: Injected Market Feed Boundary & Canonical Mapper Tests ---
+
+    fn sample_sol_context(label: &str, slot: u64, ts: i64) -> FeedObservationContext {
+        FeedObservationContext::new(
+            ChainFamily::Solana,
+            FeedSourceLabel::new(label).unwrap(),
+            FeedFinality::Confirmed,
+            Some(slot),
+            ts,
+        )
+        .unwrap()
+    }
+
+    fn sample_evm_context(label: &str, block: u64, ts: i64) -> FeedObservationContext {
+        FeedObservationContext::new(
+            ChainFamily::Evm,
+            FeedSourceLabel::new(label).unwrap(),
+            FeedFinality::Finalized,
+            Some(block),
+            ts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_solana_neutral_input_normalizes_with_preserved_metadata() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let context_snap = sample_sol_context("yellowstone-primary", 250_000_100, 1_000_000);
+        let raw_snap = RawFeedEnvelope::new(
+            context_snap.clone(),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![
+                    RawDepthLevel::new(150.0, 10.0),
+                    RawDepthLevel::new(149.0, 20.0),
+                ],
+                asks: vec![
+                    RawDepthLevel::new(151.0, 15.0),
+                    RawDepthLevel::new(152.0, 25.0),
+                ],
+            }),
+        )
+        .unwrap();
+
+        let context_delta = sample_sol_context("yellowstone-primary", 250_000_101, 1_000_100);
+        let raw_delta = RawFeedEnvelope::new(
+            context_delta.clone(),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(150.5, 5.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        // Injected fake source playback
+        let mut source = InjectedFeedSource::from_envelopes(vec![raw_snap, raw_delta]);
+        assert_eq!(source.len(), 2);
+
+        // Map snapshot
+        let canonical_snap = mapper.process_from_source(&mut source).unwrap().unwrap();
+        assert_eq!(canonical_snap.context, context_snap);
+        assert_eq!(canonical_snap.context.source_family, ChainFamily::Solana);
+        assert_eq!(
+            canonical_snap.context.source_label.as_str(),
+            "yellowstone-primary"
+        );
+        assert_eq!(canonical_snap.context.finality, FeedFinality::Confirmed);
+        assert_eq!(canonical_snap.context.slot_or_block, Some(250_000_100));
+        assert_eq!(canonical_snap.freshness.status, FreshnessStatus::Fresh);
+
+        match &canonical_snap.payload {
+            CanonicalFeedPayload::OrderBookSnapshot(snap) => {
+                assert_eq!(snap.sequence, Sequence(100));
+                assert_eq!(snap.bids[0].price.get(), 150.0);
+                assert_eq!(snap.asks[0].price.get(), 151.0);
+            }
+            _ => panic!("expected OrderBookSnapshot"),
+        }
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            150.0
+        );
+
+        // Map contiguous delta
+        let canonical_delta = mapper.process_from_source(&mut source).unwrap().unwrap();
+        assert_eq!(canonical_delta.context, context_delta);
+        assert_eq!(canonical_delta.context.slot_or_block, Some(250_000_101));
+        assert_eq!(mapper.current_sequence(), Some(Sequence(101)));
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            150.5
+        );
+        assert_eq!(mapper.order_book().unwrap().spread(), Some(0.5));
+
+        // Source exhausted
+        assert!(mapper.process_from_source(&mut source).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_evm_neutral_input_normalizes_with_preserved_metadata() {
+        let pool_id = PoolId::new(
+            ChainId::Ethereum,
+            "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+        )
+        .unwrap();
+        let target = FeedTarget::Pool(pool_id.clone());
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let usdc = AssetId::new(
+            ChainId::Ethereum,
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        )
+        .unwrap();
+        let weth = AssetId::new(
+            ChainId::Ethereum,
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        )
+        .unwrap();
+
+        let context = sample_evm_context("reth-ws-feed", 19_500_000, 1_700_000_000_000);
+        let raw_cpmm = RawFeedEnvelope::new(
+            context.clone(),
+            target.clone(),
+            RawFeedPayload::PoolState(RawPoolState {
+                sequence: 1,
+                kind: RawPoolKindState::Cpmm(RawCpmmState {
+                    token_0: usdc.clone(),
+                    token_1: weth.clone(),
+                    decimals_0: 6,
+                    decimals_1: 18,
+                    reserve_0: 50_000_000_000,
+                    reserve_1: 15_000_000_000_000_000_000,
+                    total_lp_supply: Some(1_000_000_000),
+                    fee_bps: 30,
+                }),
+            }),
+        )
+        .unwrap();
+
+        let canonical_env = mapper.map_envelope(raw_cpmm).unwrap();
+        assert_eq!(canonical_env.context, context);
+        assert_eq!(canonical_env.context.source_family, ChainFamily::Evm);
+        assert_eq!(canonical_env.context.source_label.as_str(), "reth-ws-feed");
+        assert_eq!(canonical_env.context.finality, FeedFinality::Finalized);
+        assert_eq!(canonical_env.context.slot_or_block, Some(19_500_000));
+        assert_eq!(canonical_env.freshness.status, FreshnessStatus::Fresh);
+
+        match &canonical_env.payload {
+            CanonicalFeedPayload::PoolState(pool_env) => {
+                assert_eq!(pool_env.sequence, Sequence(1));
+                assert_eq!(pool_env.pool_id(), &pool_id);
+                match &pool_env.state {
+                    PoolKindState::Cpmm(cpmm) => {
+                        assert_eq!(cpmm.reserve_0, AtomicAmount::new(50_000_000_000));
+                        assert_eq!(
+                            cpmm.reserve_1,
+                            AtomicAmount::new(15_000_000_000_000_000_000)
+                        );
+                        assert_eq!(cpmm.fee_bps.get(), 30);
+                    }
+                    _ => panic!("expected CPMM pool state"),
+                }
+            }
+            _ => panic!("expected PoolState"),
+        }
+        assert_eq!(mapper.current_sequence(), Some(Sequence(1)));
+        assert_eq!(mapper.last_pool_state().unwrap().pool_id(), &pool_id);
+    }
+
+    #[test]
+    fn test_clmm_and_bin_pool_state_normalization() {
+        // 1. CLMM Normalization
+        let pool_id = sample_pool_id();
+        let target = FeedTarget::Pool(pool_id.clone());
+        let mut clmm_mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+
+        let clmm_context = sample_sol_context("solana-geyser", 260_000_000, 1_000_000);
+        let raw_clmm = RawFeedEnvelope::new(
+            clmm_context.clone(),
+            target.clone(),
+            RawFeedPayload::PoolState(RawPoolState {
+                sequence: 5,
+                kind: RawPoolKindState::Clmm(RawClmmState {
+                    token_0: sol.clone(),
+                    token_1: usdc.clone(),
+                    decimals_0: 9,
+                    decimals_1: 6,
+                    tick_spacing: 64,
+                    current_tick: 0,
+                    sqrt_price_x64: 18446744073709551616,
+                    liquidity: 100_000,
+                    fee_bps: 5,
+                    ticks: vec![
+                        RawClmmTick {
+                            index: -64,
+                            liquidity_gross: 1000,
+                            liquidity_net: 1000,
+                        },
+                        RawClmmTick {
+                            index: 64,
+                            liquidity_gross: 1000,
+                            liquidity_net: -1000,
+                        },
+                    ],
+                }),
+            }),
+        )
+        .unwrap();
+
+        let clmm_env = clmm_mapper.map_envelope(raw_clmm).unwrap();
+        assert_eq!(clmm_env.context, clmm_context);
+        match clmm_env.payload {
+            CanonicalFeedPayload::PoolState(env) => match env.state {
+                PoolKindState::Clmm(clmm) => {
+                    assert_eq!(clmm.liquidity, 100_000);
+                    assert_eq!(clmm.ticks.len(), 2);
+                }
+                _ => panic!("expected CLMM"),
+            },
+            _ => panic!("expected PoolState"),
+        }
+
+        // 2. Bin Normalization
+        let mut bin_mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+        let bin_context = sample_sol_context("meteora-dlmm", 260_000_001, 1_000_000);
+        let raw_bin = RawFeedEnvelope::new(
+            bin_context.clone(),
+            target.clone(),
+            RawFeedPayload::PoolState(RawPoolState {
+                sequence: 1,
+                kind: RawPoolKindState::Bin(RawBinState {
+                    token_0: sol.clone(),
+                    token_1: usdc.clone(),
+                    decimals_0: 9,
+                    decimals_1: 6,
+                    active_bin_id: 100,
+                    bin_step: 10,
+                    fee_bps: 10,
+                    bins: vec![
+                        RawLiquidityBin {
+                            id: 99,
+                            reserve_0: 0,
+                            reserve_1: 50_000,
+                        },
+                        RawLiquidityBin {
+                            id: 100,
+                            reserve_0: 10_000,
+                            reserve_1: 10_000,
+                        },
+                        RawLiquidityBin {
+                            id: 101,
+                            reserve_0: 50_000,
+                            reserve_1: 0,
+                        },
+                    ],
+                }),
+            }),
+        )
+        .unwrap();
+
+        let bin_env = bin_mapper.map_envelope(raw_bin).unwrap();
+        assert_eq!(bin_env.context, bin_context);
+        match bin_env.payload {
+            CanonicalFeedPayload::PoolState(env) => match env.state {
+                PoolKindState::Bin(bin) => {
+                    assert_eq!(bin.active_bin_id, 100);
+                    assert_eq!(bin.bins.len(), 3);
+                }
+                _ => panic!("expected Bin"),
+            },
+            _ => panic!("expected PoolState"),
+        }
+    }
+
+    #[test]
+    fn test_candle_normalization() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument.clone());
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let context = sample_sol_context("jupiter-candles", 250_000_000, 1_700_000_060_000);
+        let raw_candle = RawFeedEnvelope::new(
+            context.clone(),
+            target.clone(),
+            RawFeedPayload::Candle(RawCandle {
+                timeframe: CandleTimeframe::M1,
+                open_time_ms: 1_700_000_000_000,
+                close_time_ms: 1_700_000_060_000,
+                open: 100.0,
+                high: 105.0,
+                low: 99.0,
+                close: 103.0,
+                volume: 500.0,
+                quote_volume: Some(51_000.0),
+                trades_count: Some(42),
+                sequence: Some(10),
+            }),
+        )
+        .unwrap();
+
+        let canonical_env = mapper.map_envelope(raw_candle).unwrap();
+        assert_eq!(canonical_env.context, context);
+        match canonical_env.payload {
+            CanonicalFeedPayload::Candle(candle) => {
+                assert_eq!(candle.instrument, instrument);
+                assert_eq!(candle.timeframe, CandleTimeframe::M1);
+                assert_eq!(candle.open.get(), 100.0);
+                assert_eq!(candle.high.get(), 105.0);
+                assert_eq!(candle.low.get(), 99.0);
+                assert_eq!(candle.close.get(), 103.0);
+                assert_eq!(candle.volume.get(), 500.0);
+                assert_eq!(candle.trades_count, Some(42));
+            }
+            _ => panic!("expected Candle"),
+        }
+    }
+
+    #[test]
+    fn test_bounded_source_label_enforcement() {
+        // Empty rejected
+        assert_eq!(
+            FeedSourceLabel::new("   "),
+            Err(MarketTypeError::EmptySourceLabel)
+        );
+
+        // Exceeding MAX_SOURCE_LABEL_LEN (64) rejected
+        let long_str = "a".repeat(65);
+        assert_eq!(
+            FeedSourceLabel::new(&long_str),
+            Err(MarketTypeError::SourceLabelTooLong {
+                len: 65,
+                max: MAX_SOURCE_LABEL_LEN,
+            })
+        );
+
+        // Valid bounded label accepted
+        let valid = FeedSourceLabel::new("yellowstone-primary:sub_1.backup").unwrap();
+        assert_eq!(valid.as_str(), "yellowstone-primary:sub_1.backup");
+
+        // Forbidden protocol schemes rejected
+        assert!(matches!(
+            FeedSourceLabel::new("https://solana.rpc.com/api"),
+            Err(MarketTypeError::InvalidSourceLabel(_))
+        ));
+        assert!(matches!(
+            FeedSourceLabel::new("ws://mainnet.infura.io"),
+            Err(MarketTypeError::InvalidSourceLabel(_))
+        ));
+
+        // Forbidden credentials keywords rejected
+        assert!(matches!(
+            FeedSourceLabel::new("provider_api_key_123"),
+            Err(MarketTypeError::InvalidSourceLabel(_))
+        ));
+        assert!(matches!(
+            FeedSourceLabel::new("secret-token-feed"),
+            Err(MarketTypeError::InvalidSourceLabel(_))
+        ));
+        assert!(matches!(
+            FeedSourceLabel::new("user:password@endpoint"),
+            Err(MarketTypeError::InvalidSourceLabel(_))
+        ));
+    }
+
+    #[test]
+    fn test_bounded_payload_limits_enforced_fail_closed() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Over-bound depth levels (> MAX_DEPTH_LEVELS)
+        let too_many_bids: Vec<RawDepthLevel> = (0..5001)
+            .map(|i| RawDepthLevel::new(100.0 - (i as f64 * 0.01), 1.0))
+            .collect();
+        let raw_overbound = RawFeedEnvelope::new(
+            sample_sol_context("source-1", 100, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 1,
+                bids: too_many_bids,
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(raw_overbound),
+            Err(MarketTypeError::DepthLevelsExceeded {
+                count: 5001,
+                max: MAX_DEPTH_LEVELS,
+            })
+        );
+        // Mapper state must not advance
+        assert_eq!(mapper.current_sequence(), None);
+        assert!(mapper.order_book().is_none());
+    }
+
+    #[test]
+    fn test_malformed_and_non_finite_inputs_fail_closed_without_state_advancement() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // 1. Establish initial baseline at sequence 100
+        let baseline = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(100.0, 10.0)],
+                asks: vec![RawDepthLevel::new(102.0, 10.0)],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(baseline).unwrap();
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 2. Non-finite price in delta (NaN)
+        let nan_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1001),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(f64::NAN, 5.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(nan_delta),
+            Err(MarketTypeError::NonFinitePrice)
+        );
+        // State sequence and book remain unchanged at 100
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+        assert_eq!(mapper.order_book().unwrap().sequence(), Sequence(100));
+
+        // 3. Non-finite quantity in delta (Infinity)
+        let inf_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1002),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(99.0, f64::INFINITY)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(inf_delta),
+            Err(MarketTypeError::NonFiniteQuantity)
+        );
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 4. Negative price in delta
+        let neg_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1003),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(-5.0, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(neg_delta),
+            Err(MarketTypeError::NegativePrice)
+        );
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 5. Unsorted bids in snapshot
+        let unsorted_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 102, 1004),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 105,
+                bids: vec![
+                    RawDepthLevel::new(90.0, 1.0),
+                    RawDepthLevel::new(95.0, 1.0), // ascending instead of descending
+                ],
+                asks: vec![RawDepthLevel::new(105.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(unsorted_snap),
+            Err(MarketTypeError::UnsortedDepthLevels { side: "bids" })
+        );
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+    }
+
+    #[test]
+    fn test_wrong_target_and_chain_family_mismatch_fail_closed() {
+        let sol_instrument = sample_instrument();
+        let target = FeedTarget::Instrument(sol_instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // 1. Target mismatch (different instrument)
+        let other_base = AssetId::new(
+            ChainId::Solana,
+            "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+        )
+        .unwrap();
+        let other_quote = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let other_target =
+            FeedTarget::Instrument(InstrumentId::new(other_base, other_quote).unwrap());
+
+        let wrong_target_env = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1000),
+            other_target,
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 1,
+                bids: vec![RawDepthLevel::new(10.0, 1.0)],
+                asks: vec![RawDepthLevel::new(12.0, 1.0)],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(wrong_target_env),
+            Err(MarketTypeError::TargetMismatch)
+        );
+        assert_eq!(mapper.current_sequence(), None);
+
+        // 2. Chain family mismatch: EVM source context targeting Solana instrument
+        let evm_context_on_sol = sample_evm_context("reth-feed", 19_000_000, 1000);
+        let family_mismatch_env = RawFeedEnvelope::new(
+            evm_context_on_sol,
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 1,
+                bids: vec![RawDepthLevel::new(10.0, 1.0)],
+                asks: vec![RawDepthLevel::new(12.0, 1.0)],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(family_mismatch_env),
+            Err(MarketTypeError::SourceChainFamilyMismatch {
+                source_family: "evm",
+                target_chain: "solana",
+            })
+        );
+        assert_eq!(mapper.current_sequence(), None);
+    }
+
+    #[test]
+    fn test_sequence_gap_latches_resync_fail_closed() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // 1. Establish baseline at sequence 100
+        let snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(100.0, 10.0)],
+                asks: vec![RawDepthLevel::new(102.0, 10.0)],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(snap).unwrap();
+        assert!(!mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 2. Sequence gap delta [105, 105] (expected 101, received 105)
+        let gap_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1010),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 105,
+                end_sequence: 105,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        let gap_err = mapper.map_envelope(gap_delta);
+        assert_eq!(
+            gap_err,
+            Err(MarketTypeError::SequenceGap {
+                expected: 101,
+                received: 105,
+            })
+        );
+        // Latch is sticky resync, state sequence is STILL 100
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 3. Subsequent contiguous delta [101, 101] MUST STILL be rejected while latched
+        let next_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 102, 1020),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(next_delta),
+            Err(MarketTypeError::ResyncRequired {
+                reason: "stream resync latched: valid snapshot required",
+            })
+        );
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 4. Stale snapshot at sequence 95 rejected, latch remains held
+        let stale_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 103, 1030),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 95,
+                bids: vec![RawDepthLevel::new(99.0, 1.0)],
+                asks: vec![RawDepthLevel::new(103.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(stale_snap),
+            Err(MarketTypeError::StaleSequence {
+                sequence: 95,
+                current: 100,
+            })
+        );
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 5. Duplicate snapshot at sequence 100 rejected, latch remains held
+        let dup_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 104, 1040),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(99.0, 1.0)],
+                asks: vec![RawDepthLevel::new(103.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(dup_snap),
+            Err(MarketTypeError::DuplicateSequence(100))
+        );
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // 6. Valid newer snapshot at sequence 110 recovers and clears latch
+        let recovery_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 105, 1050),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 110,
+                bids: vec![RawDepthLevel::new(101.0, 20.0)],
+                asks: vec![RawDepthLevel::new(103.0, 20.0)],
+            }),
+        )
+        .unwrap();
+        let recovery_res = mapper.map_envelope(recovery_snap).unwrap();
+        assert!(!mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(110)));
+        match recovery_res.payload {
+            CanonicalFeedPayload::OrderBookSnapshot(s) => assert_eq!(s.sequence, Sequence(110)),
+            _ => panic!("expected snapshot"),
+        }
+
+        // 7. Subsequent delta at 111 now succeeds cleanly
+        let delta_111 = RawFeedEnvelope::new(
+            sample_sol_context("src", 106, 1060),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 111,
+                end_sequence: 111,
+                bids: vec![RawDepthLevel::new(101.5, 5.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(delta_111).unwrap();
+        assert_eq!(mapper.current_sequence(), Some(Sequence(111)));
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            101.5
+        );
+    }
+
+    #[test]
+    fn test_sequence_overlap_latches_resync_fail_closed() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Baseline at sequence 100
+        let snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(100.0, 10.0)],
+                asks: vec![RawDepthLevel::new(102.0, 10.0)],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(snap).unwrap();
+
+        // Overlapping delta: [99, 105] (start 99 <= current 100 < end 105)
+        let overlap_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1010),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 99,
+                end_sequence: 105,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(overlap_delta),
+            Err(MarketTypeError::SequenceOverlap {
+                start: 99,
+                end: 105,
+                current: 100,
+            })
+        );
+        // Resync latched, sequence unchanged
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+
+        // Overlap starting exactly at current: [100, 105]
+        let overlap_delta2 = RawFeedEnvelope::new(
+            sample_sol_context("src", 102, 1020),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 100,
+                end_sequence: 105,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(overlap_delta2),
+            Err(MarketTypeError::ResyncRequired {
+                reason: "stream resync latched: valid snapshot required",
+            })
+        );
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+    }
+
+    #[test]
+    fn test_crossed_order_book_delta_rolls_back_completely() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Snapshot at 100: bid 100.0, ask 102.0
+        let snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(100.0, 10.0)],
+                asks: vec![RawDepthLevel::new(102.0, 10.0)],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(snap).unwrap();
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            100.0
+        );
+        assert_eq!(
+            mapper.order_book().unwrap().best_ask().unwrap().price.get(),
+            102.0
+        );
+
+        // Delta at 101 attempts to set bid to 103.0 (crossing best ask 102.0)
+        let crossing_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1010),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(103.0, 5.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(crossing_delta),
+            Err(MarketTypeError::CrossedOrderBook)
+        );
+
+        // Sequence, bids, and asks must remain untouched
+        assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
+        assert_eq!(mapper.order_book().unwrap().sequence(), Sequence(100));
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            100.0
+        );
+        assert_eq!(
+            mapper.order_book().unwrap().best_ask().unwrap().price.get(),
+            102.0
+        );
+
+        // Valid contiguous delta at 101 with bid 101.0 succeeds cleanly
+        let valid_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1020),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(101.0, 5.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(valid_delta).unwrap();
+        assert_eq!(mapper.current_sequence(), Some(Sequence(101)));
+        assert_eq!(
+            mapper.order_book().unwrap().best_bid().unwrap().price.get(),
+            101.0
+        );
+    }
+
+    #[test]
+    fn test_delta_before_baseline_snapshot_fails_closed() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 1, 1000),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 1,
+                end_sequence: 1,
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapper.map_envelope(delta),
+            Err(MarketTypeError::MissingBaselineSnapshot)
+        );
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), None);
+    }
+
+    #[test]
+    fn test_injected_source_error_propagation() {
+        struct FailingSource;
+        impl MarketFeedSource for FailingSource {
+            fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
+                Err(MarketTypeError::InjectedSourceError(
+                    "simulated feed corruption",
+                ))
+            }
+        }
+
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target).unwrap();
+
+        let mut failing = FailingSource;
+        let res = mapper.process_from_source(&mut failing);
+        assert_eq!(
+            res,
+            Err(MarketTypeError::InjectedSourceError(
+                "simulated feed corruption"
+            ))
+        );
+        assert_eq!(mapper.current_sequence(), None);
+    }
+
+    #[test]
+    fn test_serialization_round_trips_for_feed_types() {
+        // 1. FeedSourceLabel round trip
+        let label = FeedSourceLabel::new("yellowstone-primary-feed").unwrap();
+        let label_json = serde_json::to_string(&label).unwrap();
+        assert_eq!(label_json, r#""yellowstone-primary-feed""#);
+        let decoded_label: FeedSourceLabel = serde_json::from_str(&label_json).unwrap();
+        assert_eq!(decoded_label, label);
+
+        // 2. FeedObservationContext round trip
+        let context = sample_sol_context("solana-geyser", 250_000_100, 1_700_000_000_000);
+        let context_json = serde_json::to_string(&context).unwrap();
+        let decoded_context: FeedObservationContext = serde_json::from_str(&context_json).unwrap();
+        assert_eq!(decoded_context, context);
+
+        // 3. RawFeedEnvelope round trip
+        let raw_env = RawFeedEnvelope::new(
+            context.clone(),
+            FeedTarget::Instrument(sample_instrument()),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 42,
+                bids: vec![RawDepthLevel::new(100.0, 5.0)],
+                asks: vec![RawDepthLevel::new(101.0, 5.0)],
+            }),
+        )
+        .unwrap();
+        let raw_json = serde_json::to_string(&raw_env).unwrap();
+        let decoded_raw: RawFeedEnvelope = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(decoded_raw, raw_env);
+
+        // 4. CanonicalFeedEnvelope round trip
+        let mut mapper = CanonicalMarketFeedMapper::new(raw_env.target.clone()).unwrap();
+        let canonical_env = mapper.map_envelope(raw_env).unwrap();
+        let canonical_json = serde_json::to_string(&canonical_env).unwrap();
+        let decoded_canonical: CanonicalFeedEnvelope =
+            serde_json::from_str(&canonical_json).unwrap();
+        assert_eq!(decoded_canonical, canonical_env);
     }
 }
