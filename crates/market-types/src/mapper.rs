@@ -31,7 +31,7 @@ use crate::sequence::{DeltaClassification, SequenceRange, SequencedStreamTracker
 /// Converts injected raw market feed envelopes into canonical `market-types` contracts.
 /// All rejected inputs (malformed, non-finite, over-bound, wrong-target, sequence-gap,
 /// sequence-overlap) fail closed with structured errors leaving mapper state untouched.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalMarketFeedMapper {
     target: FeedTarget,
     freshness_policy: FreshnessPolicy,
@@ -152,13 +152,14 @@ impl CanonicalMarketFeedMapper {
         evaluated_at_ms: i64,
     ) -> Result<Vec<CanonicalFeedEnvelope>, MarketTypeError> {
         let mut results = Vec::new();
-        while let Some(event) = self.process_from_source(source, evaluated_at_ms)? {
+        while let Some(envelope) = source.next_envelope()? {
             if results.len() >= MAX_FEED_BATCH_SIZE {
                 return Err(MarketTypeError::FeedBatchExceeded {
                     count: results.len() + 1,
                     max: MAX_FEED_BATCH_SIZE,
                 });
             }
+            let event = self.map_envelope(envelope, evaluated_at_ms)?;
             results.push(event);
         }
         Ok(results)

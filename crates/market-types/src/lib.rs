@@ -2934,30 +2934,85 @@ mod tests {
         );
         assert_eq!(source.len(), MAX_FEED_BATCH_SIZE);
 
-        // 4. process_all_from_source enforces MAX_FEED_BATCH_SIZE
-        struct InfiniteSource {
+        // 4. process_all_from_source enforces MAX_FEED_BATCH_SIZE before mapping
+        // and does NOT advance mapper state for envelope MAX + 1.
+        struct TrackingSource {
             target: FeedTarget,
             count: u64,
+            yielded_sequences: Vec<u64>,
         }
-        impl MarketFeedSource for InfiniteSource {
+        impl MarketFeedSource for TrackingSource {
             fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
                 self.count += 1;
+                let (seq, ts, bid_price, ask_price) = if self.count <= MAX_FEED_BATCH_SIZE as u64 {
+                    (
+                        self.count,
+                        1_000_000 + self.count as i64,
+                        100.0 + self.count as f64 * 0.01,
+                        200.0 + self.count as f64 * 0.01,
+                    )
+                } else {
+                    // Clearly distinguishable sequence, timestamp, and orderbook prices for MAX+1
+                    (99_999, 9_999_999, 888.88, 999.99)
+                };
+
+                self.yielded_sequences.push(seq);
                 let env = RawFeedEnvelope::new(
-                    sample_sol_context("src", self.count, 1_000_000 + self.count as i64),
+                    sample_sol_context("src", seq, ts),
                     self.target.clone(),
                     RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
-                        sequence: self.count,
-                        bids: vec![RawDepthLevel::new(100.0, 1.0)],
-                        asks: vec![RawDepthLevel::new(101.0, 1.0)],
+                        sequence: seq,
+                        bids: vec![RawDepthLevel::new(bid_price, 10.0 + self.count as f64)],
+                        asks: vec![RawDepthLevel::new(ask_price, 20.0 + self.count as f64)],
                     }),
                 )?;
                 Ok(Some(env))
             }
         }
 
+        // Run baseline mapper with exact MAX_FEED_BATCH_SIZE items
+        struct ExactBoundedSource {
+            target: FeedTarget,
+            count: u64,
+        }
+        impl MarketFeedSource for ExactBoundedSource {
+            fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
+                if self.count >= MAX_FEED_BATCH_SIZE as u64 {
+                    return Ok(None);
+                }
+                self.count += 1;
+                let seq = self.count;
+                let ts = 1_000_000 + self.count as i64;
+                let bid_price = 100.0 + self.count as f64 * 0.01;
+                let ask_price = 200.0 + self.count as f64 * 0.01;
+                let env = RawFeedEnvelope::new(
+                    sample_sol_context("src", seq, ts),
+                    self.target.clone(),
+                    RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                        sequence: seq,
+                        bids: vec![RawDepthLevel::new(bid_price, 10.0 + self.count as f64)],
+                        asks: vec![RawDepthLevel::new(ask_price, 20.0 + self.count as f64)],
+                    }),
+                )?;
+                Ok(Some(env))
+            }
+        }
+
+        let mut baseline_mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+        let mut exact_source = ExactBoundedSource {
+            target: target.clone(),
+            count: 0,
+        };
+        let baseline_res = baseline_mapper.process_all_from_source(&mut exact_source, 2_000_000);
+        assert_eq!(baseline_res.unwrap().len(), MAX_FEED_BATCH_SIZE);
+
         let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
-        let mut infinite = InfiniteSource { target, count: 0 };
-        let batch_err = mapper.process_all_from_source(&mut infinite, 2_000_000);
+        let mut tracking_source = TrackingSource {
+            target: target.clone(),
+            count: 0,
+            yielded_sequences: Vec::new(),
+        };
+        let batch_err = mapper.process_all_from_source(&mut tracking_source, 2_000_000);
         assert_eq!(
             batch_err.unwrap_err(),
             MarketTypeError::FeedBatchExceeded {
@@ -2965,5 +3020,226 @@ mod tests {
                 max: MAX_FEED_BATCH_SIZE,
             }
         );
+
+        // Fake source proves that envelope MAX + 1 was yielded to establish attempted count
+        assert_eq!(tracking_source.count, (MAX_FEED_BATCH_SIZE + 1) as u64);
+        assert_eq!(
+            tracking_source.yielded_sequences.len(),
+            MAX_FEED_BATCH_SIZE + 1
+        );
+        assert_eq!(
+            tracking_source.yielded_sequences.last().copied(),
+            Some(99_999)
+        );
+
+        // Mapper state must exactly equal baseline mapper after first MAX_FEED_BATCH_SIZE accepted events
+        assert_eq!(mapper, baseline_mapper);
+        assert_eq!(
+            mapper.current_sequence(),
+            Some(Sequence::new(MAX_FEED_BATCH_SIZE as u64))
+        );
+        assert_eq!(
+            mapper.last_timestamp_ms(),
+            Some(1_000_000 + MAX_FEED_BATCH_SIZE as i64)
+        );
+        assert!(!mapper.is_resync_required());
+
+        let book = mapper.order_book().unwrap();
+        assert_eq!(book.sequence(), Sequence::new(MAX_FEED_BATCH_SIZE as u64));
+        assert_eq!(book.timestamp_ms(), 1_000_000 + MAX_FEED_BATCH_SIZE as i64);
+        assert_eq!(
+            book.best_bid().unwrap().price.get(),
+            100.0 + MAX_FEED_BATCH_SIZE as f64 * 0.01
+        );
+        assert_eq!(
+            book.best_bid().unwrap().quantity.get(),
+            10.0 + MAX_FEED_BATCH_SIZE as f64
+        );
+        assert_eq!(
+            book.best_ask().unwrap().price.get(),
+            200.0 + MAX_FEED_BATCH_SIZE as f64 * 0.01
+        );
+        assert_eq!(
+            book.best_ask().unwrap().quantity.get(),
+            20.0 + MAX_FEED_BATCH_SIZE as f64
+        );
+
+        // Explicitly assert that MAX+1 distinguishable properties never leaked into mapper state
+        assert_ne!(mapper.current_sequence(), Some(Sequence::new(99_999)));
+        assert_ne!(mapper.last_timestamp_ms(), Some(9_999_999));
+        assert_ne!(book.best_bid().unwrap().price.get(), 888.88);
+        assert_ne!(book.best_ask().unwrap().price.get(), 999.99);
+
+        // 5. Fake source proves extra envelope was not mapped:
+        // Envelope MAX+1 carries an invalid target. If map_envelope were called on MAX+1,
+        // it would return Err(TargetMismatch). Instead, process_all_from_source returns
+        // FeedBatchExceeded, proving MAX+1 never reached map_envelope.
+        let other_target = FeedTarget::Pool(sample_pool_id());
+        struct PoisonExtraSource {
+            valid_target: FeedTarget,
+            invalid_target: FeedTarget,
+            count: u64,
+        }
+        impl MarketFeedSource for PoisonExtraSource {
+            fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
+                self.count += 1;
+                let target = if self.count <= MAX_FEED_BATCH_SIZE as u64 {
+                    self.valid_target.clone()
+                } else {
+                    self.invalid_target.clone()
+                };
+                let env = RawFeedEnvelope::new(
+                    sample_sol_context("src", self.count, 1_000_000 + self.count as i64),
+                    target,
+                    RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                        sequence: self.count,
+                        bids: vec![RawDepthLevel::new(
+                            100.0 + self.count as f64 * 0.01,
+                            10.0 + self.count as f64,
+                        )],
+                        asks: vec![RawDepthLevel::new(
+                            200.0 + self.count as f64 * 0.01,
+                            20.0 + self.count as f64,
+                        )],
+                    }),
+                )?;
+                Ok(Some(env))
+            }
+        }
+
+        let mut poison_mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+        let mut poison_source = PoisonExtraSource {
+            valid_target: target,
+            invalid_target: other_target,
+            count: 0,
+        };
+        let poison_err = poison_mapper.process_all_from_source(&mut poison_source, 2_000_000);
+        assert_eq!(
+            poison_err.unwrap_err(),
+            MarketTypeError::FeedBatchExceeded {
+                count: MAX_FEED_BATCH_SIZE + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            }
+        );
+        assert_eq!(poison_source.count, (MAX_FEED_BATCH_SIZE + 1) as u64);
+        assert_eq!(poison_mapper, baseline_mapper);
+
+        // 6. Pool state: process_all_from_source enforces MAX_FEED_BATCH_SIZE before mapping
+        let pool_id = sample_pool_id();
+        let pool_target = FeedTarget::Pool(pool_id);
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+
+        struct PoolBatchSource {
+            target: FeedTarget,
+            sol: AssetId,
+            usdc: AssetId,
+            count: u64,
+            max: usize,
+        }
+        impl MarketFeedSource for PoolBatchSource {
+            fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
+                if self.count >= self.max as u64 {
+                    return Ok(None);
+                }
+                self.count += 1;
+                let (seq, ts, reserve_0) = if self.count <= MAX_FEED_BATCH_SIZE as u64 {
+                    (
+                        self.count,
+                        1_000_000 + self.count as i64,
+                        1_000_000_000 + self.count as u128,
+                    )
+                } else {
+                    (99_999, 9_999_999, 999_999_999_999)
+                };
+                let env = RawFeedEnvelope::new(
+                    sample_sol_context("src", seq, ts),
+                    self.target.clone(),
+                    RawFeedPayload::PoolState(RawPoolState {
+                        sequence: seq,
+                        kind: RawPoolKindState::Cpmm(RawCpmmState {
+                            token_0: self.sol.clone(),
+                            token_1: self.usdc.clone(),
+                            decimals_0: 9,
+                            decimals_1: 6,
+                            reserve_0,
+                            reserve_1: 20_000_000,
+                            total_lp_supply: Some(100_000),
+                            fee_bps: 25,
+                        }),
+                    }),
+                )?;
+                Ok(Some(env))
+            }
+        }
+
+        let mut baseline_pool_mapper = CanonicalMarketFeedMapper::new(pool_target.clone()).unwrap();
+        let mut baseline_pool_source = PoolBatchSource {
+            target: pool_target.clone(),
+            sol: sol.clone(),
+            usdc: usdc.clone(),
+            count: 0,
+            max: MAX_FEED_BATCH_SIZE,
+        };
+        let baseline_pool_res =
+            baseline_pool_mapper.process_all_from_source(&mut baseline_pool_source, 2_000_000);
+        assert_eq!(baseline_pool_res.unwrap().len(), MAX_FEED_BATCH_SIZE);
+
+        let mut pool_mapper = CanonicalMarketFeedMapper::new(pool_target.clone()).unwrap();
+        let mut over_pool_source = PoolBatchSource {
+            target: pool_target,
+            sol,
+            usdc,
+            count: 0,
+            max: MAX_FEED_BATCH_SIZE + 1,
+        };
+        let pool_batch_err = pool_mapper.process_all_from_source(&mut over_pool_source, 2_000_000);
+        assert_eq!(
+            pool_batch_err.unwrap_err(),
+            MarketTypeError::FeedBatchExceeded {
+                count: MAX_FEED_BATCH_SIZE + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            }
+        );
+        assert_eq!(over_pool_source.count, (MAX_FEED_BATCH_SIZE + 1) as u64);
+        assert_eq!(pool_mapper, baseline_pool_mapper);
+        assert_eq!(
+            pool_mapper.current_sequence(),
+            Some(Sequence::new(MAX_FEED_BATCH_SIZE as u64))
+        );
+        assert_eq!(
+            pool_mapper.last_timestamp_ms(),
+            Some(1_000_000 + MAX_FEED_BATCH_SIZE as i64)
+        );
+        assert_ne!(pool_mapper.current_sequence(), Some(Sequence::new(99_999)));
+        assert_ne!(pool_mapper.last_timestamp_ms(), Some(9_999_999));
+
+        let pool_state = pool_mapper.last_pool_state().unwrap();
+        assert_eq!(
+            pool_state.sequence,
+            Sequence::new(MAX_FEED_BATCH_SIZE as u64)
+        );
+        assert_eq!(
+            pool_state.observed_at_ms,
+            1_000_000 + MAX_FEED_BATCH_SIZE as i64
+        );
+        match &pool_state.state {
+            PoolKindState::Cpmm(cpmm) => {
+                assert_eq!(
+                    cpmm.reserve_0.get(),
+                    1_000_000_000 + MAX_FEED_BATCH_SIZE as u128
+                );
+                assert_ne!(cpmm.reserve_0.get(), 999_999_999_999);
+            }
+            _ => panic!("expected cpmm pool state"),
+        }
     }
 }
