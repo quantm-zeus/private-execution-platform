@@ -1,0 +1,50 @@
+{
+  "context": {
+    "source_family": "solana",
+    "source_label": "solana-synthetic-primary",
+    "finality": "confirmed",
+    "slot_or_block": 250000110,
+    "observed_at_ms": 1700000001000
+  },
+  "target": {
+    "target_type": "instrument",
+    "target_id": {
+      "base": {
+        "chain": {
+          "kind": "solana"
+        },
+        "address": "So11111111111111111111111111111111111111112"
+      },
+      "quote": {
+        "chain": {
+          "kind": "solana"
+        },
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      }
+    }
+  },
+  "payload": {
+    "payload_type": "order_book_snapshot",
+    "sequence": 110,
+    "bids": [
+      {
+        "price": 151.0,
+        "quantity": 20.0
+      },
+      {
+        "price": 150.0,
+        "quantity": 30.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 152.0,
+        "quantity": 25.0
+      },
+      {
+        "price": 153.0,
+        "quantity": 35.0
+      }
+    ]
+  }
+}
