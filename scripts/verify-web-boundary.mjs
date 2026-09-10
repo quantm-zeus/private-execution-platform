@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -67,6 +67,7 @@ const forbiddenStorageTerms = [
 
 let unlockSecret;
 let temp;
+let brokerProc;
 
 try {
   // =========================================================================
@@ -262,6 +263,7 @@ try {
   const shellSourceFiles = [
     resolve("web/workspace-shell/src/index.tsx"),
     resolve("web/workspace-shell/src/wasm-loader.ts"),
+    resolve("web/workspace-shell/src/unlock-runtime.ts"),
     shellHtmlPath,
     shellHeadersPath,
   ];
@@ -308,7 +310,12 @@ try {
   // 3a. Shell source must NOT import workspace-payload
   const shellIndexSrc = await readFile(resolve("web/workspace-shell/src/index.tsx"), "utf8");
   const shellLoaderSrc = await readFile(resolve("web/workspace-shell/src/wasm-loader.ts"), "utf8");
-  for (const [name, content] of [["index.tsx", shellIndexSrc], ["wasm-loader.ts", shellLoaderSrc]]) {
+  const shellUnlockSrc = await readFile(resolve("web/workspace-shell/src/unlock-runtime.ts"), "utf8");
+  for (const [name, content] of [
+    ["index.tsx", shellIndexSrc],
+    ["wasm-loader.ts", shellLoaderSrc],
+    ["unlock-runtime.ts", shellUnlockSrc],
+  ]) {
     if (content.includes("workspace-payload") || content.includes("@evergreen/workspace-payload")) {
       throw new Error(`circular bootstrap: shell ${name} imports private payload`);
     }
@@ -735,8 +742,393 @@ try {
     throw new Error("all-zero kid was unexpectedly accepted by decrypt-artifact CLI");
   }
 
+  // =========================================================================
+  // 10. Executable boundary shell proof with audited WASM and memory-only unlock runtime
+  // =========================================================================
+  console.log("verifying memory-only unlock runtime and audited wasm boundary...");
+
+  const {
+    WorkspaceUnlockRuntime,
+    unpackPackageFromMemory,
+    toBase64,
+    fromBase64,
+    loadWasm: loadShellWasm,
+  } = await import("../web/workspace-shell/src/unlock-runtime.ts");
+
+  // 10a. Audited WASM loads and binds
+  await loadShellWasm();
+
+  // 10b. Derive workspace keypair deterministically in WASM memory
+  const wasmKey = new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(kid));
+  try {
+    const derivedPk = Buffer.from(wasmKey.public_key());
+    if (!derivedPk.equals(publicKey)) {
+      throw new Error("WasmWorkspaceKey derived public key mismatch");
+    }
+    if (!Buffer.from(wasmKey.kid()).equals(kid)) {
+      throw new Error("WasmWorkspaceKey kid mismatch");
+    }
+    if (wasmKey.version() !== ARTIFACT_VERSION) {
+      throw new Error("WasmWorkspaceKey version mismatch");
+    }
+
+    // Strict parameter validation in WASM key constructor
+    let wasmRejected = false;
+    try {
+      new wasmModule.WasmWorkspaceKey(new Uint8Array(32), ARTIFACT_VERSION, new Uint8Array(kid));
+    } catch {
+      wasmRejected = true;
+    }
+    if (!wasmRejected) throw new Error("all-zero secret accepted by WasmWorkspaceKey");
+
+    wasmRejected = false;
+    try {
+      new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(16));
+    } catch {
+      wasmRejected = true;
+    }
+    if (!wasmRejected) throw new Error("all-zero kid accepted by WasmWorkspaceKey");
+
+    wasmRejected = false;
+    try {
+      new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), 2, new Uint8Array(kid));
+    } catch {
+      wasmRejected = true;
+    }
+    if (!wasmRejected) throw new Error("unsupported version accepted by WasmWorkspaceKey");
+
+    // Standalone convenience derive
+    const convPk = Buffer.from(wasmModule.derive_workspace_public_key(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(kid)));
+    if (!convPk.equals(publicKey)) {
+      throw new Error("derive_workspace_public_key result mismatch");
+    }
+
+    // 10c. Decrypt inner artifact with WasmWorkspaceKey in memory
+    const wasmDecryptedBytes = wasmKey.decrypt_artifact(new Uint8Array(rawArtifact));
+    if (digest(Buffer.from(wasmDecryptedBytes)) !== expectedPayloadHash) {
+      throw new Error("WasmWorkspaceKey decrypted payload digest mismatch");
+    }
+
+    // Standalone convenience decrypt
+    const convDecrypted = wasmModule.decrypt_workspace_artifact(
+      new Uint8Array(unlockSecret),
+      ARTIFACT_VERSION,
+      new Uint8Array(kid),
+      new Uint8Array(rawArtifact),
+    );
+    if (digest(Buffer.from(convDecrypted)) !== expectedPayloadHash) {
+      throw new Error("decrypt_workspace_artifact result mismatch");
+    }
+
+    // Negative crypto tamper checks directly in WASM:
+    // Tampered ciphertext fails closed
+    wasmRejected = false;
+    try {
+      wasmKey.decrypt_artifact(new Uint8Array(tamperedCt));
+    } catch (e) {
+      wasmRejected = true;
+      if (String(e).includes(unlockSecret.toString("base64"))) {
+        throw new Error("tampered ciphertext error leaked secret");
+      }
+    }
+    if (!wasmRejected) throw new Error("WASM accepted tampered ciphertext");
+
+    // Tampered kid fails closed
+    wasmRejected = false;
+    try {
+      wasmKey.decrypt_artifact(new Uint8Array(tamperedKid));
+    } catch {
+      wasmRejected = true;
+    }
+    if (!wasmRejected) throw new Error("WASM accepted tampered kid");
+
+    // Tampered version fails closed
+    wasmRejected = false;
+    try {
+      wasmKey.decrypt_artifact(new Uint8Array(tamperedVer));
+    } catch {
+      wasmRejected = true;
+    }
+    if (!wasmRejected) throw new Error("WASM accepted tampered version");
+
+    // Wrong secret key fails closed
+    const wrongWasmKey = new wasmModule.WasmWorkspaceKey(new Uint8Array(wrongSecret), ARTIFACT_VERSION, new Uint8Array(kid));
+    try {
+      wasmRejected = false;
+      try {
+        wrongWasmKey.decrypt_artifact(new Uint8Array(rawArtifact));
+      } catch (e) {
+        wasmRejected = true;
+        if (String(e).includes(wrongSecret.toString("base64"))) {
+          throw new Error("wrong secret decrypt error leaked secret");
+        }
+      }
+      if (!wasmRejected) throw new Error("WASM accepted wrong unlock secret");
+    } finally {
+      wrongWasmKey.free();
+    }
+
+    // 10d. Unpack package from memory without disk writes
+    const inMemoryFiles = unpackPackageFromMemory(wasmDecryptedBytes);
+    const inMemoryNames = Array.from(inMemoryFiles.keys()).sort();
+    if (JSON.stringify(inMemoryNames) !== JSON.stringify(expectedPayloadFiles)) {
+      throw new Error(`unpackPackageFromMemory file list mismatch: ${inMemoryNames.join(", ")}`);
+    }
+    if (!inMemoryFiles.has("index.html") || inMemoryFiles.get("index.html").length === 0) {
+      throw new Error("unpackPackageFromMemory missing index.html");
+    }
+
+    // Negative package tests fail closed
+    let packageRejected = false;
+    try {
+      unpackPackageFromMemory(new Uint8Array(3));
+    } catch {
+      packageRejected = true;
+    }
+    if (!packageRejected) throw new Error("truncated package accepted");
+
+    packageRejected = false;
+    try {
+      unpackPackageFromMemory(new Uint8Array(100)); // zeroes = 0 file count
+    } catch {
+      packageRejected = true;
+    }
+    if (!packageRejected) throw new Error("zero-file package accepted");
+  } finally {
+    wasmKey.free();
+  }
+
+  // 10e. End-to-end WorkspaceUnlockRuntime lifecycle with mock transport server
+  const runtime = new WorkspaceUnlockRuntime();
+  if (runtime.unlocked) throw new Error("new runtime should not be unlocked");
+  if (runtime.getActiveUrlCount() !== 0) throw new Error("new runtime should have 0 active urls");
+
+  // Spawn test-session-host broker
+  brokerProc = spawn("cargo", ["run", "--quiet", "-p", "crypto-envelope", "--bin", "test-session-host"], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+
+  const brokerStdoutQueue = [];
+  const brokerWaiters = [];
+  let brokerLineBuf = "";
+  brokerProc.stdout.on("data", (chunk) => {
+    brokerLineBuf += chunk.toString();
+    while (brokerLineBuf.includes("\n")) {
+      const idx = brokerLineBuf.indexOf("\n");
+      const line = brokerLineBuf.slice(0, idx).trim();
+      brokerLineBuf = brokerLineBuf.slice(idx + 1);
+      if (brokerWaiters.length > 0) {
+        const resolveWait = brokerWaiters.shift();
+        resolveWait(line);
+      } else {
+        brokerStdoutQueue.push(line);
+      }
+    }
+  });
+
+  function readBrokerLine() {
+    if (brokerStdoutQueue.length > 0) {
+      return Promise.resolve(brokerStdoutQueue.shift());
+    }
+    return new Promise((resolveWait) => brokerWaiters.push(resolveWait));
+  }
+
+  async function getBrokerOffer() {
+    brokerProc.stdin.write("OFFER\n");
+    const line = await readBrokerLine();
+    const [offerKid, offerPk] = line.split(" ");
+    return { offerKid, offerPk };
+  }
+
+  async function sealBrokerEnvelope(encKeyB64, inPath, outPath) {
+    brokerProc.stdin.write(`SEAL ${encKeyB64} ${inPath} ${outPath}\n`);
+    const line = await readBrokerLine();
+    if (line !== "OK") throw new Error(`broker seal failed: ${line}`);
+  }
+
+  // Track what server receives to prove server retains ONLY public metadata
+  const serverReceivedEnrollment = [];
+  const tempEnvelopePath = join(temp, "test-runtime-envelope.bin");
+  let activeOffer = null;
+
+  const mockFetch = async (url, init = {}) => {
+    const parsedUrl = new URL(url, "https://localhost:8081");
+    if (parsedUrl.pathname === "/internal/auth/enroll") {
+      const body = JSON.parse(init.body || "{}");
+      serverReceivedEnrollment.push(body);
+      // Server validates public key enrollment: canonical 32-byte public key, 16-byte kid, version 1
+      if (
+        body.version !== ARTIFACT_VERSION ||
+        !body.kid ||
+        !body.public_key
+      ) {
+        return { ok: false, status: 400 };
+      }
+      return { ok: true, status: 200, json: async () => ({ status: "enrolled" }) };
+    }
+    if (parsedUrl.pathname === "/internal/artifact/grant") {
+      activeOffer = await getBrokerOffer();
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          grant_id: "test-grant-1",
+          kid: activeOffer.offerKid,
+          recipient_public_key: activeOffer.offerPk,
+        }),
+      };
+    }
+    if (parsedUrl.pathname === "/internal/artifact") {
+      const body = JSON.parse(init.body || "{}");
+      if (body.grant_id !== "test-grant-1" || !activeOffer || body.kid !== activeOffer.offerKid || !body.encapsulated_key) {
+        return { ok: false, status: 400 };
+      }
+      // Seal rawArtifact using test-session-host broker
+      await sealBrokerEnvelope(body.encapsulated_key, artifactPath, tempEnvelopePath);
+      const envelopeData = await readFile(tempEnvelopePath);
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => envelopeData.buffer.slice(envelopeData.byteOffset, envelopeData.byteOffset + envelopeData.byteLength),
+      };
+    }
+    return { ok: false, status: 404 };
+  };
+
+  const unlockResult = await runtime.unlock(
+    unlockSecret.toString("base64"),
+    kid.toString("base64"),
+    {
+      fetchFn: mockFetch,
+    },
+  );
+
+  // 10f. Verify unlocked runtime state and payload mount
+  if (!runtime.unlocked) throw new Error("runtime should be unlocked after successful unlock");
+  if (runtime.getActiveUrlCount() === 0) throw new Error("runtime should have active blob URLs");
+  if (!unlockResult.htmlUrl.startsWith("blob:")) throw new Error("mounted HTML URL must be a blob: URL");
+  if (unlockResult.files.size !== expectedPayloadFiles.length) {
+    throw new Error("mounted file count does not match payload build");
+  }
+
+  // Verify server received ONLY public metadata (never secret, private key, or content key)
+  if (serverReceivedEnrollment.length < 1) {
+    throw new Error("expected at least one enrollment request");
+  }
+  const enrollReq = serverReceivedEnrollment[0];
+  if (enrollReq.version !== 1) throw new Error("enrollment version mismatch");
+  if (enrollReq.kid !== kid.toString("base64")) throw new Error("enrollment kid mismatch");
+  if (enrollReq.public_key !== publicKey.toString("base64")) throw new Error("enrollment public key mismatch");
+  for (const forbidden of ["secret", "private_key", "content_key", "unlock_secret", "key"]) {
+    if (forbidden in enrollReq) {
+      throw new Error(`server enrollment received forbidden secret key field: ${forbidden}`);
+    }
+  }
+
+  // 10g. Lock runtime: revokes blob URLs and scrubs RAM
+  runtime.lock();
+  if (runtime.unlocked) throw new Error("runtime should be locked after lock()");
+  if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime active URLs not revoked after lock()");
+
+  // 10h. Negative runtime unlock tests fail closed with no secret leakage
+  // Wrong unlock secret
+  let unlockFailed = false;
+  try {
+    await runtime.unlock(
+      wrongSecret.toString("base64"),
+      kid.toString("base64"),
+      {
+        fetchFn: mockFetch,
+      },
+    );
+  } catch (e) {
+    unlockFailed = true;
+    if (String(e).includes(wrongSecret.toString("base64"))) {
+      throw new Error("unlock error leaked secret");
+    }
+  }
+  if (!unlockFailed) throw new Error("runtime unlock accepted wrong secret");
+  if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
+  if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime should have 0 URLs on failure");
+
+  // Wrong kid
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret.toString("base64"),
+      Buffer.from(wrongKid).toString("base64"),
+      {
+        fetchFn: mockFetch,
+      },
+    );
+  } catch {
+    unlockFailed = true;
+  }
+  if (!unlockFailed) throw new Error("runtime unlock accepted wrong kid");
+  if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
+
+  // All-zero secret fails closed before network
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      Buffer.alloc(32).toString("base64"),
+      kid.toString("base64"),
+      { fetchFn: mockFetch },
+    );
+  } catch {
+    unlockFailed = true;
+  }
+  if (!unlockFailed) throw new Error("runtime accepted all-zero secret");
+
+  // All-zero kid fails closed before network
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret.toString("base64"),
+      Buffer.alloc(16).toString("base64"),
+      { fetchFn: mockFetch },
+    );
+  } catch {
+    unlockFailed = true;
+  }
+  if (!unlockFailed) throw new Error("runtime accepted all-zero kid");
+
+  // Server enrollment error fails closed
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret.toString("base64"),
+      kid.toString("base64"),
+      {
+        fetchFn: async (url) => {
+          if (url.includes("enroll")) return { ok: false, status: 500 };
+          return { ok: true };
+        },
+      },
+    );
+  } catch {
+    unlockFailed = true;
+  }
+  if (!unlockFailed) throw new Error("runtime succeeded when server enrollment failed");
+  if (runtime.unlocked) throw new Error("runtime should remain locked on server error");
+
+  // Shutdown broker
+  if (brokerProc) {
+    try {
+      brokerProc.stdin.write("QUIT\n");
+      brokerProc.kill();
+      brokerProc = null;
+    } catch {}
+  }
+
   console.log("web boundary verification passed");
 } finally {
+  if (brokerProc) {
+    try {
+      brokerProc.stdin.write("QUIT\n");
+      brokerProc.kill();
+    } catch {}
+  }
   if (unlockSecret) unlockSecret.fill(0);
   delete process.env.WORKSPACE_PUBLIC_KEY_B64;
   delete process.env.WORKSPACE_ARTIFACT_KID_B64;

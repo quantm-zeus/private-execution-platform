@@ -21,6 +21,10 @@ path = "src/bin/decrypt_artifact.rs"
 name = "derive-public-key"
 path = "src/bin/derive_public_key.rs"
 
+[[bin]]
+name = "test-session-host"
+path = "src/bin/test_session_host.rs"
+
 [dependencies]
 chacha20poly1305 = "0.11"
 zeroize = { version = "1", features = ["zeroize_derive"] }
