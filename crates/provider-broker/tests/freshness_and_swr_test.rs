@@ -51,11 +51,17 @@ async fn test_fresh_hit_returns_immediately_without_adapter_call() {
 async fn test_stale_while_revalidate_and_bounded_single_refresh() {
     let clock = Arc::new(ManualClock::new(1_000));
     let fake_provider = Arc::new(FakeIntelligenceProvider::new());
-    let broker = ProviderBroker::new(
-        clock.clone(),
-        fake_provider.clone(),
-        BrokerConfig::default(),
-    );
+
+    // Disable refill so budget tracking is exact
+    let config = BrokerConfig {
+        gmgn: provider_broker::ProviderPolicy {
+            budget_refill_per_sec: 0,
+            ..provider_broker::ProviderPolicy::default_gmgn()
+        },
+        ..Default::default()
+    };
+
+    let broker = ProviderBroker::new(clock.clone(), fake_provider.clone(), config);
     let ctx = RequestContext::default();
 
     let req = GmgnTrendingRequest {
@@ -64,7 +70,9 @@ async fn test_stale_while_revalidate_and_bounded_single_refresh() {
         limit: 10,
     };
 
-    // Initial request at t = 1,000 (seq = 0)
+    let initial_budget = broker.health(McpServiceId::Gmgn).available_budget;
+
+    // Initial request at t = 1,000 (seq = 0) -> consumes 1 budget unit
     let res1 = broker
         .gmgn_trending(req.clone(), &ctx)
         .await
@@ -72,11 +80,16 @@ async fn test_stale_while_revalidate_and_bounded_single_refresh() {
     assert_eq!(res1.meta.cache_state, CacheState::Miss);
     assert_eq!(res1.value.payload["seq"], 0);
     assert_eq!(fake_provider.gmgn_trending_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        initial_budget - broker.health(McpServiceId::Gmgn).available_budget,
+        1,
+        "initial miss must charge exactly 1 operation weight"
+    );
 
     // Advance clock to t = 15,000 (age 14,000 > fresh TTL 10,000, but < stale grace 40,000)
     clock.set_ms(15_000);
 
-    // Multiple rapid requests during stale window
+    // Multiple rapid requests during stale window (none of which consume budget directly)
     let res_stale1 = broker
         .gmgn_trending(req.clone(), &ctx)
         .await
@@ -106,6 +119,13 @@ async fn test_stale_while_revalidate_and_bounded_single_refresh() {
         "SWR must schedule at most one bounded refresh across multiple stale requests"
     );
 
+    // SWR refresh must charge exactly one operation weight
+    assert_eq!(
+        initial_budget - broker.health(McpServiceId::Gmgn).available_budget,
+        2,
+        "SWR refresh must charge exactly one operation weight"
+    );
+
     // Next request at same timestamp now hits fresh updated cache (seq = 1)
     let res_fresh = broker
         .gmgn_trending(req.clone(), &ctx)
@@ -113,8 +133,12 @@ async fn test_stale_while_revalidate_and_bounded_single_refresh() {
         .expect("fresh after SWR failed");
     assert_eq!(res_fresh.meta.cache_state, CacheState::FreshHit);
     assert_eq!(res_fresh.value.payload["seq"], 1);
-    // Zero additional adapter calls made
+    // Zero additional adapter calls and zero additional budget charge
     assert_eq!(fake_provider.gmgn_trending_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        initial_budget - broker.health(McpServiceId::Gmgn).available_budget,
+        2
+    );
 }
 
 #[tokio::test]

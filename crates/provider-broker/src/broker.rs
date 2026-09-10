@@ -618,64 +618,7 @@ impl ProviderBroker {
             }
         }
 
-        // 3. Pre-flight check (Circuit breaker, priority shedding, budget)
-        let pre_flight_res = match provider {
-            ProviderId::Fomo => self.fomo_state.lock().unwrap().pre_flight_check(
-                now_ms,
-                op.weight,
-                context.priority,
-            ),
-            ProviderId::Gmgn => self.gmgn_state.lock().unwrap().pre_flight_check(
-                now_ms,
-                op.weight,
-                context.priority,
-            ),
-        };
-
-        if let Err(degraded_reason) = pre_flight_res {
-            // Attempt to serve historical stale fallback if available during degradation
-            if let Some(fallback) = self.cache.lock().unwrap().get_stale_fallback::<T>(&key) {
-                let meta = self.build_meta(
-                    provider,
-                    CacheState::StaleServed,
-                    None,
-                    Some(degraded_reason),
-                    now_ms,
-                    0,
-                );
-                return Ok(BrokerResponse::new((*fallback).clone(), meta));
-            }
-
-            let meta = self.build_meta(
-                provider,
-                CacheState::Miss,
-                None,
-                Some(degraded_reason),
-                now_ms,
-                0,
-            );
-            return Err(match degraded_reason {
-                DegradedReason::BudgetExhausted => BrokerError::BudgetExhausted { provider, meta },
-                DegradedReason::CircuitBreakerOpen => BrokerError::CircuitOpen { provider, meta },
-                DegradedReason::CooldownActive => BrokerError::CooldownActive { provider, meta },
-                DegradedReason::LowPriorityShed => BrokerError::PriorityShed { provider, meta },
-                DegradedReason::CandidateGatingRejected => BrokerError::CandidateNotEligible {
-                    candidate_id: "none".into(),
-                    meta,
-                },
-                DegradedReason::ProviderUnavailable => BrokerError::Adapter {
-                    error: McpAdapterError::ServiceUnavailable { service: provider },
-                    meta,
-                },
-                DegradedReason::NegativeCached => BrokerError::NegativeCached {
-                    provider,
-                    kind: OpaqueFailureKind::Other,
-                    meta,
-                },
-            });
-        }
-
-        // 4. Singleflight coalescing for concurrent requests
+        // 3. Singleflight coalescing for concurrent requests
         let (follower_rx, is_leader) = {
             let mut in_flight = self.in_flight.lock().unwrap();
             if let Some(tx) = in_flight.get(&key) {
@@ -726,9 +669,15 @@ impl ProviderBroker {
             };
         }
 
-        // Leader branch: invoke adapter and broadcast outcome
-        self.execute_leader_and_broadcast::<T, F, Fut>(key, provider, op.weight, fetch_factory)
-            .await
+        // Leader branch: perform pre-flight check (budget charged exactly once here), invoke adapter, and broadcast outcome
+        self.execute_leader_and_broadcast::<T, F, Fut>(
+            key,
+            provider,
+            op.weight,
+            context.priority,
+            fetch_factory,
+        )
+        .await
     }
 
     async fn execute_leader_and_broadcast<T, F, Fut>(
@@ -736,6 +685,7 @@ impl ProviderBroker {
         key: LogicalRequestKey,
         provider: ProviderId,
         cost: u32,
+        priority: RequestPriority,
         fetch_factory: F,
     ) -> Result<BrokerResponse<T>, BrokerError>
     where
@@ -744,6 +694,79 @@ impl ProviderBroker {
         Fut: Future<Output = Result<T, McpAdapterError>> + Send + 'static,
     {
         let now_ms = self.clock.now_ms();
+
+        // 1. Leader pre-flight check (circuit breaker, pressure shedding, and budget deduction)
+        let pre_flight_res = match provider {
+            ProviderId::Fomo => self
+                .fomo_state
+                .lock()
+                .unwrap()
+                .pre_flight_check(now_ms, cost, priority),
+            ProviderId::Gmgn => self
+                .gmgn_state
+                .lock()
+                .unwrap()
+                .pre_flight_check(now_ms, cost, priority),
+        };
+
+        if let Err(degraded_reason) = pre_flight_res {
+            // Remove from in_flight map and broadcast failure to any followers that registered
+            let maybe_tx = {
+                let mut in_flight = self.in_flight.lock().unwrap();
+                in_flight.remove(&key)
+            };
+
+            // Attempt to serve historical stale fallback if available during degradation
+            if let Some(fallback) = self.cache.lock().unwrap().get_stale_fallback::<T>(&key) {
+                let meta = self.build_meta(
+                    provider,
+                    CacheState::StaleServed,
+                    None,
+                    Some(degraded_reason),
+                    now_ms,
+                    0,
+                );
+                if let Some(tx) = maybe_tx {
+                    let _ = tx.send(Some(Ok(fallback.clone() as Arc<dyn Any + Send + Sync>)));
+                }
+                return Ok(BrokerResponse::new((*fallback).clone(), meta));
+            }
+
+            let meta = self.build_meta(
+                provider,
+                CacheState::Miss,
+                None,
+                Some(degraded_reason),
+                now_ms,
+                0,
+            );
+            let broker_err = match degraded_reason {
+                DegradedReason::BudgetExhausted => BrokerError::BudgetExhausted { provider, meta },
+                DegradedReason::CircuitBreakerOpen => BrokerError::CircuitOpen { provider, meta },
+                DegradedReason::CooldownActive => BrokerError::CooldownActive { provider, meta },
+                DegradedReason::LowPriorityShed => BrokerError::PriorityShed { provider, meta },
+                DegradedReason::CandidateGatingRejected => BrokerError::CandidateNotEligible {
+                    candidate_id: "none".into(),
+                    meta,
+                },
+                DegradedReason::ProviderUnavailable => BrokerError::Adapter {
+                    error: McpAdapterError::ServiceUnavailable { service: provider },
+                    meta,
+                },
+                DegradedReason::NegativeCached => BrokerError::NegativeCached {
+                    provider,
+                    kind: OpaqueFailureKind::Other,
+                    meta,
+                },
+            };
+
+            if let Some(tx) = maybe_tx {
+                let _ = tx.send(Some(Err(broker_err.clone())));
+            }
+            return Err(broker_err);
+        }
+
+        // 2. Budget is charged exactly once for this leader invocation. Invoke adapter.
         let fut = fetch_factory();
         let adapter_res = fut.await;
 
