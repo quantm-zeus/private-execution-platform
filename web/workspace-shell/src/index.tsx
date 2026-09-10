@@ -110,6 +110,7 @@ function App() {
             id="workspace-frame"
             src={payloadUrl()}
             title="Workspace Frame"
+            sandbox="allow-scripts"
             style={{ width: "100%", height: "80vh", border: "1px solid #ccc" }}
           />
         </div>

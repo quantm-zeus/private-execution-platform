@@ -279,7 +279,7 @@ export class WorkspaceUnlockRuntime {
       }),
     });
 
-    if (!enrollResponse.ok && enrollResponse.status !== 409) {
+    if (!enrollResponse.ok) {
       workspaceKey.free();
       throw new Error("Workspace enrollment rejected");
     }

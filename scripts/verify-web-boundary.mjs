@@ -127,6 +127,9 @@ try {
   if (!cspContent.includes("connect-src 'self'")) {
     throw new Error("shell CSP missing connect-src 'self'");
   }
+  if (!cspContent.includes("frame-src blob:")) {
+    throw new Error("shell CSP missing frame-src blob:");
+  }
   // No external hosts or unconstrained origins
   if (/https?:\/\//i.test(cspContent) || cspContent.includes("*")) {
     throw new Error(`shell CSP contains non-own-origin or wildcard directive: ${cspContent}`);
@@ -148,7 +151,7 @@ try {
   const shellHeadersPath = join(shellDist, "_headers");
   const shellHeadersRaw = await readFile(shellHeadersPath, "utf8");
   const expectedCspHeader =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'";
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'self'";
 
   // Parse standard static-host _headers format (Cloudflare Pages / Netlify convention)
   const headerRules = [];
@@ -258,6 +261,9 @@ try {
   if (!shellViteConfig.includes("sourcemap: false")) {
     throw new Error("workspace-shell vite.config.ts must enforce sourcemap: false");
   }
+  if (!shellViteConfig.includes("frame-src blob:")) {
+    throw new Error("workspace-shell vite.config.ts missing frame-src blob: in Content-Security-Policy");
+  }
 
   // 2f. Shell code & bundle contains no third-party network calls, analytics, or persistent storage
   const shellSourceFiles = [
@@ -302,6 +308,36 @@ try {
         throw new Error(`shell file ${path} references external tracker: ${tracker}`);
       }
     }
+  }
+
+  // 2g. Shell iframe isolation and static CSP contract
+  // Assert iframe has sandbox="allow-scripts" and strictly forbids allow-same-origin
+  const iframeMatch = (await readFile(resolve("web/workspace-shell/src/index.tsx"), "utf8")).match(/<iframe[\s\S]*?\/>/);
+  if (!iframeMatch) {
+    throw new Error("workspace-shell src/index.tsx missing iframe element");
+  }
+  const iframeTag = iframeMatch[0];
+  if (!iframeTag.includes('sandbox="allow-scripts"')) {
+    throw new Error('workspace-shell src/index.tsx iframe missing sandbox="allow-scripts" attribute');
+  }
+  if (iframeTag.includes("allow-same-origin")) {
+    throw new Error("workspace-shell src/index.tsx iframe improperly grants allow-same-origin");
+  }
+  for (const forbiddenSandbox of ["allow-top-navigation", "allow-modals", "allow-popups", "allow-same-origin"]) {
+    if (iframeTag.includes(forbiddenSandbox)) {
+      throw new Error(`workspace-shell iframe grants excessive sandbox privilege: ${forbiddenSandbox}`);
+    }
+  }
+  const shellBundleJs = shellBuiltFiles.find((p) => /index-.*\.js$/.test(p));
+  if (!shellBundleJs) {
+    throw new Error("workspace-shell built bundle missing index-*.js");
+  }
+  const bundleContent = await readFile(shellBundleJs, "utf8");
+  if (!bundleContent.includes("sandbox=allow-scripts") && !bundleContent.includes('sandbox="allow-scripts"')) {
+    throw new Error("workspace-shell built bundle missing sandbox allow-scripts attribute");
+  }
+  if (bundleContent.includes("allow-same-origin")) {
+    throw new Error("workspace-shell built bundle improperly contains allow-same-origin");
   }
 
   // =========================================================================
@@ -904,7 +940,7 @@ try {
   if (runtime.getActiveUrlCount() !== 0) throw new Error("new runtime should have 0 active urls");
 
   // Spawn test-session-host broker
-  brokerProc = spawn("cargo", ["run", "--quiet", "-p", "crypto-envelope", "--bin", "test-session-host"], {
+  brokerProc = spawn("cargo", ["run", "--quiet", "-p", "crypto-envelope", "--example", "test-session-host"], {
     stdio: ["pipe", "pipe", "inherit"],
   });
 
@@ -1111,6 +1147,53 @@ try {
   }
   if (!unlockFailed) throw new Error("runtime succeeded when server enrollment failed");
   if (runtime.unlocked) throw new Error("runtime should remain locked on server error");
+
+  // Server enrollment 409 Conflict fails closed: stops before artifact-grant delivery, exposes no secret
+  let grantAttemptedOn409 = false;
+  let deliverAttemptedOn409 = false;
+  let enrollPayload409 = null;
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret.toString("base64"),
+      kid.toString("base64"),
+      {
+        fetchFn: async (url, init = {}) => {
+          const parsed = new URL(url, "https://localhost:8081");
+          if (parsed.pathname.includes("enroll")) {
+            enrollPayload409 = init.body ? JSON.parse(init.body) : null;
+            return { ok: false, status: 409 };
+          }
+          if (parsed.pathname.includes("grant")) {
+            grantAttemptedOn409 = true;
+            return { ok: false, status: 500 };
+          }
+          if (parsed.pathname.includes("artifact")) {
+            deliverAttemptedOn409 = true;
+            return { ok: false, status: 500 };
+          }
+          return { ok: false, status: 404 };
+        },
+      },
+    );
+  } catch (e) {
+    unlockFailed = true;
+    if (String(e).includes(unlockSecret.toString("base64"))) {
+      throw new Error("409 enrollment conflict error leaked unlock secret in error message");
+    }
+  }
+  if (!unlockFailed) throw new Error("runtime succeeded when server enrollment returned 409 Conflict");
+  if (grantAttemptedOn409) throw new Error("runtime attempted artifact grant after 409 enrollment conflict");
+  if (deliverAttemptedOn409) throw new Error("runtime attempted artifact delivery after 409 enrollment conflict");
+  if (runtime.unlocked) throw new Error("runtime should remain locked on 409 enrollment conflict");
+  if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime active URLs must remain 0 on 409 failure");
+  if (enrollPayload409) {
+    for (const forbidden of ["secret", "private_key", "content_key", "unlock_secret", "key"]) {
+      if (forbidden in enrollPayload409) {
+        throw new Error(`409 enrollment payload leaked forbidden secret field: ${forbidden}`);
+      }
+    }
+  }
 
   // Shutdown broker
   if (brokerProc) {
