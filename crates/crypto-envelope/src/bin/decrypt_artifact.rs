@@ -4,14 +4,18 @@
 //! Private key material is derived in RAM and zeroized on drop.
 
 use base64::Engine;
-use crypto_envelope::{decrypt_artifact_with_secret, ARTIFACT_VERSION, KID_LEN, UNLOCK_SECRET_LEN};
+use crypto_envelope::{
+    decrypt_artifact_with_secret, ARTIFACT_VERSION, KID_LEN, MAX_ARTIFACT_LEN, MIN_ARTIFACT_LEN,
+    UNLOCK_SECRET_LEN,
+};
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: decrypt-artifact --unlock-secret-b64 <B64> [--kid-b64 <B64>] [--version <U8>] --input <PATH> --output <PATH>"
+        "Usage: decrypt-artifact --unlock-secret-b64 <B64> --kid-b64 <B64> [--version <U8>] --input <PATH> --output <PATH>"
     );
     std::process::exit(1);
 }
@@ -113,34 +117,88 @@ fn main() {
     let mut secret_arr = [0u8; UNLOCK_SECRET_LEN];
     secret_arr.copy_from_slice(&secret_bytes);
 
-    let kid: [u8; KID_LEN] = if let Some(k) = kid_b64 {
-        let kid_bytes = b64_engine.decode(k.trim()).unwrap_or_else(|_| {
-            eprintln!("error: invalid base64 kid");
-            std::process::exit(1);
-        });
-        if kid_bytes.len() != KID_LEN {
-            eprintln!(
-                "error: kid must be exactly {} bytes, got {}",
-                KID_LEN,
-                kid_bytes.len()
-            );
-            std::process::exit(1);
-        }
-        let mut arr = [0u8; KID_LEN];
-        arr.copy_from_slice(&kid_bytes);
-        arr
-    } else {
-        [0u8; KID_LEN]
-    };
-
-    let artifact_wire = fs::read(&input).unwrap_or_else(|e| {
+    let kid_str = kid_b64.unwrap_or_else(|| {
+        eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
+        std::process::exit(1);
+    });
+    let kid_bytes = b64_engine.decode(kid_str.trim()).unwrap_or_else(|_| {
+        eprintln!("error: invalid base64 kid");
+        std::process::exit(1);
+    });
+    if kid_bytes.len() != KID_LEN {
         eprintln!(
-            "error: failed to read input file {}: {}",
+            "error: kid must be exactly {} bytes, got {}",
+            KID_LEN,
+            kid_bytes.len()
+        );
+        std::process::exit(1);
+    }
+    let mut kid = [0u8; KID_LEN];
+    kid.copy_from_slice(&kid_bytes);
+    if kid.iter().all(|&b| b == 0) {
+        eprintln!("error: all-zero kid rejected");
+        std::process::exit(1);
+    }
+
+    let input_meta = fs::metadata(&input).unwrap_or_else(|e| {
+        eprintln!(
+            "error: failed to inspect input file {}: {}",
             input.display(),
             e
         );
         std::process::exit(1);
     });
+    if !input_meta.is_file() {
+        eprintln!(
+            "error: input path {} is not a regular file",
+            input.display()
+        );
+        std::process::exit(1);
+    }
+    let file_len = input_meta.len();
+    if file_len < MIN_ARTIFACT_LEN as u64 {
+        eprintln!(
+            "error: artifact file too small ({} bytes < minimum {} bytes)",
+            file_len, MIN_ARTIFACT_LEN
+        );
+        std::process::exit(1);
+    }
+    if file_len > MAX_ARTIFACT_LEN as u64 {
+        eprintln!(
+            "error: artifact file exceeds maximum size of {} bytes",
+            MAX_ARTIFACT_LEN
+        );
+        std::process::exit(1);
+    }
+
+    let mut file = fs::File::open(&input).unwrap_or_else(|e| {
+        eprintln!(
+            "error: failed to open input file {}: {}",
+            input.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+    let mut artifact_wire = Vec::with_capacity(file_len as usize);
+    file.by_ref()
+        .take((MAX_ARTIFACT_LEN + 1) as u64)
+        .read_to_end(&mut artifact_wire)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "error: failed to read input file {}: {}",
+                input.display(),
+                e
+            );
+            std::process::exit(1);
+        });
+    if artifact_wire.len() < MIN_ARTIFACT_LEN {
+        eprintln!("error: artifact file too small");
+        std::process::exit(1);
+    }
+    if artifact_wire.len() > MAX_ARTIFACT_LEN {
+        eprintln!("error: artifact file exceeded maximum size");
+        std::process::exit(1);
+    }
 
     let plaintext = decrypt_artifact_with_secret(&secret_arr, version, &kid, &artifact_wire)
         .unwrap_or_else(|e| {

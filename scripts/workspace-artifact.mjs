@@ -39,7 +39,7 @@ export function artifactPublicKeyFromEnv(env = process.env) {
 export function artifactKidFromEnv(env = process.env) {
   const raw = env.WORKSPACE_ARTIFACT_KID_B64;
   if (!raw) {
-    return Buffer.alloc(KID_BYTES);
+    throw new Error("workspace kid unavailable or missing: WORKSPACE_ARTIFACT_KID_B64 required");
   }
   if (typeof raw !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(raw)) {
     throw new Error("workspace kid invalid base64");
@@ -47,6 +47,9 @@ export function artifactKidFromEnv(env = process.env) {
   const kid = Buffer.from(raw, "base64");
   if (kid.length !== KID_BYTES || kid.toString("base64") !== raw) {
     throw new Error("workspace kid must be exactly 16 bytes");
+  }
+  if (kid.every((b) => b === 0)) {
+    throw new Error("all-zero workspace kid rejected");
   }
   return kid;
 }
@@ -95,14 +98,20 @@ function runRustCli(binName, args) {
 
 export function derivePublicKey(
   unlockSecret,
-  kid = Buffer.alloc(KID_BYTES),
+  kid,
   version = ARTIFACT_VERSION,
 ) {
   if (!Buffer.isBuffer(unlockSecret) || unlockSecret.length !== UNLOCK_SECRET_BYTES) {
     throw new Error("invalid unlock secret");
   }
+  if (unlockSecret.every((b) => b === 0)) {
+    throw new Error("all-zero workspace unlock secret rejected");
+  }
   if (!Buffer.isBuffer(kid) || kid.length !== KID_BYTES) {
     throw new Error("invalid kid");
+  }
+  if (kid.every((b) => b === 0)) {
+    throw new Error("all-zero workspace kid rejected");
   }
   const { directPath } = resolveBin("derive-public-key");
   const args = [
@@ -136,7 +145,7 @@ export function derivePublicKey(
 export async function sealPackage(
   plaintext,
   publicKey,
-  kid = Buffer.alloc(KID_BYTES),
+  kid,
   version = ARTIFACT_VERSION,
 ) {
   if (!Buffer.isBuffer(plaintext) || plaintext.length === 0 || plaintext.length > MAX_PACKAGE_BYTES) {
@@ -145,8 +154,14 @@ export async function sealPackage(
   if (!Buffer.isBuffer(publicKey) || publicKey.length !== PUBLIC_KEY_BYTES) {
     throw new Error("invalid recipient public key");
   }
+  if (publicKey.every((b) => b === 0)) {
+    throw new Error("all-zero workspace public key rejected");
+  }
   if (!Buffer.isBuffer(kid) || kid.length !== KID_BYTES) {
     throw new Error("invalid kid");
+  }
+  if (kid.every((b) => b === 0)) {
+    throw new Error("all-zero workspace kid rejected");
   }
   if (version !== ARTIFACT_VERSION) {
     throw new Error("unsupported artifact version");
@@ -182,17 +197,23 @@ export async function sealPackage(
 export async function decryptArtifact(
   artifact,
   unlockSecret,
-  kid = Buffer.alloc(KID_BYTES),
+  kid,
   version = ARTIFACT_VERSION,
 ) {
-  if (!Buffer.isBuffer(artifact) || artifact.length < MIN_ARTIFACT_BYTES) {
+  if (!Buffer.isBuffer(artifact) || artifact.length < MIN_ARTIFACT_BYTES || artifact.length > MAX_PACKAGE_BYTES) {
     throw new Error("invalid artifact");
   }
   if (!Buffer.isBuffer(unlockSecret) || unlockSecret.length !== UNLOCK_SECRET_BYTES) {
     throw new Error("invalid unlock secret");
   }
+  if (unlockSecret.every((b) => b === 0)) {
+    throw new Error("all-zero workspace unlock secret rejected");
+  }
   if (!Buffer.isBuffer(kid) || kid.length !== KID_BYTES) {
     throw new Error("invalid kid");
+  }
+  if (kid.every((b) => b === 0)) {
+    throw new Error("all-zero workspace kid rejected");
   }
   if (version !== ARTIFACT_VERSION) {
     throw new Error("unsupported artifact version");

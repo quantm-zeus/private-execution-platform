@@ -1,16 +1,25 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import {
   artifactKidFromEnv,
   decryptArtifact,
   unlockSecretFromEnv,
   unpackPackage,
   writeUnpacked,
+  MIN_ARTIFACT_BYTES,
+  MAX_PACKAGE_BYTES,
 } from "./workspace-artifact.mjs";
 
 export async function decryptArtifactFile(path, env = process.env) {
   const secret = unlockSecretFromEnv(env);
   const kid = artifactKidFromEnv(env);
   try {
+    const st = await stat(path);
+    if (!st.isFile()) {
+      throw new Error("artifact path is not a file");
+    }
+    if (st.size < MIN_ARTIFACT_BYTES || st.size > MAX_PACKAGE_BYTES) {
+      throw new Error("artifact file size out of bounds");
+    }
     const plaintext = await decryptArtifact(await readFile(path), secret, kid);
     return { plaintext, files: unpackPackage(plaintext) };
   } finally {

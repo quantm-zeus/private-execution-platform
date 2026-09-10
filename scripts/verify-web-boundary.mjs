@@ -91,6 +91,31 @@ try {
     throw new Error("WORKSPACE_ARTIFACT_KEY_B64 was unexpectedly accepted by encrypted build");
   }
 
+  // 4b. Verify missing WORKSPACE_ARTIFACT_KID_B64 is strictly rejected
+  const missingKidBuildAttempt = spawnSync("pnpm", ["build:workspace:encrypted"], {
+    stdio: "pipe",
+    env: {
+      ...process.env,
+      WORKSPACE_PUBLIC_KEY_B64: publicKey.toString("base64"),
+    },
+  });
+  if (missingKidBuildAttempt.status === 0) {
+    throw new Error("missing WORKSPACE_ARTIFACT_KID_B64 was unexpectedly accepted by encrypted build");
+  }
+
+  // 4c. Verify all-zero WORKSPACE_ARTIFACT_KID_B64 is strictly rejected
+  const zeroKidBuildAttempt = spawnSync("pnpm", ["build:workspace:encrypted"], {
+    stdio: "pipe",
+    env: {
+      ...process.env,
+      WORKSPACE_PUBLIC_KEY_B64: publicKey.toString("base64"),
+      WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16).toString("base64"),
+    },
+  });
+  if (zeroKidBuildAttempt.status === 0) {
+    throw new Error("all-zero WORKSPACE_ARTIFACT_KID_B64 was unexpectedly accepted by encrypted build");
+  }
+
   // 5. Build encrypted workspace artifact with ONLY public key and kid
   run(["build:workspace:encrypted"], {
     ...process.env,
@@ -219,6 +244,103 @@ try {
     rejected = true;
   }
   if (!rejected) throw new Error("wrong kid in context was accepted");
+
+  // 9f. Missing kid in decrypt env (fails closed)
+  rejected = false;
+  try {
+    await decryptArtifactFile(artifactPath, {
+      WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
+    });
+  } catch {
+    rejected = true;
+  }
+  if (!rejected) throw new Error("missing kid in decrypt env was accepted");
+
+  // 9g. All-zero kid in decrypt env (fails closed)
+  rejected = false;
+  try {
+    await decryptArtifactFile(artifactPath, {
+      WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
+      WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16).toString("base64"),
+    });
+  } catch {
+    rejected = true;
+  }
+  if (!rejected) throw new Error("all-zero kid in decrypt env was accepted");
+
+  // 9h. Preflight metadata: empty input file fails closed in seal-artifact CLI
+  const emptyFile = join(temp, "empty-input.bin");
+  await writeFile(emptyFile, Buffer.alloc(0));
+  const sealEmptyAttempt = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "seal-artifact", "--",
+    "--public-key-b64", publicKey.toString("base64"),
+    "--kid-b64", kid.toString("base64"),
+    "--input", emptyFile,
+    "--output", join(temp, "empty-out.bin"),
+  ], { stdio: "pipe" });
+  if (sealEmptyAttempt.status === 0) {
+    throw new Error("empty input file was unexpectedly accepted by seal-artifact");
+  }
+
+  // 9i. Preflight metadata: truncated artifact file (< 65 bytes) fails closed in decrypt-artifact CLI
+  const truncFile = join(temp, "trunc-input.bin");
+  await writeFile(truncFile, Buffer.alloc(64));
+  const decryptTruncAttempt = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
+    "--unlock-secret-b64", unlockSecret.toString("base64"),
+    "--kid-b64", kid.toString("base64"),
+    "--input", truncFile,
+    "--output", join(temp, "trunc-out.bin"),
+  ], { stdio: "pipe" });
+  if (decryptTruncAttempt.status === 0) {
+    throw new Error("truncated artifact was unexpectedly accepted by decrypt-artifact");
+  }
+
+  // 9j. Missing kid fails closed on CLI seal-artifact
+  const missingKidSeal = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "seal-artifact", "--",
+    "--public-key-b64", publicKey.toString("base64"),
+    "--input", artifactPath,
+    "--output", join(temp, "cli-out.bin"),
+  ], { stdio: "pipe", env: { PATH: process.env.PATH } });
+  if (missingKidSeal.status === 0) {
+    throw new Error("missing kid was unexpectedly accepted by seal-artifact CLI");
+  }
+
+  // 9k. All-zero kid fails closed on CLI seal-artifact
+  const zeroKidSeal = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "seal-artifact", "--",
+    "--public-key-b64", publicKey.toString("base64"),
+    "--kid-b64", Buffer.alloc(16).toString("base64"),
+    "--input", artifactPath,
+    "--output", join(temp, "cli-out.bin"),
+  ], { stdio: "pipe", env: { PATH: process.env.PATH } });
+  if (zeroKidSeal.status === 0) {
+    throw new Error("all-zero kid was unexpectedly accepted by seal-artifact CLI");
+  }
+
+  // 9l. Missing kid fails closed on CLI decrypt-artifact
+  const missingKidDecrypt = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
+    "--unlock-secret-b64", unlockSecret.toString("base64"),
+    "--input", artifactPath,
+    "--output", join(temp, "cli-out.bin"),
+  ], { stdio: "pipe", env: { PATH: process.env.PATH } });
+  if (missingKidDecrypt.status === 0) {
+    throw new Error("missing kid was unexpectedly accepted by decrypt-artifact CLI");
+  }
+
+  // 9m. All-zero kid fails closed on CLI decrypt-artifact
+  const zeroKidDecrypt = spawnSync("cargo", [
+    "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
+    "--unlock-secret-b64", unlockSecret.toString("base64"),
+    "--kid-b64", Buffer.alloc(16).toString("base64"),
+    "--input", artifactPath,
+    "--output", join(temp, "cli-out.bin"),
+  ], { stdio: "pipe", env: { PATH: process.env.PATH } });
+  if (zeroKidDecrypt.status === 0) {
+    throw new Error("all-zero kid was unexpectedly accepted by decrypt-artifact CLI");
+  }
 
   console.log("web boundary verification passed");
 } finally {

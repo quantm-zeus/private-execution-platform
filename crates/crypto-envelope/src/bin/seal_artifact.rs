@@ -6,15 +6,17 @@
 
 use base64::Engine;
 use crypto_envelope::{
-    hpke::HpkePublicKey, seal_artifact, ARTIFACT_VERSION, KID_LEN, PUBLIC_KEY_LEN,
+    hpke::HpkePublicKey, seal_artifact, ARTIFACT_VERSION, KID_LEN, MAX_ARTIFACT_PAYLOAD_LEN,
+    PUBLIC_KEY_LEN,
 };
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: seal-artifact --public-key-b64 <B64> [--kid-b64 <B64>] [--version <U8>] --input <PATH> --output <PATH>"
+        "Usage: seal-artifact --public-key-b64 <B64> --kid-b64 <B64> [--version <U8>] --input <PATH> --output <PATH>"
     );
     std::process::exit(1);
 }
@@ -130,34 +132,85 @@ fn main() {
     }
     let recipient_pk = HpkePublicKey(pk_array);
 
-    let kid: [u8; KID_LEN] = if let Some(k) = kid_b64 {
-        let kid_bytes = b64_engine.decode(k.trim()).unwrap_or_else(|_| {
-            eprintln!("error: invalid base64 kid");
-            std::process::exit(1);
-        });
-        if kid_bytes.len() != KID_LEN {
-            eprintln!(
-                "error: kid must be exactly {} bytes, got {}",
-                KID_LEN,
-                kid_bytes.len()
-            );
-            std::process::exit(1);
-        }
-        let mut arr = [0u8; KID_LEN];
-        arr.copy_from_slice(&kid_bytes);
-        arr
-    } else {
-        [0u8; KID_LEN]
-    };
-
-    let payload = fs::read(&input).unwrap_or_else(|e| {
+    let kid_str = kid_b64.unwrap_or_else(|| {
+        eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
+        std::process::exit(1);
+    });
+    let kid_bytes = b64_engine.decode(kid_str.trim()).unwrap_or_else(|_| {
+        eprintln!("error: invalid base64 kid");
+        std::process::exit(1);
+    });
+    if kid_bytes.len() != KID_LEN {
         eprintln!(
-            "error: failed to read input file {}: {}",
+            "error: kid must be exactly {} bytes, got {}",
+            KID_LEN,
+            kid_bytes.len()
+        );
+        std::process::exit(1);
+    }
+    let mut kid = [0u8; KID_LEN];
+    kid.copy_from_slice(&kid_bytes);
+    if kid.iter().all(|&b| b == 0) {
+        eprintln!("error: all-zero kid rejected");
+        std::process::exit(1);
+    }
+
+    let input_meta = fs::metadata(&input).unwrap_or_else(|e| {
+        eprintln!(
+            "error: failed to inspect input file {}: {}",
             input.display(),
             e
         );
         std::process::exit(1);
     });
+    if !input_meta.is_file() {
+        eprintln!(
+            "error: input path {} is not a regular file",
+            input.display()
+        );
+        std::process::exit(1);
+    }
+    let file_len = input_meta.len();
+    if file_len == 0 {
+        eprintln!("error: input file is empty");
+        std::process::exit(1);
+    }
+    if file_len > MAX_ARTIFACT_PAYLOAD_LEN as u64 {
+        eprintln!(
+            "error: input file exceeds maximum payload size of {} bytes",
+            MAX_ARTIFACT_PAYLOAD_LEN
+        );
+        std::process::exit(1);
+    }
+
+    let mut file = fs::File::open(&input).unwrap_or_else(|e| {
+        eprintln!(
+            "error: failed to open input file {}: {}",
+            input.display(),
+            e
+        );
+        std::process::exit(1);
+    });
+    let mut payload = Vec::with_capacity(file_len as usize);
+    file.by_ref()
+        .take((MAX_ARTIFACT_PAYLOAD_LEN + 1) as u64)
+        .read_to_end(&mut payload)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "error: failed to read input file {}: {}",
+                input.display(),
+                e
+            );
+            std::process::exit(1);
+        });
+    if payload.is_empty() {
+        eprintln!("error: input file is empty");
+        std::process::exit(1);
+    }
+    if payload.len() > MAX_ARTIFACT_PAYLOAD_LEN {
+        eprintln!("error: input file exceeded maximum payload size");
+        std::process::exit(1);
+    }
 
     let sealed = seal_artifact(&recipient_pk, version, &kid, &payload).unwrap_or_else(|e| {
         eprintln!("error: artifact sealing failed: {}", e);

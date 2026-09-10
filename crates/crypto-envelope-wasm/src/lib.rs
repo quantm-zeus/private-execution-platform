@@ -159,7 +159,7 @@ impl WasmWorkspaceKey {
         if unlock_secret.len() != UNLOCK_SECRET_LEN || unlock_secret.iter().all(|&b| b == 0) {
             return Err(invalid_input());
         }
-        if kid.len() != KID_LEN {
+        if kid.len() != KID_LEN || kid.iter().all(|&b| b == 0) {
             return Err(invalid_input());
         }
         if version != crypto_envelope::ARTIFACT_VERSION {
@@ -230,10 +230,10 @@ pub fn decrypt_workspace_artifact(
     key.decrypt_artifact(artifact_wire)
 }
 
-/// Seals a payload to a recipient public key using audited Rust HPKE crypto.
-/// Input is ONLY the 32-byte recipient public key.
-#[wasm_bindgen]
-pub fn seal_workspace_artifact(
+/// Test-only helper to seal a payload to a recipient public key using audited Rust HPKE crypto.
+/// Retained strictly for native/private testing; NOT exported across the WASM-JS boundary.
+#[cfg(test)]
+fn seal_workspace_artifact(
     recipient_public_key: &[u8],
     version: u8,
     kid: &[u8],
@@ -242,7 +242,7 @@ pub fn seal_workspace_artifact(
     if recipient_public_key.len() != PK_LEN || recipient_public_key.iter().all(|&b| b == 0) {
         return Err(invalid_input());
     }
-    if kid.len() != KID_LEN {
+    if kid.len() != KID_LEN || kid.iter().all(|&b| b == 0) {
         return Err(invalid_input());
     }
     if version != crypto_envelope::ARTIFACT_VERSION {
@@ -267,13 +267,18 @@ mod tests {
     use wasm_bindgen_test::*;
 
     const TEST_SECRET: [u8; 32] = [
-        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
-        0x5f, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d,
-        0x6e, 0x6f,
+        0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50,
+        0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f,
+        0x60, 0x61,
     ];
     const TEST_KID: [u8; 16] = [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
-        0x1f,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
+    const EXPECTED_PUBLIC_KEY: [u8; 32] = [
+        0xfc, 0x41, 0xce, 0x56, 0x69, 0xad, 0x52, 0xcf, 0xb3, 0xa5, 0x3a, 0x58, 0x1e, 0x35, 0xbd,
+        0x5e, 0xe7, 0x09, 0x01, 0x15, 0xcd, 0xa8, 0x03, 0x26, 0x35, 0xc6, 0x46, 0xad, 0x2c, 0xc9,
+        0xe0, 0x34,
     ];
     const TEST_VERSION: u8 = 1;
 
@@ -282,11 +287,11 @@ mod tests {
         let key1 = WasmWorkspaceKey::new(&TEST_SECRET, TEST_VERSION, &TEST_KID).expect("key 1");
         let key2 = WasmWorkspaceKey::new(&TEST_SECRET, TEST_VERSION, &TEST_KID).expect("key 2");
         assert_eq!(key1.public_key(), key2.public_key());
-        assert_eq!(key1.public_key().len(), 32);
+        assert_eq!(key1.public_key().as_slice(), &EXPECTED_PUBLIC_KEY);
 
         let pk_direct =
             derive_workspace_public_key(&TEST_SECRET, TEST_VERSION, &TEST_KID).expect("direct");
-        assert_eq!(key1.public_key(), pk_direct);
+        assert_eq!(pk_direct.as_slice(), &EXPECTED_PUBLIC_KEY);
     }
 
     #[wasm_bindgen_test]
@@ -426,5 +431,15 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 1;
         assert!(initiator.decrypt(&tampered).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn all_zero_kid_rejected() {
+        let zero_kid = [0u8; 16];
+        assert!(WasmWorkspaceKey::new(&TEST_SECRET, TEST_VERSION, &zero_kid).is_err());
+        assert!(derive_workspace_public_key(&TEST_SECRET, TEST_VERSION, &zero_kid).is_err());
+        assert!(
+            decrypt_workspace_artifact(&TEST_SECRET, TEST_VERSION, &zero_kid, &[0u8; 65]).is_err()
+        );
     }
 }

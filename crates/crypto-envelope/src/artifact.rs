@@ -29,6 +29,7 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub const ARTIFACT_HEADER_LEN: usize = 1 + KID_LEN + ENCAPSULATED_KEY_LEN; // 49 bytes
 pub const MIN_ARTIFACT_LEN: usize = ARTIFACT_HEADER_LEN + AEAD_TAG_LEN; // 65 bytes
 pub const MAX_ARTIFACT_LEN: usize = 256 * 1024 * 1024; // 256 MiB bound
+pub const MAX_ARTIFACT_PAYLOAD_LEN: usize = MAX_ARTIFACT_LEN - MIN_ARTIFACT_LEN;
 
 /// Canonical domain-separated info for deterministic workspace key derivation.
 pub fn canonical_unlock_info(version: u8, kid: &[u8; KID_LEN]) -> Vec<u8> {
@@ -98,6 +99,9 @@ pub fn derive_workspace_keypair(
     if unlock_secret.iter().all(|&b| b == 0) {
         return Err(CryptoError::InvalidInput);
     }
+    if kid.iter().all(|&b| b == 0) {
+        return Err(CryptoError::InvalidInput);
+    }
 
     let info = canonical_unlock_info(version, kid);
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, unlock_secret);
@@ -146,6 +150,9 @@ impl ArtifactEnvelope {
         }
         let mut kid = [0u8; KID_LEN];
         kid.copy_from_slice(&wire[1..1 + KID_LEN]);
+        if kid.iter().all(|&b| b == 0) {
+            return Err(CryptoError::FormatError);
+        }
 
         let mut encapsulated_key = [0u8; ENCAPSULATED_KEY_LEN];
         encapsulated_key.copy_from_slice(&wire[1 + KID_LEN..ARTIFACT_HEADER_LEN]);
@@ -181,7 +188,10 @@ pub fn seal_artifact(
     if recipient_public_key.0.iter().all(|&b| b == 0) {
         return Err(CryptoError::InvalidInput);
     }
-    if payload.is_empty() || payload.len() > MAX_ARTIFACT_LEN - MIN_ARTIFACT_LEN {
+    if kid.iter().all(|&b| b == 0) {
+        return Err(CryptoError::InvalidInput);
+    }
+    if payload.is_empty() || payload.len() > MAX_ARTIFACT_PAYLOAD_LEN {
         return Err(CryptoError::InvalidInput);
     }
 
@@ -282,6 +292,11 @@ mod tests {
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
         0x10,
     ];
+    const EXPECTED_PUBLIC_KEY: [u8; 32] = [
+        0xfc, 0x41, 0xce, 0x56, 0x69, 0xad, 0x52, 0xcf, 0xb3, 0xa5, 0x3a, 0x58, 0x1e, 0x35, 0xbd,
+        0x5e, 0xe7, 0x09, 0x01, 0x15, 0xcd, 0xa8, 0x03, 0x26, 0x35, 0xc6, 0x46, 0xad, 0x2c, 0xc9,
+        0xe0, 0x34,
+    ];
 
     #[test]
     fn deterministic_unlock_secret_derivation_known_vector() {
@@ -293,11 +308,15 @@ mod tests {
         let pk1 = keypair1.public_key_bytes();
         let pk2 = keypair2.public_key_bytes();
         assert_eq!(pk1, pk2, "derivation must be deterministic");
+        assert_eq!(
+            pk1, EXPECTED_PUBLIC_KEY,
+            "derived public key must match hard-coded expected vector"
+        );
 
         // Verify repeatability: fixed vector check
         let keypair3 = derive_workspace_keypair(&TEST_SECRET, ARTIFACT_VERSION, &TEST_KID)
             .expect("derivation 3");
-        assert_eq!(keypair3.public_key_bytes(), pk1);
+        assert_eq!(keypair3.public_key_bytes(), EXPECTED_PUBLIC_KEY);
     }
 
     #[test]
@@ -445,6 +464,48 @@ mod tests {
             ARTIFACT_VERSION,
             &TEST_KID,
             b"test"
+        )
+        .is_err());
+        // All zero kid is rejected in derivation and sealing
+        assert!(derive_workspace_keypair(&TEST_SECRET, ARTIFACT_VERSION, &[0u8; 16]).is_err());
+        assert!(
+            seal_artifact(&keypair.public_key(), ARTIFACT_VERSION, &[0u8; 16], b"test").is_err()
+        );
+    }
+
+    #[test]
+    fn all_zero_kid_rejected_consistently() {
+        let all_zero_kid = [0u8; 16];
+        // 1. Key derivation rejects all-zero kid
+        assert!(derive_workspace_keypair(&TEST_SECRET, ARTIFACT_VERSION, &all_zero_kid).is_err());
+
+        // 2. Artifact seal rejects all-zero kid
+        let keypair = derive_workspace_keypair(&TEST_SECRET, ARTIFACT_VERSION, &TEST_KID).unwrap();
+        assert!(seal_artifact(
+            &keypair.public_key(),
+            ARTIFACT_VERSION,
+            &all_zero_kid,
+            b"payload"
+        )
+        .is_err());
+
+        // 3. Artifact wire envelope with all-zero kid is rejected by parser and decryptors
+        let valid_sealed = seal_artifact(
+            &keypair.public_key(),
+            ARTIFACT_VERSION,
+            &TEST_KID,
+            b"payload",
+        )
+        .unwrap();
+        let mut tampered_zero_kid = valid_sealed.clone();
+        tampered_zero_kid[1..17].fill(0);
+        assert!(ArtifactEnvelope::from_bytes(&tampered_zero_kid).is_err());
+        assert!(decrypt_artifact(&keypair, &tampered_zero_kid).is_err());
+        assert!(decrypt_artifact_with_secret(
+            &TEST_SECRET,
+            ARTIFACT_VERSION,
+            &TEST_KID,
+            &tampered_zero_kid
         )
         .is_err());
     }

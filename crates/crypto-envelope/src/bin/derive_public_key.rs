@@ -9,7 +9,7 @@ use std::env;
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: derive-public-key --unlock-secret-b64 <B64> [--kid-b64 <B64>] [--version <U8>]"
+        "Usage: derive-public-key --unlock-secret-b64 <B64> --kid-b64 <B64> [--version <U8>]"
     );
     std::process::exit(1);
 }
@@ -87,25 +87,28 @@ fn main() {
     let mut secret_arr = [0u8; UNLOCK_SECRET_LEN];
     secret_arr.copy_from_slice(&secret_bytes);
 
-    let kid: [u8; KID_LEN] = if let Some(k) = kid_b64 {
-        let kid_bytes = b64_engine.decode(k.trim()).unwrap_or_else(|_| {
-            eprintln!("error: invalid base64 kid");
-            std::process::exit(1);
-        });
-        if kid_bytes.len() != KID_LEN {
-            eprintln!(
-                "error: kid must be exactly {} bytes, got {}",
-                KID_LEN,
-                kid_bytes.len()
-            );
-            std::process::exit(1);
-        }
-        let mut arr = [0u8; KID_LEN];
-        arr.copy_from_slice(&kid_bytes);
-        arr
-    } else {
-        [0u8; KID_LEN]
-    };
+    let kid_str = kid_b64.unwrap_or_else(|| {
+        eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
+        std::process::exit(1);
+    });
+    let kid_bytes = b64_engine.decode(kid_str.trim()).unwrap_or_else(|_| {
+        eprintln!("error: invalid base64 kid");
+        std::process::exit(1);
+    });
+    if kid_bytes.len() != KID_LEN {
+        eprintln!(
+            "error: kid must be exactly {} bytes, got {}",
+            KID_LEN,
+            kid_bytes.len()
+        );
+        std::process::exit(1);
+    }
+    let mut kid = [0u8; KID_LEN];
+    kid.copy_from_slice(&kid_bytes);
+    if kid.iter().all(|&b| b == 0) {
+        eprintln!("error: all-zero kid rejected");
+        std::process::exit(1);
+    }
 
     let keypair = derive_workspace_keypair(&secret_arr, version, &kid).unwrap_or_else(|e| {
         eprintln!("error: workspace key derivation failed: {}", e);

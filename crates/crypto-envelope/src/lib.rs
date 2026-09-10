@@ -20,8 +20,8 @@ pub use artifact::{
     canonical_artifact_info, canonical_unlock_info, decrypt_artifact, decrypt_artifact_with_secret,
     derive_workspace_keypair, seal_artifact, ArtifactEnvelope, WorkspaceUnlockKeyPair,
     AEAD_TAG_LEN, ARTIFACT_HEADER_LEN, ARTIFACT_SEAL_DOMAIN, ARTIFACT_VERSION,
-    ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MIN_ARTIFACT_LEN, PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN,
-    WORKSPACE_UNLOCK_DOMAIN,
+    ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MAX_ARTIFACT_PAYLOAD_LEN, MIN_ARTIFACT_LEN,
+    PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN, WORKSPACE_UNLOCK_DOMAIN,
 };
 
 pub const SESSION_KEY_LEN: usize = 32;
