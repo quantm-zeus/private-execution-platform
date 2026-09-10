@@ -10,7 +10,7 @@ use crate::error::MarketTypeError;
 use crate::feed::{
     CanonicalFeedEnvelope, CanonicalFeedPayload, MarketFeedSource, RawBinState, RawCandle,
     RawClmmState, RawCpmmState, RawDepthDelta, RawDepthSnapshot, RawFeedEnvelope, RawFeedPayload,
-    RawPoolKindState, RawPoolState,
+    RawPoolKindState, RawPoolState, MAX_FEED_BATCH_SIZE,
 };
 use crate::freshness::{evaluate_freshness, FreshnessPolicy};
 use crate::identity::FeedTarget;
@@ -133,37 +133,51 @@ impl CanonicalMarketFeedMapper {
         Ok(())
     }
 
-    /// Process the next envelope yielded by an injected market feed source.
+    /// Process the next envelope yielded by an injected market feed source using a deterministic reference timestamp.
     pub fn process_from_source(
         &mut self,
         source: &mut dyn MarketFeedSource,
+        evaluated_at_ms: i64,
     ) -> Result<Option<CanonicalFeedEnvelope>, MarketTypeError> {
         match source.next_envelope()? {
-            Some(envelope) => self.map_envelope(envelope).map(Some),
+            Some(envelope) => self.map_envelope(envelope, evaluated_at_ms).map(Some),
             None => Ok(None),
         }
     }
 
-    /// Process and map all remaining envelopes yielded by an injected market feed source.
+    /// Process and map all remaining envelopes yielded by an injected market feed source up to `MAX_FEED_BATCH_SIZE`.
     pub fn process_all_from_source(
         &mut self,
         source: &mut dyn MarketFeedSource,
+        evaluated_at_ms: i64,
     ) -> Result<Vec<CanonicalFeedEnvelope>, MarketTypeError> {
         let mut results = Vec::new();
-        while let Some(event) = self.process_from_source(source)? {
+        while let Some(event) = self.process_from_source(source, evaluated_at_ms)? {
+            if results.len() >= MAX_FEED_BATCH_SIZE {
+                return Err(MarketTypeError::FeedBatchExceeded {
+                    count: results.len() + 1,
+                    max: MAX_FEED_BATCH_SIZE,
+                });
+            }
             results.push(event);
         }
         Ok(results)
     }
 
-    /// Maps a raw feed envelope into a canonical task-20 contract envelope.
+    /// Maps a raw feed envelope into a canonical task-20 contract envelope using a deterministic reference timestamp.
     ///
-    /// Fails closed on malformed, non-finite, over-bound, wrong-target, or sequence-gap/overlap input.
+    /// Fails closed on malformed, non-finite, over-bound, wrong-target, invalid timestamp, or sequence-gap/overlap input.
     /// Mapper state NEVER advances on rejected input.
     pub fn map_envelope(
         &mut self,
         envelope: RawFeedEnvelope,
+        evaluated_at_ms: i64,
     ) -> Result<CanonicalFeedEnvelope, MarketTypeError> {
+        // Validate evaluation timestamp immediately before any state mutation
+        if evaluated_at_ms <= 0 {
+            return Err(MarketTypeError::InvalidTimestamp(evaluated_at_ms));
+        }
+
         // 1. Target check
         if envelope.target != self.target {
             return Err(MarketTypeError::TargetMismatch);
@@ -187,13 +201,17 @@ impl CanonicalMarketFeedMapper {
         // 3. Payload-specific normalization and sequence validation
         match envelope.payload {
             RawFeedPayload::OrderBookSnapshot(raw_snap) => {
-                self.map_order_book_snapshot(envelope.context, raw_snap)
+                self.map_order_book_snapshot(envelope.context, raw_snap, evaluated_at_ms)
             }
             RawFeedPayload::OrderBookDelta(raw_delta) => {
-                self.map_order_book_delta(envelope.context, raw_delta)
+                self.map_order_book_delta(envelope.context, raw_delta, evaluated_at_ms)
             }
-            RawFeedPayload::PoolState(raw_pool) => self.map_pool_state(envelope.context, raw_pool),
-            RawFeedPayload::Candle(raw_candle) => self.map_candle(envelope.context, raw_candle),
+            RawFeedPayload::PoolState(raw_pool) => {
+                self.map_pool_state(envelope.context, raw_pool, evaluated_at_ms)
+            }
+            RawFeedPayload::Candle(raw_candle) => {
+                self.map_candle(envelope.context, raw_candle, evaluated_at_ms)
+            }
         }
     }
 
@@ -201,6 +219,7 @@ impl CanonicalMarketFeedMapper {
         &mut self,
         context: crate::feed::FeedObservationContext,
         raw_snap: RawDepthSnapshot,
+        evaluated_at_ms: i64,
     ) -> Result<CanonicalFeedEnvelope, MarketTypeError> {
         let seq = Sequence::new(raw_snap.sequence);
         seq.validate()?;
@@ -258,20 +277,26 @@ impl CanonicalMarketFeedMapper {
             }
         }
 
-        // Fresh snapshot baseline advance (clears resync latch)
-        self.stream_tracker
-            .apply_snapshot_sequence(seq, context.observed_at_ms);
-
+        // Validate book construction before modifying state
         let book = OrderBookDepth::new(canonical_snapshot.clone(), self.max_depth_levels)?;
-        self.order_book = Some(book);
 
         let freshness = evaluate_freshness(
             &self.freshness_policy,
             context.observed_at_ms,
-            context.observed_at_ms,
+            evaluated_at_ms,
             seq,
             false,
         )?;
+
+        // If future skew beyond policy yields ResyncRequired, remain fail-closed without advancing baseline
+        if freshness.is_resync_required() {
+            self.trigger_resync();
+        } else {
+            // Fresh or stale snapshot baseline advance (clears resync latch)
+            self.stream_tracker
+                .apply_snapshot_sequence(seq, context.observed_at_ms);
+            self.order_book = Some(book);
+        }
 
         Ok(CanonicalFeedEnvelope {
             context,
@@ -284,6 +309,7 @@ impl CanonicalMarketFeedMapper {
         &mut self,
         context: crate::feed::FeedObservationContext,
         raw_delta: RawDepthDelta,
+        evaluated_at_ms: i64,
     ) -> Result<CanonicalFeedEnvelope, MarketTypeError> {
         // Fail-closed if resync is latched
         if self.stream_tracker.is_resync_required() {
@@ -386,12 +412,13 @@ impl CanonicalMarketFeedMapper {
         canonical_delta.validate()?;
 
         // Stage delta on order book if present (rolls back completely on CrossedOrderBook)
+        let mut staged_book = None;
         if let Some(book) = &self.order_book {
-            let mut staged_book = book.clone();
-            let outcome = staged_book.apply_delta(&canonical_delta)?;
+            let mut staged = book.clone();
+            let outcome = staged.apply_delta(&canonical_delta)?;
             match outcome {
                 DeltaClassification::Contiguous { .. } => {
-                    self.order_book = Some(staged_book);
+                    staged_book = Some(staged);
                 }
                 DeltaClassification::ResyncRequired { expected, received } => {
                     self.stream_tracker.trigger_resync();
@@ -407,16 +434,24 @@ impl CanonicalMarketFeedMapper {
             }
         }
 
-        self.stream_tracker
-            .apply_delta_range(range, context.observed_at_ms);
-
         let freshness = evaluate_freshness(
             &self.freshness_policy,
             context.observed_at_ms,
-            context.observed_at_ms,
+            evaluated_at_ms,
             range.end,
             false,
         )?;
+
+        // If future skew beyond policy yields ResyncRequired, remain fail-closed without applying delta
+        if freshness.is_resync_required() {
+            self.trigger_resync();
+        } else {
+            if let Some(staged) = staged_book {
+                self.order_book = Some(staged);
+            }
+            self.stream_tracker
+                .apply_delta_range(range, context.observed_at_ms);
+        }
 
         Ok(CanonicalFeedEnvelope {
             context,
@@ -429,6 +464,7 @@ impl CanonicalMarketFeedMapper {
         &mut self,
         context: crate::feed::FeedObservationContext,
         raw_pool: RawPoolState,
+        evaluated_at_ms: i64,
     ) -> Result<CanonicalFeedEnvelope, MarketTypeError> {
         let pool_id = match &self.target {
             FeedTarget::Pool(p) => p.clone(),
@@ -468,17 +504,21 @@ impl CanonicalMarketFeedMapper {
         };
         envelope_pool.validate()?;
 
-        self.stream_tracker
-            .apply_snapshot_sequence(seq, context.observed_at_ms);
-        self.last_pool_state = Some(envelope_pool.clone());
-
         let freshness = evaluate_freshness(
             &self.freshness_policy,
             context.observed_at_ms,
-            context.observed_at_ms,
+            evaluated_at_ms,
             seq,
             false,
         )?;
+
+        if freshness.is_resync_required() {
+            self.trigger_resync();
+        } else {
+            self.stream_tracker
+                .apply_snapshot_sequence(seq, context.observed_at_ms);
+            self.last_pool_state = Some(envelope_pool.clone());
+        }
 
         Ok(CanonicalFeedEnvelope {
             context,
@@ -491,6 +531,7 @@ impl CanonicalMarketFeedMapper {
         &mut self,
         context: crate::feed::FeedObservationContext,
         raw_candle: RawCandle,
+        evaluated_at_ms: i64,
     ) -> Result<CanonicalFeedEnvelope, MarketTypeError> {
         let instrument = match &self.target {
             FeedTarget::Instrument(i) => i.clone(),
@@ -536,10 +577,14 @@ impl CanonicalMarketFeedMapper {
         let freshness = evaluate_freshness(
             &self.freshness_policy,
             context.observed_at_ms,
-            context.observed_at_ms,
+            evaluated_at_ms,
             seq,
             false,
         )?;
+
+        if freshness.is_resync_required() {
+            self.trigger_resync();
+        }
 
         Ok(CanonicalFeedEnvelope {
             context,

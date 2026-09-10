@@ -138,4 +138,6 @@ pub enum MarketTypeError {
     UnsupportedPayloadForTarget(&'static str),
     #[error("injected source error: {0}")]
     InjectedSourceError(&'static str),
+    #[error("feed batch count {count} exceeds maximum {max}")]
+    FeedBatchExceeded { count: usize, max: usize },
 }

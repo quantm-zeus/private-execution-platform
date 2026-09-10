@@ -21,6 +21,9 @@ use crate::pool::PoolStateEnvelope;
 /// Maximum allowed length in bytes for a feed source label.
 pub const MAX_SOURCE_LABEL_LEN: usize = 64;
 
+/// Maximum allowed number of envelopes in an injected feed source or batch ingestion helper.
+pub const MAX_FEED_BATCH_SIZE: usize = 1_000;
+
 /// Strongly typed, bounded identifier for a feed source (e.g. "yellowstone-primary", "reth-ws-local").
 ///
 /// Disallows blank strings, excessively long strings, URL protocol schemes, and credential keywords.
@@ -444,14 +447,43 @@ impl InjectedFeedSource {
         Self::default()
     }
 
-    pub fn from_envelopes(envelopes: impl IntoIterator<Item = RawFeedEnvelope>) -> Self {
-        Self {
-            envelopes: envelopes.into_iter().collect(),
+    /// Creates an injected feed source from a bounded batch of envelopes.
+    ///
+    /// Fails closed with `MarketTypeError::FeedBatchExceeded` if the input batch exceeds `MAX_FEED_BATCH_SIZE`.
+    pub fn from_envelopes(
+        envelopes: impl IntoIterator<Item = RawFeedEnvelope>,
+    ) -> Result<Self, MarketTypeError> {
+        let iter = envelopes.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > MAX_FEED_BATCH_SIZE {
+            return Err(MarketTypeError::FeedBatchExceeded {
+                count: lower,
+                max: MAX_FEED_BATCH_SIZE,
+            });
         }
+        let mut queue = VecDeque::new();
+        for envelope in iter {
+            if queue.len() >= MAX_FEED_BATCH_SIZE {
+                return Err(MarketTypeError::FeedBatchExceeded {
+                    count: queue.len() + 1,
+                    max: MAX_FEED_BATCH_SIZE,
+                });
+            }
+            queue.push_back(envelope);
+        }
+        Ok(Self { envelopes: queue })
     }
 
-    pub fn push_back(&mut self, envelope: RawFeedEnvelope) {
+    /// Pushes an envelope to the back of the queue, rejecting if `MAX_FEED_BATCH_SIZE` is reached.
+    pub fn push_back(&mut self, envelope: RawFeedEnvelope) -> Result<(), MarketTypeError> {
+        if self.envelopes.len() >= MAX_FEED_BATCH_SIZE {
+            return Err(MarketTypeError::FeedBatchExceeded {
+                count: self.envelopes.len() + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            });
+        }
         self.envelopes.push_back(envelope);
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

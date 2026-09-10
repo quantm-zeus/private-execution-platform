@@ -16,7 +16,8 @@ pub use feed::{
     CanonicalFeedEnvelope, CanonicalFeedPayload, ChainFamily, FeedFinality, FeedObservationContext,
     FeedSourceLabel, InjectedFeedSource, MarketFeedSource, RawBinState, RawCandle, RawClmmState,
     RawClmmTick, RawCpmmState, RawDepthDelta, RawDepthLevel, RawDepthSnapshot, RawFeedEnvelope,
-    RawFeedPayload, RawLiquidityBin, RawPoolKindState, RawPoolState, MAX_SOURCE_LABEL_LEN,
+    RawFeedPayload, RawLiquidityBin, RawPoolKindState, RawPoolState, MAX_FEED_BATCH_SIZE,
+    MAX_SOURCE_LABEL_LEN,
 };
 pub use freshness::{
     evaluate_freshness, FreshnessPolicy, FreshnessStatus, SafeFreshnessMeta,
@@ -1581,11 +1582,14 @@ mod tests {
         .unwrap();
 
         // Injected fake source playback
-        let mut source = InjectedFeedSource::from_envelopes(vec![raw_snap, raw_delta]);
+        let mut source = InjectedFeedSource::from_envelopes(vec![raw_snap, raw_delta]).unwrap();
         assert_eq!(source.len(), 2);
 
         // Map snapshot
-        let canonical_snap = mapper.process_from_source(&mut source).unwrap().unwrap();
+        let canonical_snap = mapper
+            .process_from_source(&mut source, 1_000_100)
+            .unwrap()
+            .unwrap();
         assert_eq!(canonical_snap.context, context_snap);
         assert_eq!(canonical_snap.context.source_family, ChainFamily::Solana);
         assert_eq!(
@@ -1611,7 +1615,10 @@ mod tests {
         );
 
         // Map contiguous delta
-        let canonical_delta = mapper.process_from_source(&mut source).unwrap().unwrap();
+        let canonical_delta = mapper
+            .process_from_source(&mut source, 1_000_100)
+            .unwrap()
+            .unwrap();
         assert_eq!(canonical_delta.context, context_delta);
         assert_eq!(canonical_delta.context.slot_or_block, Some(250_000_101));
         assert_eq!(mapper.current_sequence(), Some(Sequence(101)));
@@ -1622,7 +1629,10 @@ mod tests {
         assert_eq!(mapper.order_book().unwrap().spread(), Some(0.5));
 
         // Source exhausted
-        assert!(mapper.process_from_source(&mut source).unwrap().is_none());
+        assert!(mapper
+            .process_from_source(&mut source, 1_000_100)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1666,7 +1676,7 @@ mod tests {
         )
         .unwrap();
 
-        let canonical_env = mapper.map_envelope(raw_cpmm).unwrap();
+        let canonical_env = mapper.map_envelope(raw_cpmm, 1_700_000_000_000).unwrap();
         assert_eq!(canonical_env.context, context);
         assert_eq!(canonical_env.context.source_family, ChainFamily::Evm);
         assert_eq!(canonical_env.context.source_label.as_str(), "reth-ws-feed");
@@ -1747,7 +1757,7 @@ mod tests {
         )
         .unwrap();
 
-        let clmm_env = clmm_mapper.map_envelope(raw_clmm).unwrap();
+        let clmm_env = clmm_mapper.map_envelope(raw_clmm, 1_000_000).unwrap();
         assert_eq!(clmm_env.context, clmm_context);
         match clmm_env.payload {
             CanonicalFeedPayload::PoolState(env) => match env.state {
@@ -1798,7 +1808,7 @@ mod tests {
         )
         .unwrap();
 
-        let bin_env = bin_mapper.map_envelope(raw_bin).unwrap();
+        let bin_env = bin_mapper.map_envelope(raw_bin, 1_000_000).unwrap();
         assert_eq!(bin_env.context, bin_context);
         match bin_env.payload {
             CanonicalFeedPayload::PoolState(env) => match env.state {
@@ -1838,7 +1848,7 @@ mod tests {
         )
         .unwrap();
 
-        let canonical_env = mapper.map_envelope(raw_candle).unwrap();
+        let canonical_env = mapper.map_envelope(raw_candle, 1_700_000_060_000).unwrap();
         assert_eq!(canonical_env.context, context);
         match canonical_env.payload {
             CanonicalFeedPayload::Candle(candle) => {
@@ -1924,7 +1934,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(raw_overbound),
+            mapper.map_envelope(raw_overbound, 1000),
             Err(MarketTypeError::DepthLevelsExceeded {
                 count: 5001,
                 max: MAX_DEPTH_LEVELS,
@@ -1952,7 +1962,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(baseline).unwrap();
+        mapper.map_envelope(baseline, 1000).unwrap();
         assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
 
         // 2. Non-finite price in delta (NaN)
@@ -1968,7 +1978,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(nan_delta),
+            mapper.map_envelope(nan_delta, 1001),
             Err(MarketTypeError::NonFinitePrice)
         );
         // State sequence and book remain unchanged at 100
@@ -1988,7 +1998,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(inf_delta),
+            mapper.map_envelope(inf_delta, 1002),
             Err(MarketTypeError::NonFiniteQuantity)
         );
         assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
@@ -2006,7 +2016,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(neg_delta),
+            mapper.map_envelope(neg_delta, 1003),
             Err(MarketTypeError::NegativePrice)
         );
         assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
@@ -2026,7 +2036,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(unsorted_snap),
+            mapper.map_envelope(unsorted_snap, 1004),
             Err(MarketTypeError::UnsortedDepthLevels { side: "bids" })
         );
         assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
@@ -2064,7 +2074,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(wrong_target_env),
+            mapper.map_envelope(wrong_target_env, 1000),
             Err(MarketTypeError::TargetMismatch)
         );
         assert_eq!(mapper.current_sequence(), None);
@@ -2076,14 +2086,14 @@ mod tests {
             target.clone(),
             RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
                 sequence: 1,
-                bids: vec![RawDepthLevel::new(10.0, 1.0)],
-                asks: vec![RawDepthLevel::new(12.0, 1.0)],
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![RawDepthLevel::new(102.0, 1.0)],
             }),
         )
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(family_mismatch_env),
+            mapper.map_envelope(family_mismatch_env, 1000),
             Err(MarketTypeError::SourceChainFamilyMismatch {
                 source_family: "evm",
                 target_chain: "solana",
@@ -2109,7 +2119,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(snap).unwrap();
+        mapper.map_envelope(snap, 1000).unwrap();
         assert!(!mapper.is_resync_required());
         assert_eq!(mapper.current_sequence(), Some(Sequence(100)));
 
@@ -2126,7 +2136,7 @@ mod tests {
         )
         .unwrap();
 
-        let gap_err = mapper.map_envelope(gap_delta);
+        let gap_err = mapper.map_envelope(gap_delta, 1010);
         assert_eq!(
             gap_err,
             Err(MarketTypeError::SequenceGap {
@@ -2151,7 +2161,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(next_delta),
+            mapper.map_envelope(next_delta, 1020),
             Err(MarketTypeError::ResyncRequired {
                 reason: "stream resync latched: valid snapshot required",
             })
@@ -2171,7 +2181,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(stale_snap),
+            mapper.map_envelope(stale_snap, 1030),
             Err(MarketTypeError::StaleSequence {
                 sequence: 95,
                 current: 100,
@@ -2192,7 +2202,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(dup_snap),
+            mapper.map_envelope(dup_snap, 1040),
             Err(MarketTypeError::DuplicateSequence(100))
         );
         assert!(mapper.is_resync_required());
@@ -2209,7 +2219,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let recovery_res = mapper.map_envelope(recovery_snap).unwrap();
+        let recovery_res = mapper.map_envelope(recovery_snap, 1050).unwrap();
         assert!(!mapper.is_resync_required());
         assert_eq!(mapper.current_sequence(), Some(Sequence(110)));
         match recovery_res.payload {
@@ -2229,7 +2239,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(delta_111).unwrap();
+        mapper.map_envelope(delta_111, 1060).unwrap();
         assert_eq!(mapper.current_sequence(), Some(Sequence(111)));
         assert_eq!(
             mapper.order_book().unwrap().best_bid().unwrap().price.get(),
@@ -2254,7 +2264,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(snap).unwrap();
+        mapper.map_envelope(snap, 1000).unwrap();
 
         // Overlapping delta: [99, 105] (start 99 <= current 100 < end 105)
         let overlap_delta = RawFeedEnvelope::new(
@@ -2270,7 +2280,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(overlap_delta),
+            mapper.map_envelope(overlap_delta, 1010),
             Err(MarketTypeError::SequenceOverlap {
                 start: 99,
                 end: 105,
@@ -2294,7 +2304,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mapper.map_envelope(overlap_delta2),
+            mapper.map_envelope(overlap_delta2, 1020),
             Err(MarketTypeError::ResyncRequired {
                 reason: "stream resync latched: valid snapshot required",
             })
@@ -2319,7 +2329,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(snap).unwrap();
+        mapper.map_envelope(snap, 1000).unwrap();
         assert_eq!(
             mapper.order_book().unwrap().best_bid().unwrap().price.get(),
             100.0
@@ -2343,7 +2353,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(crossing_delta),
+            mapper.map_envelope(crossing_delta, 1010),
             Err(MarketTypeError::CrossedOrderBook)
         );
 
@@ -2371,7 +2381,7 @@ mod tests {
             }),
         )
         .unwrap();
-        mapper.map_envelope(valid_delta).unwrap();
+        mapper.map_envelope(valid_delta, 1020).unwrap();
         assert_eq!(mapper.current_sequence(), Some(Sequence(101)));
         assert_eq!(
             mapper.order_book().unwrap().best_bid().unwrap().price.get(),
@@ -2398,7 +2408,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            mapper.map_envelope(delta),
+            mapper.map_envelope(delta, 1000),
             Err(MarketTypeError::MissingBaselineSnapshot)
         );
         assert!(mapper.is_resync_required());
@@ -2421,7 +2431,7 @@ mod tests {
         let mut mapper = CanonicalMarketFeedMapper::new(target).unwrap();
 
         let mut failing = FailingSource;
-        let res = mapper.process_from_source(&mut failing);
+        let res = mapper.process_from_source(&mut failing, 1000);
         assert_eq!(
             res,
             Err(MarketTypeError::InjectedSourceError(
@@ -2463,10 +2473,497 @@ mod tests {
 
         // 4. CanonicalFeedEnvelope round trip
         let mut mapper = CanonicalMarketFeedMapper::new(raw_env.target.clone()).unwrap();
-        let canonical_env = mapper.map_envelope(raw_env).unwrap();
+        let canonical_env = mapper.map_envelope(raw_env, 1_700_000_000_000).unwrap();
         let canonical_json = serde_json::to_string(&canonical_env).unwrap();
         let decoded_canonical: CanonicalFeedEnvelope =
             serde_json::from_str(&canonical_json).unwrap();
         assert_eq!(decoded_canonical, canonical_env);
+    }
+
+    #[test]
+    fn regression_fresh_snapshot_deterministic_nonzero_and_zero_age() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        let ctx = sample_sol_context("yellowstone", 100, 1_000_000);
+        let raw_snap = RawFeedEnvelope::new(
+            ctx,
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 10,
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![RawDepthLevel::new(101.0, 1.0)],
+            }),
+        )
+        .unwrap();
+
+        // 1. Non-zero age relative to explicitly supplied evaluation time
+        let env_nonzero = mapper.map_envelope(raw_snap.clone(), 1_005_000).unwrap();
+        assert_eq!(env_nonzero.freshness.status, FreshnessStatus::Fresh);
+        assert_eq!(env_nonzero.freshness.age_ms, 5_000);
+        assert_eq!(env_nonzero.freshness.observed_at_ms, 1_000_000);
+        assert_eq!(env_nonzero.freshness.evaluated_at_ms, 1_005_000);
+
+        // 2. Zero age relative to explicitly supplied evaluation time == observed time
+        let mut mapper_zero = CanonicalMarketFeedMapper::new(target).unwrap();
+        let env_zero = mapper_zero.map_envelope(raw_snap, 1_000_000).unwrap();
+        assert_eq!(env_zero.freshness.status, FreshnessStatus::Fresh);
+        assert_eq!(env_zero.freshness.age_ms, 0);
+        assert_eq!(env_zero.freshness.observed_at_ms, 1_000_000);
+        assert_eq!(env_zero.freshness.evaluated_at_ms, 1_000_000);
+    }
+
+    #[test]
+    fn regression_stale_snapshot_returns_stale_with_correct_age() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Observed at 1_000_000, evaluated at 1_015_000 (age 15_000ms > policy staleness 10_000ms)
+        let ctx = sample_sol_context("yellowstone", 100, 1_000_000);
+        let raw_snap = RawFeedEnvelope::new(
+            ctx,
+            target,
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 10,
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![RawDepthLevel::new(101.0, 1.0)],
+            }),
+        )
+        .unwrap();
+
+        let env = mapper.map_envelope(raw_snap, 1_015_000).unwrap();
+        assert_eq!(env.freshness.status, FreshnessStatus::Stale);
+        assert_eq!(env.freshness.age_ms, 15_000);
+        assert_eq!(env.freshness.observed_at_ms, 1_000_000);
+        assert_eq!(env.freshness.evaluated_at_ms, 1_015_000);
+        // Stale snapshot establishes baseline sequence but retains Stale classification
+        assert_eq!(mapper.current_sequence(), Some(Sequence(10)));
+        assert!(!mapper.is_resync_required());
+    }
+
+    #[test]
+    fn regression_future_skew_returns_resync_required_fail_closed() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Observed at 1_005_000, evaluated at 1_000_000 (skew 5_000ms > default policy max skew 2_000ms)
+        let ctx = sample_sol_context("yellowstone", 100, 1_005_000);
+        let raw_snap = RawFeedEnvelope::new(
+            ctx,
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 10,
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![RawDepthLevel::new(101.0, 1.0)],
+            }),
+        )
+        .unwrap();
+
+        let env = mapper.map_envelope(raw_snap, 1_000_000).unwrap();
+        assert_eq!(env.freshness.status, FreshnessStatus::ResyncRequired);
+        assert_eq!(env.freshness.age_ms, 0);
+        assert_eq!(env.freshness.observed_at_ms, 1_005_000);
+        assert_eq!(env.freshness.evaluated_at_ms, 1_000_000);
+
+        // Fail closed: mapper must latch resync_required and NOT establish baseline sequence
+        assert!(mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), None);
+        assert!(mapper.order_book().is_none());
+
+        // Subsequent delta must be rejected fail-closed
+        let delta = RawFeedEnvelope::new(
+            sample_sol_context("yellowstone", 101, 1_005_100),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 11,
+                end_sequence: 11,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(delta, 1_005_100),
+            Err(MarketTypeError::ResyncRequired {
+                reason: "stream resync latched: valid snapshot required",
+            })
+        );
+
+        // A valid fresh snapshot clears the latch and restores baseline
+        let fresh_snap = RawFeedEnvelope::new(
+            sample_sol_context("yellowstone", 102, 1_006_000),
+            target,
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 20,
+                bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                asks: vec![RawDepthLevel::new(101.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        let fresh_env = mapper.map_envelope(fresh_snap, 1_006_100).unwrap();
+        assert_eq!(fresh_env.freshness.status, FreshnessStatus::Fresh);
+        assert!(!mapper.is_resync_required());
+        assert_eq!(mapper.current_sequence(), Some(Sequence(20)));
+    }
+
+    #[test]
+    fn regression_non_orderbook_payloads_preserve_freshness_semantics() {
+        // 1. Pool State (CPMM)
+        let pool_id = sample_pool_id();
+        let pool_target = FeedTarget::Pool(pool_id.clone());
+        let mut pool_mapper = CanonicalMarketFeedMapper::new(pool_target.clone()).unwrap();
+
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+
+        // 1a. Stale pool state: observed 1_000_000, evaluated 1_020_000 (age 20_000ms > 10_000ms)
+        let raw_cpmm = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1_000_000),
+            pool_target.clone(),
+            RawFeedPayload::PoolState(RawPoolState {
+                sequence: 1,
+                kind: RawPoolKindState::Cpmm(RawCpmmState {
+                    token_0: sol.clone(),
+                    token_1: usdc.clone(),
+                    decimals_0: 9,
+                    decimals_1: 6,
+                    reserve_0: 1_000_000_000,
+                    reserve_1: 20_000_000,
+                    total_lp_supply: Some(100_000),
+                    fee_bps: 25,
+                }),
+            }),
+        )
+        .unwrap();
+        let stale_pool_env = pool_mapper.map_envelope(raw_cpmm, 1_020_000).unwrap();
+        assert_eq!(stale_pool_env.freshness.status, FreshnessStatus::Stale);
+        assert_eq!(stale_pool_env.freshness.age_ms, 20_000);
+        assert_eq!(pool_mapper.current_sequence(), Some(Sequence(1)));
+
+        // 1b. Future skew pool state: observed 1_010_000, evaluated 1_000_000 (skew 10_000ms > 2_000ms)
+        let mut skew_pool_mapper = CanonicalMarketFeedMapper::new(pool_target.clone()).unwrap();
+        let raw_cpmm_skew = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_010_000),
+            pool_target,
+            RawFeedPayload::PoolState(RawPoolState {
+                sequence: 2,
+                kind: RawPoolKindState::Cpmm(RawCpmmState {
+                    token_0: sol,
+                    token_1: usdc,
+                    decimals_0: 9,
+                    decimals_1: 6,
+                    reserve_0: 1_000_000_000,
+                    reserve_1: 20_000_000,
+                    total_lp_supply: Some(100_000),
+                    fee_bps: 25,
+                }),
+            }),
+        )
+        .unwrap();
+        let skew_pool_env = skew_pool_mapper
+            .map_envelope(raw_cpmm_skew, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            skew_pool_env.freshness.status,
+            FreshnessStatus::ResyncRequired
+        );
+        assert!(skew_pool_mapper.is_resync_required());
+        assert_eq!(skew_pool_mapper.current_sequence(), None);
+        assert!(skew_pool_mapper.last_pool_state().is_none());
+
+        // 2. Candle payload
+        let instrument = sample_instrument();
+        let inst_target = FeedTarget::Instrument(instrument.clone());
+        let mut candle_mapper = CanonicalMarketFeedMapper::new(inst_target.clone()).unwrap();
+
+        // 2a. Stale candle
+        let raw_candle_stale = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1_000_000),
+            inst_target.clone(),
+            RawFeedPayload::Candle(RawCandle {
+                timeframe: CandleTimeframe::M1,
+                open_time_ms: 940_000,
+                close_time_ms: 1_000_000,
+                open: 100.0,
+                high: 105.0,
+                low: 99.0,
+                close: 102.0,
+                volume: 50.0,
+                quote_volume: None,
+                trades_count: None,
+                sequence: Some(5),
+            }),
+        )
+        .unwrap();
+        let stale_candle_env = candle_mapper
+            .map_envelope(raw_candle_stale, 1_020_000)
+            .unwrap();
+        assert_eq!(stale_candle_env.freshness.status, FreshnessStatus::Stale);
+        assert_eq!(stale_candle_env.freshness.age_ms, 20_000);
+
+        // 2b. Future skew candle
+        let mut skew_candle_mapper = CanonicalMarketFeedMapper::new(inst_target.clone()).unwrap();
+        let raw_candle_skew = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_010_000),
+            inst_target,
+            RawFeedPayload::Candle(RawCandle {
+                timeframe: CandleTimeframe::M1,
+                open_time_ms: 950_000,
+                close_time_ms: 1_010_000,
+                open: 100.0,
+                high: 105.0,
+                low: 99.0,
+                close: 102.0,
+                volume: 50.0,
+                quote_volume: None,
+                trades_count: None,
+                sequence: Some(6),
+            }),
+        )
+        .unwrap();
+        let skew_candle_env = skew_candle_mapper
+            .map_envelope(raw_candle_skew, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            skew_candle_env.freshness.status,
+            FreshnessStatus::ResyncRequired
+        );
+        assert!(skew_candle_mapper.is_resync_required());
+    }
+
+    #[test]
+    fn regression_rejected_mapper_input_leaves_state_unchanged() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument.clone());
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+
+        // Establish initial valid baseline
+        let snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 100, 1_000_000),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(100.0, 10.0)],
+                asks: vec![RawDepthLevel::new(102.0, 10.0)],
+            }),
+        )
+        .unwrap();
+        mapper.map_envelope(snap, 1_000_000).unwrap();
+
+        let initial_seq = mapper.current_sequence();
+        let initial_ts = mapper.last_timestamp_ms();
+        let initial_resync = mapper.is_resync_required();
+        let initial_book = mapper.order_book().cloned().unwrap();
+
+        // 1. Rejected on invalid evaluation timestamp (<= 0)
+        let delta_valid_data = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_000_100),
+            target.clone(),
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(delta_valid_data.clone(), 0),
+            Err(MarketTypeError::InvalidTimestamp(0))
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+
+        assert_eq!(
+            mapper.map_envelope(delta_valid_data, -5),
+            Err(MarketTypeError::InvalidTimestamp(-5))
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+
+        // 2. Rejected on target mismatch
+        let other_target = FeedTarget::Pool(sample_pool_id());
+        let wrong_target = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_000_100),
+            other_target,
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(100.5, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(wrong_target, 1_000_100),
+            Err(MarketTypeError::TargetMismatch)
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+
+        // 3. Rejected on stale sequence
+        let stale_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_000_100),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 99,
+                bids: vec![RawDepthLevel::new(99.0, 1.0)],
+                asks: vec![RawDepthLevel::new(103.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(stale_snap, 1_000_100),
+            Err(MarketTypeError::StaleSequence {
+                sequence: 99,
+                current: 100
+            })
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+
+        // 4. Rejected on duplicate sequence
+        let dup_snap = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_000_100),
+            target.clone(),
+            RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                sequence: 100,
+                bids: vec![RawDepthLevel::new(99.0, 1.0)],
+                asks: vec![RawDepthLevel::new(103.0, 1.0)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(dup_snap, 1_000_100),
+            Err(MarketTypeError::DuplicateSequence(100))
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+
+        // 5. Rejected on crossed order book delta
+        let crossed_delta = RawFeedEnvelope::new(
+            sample_sol_context("src", 101, 1_000_100),
+            target,
+            RawFeedPayload::OrderBookDelta(RawDepthDelta {
+                start_sequence: 101,
+                end_sequence: 101,
+                bids: vec![RawDepthLevel::new(103.0, 1.0)],
+                asks: vec![],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            mapper.map_envelope(crossed_delta, 1_000_100),
+            Err(MarketTypeError::CrossedOrderBook)
+        );
+        assert_eq!(mapper.current_sequence(), initial_seq);
+        assert_eq!(mapper.last_timestamp_ms(), initial_ts);
+        assert_eq!(mapper.is_resync_required(), initial_resync);
+        assert_eq!(mapper.order_book().unwrap(), &initial_book);
+    }
+
+    #[test]
+    fn regression_bounded_batch_helpers_reject_over_limit_safely() {
+        let instrument = sample_instrument();
+        let target = FeedTarget::Instrument(instrument);
+
+        let make_envelope = |seq: u64| {
+            RawFeedEnvelope::new(
+                sample_sol_context("src", seq, 1_000_000),
+                target.clone(),
+                RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                    sequence: seq,
+                    bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                    asks: vec![RawDepthLevel::new(101.0, 1.0)],
+                }),
+            )
+            .unwrap()
+        };
+
+        // 1. InjectedFeedSource::from_envelopes rejects over-limit input
+        let over_limit_vec: Vec<RawFeedEnvelope> = (0..=MAX_FEED_BATCH_SIZE)
+            .map(|i| make_envelope(i as u64 + 1))
+            .collect();
+        assert_eq!(over_limit_vec.len(), MAX_FEED_BATCH_SIZE + 1);
+
+        let err = InjectedFeedSource::from_envelopes(over_limit_vec);
+        assert_eq!(
+            err.unwrap_err(),
+            MarketTypeError::FeedBatchExceeded {
+                count: MAX_FEED_BATCH_SIZE + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            }
+        );
+
+        // 2. Exactly at MAX_FEED_BATCH_SIZE succeeds
+        let exact_vec: Vec<RawFeedEnvelope> = (0..MAX_FEED_BATCH_SIZE)
+            .map(|i| make_envelope(i as u64 + 1))
+            .collect();
+        let mut source = InjectedFeedSource::from_envelopes(exact_vec).unwrap();
+        assert_eq!(source.len(), MAX_FEED_BATCH_SIZE);
+
+        // 3. push_back rejects when capacity reached
+        let extra = make_envelope(999_999);
+        assert_eq!(
+            source.push_back(extra),
+            Err(MarketTypeError::FeedBatchExceeded {
+                count: MAX_FEED_BATCH_SIZE + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            })
+        );
+        assert_eq!(source.len(), MAX_FEED_BATCH_SIZE);
+
+        // 4. process_all_from_source enforces MAX_FEED_BATCH_SIZE
+        struct InfiniteSource {
+            target: FeedTarget,
+            count: u64,
+        }
+        impl MarketFeedSource for InfiniteSource {
+            fn next_envelope(&mut self) -> Result<Option<RawFeedEnvelope>, MarketTypeError> {
+                self.count += 1;
+                let env = RawFeedEnvelope::new(
+                    sample_sol_context("src", self.count, 1_000_000 + self.count as i64),
+                    self.target.clone(),
+                    RawFeedPayload::OrderBookSnapshot(RawDepthSnapshot {
+                        sequence: self.count,
+                        bids: vec![RawDepthLevel::new(100.0, 1.0)],
+                        asks: vec![RawDepthLevel::new(101.0, 1.0)],
+                    }),
+                )?;
+                Ok(Some(env))
+            }
+        }
+
+        let mut mapper = CanonicalMarketFeedMapper::new(target.clone()).unwrap();
+        let mut infinite = InfiniteSource { target, count: 0 };
+        let batch_err = mapper.process_all_from_source(&mut infinite, 2_000_000);
+        assert_eq!(
+            batch_err.unwrap_err(),
+            MarketTypeError::FeedBatchExceeded {
+                count: MAX_FEED_BATCH_SIZE + 1,
+                max: MAX_FEED_BATCH_SIZE,
+            }
+        );
     }
 }
