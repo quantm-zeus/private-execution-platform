@@ -696,6 +696,296 @@ mod tests {
         );
     }
 
+    #[test]
+    fn regression_orderbook_overlap_range_rejects_with_resync_and_state_unchanged() {
+        let target = FeedTarget::Instrument(sample_instrument());
+        let initial_bids = vec![DepthLevel::new(
+            NormalizedPrice::new(100.0).unwrap(),
+            NormalizedQuantity::new(10.0).unwrap(),
+        )];
+        let initial_asks = vec![DepthLevel::new(
+            NormalizedPrice::new(102.0).unwrap(),
+            NormalizedQuantity::new(10.0).unwrap(),
+        )];
+        let snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(100),
+            timestamp_ms: 1_000_000,
+            bids: initial_bids.clone(),
+            asks: initial_asks.clone(),
+        };
+
+        let mut book = OrderBookDepth::new(snapshot, 10).unwrap();
+
+        // 1. Overlapping range where start <= current < end (e.g. [99, 105])
+        let overlap_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::new(Sequence(99), Sequence(105)).unwrap(),
+            timestamp_ms: 1_000_100,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(100.5).unwrap(),
+                NormalizedQuantity::new(5.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let outcome = book.apply_delta(&overlap_delta).unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(99),
+            }
+        );
+
+        // Assert state is completely unchanged
+        assert_eq!(book.sequence(), Sequence(100));
+        assert_eq!(book.timestamp_ms(), 1_000_000);
+        assert_eq!(book.bids(), &initial_bids);
+        assert_eq!(book.asks(), &initial_asks);
+        assert!(book.is_resync_required());
+
+        // 2. Overlap starting exactly at current sequence [100, 105]
+        let mut book2 = OrderBookDepth::new(
+            DepthSnapshot {
+                target: target.clone(),
+                sequence: Sequence(100),
+                timestamp_ms: 1_000_000,
+                bids: initial_bids.clone(),
+                asks: initial_asks.clone(),
+            },
+            10,
+        )
+        .unwrap();
+
+        let overlap_delta2 = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::new(Sequence(100), Sequence(105)).unwrap(),
+            timestamp_ms: 1_000_100,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(100.5).unwrap(),
+                NormalizedQuantity::new(5.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let outcome2 = book2.apply_delta(&overlap_delta2).unwrap();
+        assert_eq!(
+            outcome2,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(100),
+            }
+        );
+        assert_eq!(book2.sequence(), Sequence(100));
+        assert_eq!(book2.timestamp_ms(), 1_000_000);
+        assert_eq!(book2.bids(), &initial_bids);
+        assert_eq!(book2.asks(), &initial_asks);
+        assert!(book2.is_resync_required());
+    }
+
+    #[test]
+    fn regression_orderbook_gap_latches_resync_and_recovers_via_snapshot() {
+        let target = FeedTarget::Instrument(sample_instrument());
+        let snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(100),
+            timestamp_ms: 1_000_000,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(100.0).unwrap(),
+                NormalizedQuantity::new(10.0).unwrap(),
+            )],
+            asks: vec![DepthLevel::new(
+                NormalizedPrice::new(102.0).unwrap(),
+                NormalizedQuantity::new(10.0).unwrap(),
+            )],
+        };
+
+        let mut book = OrderBookDepth::new(snapshot, 10).unwrap();
+        assert!(!book.is_resync_required());
+
+        // Gap delta at [105, 105] latches resync
+        let gap_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(105)).unwrap(),
+            timestamp_ms: 1_000_100,
+            bids: vec![],
+            asks: vec![],
+        };
+        let gap_outcome = book.apply_delta(&gap_delta).unwrap();
+        assert_eq!(
+            gap_outcome,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(105),
+            }
+        );
+        assert!(book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(100));
+
+        // Subsequent contiguous delta [101, 101] MUST STILL reject while resync latch is held
+        let contiguous_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(101)).unwrap(),
+            timestamp_ms: 1_000_200,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(100.5).unwrap(),
+                NormalizedQuantity::new(5.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let rejected_outcome = book.apply_delta(&contiguous_delta).unwrap();
+        assert_eq!(
+            rejected_outcome,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(101),
+            }
+        );
+        assert_eq!(book.sequence(), Sequence(100)); // still unchanged!
+        assert!(book.is_resync_required());
+
+        // Recover via validated fresh snapshot at sequence 110
+        let fresh_snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(110),
+            timestamp_ms: 1_000_300,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(101.0).unwrap(),
+                NormalizedQuantity::new(20.0).unwrap(),
+            )],
+            asks: vec![DepthLevel::new(
+                NormalizedPrice::new(103.0).unwrap(),
+                NormalizedQuantity::new(25.0).unwrap(),
+            )],
+        };
+        let snap_outcome = book.apply_snapshot(fresh_snapshot).unwrap();
+        assert_eq!(
+            snap_outcome,
+            SnapshotClassification::Accepted {
+                new_sequence: Sequence(110)
+            }
+        );
+        assert!(!book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(110));
+
+        // After recovery, normal contiguous advancement works
+        let next_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(111)).unwrap(),
+            timestamp_ms: 1_000_400,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(101.5).unwrap(),
+                NormalizedQuantity::new(15.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let next_outcome = book.apply_delta(&next_delta).unwrap();
+        assert_eq!(
+            next_outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(111)
+            }
+        );
+        assert_eq!(book.sequence(), Sequence(111));
+        assert_eq!(book.best_bid().unwrap().price.get(), 101.5);
+    }
+
+    #[test]
+    fn regression_orderbook_crossing_delta_rolls_back_completely() {
+        let target = FeedTarget::Instrument(sample_instrument());
+        let initial_bids = vec![
+            DepthLevel::new(
+                NormalizedPrice::new(100.0).unwrap(),
+                NormalizedQuantity::new(10.0).unwrap(),
+            ),
+            DepthLevel::new(
+                NormalizedPrice::new(99.0).unwrap(),
+                NormalizedQuantity::new(20.0).unwrap(),
+            ),
+        ];
+        let initial_asks = vec![
+            DepthLevel::new(
+                NormalizedPrice::new(102.0).unwrap(),
+                NormalizedQuantity::new(15.0).unwrap(),
+            ),
+            DepthLevel::new(
+                NormalizedPrice::new(103.0).unwrap(),
+                NormalizedQuantity::new(25.0).unwrap(),
+            ),
+        ];
+
+        let snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(100),
+            timestamp_ms: 1_000_000,
+            bids: initial_bids.clone(),
+            asks: initial_asks.clone(),
+        };
+
+        let mut book = OrderBookDepth::new(snapshot, 10).unwrap();
+
+        // Contiguous delta [101, 101] attempting to cross book by setting bid to 102.5 (>= best ask 102.0)
+        let crossing_bid_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(101)).unwrap(),
+            timestamp_ms: 1_000_100,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(102.5).unwrap(),
+                NormalizedQuantity::new(5.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let result = book.apply_delta(&crossing_bid_delta);
+        assert_eq!(result, Err(MarketTypeError::CrossedOrderBook));
+
+        // Exact rollback: sequence, timestamp, bids, and asks must remain unchanged!
+        assert_eq!(book.sequence(), Sequence(100));
+        assert_eq!(book.timestamp_ms(), 1_000_000);
+        assert_eq!(book.bids(), &initial_bids);
+        assert_eq!(book.asks(), &initial_asks);
+
+        // Contiguous delta [101, 101] attempting to cross book by setting ask to 99.5 (<= best bid 100.0)
+        let crossing_ask_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(101)).unwrap(),
+            timestamp_ms: 1_000_200,
+            bids: vec![],
+            asks: vec![DepthLevel::new(
+                NormalizedPrice::new(99.5).unwrap(),
+                NormalizedQuantity::new(8.0).unwrap(),
+            )],
+        };
+        let result2 = book.apply_delta(&crossing_ask_delta);
+        assert_eq!(result2, Err(MarketTypeError::CrossedOrderBook));
+
+        // Exact rollback again
+        assert_eq!(book.sequence(), Sequence(100));
+        assert_eq!(book.timestamp_ms(), 1_000_000);
+        assert_eq!(book.bids(), &initial_bids);
+        assert_eq!(book.asks(), &initial_asks);
+
+        // Valid contiguous delta [101, 101] succeeds and mutates cleanly
+        let valid_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(101)).unwrap(),
+            timestamp_ms: 1_000_300,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(100.5).unwrap(),
+                NormalizedQuantity::new(12.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let valid_result = book.apply_delta(&valid_delta).unwrap();
+        assert_eq!(
+            valid_result,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(101)
+            }
+        );
+        assert_eq!(book.sequence(), Sequence(101));
+        assert_eq!(book.timestamp_ms(), 1_000_300);
+        assert_eq!(book.best_bid().unwrap().price.get(), 100.5);
+    }
+
     // --- Contract 4: Adapter-Neutral Pool State (CPMM, CLMM, Bin) ---
 
     #[test]

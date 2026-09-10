@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::error::MarketTypeError;
 use crate::identity::FeedTarget;
 use crate::primitives::{AtomicAmount, PriceRatio, Sequence};
-use crate::sequence::{DeltaClassification, SequenceRange};
+use crate::sequence::{DeltaClassification, SequenceRange, SnapshotClassification};
 
 pub const MAX_DEPTH_LEVELS: usize = 5_000;
 
@@ -413,6 +413,8 @@ pub struct OrderBookDepth {
     bids: Vec<DepthLevel>,
     asks: Vec<DepthLevel>,
     max_levels: usize,
+    #[serde(default)]
+    resync_required: bool,
 }
 
 impl OrderBookDepth {
@@ -437,6 +439,7 @@ impl OrderBookDepth {
             bids,
             asks,
             max_levels,
+            resync_required: false,
         })
     }
 
@@ -485,82 +488,171 @@ impl OrderBookDepth {
         }
     }
 
+    pub fn is_resync_required(&self) -> bool {
+        self.resync_required
+    }
+
+    pub fn trigger_resync(&mut self) {
+        self.resync_required = true;
+    }
+
+    /// Clears the resync latch and resets book state from a validated fresh snapshot.
+    pub fn reset_with_snapshot(&mut self, snapshot: DepthSnapshot) -> Result<(), MarketTypeError> {
+        snapshot.validate()?;
+        if snapshot.target != self.target {
+            return Err(MarketTypeError::TargetMismatch);
+        }
+
+        let mut bids = snapshot.bids;
+        bids.truncate(self.max_levels);
+        let mut asks = snapshot.asks;
+        asks.truncate(self.max_levels);
+
+        self.sequence = snapshot.sequence;
+        self.timestamp_ms = snapshot.timestamp_ms;
+        self.bids = bids;
+        self.asks = asks;
+        self.resync_required = false;
+
+        Ok(())
+    }
+
+    /// Applies a fresh snapshot to establish or advance book baseline and clear the resync latch.
+    pub fn apply_snapshot(
+        &mut self,
+        snapshot: DepthSnapshot,
+    ) -> Result<SnapshotClassification, MarketTypeError> {
+        snapshot.validate()?;
+        if snapshot.target != self.target {
+            return Err(MarketTypeError::TargetMismatch);
+        }
+
+        if !self.resync_required {
+            if snapshot.sequence < self.sequence {
+                return Ok(SnapshotClassification::Stale {
+                    sequence: snapshot.sequence,
+                    current: self.sequence,
+                });
+            }
+            if snapshot.sequence == self.sequence {
+                return Ok(SnapshotClassification::Duplicate {
+                    sequence: self.sequence,
+                });
+            }
+        }
+
+        let mut bids = snapshot.bids;
+        bids.truncate(self.max_levels);
+        let mut asks = snapshot.asks;
+        asks.truncate(self.max_levels);
+
+        self.sequence = snapshot.sequence;
+        self.timestamp_ms = snapshot.timestamp_ms;
+        self.bids = bids;
+        self.asks = asks;
+        self.resync_required = false;
+
+        Ok(SnapshotClassification::Accepted {
+            new_sequence: self.sequence,
+        })
+    }
+
     /// Applies an incremental depth delta to update local book state.
     /// Returns DeltaClassification representing contiguous advancement, duplicate/stale idempotency,
-    /// or fail-closed ResyncRequired if a sequence gap occurs.
+    /// or fail-closed ResyncRequired if a sequence gap or overlap occurs.
     pub fn apply_delta(
         &mut self,
         delta: &DepthDelta,
     ) -> Result<DeltaClassification, MarketTypeError> {
-        delta.validate()?;
-        if delta.target != self.target {
-            return Err(MarketTypeError::TargetMismatch);
-        }
-
-        if delta.sequence_range.end < self.sequence {
-            return Ok(DeltaClassification::Stale {
-                sequence: delta.sequence_range.end,
-                current: self.sequence,
-            });
-        }
-        if delta.sequence_range.end == self.sequence {
-            return Ok(DeltaClassification::Duplicate {
-                sequence: self.sequence,
-            });
-        }
-        if delta.sequence_range.start > self.sequence.next() {
+        // Sticky resync latch: fail-closed until a validated fresh snapshot / reset clears it
+        if self.resync_required {
             return Ok(DeltaClassification::ResyncRequired {
                 expected: self.sequence.next(),
                 received: delta.sequence_range.start,
             });
         }
 
+        delta.validate()?;
+        if delta.target != self.target {
+            return Err(MarketTypeError::TargetMismatch);
+        }
+
+        // Stale delta: range is entirely behind current sequence
+        if delta.sequence_range.end < self.sequence {
+            return Ok(DeltaClassification::Stale {
+                sequence: delta.sequence_range.end,
+                current: self.sequence,
+            });
+        }
+
+        // Duplicate delta: range ends exactly at current sequence
+        if delta.sequence_range.end == self.sequence {
+            return Ok(DeltaClassification::Duplicate {
+                sequence: self.sequence,
+            });
+        }
+
+        // Non-contiguous delta: gap (start > current.next()) or unaligned overlap (start <= current && end > current).
+        // Both fail closed, latch resync_required = true, and leave state sequence/timestamp/levels unchanged.
+        if delta.sequence_range.start != self.sequence.next() {
+            self.resync_required = true;
+            return Ok(DeltaClassification::ResyncRequired {
+                expected: self.sequence.next(),
+                received: delta.sequence_range.start,
+            });
+        }
+
+        // Stage mutation on temporary vectors to ensure atomic commit and full rollback on error
+        let mut new_bids = self.bids.clone();
+        let mut new_asks = self.asks.clone();
+
         // Apply bids: update, delete, or insert maintaining descending order
         for update in &delta.bids {
             if update.quantity.is_zero() {
-                if let Some(pos) = self.bids.iter().position(|l| l.price == update.price) {
-                    self.bids.remove(pos);
+                if let Some(pos) = new_bids.iter().position(|l| l.price == update.price) {
+                    new_bids.remove(pos);
                 }
-            } else if let Some(pos) = self.bids.iter().position(|l| l.price == update.price) {
-                self.bids[pos].quantity = update.quantity;
+            } else if let Some(pos) = new_bids.iter().position(|l| l.price == update.price) {
+                new_bids[pos].quantity = update.quantity;
             } else {
-                let pos = self
-                    .bids
+                let pos = new_bids
                     .iter()
                     .position(|l| l.price < update.price)
-                    .unwrap_or(self.bids.len());
-                self.bids.insert(pos, *update);
+                    .unwrap_or(new_bids.len());
+                new_bids.insert(pos, *update);
             }
         }
 
         // Apply asks: update, delete, or insert maintaining ascending order
         for update in &delta.asks {
             if update.quantity.is_zero() {
-                if let Some(pos) = self.asks.iter().position(|l| l.price == update.price) {
-                    self.asks.remove(pos);
+                if let Some(pos) = new_asks.iter().position(|l| l.price == update.price) {
+                    new_asks.remove(pos);
                 }
-            } else if let Some(pos) = self.asks.iter().position(|l| l.price == update.price) {
-                self.asks[pos].quantity = update.quantity;
+            } else if let Some(pos) = new_asks.iter().position(|l| l.price == update.price) {
+                new_asks[pos].quantity = update.quantity;
             } else {
-                let pos = self
-                    .asks
+                let pos = new_asks
                     .iter()
                     .position(|l| l.price > update.price)
-                    .unwrap_or(self.asks.len());
-                self.asks.insert(pos, *update);
+                    .unwrap_or(new_asks.len());
+                new_asks.insert(pos, *update);
             }
         }
 
-        self.bids.truncate(self.max_levels);
-        self.asks.truncate(self.max_levels);
+        new_bids.truncate(self.max_levels);
+        new_asks.truncate(self.max_levels);
 
-        // Check crossed book
-        if let (Some(b), Some(a)) = (self.bids.first(), self.asks.first()) {
+        // Check crossed book on staged state BEFORE mutating self
+        if let (Some(b), Some(a)) = (new_bids.first(), new_asks.first()) {
             if b.price >= a.price {
                 return Err(MarketTypeError::CrossedOrderBook);
             }
         }
 
+        // Atomic commit after all validations succeed
+        self.bids = new_bids;
+        self.asks = new_asks;
         self.sequence = delta.sequence_range.end;
         self.timestamp_ms = delta.timestamp_ms;
 
