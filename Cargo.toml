@@ -5,6 +5,7 @@ members = [
     "crates/market-types",
     "crates/chain-types",
     "crates/crypto-envelope",
+    "crates/crypto-envelope-wasm",
     "crates/storage",
     "crates/telemetry",
     "crates/auth",

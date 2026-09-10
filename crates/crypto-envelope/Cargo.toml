@@ -9,10 +9,31 @@ repository.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "seal-artifact"
+path = "src/bin/seal_artifact.rs"
+
+[[bin]]
+name = "decrypt-artifact"
+path = "src/bin/decrypt_artifact.rs"
+
+[[bin]]
+name = "derive-public-key"
+path = "src/bin/derive_public_key.rs"
+
 [dependencies]
 chacha20poly1305 = "0.11"
 zeroize = { version = "1", features = ["zeroize_derive"] }
-getrandom = "0.2"
 rand_chacha = "0.10"
 thiserror = { workspace = true }
-hpke = { version = "0.14.1", default-features = false, features = ["x25519", "chacha"] }
+hpke = { version = "0.14.1", default-features = false, features = ["x25519", "chacha", "alloc"] }
+hkdf = "0.13"
+sha2 = "0.11"
+base64 = "0.22"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }

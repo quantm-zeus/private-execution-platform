@@ -34,7 +34,7 @@ pub enum HpkeSetupError {
     EntropyUnavailable,
 }
 
-fn fresh_rng() -> Result<ChaCha20Rng, HpkeSetupError> {
+pub(crate) fn fresh_rng() -> Result<ChaCha20Rng, HpkeSetupError> {
     let mut seed = [0u8; 32];
     if getrandom::getrandom(&mut seed).is_err() {
         seed.zeroize();
