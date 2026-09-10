@@ -12,5 +12,7 @@ web/public/.output/
 web/public/.solidjs/
 web/public/dist/
 web/workspace/dist/
+web/workspace-shell/dist/
+web/workspace-payload/dist/
 web/workspace-artifact/
 

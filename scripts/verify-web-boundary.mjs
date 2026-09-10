@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -103,7 +104,7 @@ try {
     }
   }
 
-  // 2b. Shell index.html enforces strict own-origin CSP, no-store, nosniff
+  // 2b. Shell index.html carries fallback client-side meta tags (defense-in-depth; not claimed to enforce HTTP response headers)
   const shellHtmlPath = join(shellDist, "index.html");
   const shellHtml = await readFile(shellHtmlPath, "utf8");
 
@@ -130,32 +131,139 @@ try {
     throw new Error(`shell CSP contains non-own-origin or wildcard directive: ${cspContent}`);
   }
 
-  // Verify no-store meta tag
+  // Verify no-store meta tag (client fallback)
   const cacheControlMatch = shellHtml.match(/<meta\s+http-equiv="Cache-Control"\s+content="([^"]+)"/i);
   if (!cacheControlMatch || !cacheControlMatch[1].includes("no-store")) {
     throw new Error("workspace-shell index.html missing Cache-Control: no-store meta tag");
   }
 
-  // Verify nosniff meta tag
+  // Verify nosniff meta tag (client fallback)
   const nosniffMatch = shellHtml.match(/<meta\s+http-equiv="X-Content-Type-Options"\s+content="nosniff"/i);
   if (!nosniffMatch) {
     throw new Error("workspace-shell index.html missing X-Content-Type-Options: nosniff meta tag");
   }
 
-  // 2c. Shell Vite config defines fail-closed server & preview headers
+  // 2c. Production static-serving header artifact (_headers) enforces HTTP response headers
+  const shellHeadersPath = join(shellDist, "_headers");
+  const shellHeadersRaw = await readFile(shellHeadersPath, "utf8");
+  const expectedCspHeader =
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'";
+
+  // Parse standard static-host _headers format (Cloudflare Pages / Netlify convention)
+  const headerRules = [];
+  let currentHeaderRule = null;
+  for (const rawLine of shellHeadersRaw.split("\n")) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t")) {
+      currentHeaderRule = { path: trimmed, headers: {} };
+      headerRules.push(currentHeaderRule);
+    } else if (currentHeaderRule) {
+      const colonIdx = trimmed.indexOf(":");
+      if (colonIdx > 0) {
+        const headerName = trimmed.slice(0, colonIdx).trim().toLowerCase();
+        const headerValue = trimmed.slice(colonIdx + 1).trim();
+        currentHeaderRule.headers[headerName] = headerValue;
+      }
+    }
+  }
+
+  const wildcardRule = headerRules.find((r) => r.path === "/*");
+  if (!wildcardRule) {
+    throw new Error("workspace-shell _headers missing universal wildcard rule (/*)");
+  }
+  if (wildcardRule.headers["cache-control"] !== "no-store") {
+    throw new Error(`workspace-shell _headers Cache-Control mismatch: ${wildcardRule.headers["cache-control"]}`);
+  }
+  if (wildcardRule.headers["x-content-type-options"] !== "nosniff") {
+    throw new Error(`workspace-shell _headers X-Content-Type-Options mismatch: ${wildcardRule.headers["x-content-type-options"]}`);
+  }
+  if (wildcardRule.headers["referrer-policy"] !== "no-referrer") {
+    throw new Error(`workspace-shell _headers Referrer-Policy mismatch: ${wildcardRule.headers["referrer-policy"]}`);
+  }
+  if (wildcardRule.headers["content-security-policy"] !== expectedCspHeader) {
+    throw new Error(`workspace-shell _headers Content-Security-Policy mismatch: ${wildcardRule.headers["content-security-policy"]}`);
+  }
+  const headerCsp = wildcardRule.headers["content-security-policy"];
+  if (/https?:\/\//i.test(headerCsp) || headerCsp.includes("*")) {
+    throw new Error(`shell _headers CSP contains non-own-origin or wildcard directive: ${headerCsp}`);
+  }
+
+  // 2d. Assert actual HTTP response headers via local static server consuming _headers
+  const staticServer = createServer(async (req, res) => {
+    const urlPath = (req.url || "/").split("?")[0];
+    for (const rule of headerRules) {
+      if (rule.path === "/*" || rule.path === urlPath) {
+        for (const [k, v] of Object.entries(rule.headers)) {
+          res.setHeader(k, v);
+        }
+      }
+    }
+    const relativeFile = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
+    const targetFile = join(shellDist, relativeFile);
+    try {
+      const data = await readFile(targetFile);
+      res.statusCode = 200;
+      res.end(data);
+    } catch {
+      res.statusCode = 404;
+      res.end("Not Found");
+    }
+  });
+
+  await new Promise((res, rej) => {
+    staticServer.listen(0, "127.0.0.1", () => res());
+    staticServer.once("error", rej);
+  });
+  const serverAddress = staticServer.address();
+  const serverPort = typeof serverAddress === "object" && serverAddress ? serverAddress.port : 0;
+  try {
+    const testPaths = ["/", "/index.html"];
+    for (const file of shellBuiltFiles) {
+      if (file !== shellHeadersPath) {
+        testPaths.push("/" + file.slice(shellDist.length + 1));
+      }
+    }
+    for (const reqPath of testPaths) {
+      const resp = await fetch(`http://127.0.0.1:${serverPort}${reqPath}`);
+      if (resp.status !== 200) {
+        throw new Error(`static shell server returned status ${resp.status} for ${reqPath}`);
+      }
+      if (resp.headers.get("cache-control") !== "no-store") {
+        throw new Error(`actual response for ${reqPath} missing Cache-Control: no-store`);
+      }
+      if (resp.headers.get("x-content-type-options") !== "nosniff") {
+        throw new Error(`actual response for ${reqPath} missing X-Content-Type-Options: nosniff`);
+      }
+      if (resp.headers.get("referrer-policy") !== "no-referrer") {
+        throw new Error(`actual response for ${reqPath} missing Referrer-Policy: no-referrer`);
+      }
+      if (resp.headers.get("content-security-policy") !== expectedCspHeader) {
+        throw new Error(`actual response for ${reqPath} Content-Security-Policy mismatch`);
+      }
+    }
+  } finally {
+    await new Promise((res) => staticServer.close(res));
+  }
+
+  // 2e. Shell Vite config defines fail-closed server & preview headers
   const shellViteConfig = await readFile(resolve("web/workspace-shell/vite.config.ts"), "utf8");
   if (!shellViteConfig.includes('"Cache-Control": "no-store"') || !shellViteConfig.includes('"X-Content-Type-Options": "nosniff"')) {
     throw new Error("workspace-shell vite.config.ts missing fail-closed security headers");
+  }
+  if (!shellViteConfig.includes('"Referrer-Policy": "no-referrer"')) {
+    throw new Error("workspace-shell vite.config.ts missing fail-closed Referrer-Policy header");
   }
   if (!shellViteConfig.includes("sourcemap: false")) {
     throw new Error("workspace-shell vite.config.ts must enforce sourcemap: false");
   }
 
-  // 2d. Shell code & bundle contains no third-party network calls, analytics, or persistent storage
+  // 2f. Shell code & bundle contains no third-party network calls, analytics, or persistent storage
   const shellSourceFiles = [
     resolve("web/workspace-shell/src/index.tsx"),
     resolve("web/workspace-shell/src/wasm-loader.ts"),
     shellHtmlPath,
+    shellHeadersPath,
   ];
   for (const p of shellBuiltFiles) {
     if (/\.(?:m?js|html|css)$/i.test(p)) shellSourceFiles.push(p);
@@ -349,6 +457,13 @@ try {
   // 7. Establish expected payload plaintext digest from clean payload build
   // =========================================================================
   run(["build:workspace-payload"]);
+  const payloadRawFiles = await filesUnder(payloadDist);
+  for (const p of payloadRawFiles) {
+    const rel = p.slice(payloadDist.length + 1);
+    if (rel === "_headers" || rel.endsWith("/_headers") || rel.toLowerCase().includes("header")) {
+      throw new Error(`payload dist contains forbidden header artifact: ${rel}`);
+    }
+  }
   const expectedPackedPayload = await packDirectory(payloadDist);
   const expectedPayloadHash = digest(expectedPackedPayload);
   const expectedPayloadFiles = (await filesUnder(payloadDist)).map((p) => p.slice(payloadDist.length + 1)).sort();
@@ -375,7 +490,16 @@ try {
   const rawArtifact = await readFile(artifactPath);
 
   // Scan artifact for plaintext leaks (no html/clear strings)
-  for (const clear of ["index.html", "Workspace", "payload", "shell"]) {
+  for (const clear of [
+    "index.html",
+    "Workspace",
+    "payload",
+    "shell",
+    "_headers",
+    "Content-Security-Policy",
+    "X-Content-Type-Options",
+    "Referrer-Policy",
+  ]) {
     if (rawArtifact.includes(Buffer.from(clear))) {
       throw new Error(`artifact leaks plaintext metadata: ${clear}`);
     }
@@ -406,15 +530,27 @@ try {
     throw new Error("decrypted artifact digest mismatch");
   }
 
-  // 8d. Executable proof: Payload-only sealed archive (contains ONLY payload files, NO shell files)
+  // 8d. Executable proof: Payload-only sealed archive (contains ONLY payload files, NO shell or header files)
   const unpackedNames = Array.from(unpackedMap.keys()).sort();
   if (JSON.stringify(unpackedNames) !== JSON.stringify(expectedPayloadFiles)) {
     throw new Error(`unpacked artifact file list does not match payload build: ${unpackedNames.join(", ")}`);
+  }
+  if (unpackedNames.includes("_headers") || unpackedNames.some((n) => n.endsWith("/_headers") || n.toLowerCase().includes("header"))) {
+    throw new Error("unpacked payload artifact contains forbidden header artifact");
   }
   for (const name of unpackedNames) {
     if (name.includes("shell") || name.includes("wasm-loader") || name.includes("crypto-envelope-wasm")) {
       throw new Error(`unpacked artifact contains non-payload file: ${name}`);
     }
+  }
+  if (decryptedPlaintext.includes(Buffer.from("_headers"))) {
+    throw new Error("decrypted artifact contains _headers artifact reference");
+  }
+  if (decryptedPlaintext.includes(Buffer.from("X-Content-Type-Options"))) {
+    throw new Error("decrypted artifact contains header configuration artifact reference");
+  }
+  if (decryptedPlaintext.includes(Buffer.from("Referrer-Policy"))) {
+    throw new Error("decrypted artifact contains header configuration artifact reference");
   }
 
   // =========================================================================
