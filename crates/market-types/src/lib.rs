@@ -890,6 +890,154 @@ mod tests {
     }
 
     #[test]
+    fn regression_orderbook_latched_snapshot_sequence_safety() {
+        let target = FeedTarget::Instrument(sample_instrument());
+        let initial_bids = vec![DepthLevel::new(
+            NormalizedPrice::new(100.0).unwrap(),
+            NormalizedQuantity::new(10.0).unwrap(),
+        )];
+        let initial_asks = vec![DepthLevel::new(
+            NormalizedPrice::new(102.0).unwrap(),
+            NormalizedQuantity::new(10.0).unwrap(),
+        )];
+        let snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(100),
+            timestamp_ms: 1_000_000,
+            bids: initial_bids.clone(),
+            asks: initial_asks.clone(),
+        };
+
+        let mut book = OrderBookDepth::new(snapshot, 10).unwrap();
+
+        // Trigger gap latch: sequence 100 sees gap delta [105, 105]
+        let gap_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(105)).unwrap(),
+            timestamp_ms: 1_000_100,
+            bids: vec![],
+            asks: vec![],
+        };
+        let gap_outcome = book.apply_delta(&gap_delta).unwrap();
+        assert_eq!(
+            gap_outcome,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(105),
+            }
+        );
+        assert!(book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(100));
+
+        // 1. Gap latch -> stale snapshot (sequence 95 < 100):
+        // Remains latched and all state unchanged!
+        let stale_snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(95),
+            timestamp_ms: 1_000_050,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(90.0).unwrap(),
+                NormalizedQuantity::new(1.0).unwrap(),
+            )],
+            asks: vec![DepthLevel::new(
+                NormalizedPrice::new(110.0).unwrap(),
+                NormalizedQuantity::new(1.0).unwrap(),
+            )],
+        };
+        let stale_outcome = book.apply_snapshot(stale_snapshot).unwrap();
+        assert_eq!(
+            stale_outcome,
+            SnapshotClassification::Stale {
+                sequence: Sequence(95),
+                current: Sequence(100),
+            }
+        );
+        assert!(book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(100));
+        assert_eq!(book.timestamp_ms(), 1_000_000);
+        assert_eq!(book.bids(), &initial_bids);
+        assert_eq!(book.asks(), &initial_asks);
+
+        // 2. Gap latch -> duplicate snapshot (sequence 100 == 100):
+        // Remains latched and all state unchanged!
+        let dup_snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(100),
+            timestamp_ms: 1_000_090,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(95.0).unwrap(),
+                NormalizedQuantity::new(2.0).unwrap(),
+            )],
+            asks: vec![DepthLevel::new(
+                NormalizedPrice::new(105.0).unwrap(),
+                NormalizedQuantity::new(2.0).unwrap(),
+            )],
+        };
+        let dup_outcome = book.apply_snapshot(dup_snapshot).unwrap();
+        assert_eq!(
+            dup_outcome,
+            SnapshotClassification::Duplicate {
+                sequence: Sequence(100),
+            }
+        );
+        assert!(book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(100));
+        assert_eq!(book.timestamp_ms(), 1_000_000);
+        assert_eq!(book.bids(), &initial_bids);
+        assert_eq!(book.asks(), &initial_asks);
+
+        // 3. Gap latch -> newer validated snapshot (sequence 110 > 100):
+        // Advances state and clears latch!
+        let newer_bids = vec![DepthLevel::new(
+            NormalizedPrice::new(101.0).unwrap(),
+            NormalizedQuantity::new(15.0).unwrap(),
+        )];
+        let newer_asks = vec![DepthLevel::new(
+            NormalizedPrice::new(103.0).unwrap(),
+            NormalizedQuantity::new(20.0).unwrap(),
+        )];
+        let newer_snapshot = DepthSnapshot {
+            target: target.clone(),
+            sequence: Sequence(110),
+            timestamp_ms: 1_000_200,
+            bids: newer_bids.clone(),
+            asks: newer_asks.clone(),
+        };
+        let newer_outcome = book.apply_snapshot(newer_snapshot).unwrap();
+        assert_eq!(
+            newer_outcome,
+            SnapshotClassification::Accepted {
+                new_sequence: Sequence(110),
+            }
+        );
+        assert!(!book.is_resync_required());
+        assert_eq!(book.sequence(), Sequence(110));
+        assert_eq!(book.timestamp_ms(), 1_000_200);
+        assert_eq!(book.bids(), &newer_bids);
+        assert_eq!(book.asks(), &newer_asks);
+
+        // Next contiguous delta [111, 111] now succeeds cleanly
+        let next_delta = DepthDelta {
+            target: target.clone(),
+            sequence_range: SequenceRange::point(Sequence(111)).unwrap(),
+            timestamp_ms: 1_000_300,
+            bids: vec![DepthLevel::new(
+                NormalizedPrice::new(101.5).unwrap(),
+                NormalizedQuantity::new(5.0).unwrap(),
+            )],
+            asks: vec![],
+        };
+        let next_outcome = book.apply_delta(&next_delta).unwrap();
+        assert_eq!(
+            next_outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(111),
+            }
+        );
+        assert_eq!(book.sequence(), Sequence(111));
+    }
+
+    #[test]
     fn regression_orderbook_crossing_delta_rolls_back_completely() {
         let target = FeedTarget::Instrument(sample_instrument());
         let initial_bids = vec![

@@ -527,18 +527,16 @@ impl OrderBookDepth {
             return Err(MarketTypeError::TargetMismatch);
         }
 
-        if !self.resync_required {
-            if snapshot.sequence < self.sequence {
-                return Ok(SnapshotClassification::Stale {
-                    sequence: snapshot.sequence,
-                    current: self.sequence,
-                });
-            }
-            if snapshot.sequence == self.sequence {
-                return Ok(SnapshotClassification::Duplicate {
-                    sequence: self.sequence,
-                });
-            }
+        if snapshot.sequence < self.sequence {
+            return Ok(SnapshotClassification::Stale {
+                sequence: snapshot.sequence,
+                current: self.sequence,
+            });
+        }
+        if snapshot.sequence == self.sequence {
+            return Ok(SnapshotClassification::Duplicate {
+                sequence: self.sequence,
+            });
         }
 
         let mut bids = snapshot.bids;
