@@ -32,9 +32,12 @@ pub use orderbook::{
     MAX_DEPTH_LEVELS,
 };
 pub use pool::{
-    BinPoolState, ClmmPoolState, ClmmTick, CpmmPoolState, LiquidityBin, PoolKindState,
-    PoolStateEnvelope, MAX_BIN_COUNT, MAX_BIN_ID, MAX_BIN_STEP_BPS, MAX_CLMM_TICKS, MAX_DECIMALS,
-    MAX_TICK, MIN_BIN_ID, MIN_TICK,
+    BinPoolDelta, BinPoolDeltaEnvelope, BinPoolReducer, BinPoolState, ClmmPoolDelta,
+    ClmmPoolDeltaEnvelope, ClmmPoolReducer, ClmmPoolState, ClmmTick, CpmmPoolDelta,
+    CpmmPoolDeltaEnvelope, CpmmPoolReducer, CpmmPoolState, LiquidityBin, PoolDelta,
+    PoolDeltaEnvelope, PoolKindDelta, PoolKindState, PoolReducer, PoolStateEnvelope, MAX_BIN_COUNT,
+    MAX_BIN_DELTA_BINS, MAX_BIN_ID, MAX_BIN_STEP_BPS, MAX_CLMM_DELTA_TICKS, MAX_CLMM_TICKS,
+    MAX_DECIMALS, MAX_TICK, MIN_BIN_ID, MIN_TICK,
 };
 pub use primitives::{AssetAmount, AtomicAmount, Bps, Freshness, PriceRatio, Sequence, Version};
 pub use sequence::{
@@ -3241,5 +3244,635 @@ mod tests {
             }
             _ => panic!("expected cpmm pool state"),
         }
+    }
+
+    // --- Contract 8: Deterministic Local Pool-State Reducers (P22) ---
+
+    #[test]
+    fn test_cpmm_reducer_atomic_staging_and_rollback() {
+        let pool_id = sample_pool_id();
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let cpmm = CpmmPoolState {
+            token_0: sol,
+            token_1: usdc,
+            decimals_0: 9,
+            decimals_1: 6,
+            reserve_0: AtomicAmount::new(1_000_000_000),
+            reserve_1: AtomicAmount::new(150_000_000_000),
+            total_lp_supply: Some(AtomicAmount::new(500_000_000)),
+            fee_bps: Bps::new(30).unwrap(),
+        };
+
+        let mut reducer =
+            CpmmPoolReducer::new(pool_id, Sequence(100), 1_000_000, cpmm.clone()).unwrap();
+
+        // 1. Invalid timestamp (<= 0)
+        let delta = CpmmPoolDelta::new(Some(AtomicAmount::new(2_000_000_000)), None, None, None);
+        let err = reducer.apply_delta(SequenceRange::point(Sequence(101)).unwrap(), 0, &delta);
+        assert_eq!(err, Err(MarketTypeError::InvalidTimestamp(0)));
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.state().reserve_0.get(), 1_000_000_000);
+
+        // 2. Setting reserve_0 to zero fails closed with ZeroAmount
+        let zero_delta = CpmmPoolDelta::new(Some(AtomicAmount::ZERO), None, None, None);
+        let err2 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &zero_delta,
+        );
+        assert_eq!(err2, Err(MarketTypeError::ZeroAmount));
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.state().reserve_0.get(), 1_000_000_000);
+
+        // 3. Setting reserve_1 to zero fails closed with ZeroAmount
+        let zero_delta1 = CpmmPoolDelta::new(None, Some(AtomicAmount::ZERO), None, None);
+        let err3 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &zero_delta1,
+        );
+        assert_eq!(err3, Err(MarketTypeError::ZeroAmount));
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.state().reserve_1.get(), 150_000_000_000);
+
+        // 4. Valid contiguous delta commits atomically
+        let valid_delta = CpmmPoolDelta::new(
+            Some(AtomicAmount::new(1_100_000_000)),
+            Some(AtomicAmount::new(140_000_000_000)),
+            Some(AtomicAmount::new(510_000_000)),
+            Some(Bps::new(25).unwrap()),
+        );
+        let outcome = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(101)).unwrap(),
+                1_000_100,
+                &valid_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(101)
+            }
+        );
+        assert_eq!(reducer.sequence(), Sequence(101));
+        assert_eq!(reducer.timestamp_ms(), 1_000_100);
+        assert_eq!(reducer.state().reserve_0.get(), 1_100_000_000);
+        assert_eq!(reducer.state().reserve_1.get(), 140_000_000_000);
+        assert_eq!(reducer.state().total_lp_supply.unwrap().get(), 510_000_000);
+        assert_eq!(reducer.state().fee_bps.get(), 25);
+    }
+
+    #[test]
+    fn test_clmm_reducer_atomic_staging_and_rollback() {
+        let pool_id = sample_pool_id();
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let clmm = ClmmPoolState {
+            token_0: sol,
+            token_1: usdc,
+            decimals_0: 9,
+            decimals_1: 6,
+            tick_spacing: 64,
+            current_tick: 0,
+            sqrt_price_x64: 18446744073709551616,
+            liquidity: 50_000,
+            fee_bps: Bps::new(5).unwrap(),
+            ticks: vec![
+                ClmmTick::new(-128, 10_000, 10_000),
+                ClmmTick::new(0, 20_000, -5_000),
+                ClmmTick::new(128, 15_000, -5_000),
+            ],
+        };
+
+        let mut reducer =
+            ClmmPoolReducer::new(pool_id, Sequence(100), 1_000_000, clmm.clone(), 5).unwrap();
+
+        // 1. Tick spacing mismatch fails closed
+        let bad_spacing =
+            ClmmPoolDelta::new(None, None, None, None, vec![ClmmTick::new(65, 1_000, 100)]);
+        let err = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &bad_spacing,
+        );
+        assert_eq!(
+            err,
+            Err(MarketTypeError::TickSpacingMismatch {
+                tick: 65,
+                spacing: 64
+            })
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.ticks().len(), 3);
+
+        // 2. Net liquidity > gross liquidity fails closed
+        let bad_net = ClmmPoolDelta::new(
+            None,
+            None,
+            None,
+            None,
+            vec![ClmmTick::new(64, 1_000, 2_000)],
+        );
+        let err2 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &bad_net,
+        );
+        assert_eq!(err2, Err(MarketTypeError::InvalidTickLiquidity(64)));
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 3. Gross 0 but net != 0 fails closed
+        let zero_gross_net =
+            ClmmPoolDelta::new(None, None, None, None, vec![ClmmTick::new(64, 0, 500)]);
+        let err3 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &zero_gross_net,
+        );
+        assert_eq!(err3, Err(MarketTypeError::InvalidTickLiquidity(64)));
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 4. Duplicate tick in delta fails closed
+        let dup_tick_delta = ClmmPoolDelta::new(
+            None,
+            None,
+            None,
+            None,
+            vec![ClmmTick::new(64, 1_000, 0), ClmmTick::new(64, 2_000, 0)],
+        );
+        let err4 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &dup_tick_delta,
+        );
+        assert_eq!(err4, Err(MarketTypeError::DuplicateClmmTick(64)));
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 5. Exceeding max_ticks (initial has 3, max is 5; adding 3 = 6 > 5) fails closed
+        let overflow_delta = ClmmPoolDelta::new(
+            None,
+            None,
+            None,
+            None,
+            vec![
+                ClmmTick::new(64, 1_000, 500),
+                ClmmTick::new(192, 1_000, 500),
+                ClmmTick::new(256, 1_000, 500),
+            ],
+        );
+        let err5 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &overflow_delta,
+        );
+        assert_eq!(
+            err5,
+            Err(MarketTypeError::ClmmTicksExceeded { count: 6, max: 5 })
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.ticks().len(), 3);
+
+        // 6. Valid insertion, update, and deletion in sorted order succeeds
+        let valid_delta = ClmmPoolDelta::new(
+            Some(64),
+            Some(18500000000000000000),
+            Some(55_000),
+            Some(Bps::new(10).unwrap()),
+            vec![
+                ClmmTick::new(-128, 0, 0),          // delete -128
+                ClmmTick::new(64, 8_000, 2_000),    // insert 64
+                ClmmTick::new(128, 20_000, -2_000), // update 128
+            ],
+        );
+        let outcome = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(101)).unwrap(),
+                1_000_100,
+                &valid_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(101)
+            }
+        );
+        assert_eq!(reducer.sequence(), Sequence(101));
+        assert_eq!(reducer.current_tick(), 64);
+        assert_eq!(reducer.sqrt_price_x64(), 18500000000000000000);
+        assert_eq!(reducer.liquidity(), 55_000);
+        // Ticks should be strictly sorted: [0, 64, 128]
+        assert_eq!(reducer.ticks().len(), 3);
+        assert_eq!(reducer.ticks()[0].index, 0);
+        assert_eq!(reducer.ticks()[1].index, 64);
+        assert_eq!(reducer.ticks()[1].liquidity_gross, 8_000);
+        assert_eq!(reducer.ticks()[2].index, 128);
+        assert_eq!(reducer.ticks()[2].liquidity_gross, 20_000);
+    }
+
+    #[test]
+    fn test_bin_reducer_atomic_staging_and_rollback() {
+        let pool_id = sample_pool_id();
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let bin_pool = BinPoolState {
+            token_0: sol,
+            token_1: usdc,
+            decimals_0: 9,
+            decimals_1: 6,
+            active_bin_id: 100,
+            bin_step: 10,
+            fee_bps: Bps::new(10).unwrap(),
+            bins: vec![
+                LiquidityBin::new(98, AtomicAmount::ZERO, AtomicAmount::new(50_000)),
+                LiquidityBin::new(100, AtomicAmount::new(20_000), AtomicAmount::new(30_000)),
+                LiquidityBin::new(102, AtomicAmount::new(60_000), AtomicAmount::ZERO),
+            ],
+        };
+
+        let mut reducer =
+            BinPoolReducer::new(pool_id, Sequence(100), 1_000_000, bin_pool.clone(), 5).unwrap();
+
+        // 1. Bin below active bin cannot have reserve_0 > 0
+        let bad_below = BinPoolDelta::new(
+            None,
+            None,
+            None,
+            vec![LiquidityBin::new(
+                98,
+                AtomicAmount::new(1),
+                AtomicAmount::new(50_000),
+            )],
+        );
+        let err = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &bad_below,
+        );
+        assert_eq!(
+            err,
+            Err(MarketTypeError::BinReserveSideViolation {
+                bin_id: 98,
+                active_bin_id: 100
+            })
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+        assert_eq!(reducer.bins().len(), 3);
+
+        // 2. Bin above active bin cannot have reserve_1 > 0
+        let bad_above = BinPoolDelta::new(
+            None,
+            None,
+            None,
+            vec![LiquidityBin::new(
+                102,
+                AtomicAmount::new(60_000),
+                AtomicAmount::new(1),
+            )],
+        );
+        let err2 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &bad_above,
+        );
+        assert_eq!(
+            err2,
+            Err(MarketTypeError::BinReserveSideViolation {
+                bin_id: 102,
+                active_bin_id: 100
+            })
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 3. Shift active_bin_id to 105 without clearing reserve_0 on bin 100/102 (now below active bin)
+        let bad_shift = BinPoolDelta::new(Some(105), None, None, vec![]);
+        let err3 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &bad_shift,
+        );
+        assert_eq!(
+            err3,
+            Err(MarketTypeError::BinReserveSideViolation {
+                bin_id: 100,
+                active_bin_id: 105
+            })
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 4. Duplicate bin in delta fails closed
+        let dup_bin_delta = BinPoolDelta::new(
+            None,
+            None,
+            None,
+            vec![
+                LiquidityBin::new(104, AtomicAmount::new(10_000), AtomicAmount::ZERO),
+                LiquidityBin::new(104, AtomicAmount::new(20_000), AtomicAmount::ZERO),
+            ],
+        );
+        let err4 = reducer.apply_delta(
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            &dup_bin_delta,
+        );
+        assert_eq!(err4, Err(MarketTypeError::DuplicateBin(104)));
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // 5. Valid contiguous delta: insert 104, update 100, delete 98
+        let valid_delta = BinPoolDelta::new(
+            None,
+            None,
+            None,
+            vec![
+                LiquidityBin::new(98, AtomicAmount::ZERO, AtomicAmount::ZERO), // delete 98
+                LiquidityBin::new(100, AtomicAmount::new(25_000), AtomicAmount::new(25_000)), // update 100
+                LiquidityBin::new(104, AtomicAmount::new(40_000), AtomicAmount::ZERO), // insert 104
+            ],
+        );
+        let outcome = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(101)).unwrap(),
+                1_000_100,
+                &valid_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(101)
+            }
+        );
+        assert_eq!(reducer.sequence(), Sequence(101));
+        assert_eq!(reducer.bins().len(), 3);
+        assert_eq!(reducer.bins()[0].id, 100);
+        assert_eq!(reducer.bins()[1].id, 102);
+        assert_eq!(reducer.bins()[2].id, 104);
+    }
+
+    #[test]
+    fn test_pool_reducers_sticky_resync_gap_overlap_and_newer_snapshot_recovery() {
+        let pool_id = sample_pool_id();
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let cpmm = CpmmPoolState {
+            token_0: sol.clone(),
+            token_1: usdc.clone(),
+            decimals_0: 9,
+            decimals_1: 6,
+            reserve_0: AtomicAmount::new(1_000_000_000),
+            reserve_1: AtomicAmount::new(150_000_000_000),
+            total_lp_supply: Some(AtomicAmount::new(500_000_000)),
+            fee_bps: Bps::new(30).unwrap(),
+        };
+
+        let mut reducer =
+            CpmmPoolReducer::new(pool_id.clone(), Sequence(100), 1_000_000, cpmm.clone()).unwrap();
+
+        // Gap delta [105, 105] on current 100 latches resync
+        let gap_delta =
+            CpmmPoolDelta::new(Some(AtomicAmount::new(1_050_000_000)), None, None, None);
+        let outcome = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(105)).unwrap(),
+                1_000_100,
+                &gap_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(105),
+            }
+        );
+        assert!(reducer.is_resync_required());
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // Subsequent contiguous delta [101, 101] MUST still return ResyncRequired
+        let cont_delta =
+            CpmmPoolDelta::new(Some(AtomicAmount::new(1_050_000_000)), None, None, None);
+        let rejected = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(101)).unwrap(),
+                1_000_200,
+                &cont_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            rejected,
+            DeltaClassification::ResyncRequired {
+                expected: Sequence(101),
+                received: Sequence(101),
+            }
+        );
+        assert_eq!(reducer.sequence(), Sequence(100));
+
+        // Stale snapshot (< 100) rejected, latch held
+        let stale_snap = cpmm.clone();
+        let stale_res = reducer
+            .apply_snapshot(Sequence(99), 1_000_250, stale_snap)
+            .unwrap();
+        assert_eq!(
+            stale_res,
+            SnapshotClassification::Stale {
+                sequence: Sequence(99),
+                current: Sequence(100)
+            }
+        );
+        assert!(reducer.is_resync_required());
+
+        // Duplicate snapshot (== 100) rejected, latch held
+        let dup_snap = cpmm.clone();
+        let dup_res = reducer
+            .apply_snapshot(Sequence(100), 1_000_260, dup_snap)
+            .unwrap();
+        assert_eq!(
+            dup_res,
+            SnapshotClassification::Duplicate {
+                sequence: Sequence(100)
+            }
+        );
+        assert!(reducer.is_resync_required());
+
+        // Valid newer snapshot (> 100) accepted, clears latch!
+        let mut newer_cpmm = cpmm.clone();
+        newer_cpmm.reserve_0 = AtomicAmount::new(2_000_000_000);
+        let accepted = reducer
+            .apply_snapshot(Sequence(110), 1_000_300, newer_cpmm)
+            .unwrap();
+        assert_eq!(
+            accepted,
+            SnapshotClassification::Accepted {
+                new_sequence: Sequence(110)
+            }
+        );
+        assert!(!reducer.is_resync_required());
+        assert_eq!(reducer.sequence(), Sequence(110));
+        assert_eq!(reducer.state().reserve_0.get(), 2_000_000_000);
+
+        // Next contiguous delta [111, 111] now succeeds cleanly
+        let next_delta =
+            CpmmPoolDelta::new(Some(AtomicAmount::new(2_100_000_000)), None, None, None);
+        let next_outcome = reducer
+            .apply_delta(
+                SequenceRange::point(Sequence(111)).unwrap(),
+                1_000_400,
+                &next_delta,
+            )
+            .unwrap();
+        assert_eq!(
+            next_outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(111)
+            }
+        );
+        assert_eq!(reducer.sequence(), Sequence(111));
+    }
+
+    #[test]
+    fn test_unified_pool_reducer_cross_dispatch_and_fail_closed() {
+        let pool_id = sample_pool_id();
+        let sol = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let usdc = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        let cpmm = CpmmPoolState {
+            token_0: sol,
+            token_1: usdc,
+            decimals_0: 9,
+            decimals_1: 6,
+            reserve_0: AtomicAmount::new(1_000_000_000),
+            reserve_1: AtomicAmount::new(150_000_000_000),
+            total_lp_supply: Some(AtomicAmount::new(500_000_000)),
+            fee_bps: Bps::new(30).unwrap(),
+        };
+        let envelope = PoolStateEnvelope {
+            pool_id: pool_id.clone(),
+            sequence: Sequence(100),
+            observed_at_ms: 1_000_000,
+            state: PoolKindState::Cpmm(cpmm),
+        };
+
+        let mut unified = PoolReducer::new(envelope).unwrap();
+        assert_eq!(unified.sequence(), Sequence(100));
+
+        // Applying CLMM delta to CPMM reducer fails closed with PoolKindMismatch
+        let clmm_delta_envelope = PoolDeltaEnvelope::new(
+            pool_id.clone(),
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            PoolKindDelta::Clmm(ClmmPoolDelta::new(Some(0), None, None, None, vec![])),
+        )
+        .unwrap();
+        let err = unified.apply_delta(&clmm_delta_envelope);
+        assert_eq!(
+            err,
+            Err(MarketTypeError::PoolKindMismatch {
+                expected: "cpmm",
+                received: "clmm"
+            })
+        );
+        assert_eq!(unified.sequence(), Sequence(100));
+
+        // Applying Bin delta to CPMM reducer fails closed with PoolKindMismatch
+        let bin_delta_envelope = PoolDeltaEnvelope::new(
+            pool_id.clone(),
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            PoolKindDelta::Bin(BinPoolDelta::new(Some(100), None, None, vec![])),
+        )
+        .unwrap();
+        let err2 = unified.apply_delta(&bin_delta_envelope);
+        assert_eq!(
+            err2,
+            Err(MarketTypeError::PoolKindMismatch {
+                expected: "cpmm",
+                received: "bin"
+            })
+        );
+        assert_eq!(unified.sequence(), Sequence(100));
+
+        // Applying CPMM delta with mismatched PoolId fails closed with TargetMismatch
+        let other_pool_id =
+            PoolId::new(ChainId::Solana, "11111111111111111111111111111111").unwrap();
+        let target_mismatch_delta = PoolDeltaEnvelope::new(
+            other_pool_id,
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            PoolKindDelta::Cpmm(CpmmPoolDelta::new(
+                Some(AtomicAmount::new(2_000_000_000)),
+                None,
+                None,
+                None,
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            unified.apply_delta(&target_mismatch_delta),
+            Err(MarketTypeError::TargetMismatch)
+        );
+        assert_eq!(unified.sequence(), Sequence(100));
+
+        // Valid CPMM delta succeeds
+        let valid_cpmm_delta = PoolDeltaEnvelope::new(
+            pool_id,
+            SequenceRange::point(Sequence(101)).unwrap(),
+            1_000_100,
+            PoolKindDelta::Cpmm(CpmmPoolDelta::new(
+                Some(AtomicAmount::new(1_050_000_000)),
+                None,
+                None,
+                None,
+            )),
+        )
+        .unwrap();
+        let outcome = unified.apply_delta(&valid_cpmm_delta).unwrap();
+        assert_eq!(
+            outcome,
+            DeltaClassification::Contiguous {
+                new_sequence: Sequence(101)
+            }
+        );
+        assert_eq!(unified.sequence(), Sequence(101));
     }
 }

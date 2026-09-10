@@ -47,6 +47,12 @@ impl Bps {
     pub const fn get(self) -> u16 {
         self.0
     }
+    pub fn validate(&self) -> Result<(), MarketTypeError> {
+        if self.0 > Self::MAX {
+            return Err(MarketTypeError::BpsOutOfRange(self.0));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

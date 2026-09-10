@@ -115,6 +115,11 @@ pub enum MarketTypeError {
     EmptyBin(i32),
     #[error("bin reserve side violation for bin {bin_id} relative to active bin {active_bin_id}")]
     BinReserveSideViolation { bin_id: i32, active_bin_id: i32 },
+    #[error("pool kind mismatch: expected {expected}, received {received}")]
+    PoolKindMismatch {
+        expected: &'static str,
+        received: &'static str,
+    },
 
     // --- Feed boundary & mapper errors ---
     #[error("source label must not be empty")]
