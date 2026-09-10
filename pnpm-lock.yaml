@@ -36,7 +36,20 @@ importers:
         specifier: 8.2.2
         version: 8.2.2(@types/node@26.5.0)
 
-  web/workspace:
+  web/workspace-payload:
+    dependencies:
+      solid-js:
+        specifier: 1.9.15
+        version: 1.9.15
+    devDependencies:
+      vite:
+        specifier: 8.2.2
+        version: 8.2.2(@types/node@26.5.0)
+      vite-plugin-solid:
+        specifier: 2.11.14
+        version: 2.11.14(solid-js@1.9.15)(vite@8.2.2(@types/node@26.5.0))
+
+  web/workspace-shell:
     dependencies:
       solid-js:
         specifier: 1.9.15

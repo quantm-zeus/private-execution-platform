@@ -1,29 +1,51 @@
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { artifactKeyFromEnv, encryptPackage, packDirectory } from "./workspace-artifact.mjs";
+import {
+  artifactKidFromEnv,
+  artifactPublicKeyFromEnv,
+  packDirectory,
+  sealPackage,
+} from "./workspace-artifact.mjs";
 
-const dist = resolve("web/workspace/dist");
+const dist = resolve("web/workspace-payload/dist");
 const outDir = resolve("web/workspace-artifact");
 const outFile = resolve(outDir, "blob.bin");
-let key;
+
+let publicKey;
+let kid;
 try {
-  key = artifactKeyFromEnv();
-  const build = spawnSync("pnpm", ["--filter", "@evergreen/workspace", "build"], { stdio: "inherit" });
-  if (build.status !== 0) throw new Error("workspace build failed");
+  if (process.env.WORKSPACE_ARTIFACT_KEY_B64) {
+    throw new Error(
+      "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; artifact sealing requires canonical 32-byte WORKSPACE_PUBLIC_KEY_B64",
+    );
+  }
+  publicKey = artifactPublicKeyFromEnv();
+  kid = artifactKidFromEnv();
+
+  const build = spawnSync("pnpm", ["--filter", "@evergreen/workspace-payload", "build"], {
+    stdio: "inherit",
+  });
+  if (build.status !== 0) throw new Error("workspace payload build failed");
+
   const packed = await packDirectory(dist);
-  const artifact = encryptPackage(packed, key);
+  const artifact = await sealPackage(packed, publicKey, kid);
+
   await mkdir(outDir, { recursive: true });
   await writeFile(outFile, artifact, { mode: 0o600 });
+
   // Read once so write failures/truncation are detected before plaintext cleanup.
-  if ((await readFile(outFile)).length !== artifact.length) throw new Error("artifact write failed");
+  if ((await readFile(outFile)).length !== artifact.length) {
+    throw new Error("artifact write failed");
+  }
   console.log("encrypted workspace artifact created");
 } catch (error) {
   await rm(outFile, { force: true }).catch(() => {});
   console.error(error instanceof Error ? error.message : "workspace artifact build failed");
   process.exitCode = 1;
 } finally {
-  if (key) key.fill(0);
+  delete process.env.WORKSPACE_PUBLIC_KEY_B64;
+  delete process.env.WORKSPACE_ARTIFACT_KID_B64;
   delete process.env.WORKSPACE_ARTIFACT_KEY_B64;
   await rm(dist, { recursive: true, force: true }).catch(() => {});
 }

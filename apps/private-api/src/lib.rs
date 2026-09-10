@@ -267,10 +267,20 @@ pub fn router(state: PrivateApiState) -> Router {
         .route("/internal/auth/challenge", post(issue_challenge))
         .route("/internal/auth/verify", post(verify_challenge))
         .route("/internal/auth/session", get(validate_session))
+        .route(
+            "/internal/auth/enroll",
+            post(enroll_workspace_key).get(get_workspace_enrollment_handler),
+        )
+        .route(
+            "/internal/workspace/enroll",
+            post(enroll_workspace_key).get(get_workspace_enrollment_handler),
+        )
         .route("/internal/artifact/grant", post(issue_artifact_grant))
         .route("/internal/artifact", post(deliver_artifact))
         .layer(DefaultBodyLimit::max(
-            MAX_ASSERTION_BYTES.max(MAX_OFFER_BYTES),
+            MAX_ASSERTION_BYTES
+                .max(MAX_OFFER_BYTES)
+                .max(MAX_ENROLLMENT_BYTES),
         ))
         .with_state(state)
 }
@@ -468,6 +478,147 @@ async fn validate_session(State(state): State<PrivateApiState>, headers: HeaderM
         no_store(StatusCode::NO_CONTENT.into_response())
     } else {
         clear_session(generic_error(StatusCode::UNAUTHORIZED))
+    }
+}
+
+const MAX_ENROLLMENT_BYTES: usize = 4096;
+
+#[derive(serde::Deserialize)]
+struct WorkspaceEnrollmentRequest {
+    version: u8,
+    kid: String,
+    #[serde(alias = "workspace_public_key")]
+    public_key: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkspaceEnrollmentResponse {
+    enrolled: bool,
+    version: u8,
+    kid: String,
+    public_key: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkspaceEnrollmentDetailsResponse {
+    version: u8,
+    kid: String,
+    public_key: String,
+    enrolled_at_ms: i64,
+}
+
+async fn enroll_workspace_key(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let body_bytes = match to_bytes(body, MAX_ENROLLMENT_BYTES).await {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: WorkspaceEnrollmentRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    if request.version != auth::ARTIFACT_VERSION {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
+    let kid_bytes = match base64_decode_canonical(&request.kid, auth::WORKSPACE_KID_BYTES) {
+        Some(v) => v,
+        None => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    if kid_bytes.iter().all(|&b| b == 0) {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
+    let pk_bytes =
+        match base64_decode_canonical(&request.public_key, auth::WORKSPACE_PUBLIC_KEY_BYTES) {
+            Some(v) => v,
+            None => return generic_error(StatusCode::BAD_REQUEST),
+        };
+    if pk_bytes.iter().all(|&b| b == 0) {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
+    let mut kid_arr = [0u8; auth::WORKSPACE_KID_BYTES];
+    kid_arr.copy_from_slice(&kid_bytes);
+    let mut pk_arr = [0u8; auth::WORKSPACE_PUBLIC_KEY_BYTES];
+    pk_arr.copy_from_slice(&pk_bytes);
+
+    let mut auth = match state.auth.lock() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    match auth.enroll_workspace_public_key(&session_id, request.version, kid_arr, pk_arr, now) {
+        Ok(metadata) => {
+            let response = WorkspaceEnrollmentResponse {
+                enrolled: true,
+                version: metadata.version(),
+                kid: base64_encode(metadata.kid()),
+                public_key: base64_encode(metadata.public_key()),
+            };
+            let body = match serde_json::to_vec(&response) {
+                Ok(v) => v,
+                Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+            };
+            no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+        }
+        Err(AuthError::EnrollmentConflict) => generic_error(StatusCode::CONFLICT),
+        Err(AuthError::SessionNotFound | AuthError::SessionExpired) => {
+            clear_session(generic_error(StatusCode::UNAUTHORIZED))
+        }
+        Err(AuthError::UnsupportedVersion | AuthError::InvalidInput) => {
+            generic_error(StatusCode::BAD_REQUEST)
+        }
+        Err(AuthError::VerifierUnavailable | AuthError::EntropyUnavailable) => {
+            generic_error(StatusCode::SERVICE_UNAVAILABLE)
+        }
+        Err(_) => generic_error(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn get_workspace_enrollment_handler(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let auth = match state.auth.lock() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    match auth.get_workspace_enrollment(&session_id, now) {
+        Ok(metadata) => {
+            let response = WorkspaceEnrollmentDetailsResponse {
+                version: metadata.version(),
+                kid: base64_encode(metadata.kid()),
+                public_key: base64_encode(metadata.public_key()),
+                enrolled_at_ms: metadata.enrolled_at_ms(),
+            };
+            let body = match serde_json::to_vec(&response) {
+                Ok(v) => v,
+                Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+            };
+            no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+        }
+        Err(AuthError::EnrollmentNotFound) => generic_error(StatusCode::NOT_FOUND),
+        Err(AuthError::SessionNotFound | AuthError::SessionExpired) => {
+            clear_session(generic_error(StatusCode::UNAUTHORIZED))
+        }
+        Err(_) => generic_error(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -896,6 +1047,14 @@ fn base64_decode_lenient(input: &str, expected_len: usize) -> Option<Vec<u8>> {
         return None;
     }
     Some(out)
+}
+
+fn base64_decode_canonical(input: &str, expected_len: usize) -> Option<Vec<u8>> {
+    let decoded = base64_decode_lenient(input, expected_len)?;
+    if base64_encode(&decoded) != input {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Resolves the transport-token cookie to a live SessionId. Returns None on any
@@ -2466,5 +2625,549 @@ mod tests {
                     .unwrap_or(false)
             });
         assert!(cleared, "expired grant cookie must be cleared");
+    }
+
+    async fn establish_authenticated_session(
+        state: &PrivateApiState,
+        client: &TestRegistrationClient,
+    ) -> String {
+        let (challenge_cookie, options) = begin(router(state.clone())).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(SESSION_COOKIE_NAME)
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_enrollment_succeeds_for_authenticated_session_and_is_queryable() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+
+        let kid = [0x11u8; auth::WORKSPACE_KID_BYTES];
+        let pk = [0x22u8; auth::WORKSPACE_PUBLIC_KEY_BYTES];
+        let kid_b64 = base64_encode(&kid);
+        let pk_b64 = base64_encode(&pk);
+
+        let enroll_body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": kid_b64,
+            "public_key": pk_b64,
+        });
+
+        // Enroll on /internal/auth/enroll
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-store"
+        );
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let enroll_resp: WorkspaceEnrollmentResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(enroll_resp.enrolled);
+        assert_eq!(enroll_resp.version, auth::ARTIFACT_VERSION);
+        assert_eq!(enroll_resp.kid, kid_b64);
+        assert_eq!(enroll_resp.public_key, pk_b64);
+
+        // Query via GET /internal/auth/enroll
+        let get_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/auth/enroll")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        assert_eq!(
+            get_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-store"
+        );
+        let get_bytes = get_resp.into_body().collect().await.unwrap().to_bytes();
+        let details: WorkspaceEnrollmentDetailsResponse =
+            serde_json::from_slice(&get_bytes).unwrap();
+        assert_eq!(details.version, auth::ARTIFACT_VERSION);
+        assert_eq!(details.kid, kid_b64);
+        assert_eq!(details.public_key, pk_b64);
+        assert_eq!(details.enrolled_at_ms, 1_000);
+
+        // Also query via GET /internal/workspace/enroll
+        let get_ws_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/enroll")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_ws_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn workspace_enrollment_rejects_unauthenticated_and_expired_session() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock.clone());
+
+        let kid_b64 = base64_encode(&[1u8; auth::WORKSPACE_KID_BYTES]);
+        let pk_b64 = base64_encode(&[2u8; auth::WORKSPACE_PUBLIC_KEY_BYTES]);
+        let enroll_body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": kid_b64,
+            "public_key": pk_b64,
+        });
+
+        // 1. Unauthenticated (no session cookie)
+        let unauth_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. Expired session
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+        // Advance clock past session TTL (120_000 ms)
+        clock.0.store(1_000 + 120_001, Ordering::SeqCst);
+
+        let expired_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_resp.status(), StatusCode::UNAUTHORIZED);
+        let cleared = expired_resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|v| {
+                v.to_str()
+                    .map(|s| s.starts_with(SESSION_COOKIE_NAME) && s.contains("Max-Age=0"))
+                    .unwrap_or(false)
+            });
+        assert!(cleared, "expired session cookie must be cleared");
+
+        // 3. GET on unenrolled session returns 404
+        clock.0.store(200_000, Ordering::SeqCst);
+        let fresh_cookie = establish_authenticated_session(&state, &client).await;
+        let not_found_resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/auth/enroll")
+                    .header(header::COOKIE, fresh_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_found_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn workspace_enrollment_rejects_duplicate_and_conflict() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+
+        let kid = [0x33u8; auth::WORKSPACE_KID_BYTES];
+        let pk = [0x44u8; auth::WORKSPACE_PUBLIC_KEY_BYTES];
+        let enroll_body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": base64_encode(&kid),
+            "public_key": base64_encode(&pk),
+        });
+
+        // First enrollment succeeds
+        let resp1 = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Duplicate enrollment on same session rejected with 409 Conflict
+        let resp2 = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::CONFLICT);
+
+        // Conflicting enrollment (different public key) on same session also rejected with 409 Conflict
+        let conflict_body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": base64_encode(&kid),
+            "public_key": base64_encode(&[0x99u8; auth::WORKSPACE_PUBLIC_KEY_BYTES]),
+        });
+        let resp3 = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workspace/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::from(serde_json::to_vec(&conflict_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp3.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn workspace_enrollment_rejects_malformed_inputs() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+
+        let valid_kid = base64_encode(&[1u8; auth::WORKSPACE_KID_BYTES]);
+        let valid_pk = base64_encode(&[2u8; auth::WORKSPACE_PUBLIC_KEY_BYTES]);
+
+        let test_cases = vec![
+            // Unsupported version
+            serde_json::json!({ "version": 2, "kid": valid_kid, "public_key": valid_pk }),
+            // All-zero kid
+            serde_json::json!({ "version": 1, "kid": base64_encode(&[0u8; 16]), "public_key": valid_pk }),
+            // All-zero pk
+            serde_json::json!({ "version": 1, "kid": valid_kid, "public_key": base64_encode(&[0u8; 32]) }),
+            // Truncated kid (15 bytes)
+            serde_json::json!({ "version": 1, "kid": base64_encode(&[1u8; 15]), "public_key": valid_pk }),
+            // Truncated pk (31 bytes)
+            serde_json::json!({ "version": 1, "kid": valid_kid, "public_key": base64_encode(&[2u8; 31]) }),
+            // Non-canonical base64 kid
+            serde_json::json!({ "version": 1, "kid": "not-valid-base64!", "public_key": valid_pk }),
+            // Non-canonical base64 pk
+            serde_json::json!({ "version": 1, "kid": valid_kid, "public_key": "not-valid-base64!" }),
+        ];
+
+        for body in test_cases {
+            let resp = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/auth/enroll")
+                        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                        .header(header::COOKIE, session_cookie.clone())
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {body:?}"
+            );
+        }
+
+        // Wrong Content-Type returns 415
+        let wrong_ct = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Malformed JSON returns 400
+        let bad_json = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::from("{malformed}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_json.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn workspace_enrollment_retains_only_public_metadata_proof() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+
+        let kid = [0x77u8; auth::WORKSPACE_KID_BYTES];
+        let pk = [0x88u8; auth::WORKSPACE_PUBLIC_KEY_BYTES];
+
+        let body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": base64_encode(&kid),
+            "public_key": base64_encode(&pk),
+        });
+
+        let resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Inspect internal state: AuthState holds only public metadata
+        let auth = state.auth.lock().unwrap();
+        let (session_id, _) = state
+            .transport
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let meta = auth.get_workspace_enrollment(&session_id, 1_000).unwrap();
+        assert_eq!(meta.version(), auth::ARTIFACT_VERSION);
+        assert_eq!(meta.kid(), &kid);
+        assert_eq!(meta.public_key(), &pk);
+        // Debug representation proves no private or secret key fields exist
+        let dbg = format!("{meta:?}");
+        assert!(!dbg.contains("secret"));
+        assert!(!dbg.contains("private"));
+        assert!(dbg.contains("WorkspacePublicKeyMetadata"));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_enrollment_and_workspace_artifact_unlock() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+
+        // 1. Ephemeral client unlock secret + kid
+        let unlock_secret = [0x5au8; crypto_envelope::UNLOCK_SECRET_LEN];
+        let kid = [0x6bu8; auth::WORKSPACE_KID_BYTES];
+
+        // 2. Client derives keypair in memory and computes public key
+        let keypair =
+            crypto_envelope::derive_workspace_keypair(&unlock_secret, auth::ARTIFACT_VERSION, &kid)
+                .unwrap();
+        let ws_pk = keypair.public_key();
+
+        // 3. Build pipeline seals payload to this public key
+        let original_payload = b"<!doctype html><html><body>Private Workspace Active</body></html>";
+        let sealed_artifact =
+            crypto_envelope::seal_artifact(&ws_pk, auth::ARTIFACT_VERSION, &kid, original_payload)
+                .unwrap();
+
+        let state = state.with_artifact_loader(Arc::new({
+            let artifact = sealed_artifact.clone();
+            move || Ok(artifact.clone())
+        }));
+
+        // 4. Authenticate WebAuthn session
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+
+        // 5. Authenticated enrollment of workspace public key
+        let enroll_body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": base64_encode(&kid),
+            "public_key": base64_encode(&ws_pk.0),
+        });
+        let enroll_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(serde_json::to_vec(&enroll_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enroll_resp.status(), StatusCode::OK);
+
+        // 6. Request artifact grant (HPKE offer)
+        let grant_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact/grant")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant_resp.status(), StatusCode::OK);
+
+        let grant_cookie = grant_resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with(ARTIFACT_GRANT_COOKIE_NAME)
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .unwrap();
+        let grant_bytes = grant_resp.into_body().collect().await.unwrap().to_bytes();
+        let grant_data: serde_json::Value = serde_json::from_slice(&grant_bytes).unwrap();
+        let grant_id = grant_data["grant_id"].as_str().unwrap().to_string();
+        let server_kid = grant_data["kid"].as_str().unwrap();
+        let server_pk = grant_data["recipient_public_key"].as_str().unwrap();
+
+        // 7. Client HPKE handshake
+        let (encapsulated, mut initiator) = establish_initiator(server_kid, server_pk);
+
+        // 8. Deliver artifact over HPKE session
+        let deliver_body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let deliver_resp = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&deliver_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliver_resp.status(), StatusCode::OK);
+
+        let deliver_bytes = deliver_resp.into_body().collect().await.unwrap().to_bytes();
+
+        // 9. Client decrypts session envelope in memory
+        let envelope = crypto_envelope::Envelope {
+            kid: deliver_bytes[..16].try_into().unwrap(),
+            nonce: deliver_bytes[16..28].try_into().unwrap(),
+            sequence: u64::from_be_bytes(deliver_bytes[28..36].try_into().unwrap()),
+            ciphertext: deliver_bytes[36..].to_vec(),
+        };
+        let delivered_artifact = initiator.receive(&envelope).unwrap();
+        assert_eq!(delivered_artifact, sealed_artifact);
+
+        // 10. Client decrypts inner workspace artifact in memory
+        let decrypted_payload =
+            crypto_envelope::decrypt_artifact(&keypair, &delivered_artifact).unwrap();
+        assert_eq!(decrypted_payload, original_payload);
+
+        // 11. Wrong secret fails closed
+        let mut wrong_secret = unlock_secret;
+        wrong_secret[31] ^= 0x01;
+        let wrong_keypair =
+            crypto_envelope::derive_workspace_keypair(&wrong_secret, auth::ARTIFACT_VERSION, &kid)
+                .unwrap();
+        assert!(crypto_envelope::decrypt_artifact(&wrong_keypair, &delivered_artifact).is_err());
+
+        // 12. Wrong kid fails closed
+        let mut wrong_kid = kid;
+        wrong_kid[0] ^= 0x01;
+        let wrong_kid_keypair = crypto_envelope::derive_workspace_keypair(
+            &unlock_secret,
+            auth::ARTIFACT_VERSION,
+            &wrong_kid,
+        )
+        .unwrap();
+        assert!(
+            crypto_envelope::decrypt_artifact(&wrong_kid_keypair, &delivered_artifact).is_err()
+        );
+
+        // 13. Tampered ciphertext fails closed
+        let mut tampered_artifact = delivered_artifact.clone();
+        let last_byte = tampered_artifact.len() - 1;
+        tampered_artifact[last_byte] ^= 0x01;
+        assert!(crypto_envelope::decrypt_artifact(&keypair, &tampered_artifact).is_err());
     }
 }

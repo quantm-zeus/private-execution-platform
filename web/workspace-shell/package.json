@@ -1,5 +1,5 @@
 {
-  "name": "@evergreen/workspace",
+  "name": "@evergreen/workspace-shell",
   "private": true,
   "type": "module",
   "scripts": {

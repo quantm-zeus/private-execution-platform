@@ -12,8 +12,17 @@ use getrandom::getrandom;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub mod artifact;
 #[path = "hpke.rs"]
 pub mod hpke;
+
+pub use artifact::{
+    canonical_artifact_info, canonical_unlock_info, decrypt_artifact, decrypt_artifact_with_secret,
+    derive_workspace_keypair, seal_artifact, ArtifactEnvelope, WorkspaceUnlockKeyPair,
+    AEAD_TAG_LEN, ARTIFACT_HEADER_LEN, ARTIFACT_SEAL_DOMAIN, ARTIFACT_VERSION,
+    ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MAX_ARTIFACT_PAYLOAD_LEN, MIN_ARTIFACT_LEN,
+    PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN, WORKSPACE_UNLOCK_DOMAIN,
+};
 
 pub const SESSION_KEY_LEN: usize = 32;
 pub const KID_LEN: usize = 16;
@@ -53,6 +62,14 @@ pub enum CryptoError {
     RngUnavailable,
     #[error("ciphertext is too short to contain an authentication tag")]
     CiphertextTooShort,
+    #[error("invalid input")]
+    InvalidInput,
+    #[error("unsupported version")]
+    UnsupportedVersion,
+    #[error("artifact format error")]
+    FormatError,
+    #[error("key derivation failed")]
+    DerivationFailed,
 }
 
 /// Wire envelope: exactly what crosses the boundary, nothing more.

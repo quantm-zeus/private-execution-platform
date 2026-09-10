@@ -15,10 +15,71 @@ use zeroize::Zeroize;
 use passkey::VerifiedPasskeyAuthentication;
 
 const TOKEN_BYTES: usize = 32;
+pub const WORKSPACE_PUBLIC_KEY_BYTES: usize = 32;
+pub const WORKSPACE_KID_BYTES: usize = 16;
+pub const ARTIFACT_VERSION: u8 = 1;
 /// Bounded live-grant budget (MEDIUM-1 fix). Grants are TTL-pruned on every
 /// mint; beyond this many simultaneously live grants, issue_artifact_grant
 /// fails with VerifierUnavailable (HTTP 503) instead of growing memory.
 const MAX_LIVE_ARTIFACT_GRANTS: usize = 1024;
+const MAX_LIVE_WORKSPACE_ENROLLMENTS: usize = 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct WorkspacePublicKeyMetadata {
+    version: u8,
+    kid: [u8; WORKSPACE_KID_BYTES],
+    public_key: [u8; WORKSPACE_PUBLIC_KEY_BYTES],
+    enrolled_at_ms: i64,
+}
+
+impl WorkspacePublicKeyMetadata {
+    pub fn new(
+        version: u8,
+        kid: [u8; WORKSPACE_KID_BYTES],
+        public_key: [u8; WORKSPACE_PUBLIC_KEY_BYTES],
+        enrolled_at_ms: i64,
+    ) -> Result<Self, AuthError> {
+        if version != ARTIFACT_VERSION {
+            return Err(AuthError::UnsupportedVersion);
+        }
+        if kid.iter().all(|&b| b == 0) || public_key.iter().all(|&b| b == 0) {
+            return Err(AuthError::InvalidInput);
+        }
+        Ok(Self {
+            version,
+            kid,
+            public_key,
+            enrolled_at_ms,
+        })
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub fn kid(&self) -> &[u8; WORKSPACE_KID_BYTES] {
+        &self.kid
+    }
+
+    pub fn public_key(&self) -> &[u8; WORKSPACE_PUBLIC_KEY_BYTES] {
+        &self.public_key
+    }
+
+    pub fn enrolled_at_ms(&self) -> i64 {
+        self.enrolled_at_ms
+    }
+}
+
+impl fmt::Debug for WorkspacePublicKeyMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkspacePublicKeyMetadata")
+            .field("version", &self.version)
+            .field("kid", &self.kid)
+            .field("public_key", &self.public_key)
+            .field("enrolled_at_ms", &self.enrolled_at_ms)
+            .finish()
+    }
+}
 
 macro_rules! opaque_id {
     ($name:ident) => {
@@ -110,9 +171,11 @@ pub struct AuthState {
     grant_ttl_ms: i64,
     sessions: HashMap<SessionId, AuthenticatedSession>,
     grants: HashMap<ArtifactGrantId, ArtifactGrant>,
+    enrollments: HashMap<SessionId, WorkspacePublicKeyMetadata>,
     /// Upper bound on live grants so a minting loop cannot grow this ledger
     /// without bound (MEDIUM-1 fix: bounded per-process grant budget).
     max_live_grants: usize,
+    max_live_enrollments: usize,
 }
 
 impl AuthState {
@@ -131,7 +194,9 @@ impl AuthState {
             grant_ttl_ms,
             sessions: HashMap::new(),
             grants: HashMap::new(),
+            enrollments: HashMap::new(),
             max_live_grants: MAX_LIVE_ARTIFACT_GRANTS,
+            max_live_enrollments: MAX_LIVE_WORKSPACE_ENROLLMENTS,
         })
     }
 
@@ -239,6 +304,54 @@ impl AuthState {
         }
         Ok(grant)
     }
+
+    pub fn enroll_workspace_public_key(
+        &mut self,
+        session_id: &SessionId,
+        version: u8,
+        kid: [u8; WORKSPACE_KID_BYTES],
+        public_key: [u8; WORKSPACE_PUBLIC_KEY_BYTES],
+        now_ms: i64,
+    ) -> Result<WorkspacePublicKeyMetadata, AuthError> {
+        self.validate_session(session_id, now_ms)?;
+        if version != ARTIFACT_VERSION {
+            return Err(AuthError::UnsupportedVersion);
+        }
+        if kid.iter().all(|&b| b == 0) || public_key.iter().all(|&b| b == 0) {
+            return Err(AuthError::InvalidInput);
+        }
+        if self.enrollments.contains_key(session_id) {
+            return Err(AuthError::EnrollmentConflict);
+        }
+        self.enrollments.retain(|sid, _| {
+            self.sessions
+                .get(sid)
+                .is_some_and(|s| s.expires_at_ms() > now_ms)
+        });
+        if self.enrollments.len() >= self.max_live_enrollments {
+            return Err(AuthError::VerifierUnavailable);
+        }
+        let metadata = WorkspacePublicKeyMetadata {
+            version,
+            kid,
+            public_key,
+            enrolled_at_ms: now_ms,
+        };
+        self.enrollments
+            .insert(session_id.clone(), metadata.clone());
+        Ok(metadata)
+    }
+
+    pub fn get_workspace_enrollment(
+        &self,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<&WorkspacePublicKeyMetadata, AuthError> {
+        self.validate_session(session_id, now_ms)?;
+        self.enrollments
+            .get(session_id)
+            .ok_or(AuthError::EnrollmentNotFound)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -265,6 +378,14 @@ pub enum AuthError {
     GrantExpired,
     #[error("artifact grant session mismatch")]
     GrantSessionMismatch,
+    #[error("unsupported protocol version")]
+    UnsupportedVersion,
+    #[error("invalid input")]
+    InvalidInput,
+    #[error("workspace enrollment conflict")]
+    EnrollmentConflict,
+    #[error("workspace enrollment not found")]
+    EnrollmentNotFound,
 }
 
 #[cfg(test)]
@@ -351,6 +472,119 @@ mod tests {
         // Time passes the 50 ms grant TTL: all grants prune, budget recovers.
         s.issue_artifact_grant(session.id(), 53).unwrap();
     }
+
+    #[test]
+    fn workspace_public_key_enrollment_succeeds_and_rejects_duplicate_or_conflict() {
+        let mut s = state();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
+        let kid = [1u8; WORKSPACE_KID_BYTES];
+        let public_key = [2u8; WORKSPACE_PUBLIC_KEY_BYTES];
+
+        // Valid enrollment succeeds
+        let meta = s
+            .enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, public_key, 10)
+            .unwrap();
+        assert_eq!(meta.version(), ARTIFACT_VERSION);
+        assert_eq!(meta.kid(), &kid);
+        assert_eq!(meta.public_key(), &public_key);
+        assert_eq!(meta.enrolled_at_ms(), 10);
+
+        // Fetching enrollment returns same metadata
+        let fetched = s.get_workspace_enrollment(session.id(), 15).unwrap();
+        assert_eq!(fetched, &meta);
+
+        // Duplicate enrollment with identical key fails closed with Conflict
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, public_key, 20),
+            Err(AuthError::EnrollmentConflict)
+        );
+
+        // Conflicting enrollment with different key fails closed with Conflict
+        let other_pk = [3u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, other_pk, 20),
+            Err(AuthError::EnrollmentConflict)
+        );
+    }
+
+    #[test]
+    fn workspace_public_key_enrollment_rejects_invalid_inputs() {
+        let mut s = state();
+        let verified = genuine_verified().unwrap();
+        let session = s.create_session_from_verified(verified, 1).unwrap();
+        let valid_kid = [1u8; WORKSPACE_KID_BYTES];
+        let valid_pk = [2u8; WORKSPACE_PUBLIC_KEY_BYTES];
+
+        // Unsupported version
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), 2, valid_kid, valid_pk, 5),
+            Err(AuthError::UnsupportedVersion)
+        );
+
+        // All-zero kid
+        let zero_kid = [0u8; WORKSPACE_KID_BYTES];
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, zero_kid, valid_pk, 5),
+            Err(AuthError::InvalidInput)
+        );
+
+        // All-zero public key
+        let zero_pk = [0u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, valid_kid, zero_pk, 5),
+            Err(AuthError::InvalidInput)
+        );
+
+        // Expired session rejected
+        assert_eq!(
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, valid_kid, valid_pk, 201),
+            Err(AuthError::SessionExpired)
+        );
+
+        // Unknown session rejected
+        let unknown_session = SessionId::random().unwrap();
+        assert_eq!(
+            s.enroll_workspace_public_key(
+                &unknown_session,
+                ARTIFACT_VERSION,
+                valid_kid,
+                valid_pk,
+                5
+            ),
+            Err(AuthError::SessionNotFound)
+        );
+    }
+
+    #[test]
+    fn workspace_enrollment_ledger_is_bounded_and_pruned() {
+        let mut s = state();
+        let kid = [1u8; WORKSPACE_KID_BYTES];
+        let pk = [2u8; WORKSPACE_PUBLIC_KEY_BYTES];
+
+        // Create MAX_LIVE_WORKSPACE_ENROLLMENTS sessions and enroll each
+        let mut sessions = Vec::new();
+        for _ in 0..MAX_LIVE_WORKSPACE_ENROLLMENTS {
+            let session = s.mint_session(1).unwrap();
+            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, pk, 2)
+                .unwrap();
+            sessions.push(session);
+        }
+
+        // Additional enrollment on another session exceeds budget
+        let extra_session = s.mint_session(1).unwrap();
+        assert_eq!(
+            s.enroll_workspace_public_key(extra_session.id(), ARTIFACT_VERSION, kid, pk, 2),
+            Err(AuthError::VerifierUnavailable)
+        );
+
+        // Advance clock past session TTL (200 ms) so old sessions expire
+        // Mint new session and enroll: expired enrollments are pruned and budget recovers
+        let recovered_session = s.mint_session(205).unwrap();
+        assert!(s
+            .enroll_workspace_public_key(recovered_session.id(), ARTIFACT_VERSION, kid, pk, 205)
+            .is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -382,5 +616,17 @@ mod security_tests {
         let grant = s.issue_artifact_grant(session.id(), 2).unwrap();
         let dbg = format!("{session:?}{grant:?}");
         assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn workspace_public_key_metadata_holds_only_public_data() {
+        let kid = [0x42u8; WORKSPACE_KID_BYTES];
+        let pk = [0x55u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        let meta = WorkspacePublicKeyMetadata::new(ARTIFACT_VERSION, kid, pk, 100).unwrap();
+        let dbg = format!("{meta:?}");
+        assert!(dbg.contains("WorkspacePublicKeyMetadata"));
+        assert!(dbg.contains("version: 1"));
+        assert!(!dbg.contains("secret"));
+        assert!(!dbg.contains("private"));
     }
 }
