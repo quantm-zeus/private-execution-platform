@@ -1,0 +1,58 @@
+{
+  "context": {
+    "source_family": "evm",
+    "source_label": "evm-conformance-feed",
+    "finality": "finalized",
+    "slot_or_block": 19500100,
+    "observed_at_ms": 1700000000000
+  },
+  "target": {
+    "target_type": "instrument",
+    "target_id": {
+      "base": {
+        "chain": {
+          "kind": "ethereum"
+        },
+        "address": "0x1111111111111111111111111111111111111111"
+      },
+      "quote": {
+        "chain": {
+          "kind": "ethereum"
+        },
+        "address": "0x2222222222222222222222222222222222222222"
+      }
+    }
+  },
+  "payload": {
+    "payload_type": "order_book_snapshot",
+    "sequence": 100,
+    "bids": [
+      {
+        "price": 100.0,
+        "quantity": 10.0
+      },
+      {
+        "price": 99.0,
+        "quantity": 20.0
+      },
+      {
+        "price": 98.0,
+        "quantity": 30.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 101.0,
+        "quantity": 15.0
+      },
+      {
+        "price": 102.0,
+        "quantity": 25.0
+      },
+      {
+        "price": 103.0,
+        "quantity": 35.0
+      }
+    ]
+  }
+}

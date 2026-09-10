@@ -1,0 +1,43 @@
+{
+  "context": {
+    "source_family": "evm",
+    "source_label": "evm-conformance-feed",
+    "finality": "finalized",
+    "slot_or_block": 19500102,
+    "observed_at_ms": 1700000000200
+  },
+  "target": {
+    "target_type": "instrument",
+    "target_id": {
+      "base": {
+        "chain": {
+          "kind": "ethereum"
+        },
+        "address": "0x1111111111111111111111111111111111111111"
+      },
+      "quote": {
+        "chain": {
+          "kind": "ethereum"
+        },
+        "address": "0x2222222222222222222222222222222222222222"
+      }
+    }
+  },
+  "payload": {
+    "payload_type": "order_book_delta",
+    "start_sequence": 102,
+    "end_sequence": 102,
+    "bids": [
+      {
+        "price": 99.0,
+        "quantity": 0.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 101.5,
+        "quantity": 12.0
+      }
+    ]
+  }
+}

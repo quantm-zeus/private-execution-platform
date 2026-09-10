@@ -1,0 +1,50 @@
+{
+  "context": {
+    "source_family": "solana",
+    "source_label": "solana-conformance-feed",
+    "finality": "confirmed",
+    "slot_or_block": 250000200,
+    "observed_at_ms": 1700000001000
+  },
+  "target": {
+    "target_type": "instrument",
+    "target_id": {
+      "base": {
+        "chain": {
+          "kind": "solana"
+        },
+        "address": "So11111111111111111111111111111111111111112"
+      },
+      "quote": {
+        "chain": {
+          "kind": "solana"
+        },
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      }
+    }
+  },
+  "payload": {
+    "payload_type": "order_book_snapshot",
+    "sequence": 200,
+    "bids": [
+      {
+        "price": 105.0,
+        "quantity": 10.0
+      },
+      {
+        "price": 104.0,
+        "quantity": 20.0
+      }
+    ],
+    "asks": [
+      {
+        "price": 106.0,
+        "quantity": 15.0
+      },
+      {
+        "price": 107.0,
+        "quantity": 25.0
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "context": {
+    "source_family": "solana"
+  },
+  "target": "not_a_valid_target_object",
+  "payload": {
+    "payload_type": "unknown_type"
+  }
+}
