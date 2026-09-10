@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::allowlist::{
-    FOMO_TOOL_CAPABILITIES, FOMO_TOOL_GET_RECENT_EVENTS, FOMO_TOOL_GET_TOKEN,
-    FOMO_TOOL_GET_TRENDING_TOKENS, FOMO_TOOL_SEARCH_TOKENS,
-};
+use crate::allowlist::{AllowedTool, FomoTool};
 use crate::error::McpAdapterError;
 use crate::transport::{
     unpack_mcp_response, McpServiceId, McpToolCall, McpTransport, DEFAULT_MAX_RESPONSE_BYTES,
@@ -79,44 +76,27 @@ impl FomoGetTokenRequest {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Documented FOMO trending lists: trendingTokens, mostHeld, graduatedTokens, cryptoTokens, verifiedTokens.
+pub const FOMO_TRENDING_LISTS: &[&str] = &[
+    "trendingTokens",
+    "mostHeld",
+    "graduatedTokens",
+    "cryptoTokens",
+    "verifiedTokens",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FomoTrendingTokensRequest {
-    pub category: Option<String>,
-    pub limit: Option<i64>,
+    pub list: String,
 }
 
 impl FomoTrendingTokensRequest {
-    pub const ALLOWED_CATEGORIES: &'static [&'static str] = &[
-        "trending",
-        "most-held",
-        "graduated",
-        "crypto-tokens",
-        "verified",
-    ];
-
-    pub fn validate(&self) -> Result<(Option<String>, Option<i64>), McpAdapterError> {
-        let category = match &self.category {
-            Some(cat) => {
-                let trimmed = cat.trim();
-                if !Self::ALLOWED_CATEGORIES.contains(&trimmed) {
-                    return Err(McpAdapterError::InvalidArgument { field: "category" });
-                }
-                Some(trimmed.to_owned())
-            }
-            None => None,
-        };
-
-        let limit = match self.limit {
-            Some(lim) => {
-                if !(1..=100).contains(&lim) {
-                    return Err(McpAdapterError::InvalidArgument { field: "limit" });
-                }
-                Some(lim)
-            }
-            None => None,
-        };
-
-        Ok((category, limit))
+    pub fn validate(&self) -> Result<String, McpAdapterError> {
+        let trimmed = self.list.trim();
+        if !FOMO_TRENDING_LISTS.contains(&trimmed) {
+            return Err(McpAdapterError::InvalidArgument { field: "list" });
+        }
+        Ok(trimmed.to_owned())
     }
 }
 
@@ -283,11 +263,7 @@ impl<T: McpTransport> FomoAdapter<T> {
 
     /// Calls `fomo_capabilities`. Exactly one transport call, zero retries.
     pub async fn capabilities(&self) -> Result<FomoCapabilitiesResponse, McpAdapterError> {
-        let call = McpToolCall {
-            service: McpServiceId::Fomo,
-            tool_name: FOMO_TOOL_CAPABILITIES.into(),
-            arguments: json!({}),
-        };
+        let call = McpToolCall::new(AllowedTool::Fomo(FomoTool::Capabilities), json!({}));
 
         let response = self
             .transport
@@ -309,11 +285,10 @@ impl<T: McpTransport> FomoAdapter<T> {
         req: FomoSearchTokensRequest,
     ) -> Result<FomoEnvelope, McpAdapterError> {
         let query = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Fomo,
-            tool_name: FOMO_TOOL_SEARCH_TOKENS.into(),
-            arguments: json!({ "query": query }),
-        };
+        let call = McpToolCall::new(
+            AllowedTool::Fomo(FomoTool::SearchTokens),
+            json!({ "query": query }),
+        );
 
         let response = self
             .transport
@@ -335,14 +310,13 @@ impl<T: McpTransport> FomoAdapter<T> {
         req: FomoGetTokenRequest,
     ) -> Result<FomoEnvelope, McpAdapterError> {
         let (network_id, address) = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Fomo,
-            tool_name: FOMO_TOOL_GET_TOKEN.into(),
-            arguments: json!({
+        let call = McpToolCall::new(
+            AllowedTool::Fomo(FomoTool::GetToken),
+            json!({
                 "networkId": network_id,
                 "tokenAddress": address,
             }),
-        };
+        );
 
         let response = self
             .transport
@@ -363,20 +337,11 @@ impl<T: McpTransport> FomoAdapter<T> {
         &self,
         req: FomoTrendingTokensRequest,
     ) -> Result<FomoEnvelope, McpAdapterError> {
-        let (category, limit) = req.validate()?;
-        let mut map = serde_json::Map::new();
-        if let Some(cat) = category {
-            map.insert("category".into(), json!(cat));
-        }
-        if let Some(lim) = limit {
-            map.insert("limit".into(), json!(lim));
-        }
-
-        let call = McpToolCall {
-            service: McpServiceId::Fomo,
-            tool_name: FOMO_TOOL_GET_TRENDING_TOKENS.into(),
-            arguments: Value::Object(map),
-        };
+        let list = req.validate()?;
+        let call = McpToolCall::new(
+            AllowedTool::Fomo(FomoTool::GetTrendingTokens),
+            json!({ "list": list }),
+        );
 
         let response = self
             .transport
@@ -398,11 +363,7 @@ impl<T: McpTransport> FomoAdapter<T> {
         req: FomoRecentEventsRequest,
     ) -> Result<FomoEnvelope, McpAdapterError> {
         let arguments = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Fomo,
-            tool_name: FOMO_TOOL_GET_RECENT_EVENTS.into(),
-            arguments,
-        };
+        let call = McpToolCall::new(AllowedTool::Fomo(FomoTool::GetRecentEvents), arguments);
 
         let response = self
             .transport

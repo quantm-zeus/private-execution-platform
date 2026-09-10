@@ -72,3 +72,21 @@ fn test_fail_closed_trading_disabled_invariant() {
         "TRADING_ENABLED must be false"
     );
 }
+
+#[test]
+fn test_no_generic_string_tool_call_api() {
+    // Assert that McpToolCall fields are private and no arbitrary string constructor exists
+    let transport_rs = include_str!("../src/transport.rs");
+    assert!(
+        !transport_rs.contains("pub tool_name: String"),
+        "McpToolCall must not expose a public mutable/forged tool_name: String"
+    );
+    assert!(
+        !transport_rs.contains("pub service: McpServiceId"),
+        "McpToolCall must not expose public mutable fields"
+    );
+    assert!(
+        !transport_rs.contains("pub arguments: Value"),
+        "McpToolCall must not expose public mutable fields"
+    );
+}

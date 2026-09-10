@@ -98,38 +98,18 @@ async fn test_fomo_get_token_invalid_address_rejected_before_transport() {
 }
 
 #[tokio::test]
-async fn test_fomo_get_trending_tokens_invalid_category_rejected_before_transport() {
+async fn test_fomo_get_trending_tokens_invalid_list_rejected_before_transport() {
     let transport = Arc::new(FailOnCallTransport::default());
     let adapter = FomoAdapter::new(transport.clone());
 
-    let req = FomoTrendingTokensRequest {
-        category: Some("unknown_category".to_string()),
-        limit: Some(10),
-    };
-    let err = adapter.get_trending_tokens(req).await.unwrap_err();
-    assert_eq!(err, McpAdapterError::InvalidArgument { field: "category" });
-    assert_eq!(*transport.calls.lock().unwrap(), 0);
-}
-
-#[tokio::test]
-async fn test_fomo_get_trending_tokens_invalid_limit_rejected_before_transport() {
-    let transport = Arc::new(FailOnCallTransport::default());
-    let adapter = FomoAdapter::new(transport.clone());
-
-    let req = FomoTrendingTokensRequest {
-        category: Some("trending".to_string()),
-        limit: Some(101),
-    };
-    let err = adapter.get_trending_tokens(req).await.unwrap_err();
-    assert_eq!(err, McpAdapterError::InvalidArgument { field: "limit" });
-    assert_eq!(*transport.calls.lock().unwrap(), 0);
-
-    let req0 = FomoTrendingTokensRequest {
-        category: Some("trending".to_string()),
-        limit: Some(0),
-    };
-    let err0 = adapter.get_trending_tokens(req0).await.unwrap_err();
-    assert_eq!(err0, McpAdapterError::InvalidArgument { field: "limit" });
+    // Only exact documented lists: trendingTokens, mostHeld, graduatedTokens, cryptoTokens, verifiedTokens
+    for bad_list in ["", "   ", "trending", "most_held", "randomList", "category"] {
+        let req = FomoTrendingTokensRequest {
+            list: bad_list.to_string(),
+        };
+        let err = adapter.get_trending_tokens(req).await.unwrap_err();
+        assert_eq!(err, McpAdapterError::InvalidArgument { field: "list" });
+    }
     assert_eq!(*transport.calls.lock().unwrap(), 0);
 }
 
@@ -351,6 +331,48 @@ fn test_allowlist_blocks_unsupported_documented_tools_in_first_slice() {
             Err(McpAdapterError::UnsupportedTool {
                 tool: "unsupported gmgn tool"
             })
+        );
+    }
+}
+
+#[test]
+fn test_unsupported_names_cannot_enter_call_construction_path() {
+    use serde_json::json;
+
+    // Direct construction of McpToolCall from an untrusted name must fail closed
+    let disallowed_attempts = [
+        (McpServiceId::Gmgn, "gmgn_diagnostics"),
+        (McpServiceId::Gmgn, "gmgn_trade"),
+        (McpServiceId::Gmgn, "gmgn_buy_token"),
+        (McpServiceId::Fomo, "fomo_resolve_wallet"),
+        (McpServiceId::Fomo, "fomo_sign_tx"),
+        (McpServiceId::Fomo, "fomo_auth_status"),
+    ];
+
+    for (service, tool) in disallowed_attempts {
+        let res = McpToolCall::try_from_untrusted(service, tool, json!({}));
+        assert_eq!(
+            res,
+            Err(McpAdapterError::DisallowedOperation),
+            "disallowed tool '{tool}' must fail closed before call construction"
+        );
+    }
+
+    let unsupported_attempts = [
+        (McpServiceId::Fomo, "fomo_search_users"),
+        (McpServiceId::Fomo, "fomo_get_profile"),
+        (McpServiceId::Gmgn, "gmgn_smart_money"),
+        (McpServiceId::Gmgn, "gmgn_kol"),
+        (McpServiceId::Gmgn, "arbitrary_custom_tool"),
+        (McpServiceId::Fomo, "gmgn_trending"),
+        (McpServiceId::Gmgn, "fomo_search_tokens"),
+    ];
+
+    for (service, tool) in unsupported_attempts {
+        let res = McpToolCall::try_from_untrusted(service, tool, json!({}));
+        assert!(
+            matches!(res, Err(McpAdapterError::UnsupportedTool { .. })),
+            "unsupported tool '{tool}' must fail closed before call construction"
         );
     }
 }

@@ -29,6 +29,7 @@ pub use error::McpAdapterError;
 pub use fomo::{
     FomoAdapter, FomoCapabilitiesResponse, FomoEnvelope, FomoGetTokenRequest,
     FomoRecentEventsRequest, FomoSearchTokensRequest, FomoTrendingTokensRequest,
+    FOMO_TRENDING_LISTS,
 };
 pub use gmgn::{
     GmgnAdapter, GmgnKlineRequest, GmgnMeta, GmgnResponse, GmgnSearchRequest, GmgnTokenRequest,

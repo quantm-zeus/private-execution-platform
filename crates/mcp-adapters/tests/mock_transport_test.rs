@@ -16,10 +16,12 @@ struct MockTransport {
 #[async_trait::async_trait]
 impl McpTransport for MockTransport {
     async fn call_tool(&self, call: McpToolCall) -> Result<McpToolResponse, McpTransportError> {
-        self.recorded_calls.lock().unwrap().push(call.clone());
+        let tool_name = call.tool_name().to_string();
+        let service = call.service();
+        self.recorded_calls.lock().unwrap().push(call);
 
         // Return a valid mock payload matching the requested tool
-        let payload = match (call.service, call.tool_name.as_str()) {
+        let payload = match (service, tool_name.as_str()) {
             (McpServiceId::Fomo, "fomo_capabilities") => {
                 json!({
                     "tools": [
@@ -70,9 +72,9 @@ async fn test_fomo_capabilities_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Fomo);
-    assert_eq!(calls[0].tool_name, "fomo_capabilities");
-    assert_eq!(calls[0].arguments, json!({}));
+    assert_eq!(calls[0].service(), McpServiceId::Fomo);
+    assert_eq!(calls[0].tool_name(), "fomo_capabilities");
+    assert_eq!(calls[0].arguments(), &json!({}));
 }
 
 #[tokio::test]
@@ -91,9 +93,9 @@ async fn test_fomo_search_tokens_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Fomo);
-    assert_eq!(calls[0].tool_name, "fomo_search_tokens");
-    assert_eq!(calls[0].arguments, json!({"query": "PEPE"}));
+    assert_eq!(calls[0].service(), McpServiceId::Fomo);
+    assert_eq!(calls[0].tool_name(), "fomo_search_tokens");
+    assert_eq!(calls[0].arguments(), &json!({"query": "PEPE"}));
 }
 
 #[tokio::test]
@@ -110,11 +112,11 @@ async fn test_fomo_get_token_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Fomo);
-    assert_eq!(calls[0].tool_name, "fomo_get_token");
+    assert_eq!(calls[0].service(), McpServiceId::Fomo);
+    assert_eq!(calls[0].tool_name(), "fomo_get_token");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "networkId": 8453,
             "tokenAddress": "0x020bfc650a365f8bb26819deaabf3e21291018b4"
         })
@@ -127,8 +129,7 @@ async fn test_fomo_get_trending_tokens_transport_call() {
     let adapter = FomoAdapter::new(transport.clone());
 
     let req = FomoTrendingTokensRequest {
-        category: Some("trending".to_string()),
-        limit: Some(25),
+        list: "trendingTokens".to_string(),
     };
     let res = adapter
         .get_trending_tokens(req)
@@ -138,15 +139,9 @@ async fn test_fomo_get_trending_tokens_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Fomo);
-    assert_eq!(calls[0].tool_name, "fomo_get_trending_tokens");
-    assert_eq!(
-        calls[0].arguments,
-        json!({
-            "category": "trending",
-            "limit": 25
-        })
-    );
+    assert_eq!(calls[0].service(), McpServiceId::Fomo);
+    assert_eq!(calls[0].tool_name(), "fomo_get_trending_tokens");
+    assert_eq!(calls[0].arguments(), &json!({"list": "trendingTokens"}));
 }
 
 #[tokio::test]
@@ -169,11 +164,11 @@ async fn test_fomo_get_recent_events_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Fomo);
-    assert_eq!(calls[0].tool_name, "fomo_get_recent_events");
+    assert_eq!(calls[0].service(), McpServiceId::Fomo);
+    assert_eq!(calls[0].tool_name(), "fomo_get_recent_events");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "sinceMinutes": 60,
             "limit": 15,
             "networkId": 1399811149,
@@ -199,11 +194,11 @@ async fn test_gmgn_trending_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_trending");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_trending");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "chain": "sol",
             "interval": "1h",
             "limit": 10
@@ -225,11 +220,11 @@ async fn test_gmgn_search_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_search");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_search");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "query": "bonk",
             "chain": "sol"
         })
@@ -253,11 +248,11 @@ async fn test_gmgn_token_info_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_token_info");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_token_info");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "chain": "sol",
             "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
         })
@@ -281,11 +276,11 @@ async fn test_gmgn_token_security_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_token_security");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_token_security");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "chain": "sol",
             "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
         })
@@ -311,11 +306,11 @@ async fn test_gmgn_top_holders_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_top_holders");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_top_holders");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "chain": "sol",
             "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
             "limit": 20,
@@ -341,11 +336,11 @@ async fn test_gmgn_kline_transport_call() {
 
     let calls = transport.recorded_calls.lock().unwrap();
     assert_eq!(calls.len(), 1, "must execute exactly one transport call");
-    assert_eq!(calls[0].service, McpServiceId::Gmgn);
-    assert_eq!(calls[0].tool_name, "gmgn_kline");
+    assert_eq!(calls[0].service(), McpServiceId::Gmgn);
+    assert_eq!(calls[0].tool_name(), "gmgn_kline");
     assert_eq!(
-        calls[0].arguments,
-        json!({
+        calls[0].arguments(),
+        &json!({
             "chain": "sol",
             "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
             "resolution": "1h",

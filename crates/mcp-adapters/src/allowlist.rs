@@ -95,6 +95,11 @@ impl AllowedTool {
             Self::Gmgn(_) => McpServiceId::Gmgn,
         }
     }
+
+    /// Validates an untrusted tool name against the declared allowlist for the service.
+    pub fn try_from_name(service: McpServiceId, tool_name: &str) -> Result<Self, McpAdapterError> {
+        validate_tool_allowlist(service, tool_name)
+    }
 }
 
 /// Checks if an operation string indicates a mutation, trade, probe, or disallowed capability.

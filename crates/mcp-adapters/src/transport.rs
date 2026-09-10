@@ -44,12 +44,62 @@ impl fmt::Debug for McpServiceId {
     }
 }
 
+use crate::allowlist::AllowedTool;
+
 /// A validated logical MCP tool call sent to the transport.
+///
+/// Fields are strictly private so external callers cannot construct or alter
+/// arbitrary tool calls. Construction is restricted to crate-internal, typed
+/// allowlisted operations via [`AllowedTool`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpToolCall {
-    pub service: McpServiceId,
-    pub tool_name: String,
-    pub arguments: Value,
+    service: McpServiceId,
+    tool: AllowedTool,
+    arguments: Value,
+}
+
+impl McpToolCall {
+    /// Internal constructor: only accessible within `mcp-adapters`.
+    /// Guarantees that every tool call originates from a typed [`AllowedTool`].
+    pub(crate) fn new(tool: AllowedTool, arguments: Value) -> Self {
+        Self {
+            service: tool.service(),
+            tool,
+            arguments,
+        }
+    }
+
+    /// Attempts to construct a tool call by validating an untrusted tool name against the allowlist.
+    ///
+    /// Fails closed if the tool name is unsupported, a mutation/probe operation, or unmapped.
+    pub fn try_from_untrusted(
+        service: McpServiceId,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Self, McpAdapterError> {
+        let tool = AllowedTool::try_from_name(service, tool_name)?;
+        Ok(Self::new(tool, arguments))
+    }
+
+    /// Read-only accessor for the service identity.
+    pub fn service(&self) -> McpServiceId {
+        self.service
+    }
+
+    /// Read-only accessor for the typed allowlisted tool.
+    pub fn tool(&self) -> AllowedTool {
+        self.tool
+    }
+
+    /// Read-only accessor for the exact declared service tool wire name.
+    pub fn tool_name(&self) -> &'static str {
+        self.tool.wire_name()
+    }
+
+    /// Read-only accessor for the request arguments.
+    pub fn arguments(&self) -> &Value {
+        &self.arguments
+    }
 }
 
 impl fmt::Debug for McpToolCall {
@@ -57,7 +107,7 @@ impl fmt::Debug for McpToolCall {
         // Redacted debug representation: never leak request payload or arguments.
         f.debug_struct("McpToolCall")
             .field("service", &self.service)
-            .field("tool_name", &self.tool_name)
+            .field("tool_name", &self.tool.wire_name())
             .field("arguments", &"[REDACTED]")
             .finish()
     }

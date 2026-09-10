@@ -229,11 +229,12 @@ fn test_zero_secret_and_payload_leakage_regression() {
     }
 
     // Verify McpToolCall debug representation redacts arguments
-    let call = McpToolCall {
-        service: McpServiceId::Fomo,
-        tool_name: "fomo_search_tokens".into(),
-        arguments: json!({ "secret": secret_token, "data": raw_payload }),
-    };
+    let call = McpToolCall::try_from_untrusted(
+        McpServiceId::Fomo,
+        "fomo_search_tokens",
+        json!({ "secret": secret_token, "data": raw_payload }),
+    )
+    .expect("fomo_search_tokens is allowlisted");
     let call_debug = format!("{call:?}");
     assert!(
         !call_debug.contains(secret_token),

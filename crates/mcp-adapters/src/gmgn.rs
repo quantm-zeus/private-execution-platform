@@ -12,10 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::allowlist::{
-    GMGN_OFFICIAL_CHAINS, GMGN_TOOL_KLINE, GMGN_TOOL_SEARCH, GMGN_TOOL_TOKEN_INFO,
-    GMGN_TOOL_TOKEN_SECURITY, GMGN_TOOL_TOP_HOLDERS, GMGN_TOOL_TRENDING,
-};
+use crate::allowlist::{AllowedTool, GmgnTool, GMGN_OFFICIAL_CHAINS};
 use crate::error::McpAdapterError;
 use crate::transport::{
     unpack_mcp_response, McpServiceId, McpToolCall, McpTransport, DEFAULT_MAX_RESPONSE_BYTES,
@@ -257,15 +254,14 @@ impl<T: McpTransport> GmgnAdapter<T> {
         req: GmgnTrendingRequest,
     ) -> Result<GmgnResponse, McpAdapterError> {
         let (chain, interval, limit) = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_TRENDING.into(),
-            arguments: json!({
+        let call = McpToolCall::new(
+            AllowedTool::Gmgn(GmgnTool::Trending),
+            json!({
                 "chain": chain,
                 "interval": interval,
                 "limit": limit,
             }),
-        };
+        );
 
         let response = self
             .transport
@@ -286,11 +282,7 @@ impl<T: McpTransport> GmgnAdapter<T> {
             map.insert("chain".into(), json!(c));
         }
 
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_SEARCH.into(),
-            arguments: Value::Object(map),
-        };
+        let call = McpToolCall::new(AllowedTool::Gmgn(GmgnTool::Search), Value::Object(map));
 
         let response = self
             .transport
@@ -305,14 +297,13 @@ impl<T: McpTransport> GmgnAdapter<T> {
     /// Calls `gmgn_token_info`. Boundary validated before transport call.
     pub async fn token_info(&self, req: GmgnTokenRequest) -> Result<GmgnResponse, McpAdapterError> {
         let (chain, address) = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_TOKEN_INFO.into(),
-            arguments: json!({
+        let call = McpToolCall::new(
+            AllowedTool::Gmgn(GmgnTool::TokenInfo),
+            json!({
                 "chain": chain,
                 "address": address,
             }),
-        };
+        );
 
         let response = self
             .transport
@@ -330,14 +321,13 @@ impl<T: McpTransport> GmgnAdapter<T> {
         req: GmgnTokenRequest,
     ) -> Result<GmgnResponse, McpAdapterError> {
         let (chain, address) = req.validate()?;
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_TOKEN_SECURITY.into(),
-            arguments: json!({
+        let call = McpToolCall::new(
+            AllowedTool::Gmgn(GmgnTool::TokenSecurity),
+            json!({
                 "chain": chain,
                 "address": address,
             }),
-        };
+        );
 
         let response = self
             .transport
@@ -363,11 +353,7 @@ impl<T: McpTransport> GmgnAdapter<T> {
             map.insert("order_by".into(), json!(ob));
         }
 
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_TOP_HOLDERS.into(),
-            arguments: Value::Object(map),
-        };
+        let call = McpToolCall::new(AllowedTool::Gmgn(GmgnTool::TopHolders), Value::Object(map));
 
         let response = self
             .transport
@@ -393,11 +379,7 @@ impl<T: McpTransport> GmgnAdapter<T> {
             map.insert("to".into(), json!(t));
         }
 
-        let call = McpToolCall {
-            service: McpServiceId::Gmgn,
-            tool_name: GMGN_TOOL_KLINE.into(),
-            arguments: Value::Object(map),
-        };
+        let call = McpToolCall::new(AllowedTool::Gmgn(GmgnTool::Kline), Value::Object(map));
 
         let response = self
             .transport
