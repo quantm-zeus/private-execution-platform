@@ -145,4 +145,19 @@ pub enum MarketTypeError {
     InjectedSourceError(&'static str),
     #[error("feed batch count {count} exceeds maximum {max}")]
     FeedBatchExceeded { count: usize, max: usize },
+
+    // --- Aggregation errors ---
+    #[error("arithmetic overflow during aggregation: {0}")]
+    ArithmeticOverflow(&'static str),
+    #[error("retained windows count {count} exceeds maximum {max}")]
+    RetainedWindowsExceeded { count: usize, max: usize },
+    #[error("window alignment mismatch: timestamp {timestamp_ms} does not align with window duration {duration_ms}ms")]
+    WindowAlignmentMismatch { timestamp_ms: i64, duration_ms: u64 },
+    #[error("candle timestamp {candle_open_ms} is stale or overlaps existing window close {current_close_ms}")]
+    StaleCandleWindow {
+        candle_open_ms: i64,
+        current_close_ms: i64,
+    },
+    #[error("aggregated buckets count {count} exceeds maximum {max}")]
+    AggregatedBucketsExceeded { count: usize, max: usize },
 }

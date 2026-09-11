@@ -1,5 +1,6 @@
 //! Lossless canonical market data contracts and local pool state types.
 
+pub mod aggregation;
 pub mod error;
 pub mod feed;
 pub mod freshness;
@@ -11,6 +12,11 @@ pub mod pool;
 pub mod primitives;
 pub mod sequence;
 
+pub use aggregation::{
+    ActiveCandleWindow, AggregatedDepthBook, AggregatedDepthLevel, AggregatedDepthSnapshot,
+    CumulativeDepthLevel, DepthAggregator, MarketAggregator, OhlcvAggregator,
+    MAX_AGGREGATED_BUCKETS, MAX_RETAINED_WINDOWS,
+};
 pub use error::MarketTypeError;
 pub use feed::{
     CanonicalFeedEnvelope, CanonicalFeedPayload, ChainFamily, FeedFinality, FeedObservationContext,
