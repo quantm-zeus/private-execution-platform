@@ -359,6 +359,14 @@ impl ExecutionPreview {
                 return Err(DomainError::ChainMismatch);
             }
         }
+        if first_leg.amount_in > self.simulated_net_input.amount {
+            return Err(DomainError::RouteUnmodeledFunding);
+        }
+        for window in route.legs.windows(2) {
+            if window[1].amount_in > window[0].expected_amount_out {
+                return Err(DomainError::RouteUnmodeledFunding);
+            }
+        }
 
         // 5. Freshness evaluation: local state must be Fresh
         match self.local_state_freshness {
@@ -674,6 +682,7 @@ mod tests {
         sell_intent.token_in = sell_token_in.clone();
         sell_intent.token_out = sell_token_out.clone();
         let mut sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        sell_route.legs[0].amount_in = AtomicAmount::new(100);
         sell_route.expected_net_output.amount = AtomicAmount::new(390);
 
         // Case 1C: Net input = 100 TOKEN.
@@ -698,6 +707,7 @@ mod tests {
         // Net input = 100 TOKEN. Gross output = 430 USDC. Tax = 10 USDC => Net output = 420 USDC.
         // Simulated Net price = 420/100 = 4.2 >= 4.0.
         let mut valid_sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        valid_sell_route.legs[0].amount_in = AtomicAmount::new(100);
         valid_sell_route.expected_net_output.amount = AtomicAmount::new(420);
         let valid_sell = sample_preview(&sell_intent, 100, 420, 430, FreshnessStatus::Fresh);
         let validated_sell = valid_sell
@@ -1189,11 +1199,15 @@ mod tests {
         assert_eq!(aon_overspend_preview, orig_aon_overspend_preview);
 
         // 3. All-or-nothing input under-fill: allow_partial_fill is false and simulated_net_input is less than intent.amount
+        let mut underfill_route = route.clone();
+        underfill_route.legs[0].amount_in = AtomicAmount::new(999);
+        let orig_underfill_route = underfill_route.clone();
         let aon_underfill_preview =
             sample_preview(&aon_intent, 999, 240, 250, FreshnessStatus::Fresh);
         let orig_aon_underfill_preview = aon_underfill_preview.clone();
 
-        let res_aon_underfill = aon_underfill_preview.validate(&aon_intent, &route, now_ms);
+        let res_aon_underfill =
+            aon_underfill_preview.validate(&aon_intent, &underfill_route, now_ms);
         assert_eq!(
             res_aon_underfill,
             Err(DomainError::InconsistentNetEconomics(
@@ -1201,11 +1215,15 @@ mod tests {
             ))
         );
         assert_eq!(aon_intent, orig_aon_intent);
-        assert_eq!(route, orig_route);
+        assert_eq!(underfill_route, orig_underfill_route);
         assert_eq!(aon_underfill_preview, orig_aon_underfill_preview);
 
-        let res_aon_underfill_fn =
-            validate_execution_preview(&aon_intent, &route, &aon_underfill_preview, now_ms);
+        let res_aon_underfill_fn = validate_execution_preview(
+            &aon_intent,
+            &underfill_route,
+            &aon_underfill_preview,
+            now_ms,
+        );
         assert_eq!(
             res_aon_underfill_fn,
             Err(DomainError::InconsistentNetEconomics(
@@ -1213,7 +1231,7 @@ mod tests {
             ))
         );
         assert_eq!(aon_intent, orig_aon_intent);
-        assert_eq!(route, orig_route);
+        assert_eq!(underfill_route, orig_underfill_route);
         assert_eq!(aon_underfill_preview, orig_aon_underfill_preview);
 
         // 4. All-or-nothing exact equality passes
@@ -1224,10 +1242,12 @@ mod tests {
             .is_ok());
 
         // 5. Partial fill valid under-spend passes
+        let mut partial_route = route.clone();
+        partial_route.legs[0].amount_in = AtomicAmount::new(500);
         let partial_valid_preview =
             sample_preview(&partial_intent, 500, 240, 250, FreshnessStatus::Fresh);
         assert!(partial_valid_preview
-            .validate(&partial_intent, &route, now_ms)
+            .validate(&partial_intent, &partial_route, now_ms)
             .is_ok());
 
         // 6. Partial fill exact equality passes
@@ -1351,6 +1371,7 @@ mod tests {
         sell_intent.token_in = sell_token_in.clone();
         sell_intent.token_out = sell_token_out.clone();
         let mut sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        sell_route.legs[0].amount_in = AtomicAmount::new(100);
         sell_route.expected_net_output.amount = AtomicAmount::new(390);
         let substituted_sell_preview =
             sample_preview(&sell_intent, 100, 420, 430, FreshnessStatus::Fresh);
@@ -1385,5 +1406,228 @@ mod tests {
         assert_eq!(validated.preview(), &exact_match_preview);
         assert_eq!(market_intent, orig_market_intent);
         assert_eq!(route, orig_route);
+    }
+
+    #[test]
+    fn regression_route_funding_bounds_reject_overspend_and_overfunding_and_preserve_inputs() {
+        let now_ms = 1_000;
+        let token_in = sample_asset(ChainId::Base, "0xusdc");
+        let token_mid = sample_asset(ChainId::Base, "0xweth");
+        let token_mid2 = sample_asset(ChainId::Base, "0xdai");
+        let token_out = sample_asset(ChainId::Base, "0xtoken");
+
+        let buy_limit = LimitPrice {
+            numerator_asset: token_in.clone(),
+            denominator_asset: token_out.clone(),
+            ratio: PriceRatio::new(450, 100).unwrap(), // limit price = 4.5
+        };
+        let buy_intent = sample_intent(TradeSide::Buy, OrderType::Limit, Some(buy_limit));
+        let preview = sample_preview(&buy_intent, 1_000, 240, 250, FreshnessStatus::Fresh);
+
+        // 1. First-leg overspend defect:
+        // First leg requests 1_001 USDC input, exceeding preview simulated_net_input (1_000).
+        // The route's output (240) and preview's economics (1000/240 = 4.167 <= 4.5) otherwise
+        // satisfy the user's limit constraint.
+        // Validation MUST reject fail-closed with RouteUnmodeledFunding.
+        let mut overspend_route = sample_route(&token_in, &token_out, now_ms);
+        overspend_route.legs[0].amount_in = AtomicAmount::new(1_001);
+
+        let orig_intent = buy_intent.clone();
+        let orig_overspend_route = overspend_route.clone();
+        let orig_preview = preview.clone();
+
+        let res_overspend = preview.validate(&buy_intent, &overspend_route, now_ms);
+        assert_eq!(res_overspend, Err(DomainError::RouteUnmodeledFunding));
+        // Prove rejection leaves inputs unmodified
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(overspend_route, orig_overspend_route);
+        assert_eq!(preview, orig_preview);
+
+        // Prove free-function entry point behaves identically and purely
+        let res_overspend_fn =
+            validate_execution_preview(&buy_intent, &overspend_route, &preview, now_ms);
+        assert_eq!(res_overspend_fn, Err(DomainError::RouteUnmodeledFunding));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(overspend_route, orig_overspend_route);
+        assert_eq!(preview, orig_preview);
+
+        // 2. First-leg valid under-spend:
+        // Input-side costs are included in net spend (1_000), while leg amount_in is lower (950 <= 1_000).
+        let mut underspend_route = sample_route(&token_in, &token_out, now_ms);
+        underspend_route.legs[0].amount_in = AtomicAmount::new(950);
+        assert!(underspend_route.validate().is_ok());
+        let validated_underspend = preview
+            .validate(&buy_intent, &underspend_route, now_ms)
+            .expect("first leg amount_in <= simulated_net_input must validate cleanly");
+        assert_eq!(validated_underspend.preview(), &preview);
+
+        // 3. Intermediate-leg overfunding defect:
+        // Multi-leg route where Leg 2 requests 550 mid-token input, but Leg 1 only produces 500.
+        // The route's expected_net_output (240) exactly matches preview simulated_net_output (240),
+        // and preview satisfies limit price (1000/240 = 4.167 <= 4.5).
+        // Validation MUST reject fail-closed with RouteUnmodeledFunding.
+        let overfunded_2leg_route = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "uniswap_v3".to_string(),
+                    pool_ref: "0xpool1".to_string(),
+                    token_in: token_in.clone(),
+                    token_out: token_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "sushiswap".to_string(),
+                    pool_ref: "0xpool2".to_string(),
+                    token_in: token_mid.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: AtomicAmount::new(550), // 550 > 500: unmodeled funding!
+                    expected_amount_out: AtomicAmount::new(240),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_out.clone(),
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+
+        let orig_overfunded_2leg = overfunded_2leg_route.clone();
+        let res_2leg = preview.validate(&buy_intent, &overfunded_2leg_route, now_ms);
+        assert_eq!(res_2leg, Err(DomainError::RouteUnmodeledFunding));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(overfunded_2leg_route, orig_overfunded_2leg);
+        assert_eq!(preview, orig_preview);
+
+        let res_2leg_fn =
+            validate_execution_preview(&buy_intent, &overfunded_2leg_route, &preview, now_ms);
+        assert_eq!(res_2leg_fn, Err(DomainError::RouteUnmodeledFunding));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(overfunded_2leg_route, orig_overfunded_2leg);
+        assert_eq!(preview, orig_preview);
+
+        // 4. 3-leg intermediate overfunding:
+        // Leg 1: 1000 -> 500, Leg 2: 500 -> 400, Leg 3: 420 (> 400!) -> 240
+        let overfunded_3leg_route = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "v1".to_string(),
+                    pool_ref: "p1".to_string(),
+                    token_in: token_in.clone(),
+                    token_out: token_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "v2".to_string(),
+                    pool_ref: "p2".to_string(),
+                    token_in: token_mid.clone(),
+                    token_out: token_mid2.clone(),
+                    amount_in: AtomicAmount::new(500),
+                    expected_amount_out: AtomicAmount::new(400),
+                },
+                RouteLeg {
+                    venue: "v3".to_string(),
+                    pool_ref: "p3".to_string(),
+                    token_in: token_mid2.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: AtomicAmount::new(420), // 420 > 400: unmodeled funding!
+                    expected_amount_out: AtomicAmount::new(240),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_out.clone(),
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+
+        let orig_overfunded_3leg = overfunded_3leg_route.clone();
+        let res_3leg = preview.validate(&buy_intent, &overfunded_3leg_route, now_ms);
+        assert_eq!(res_3leg, Err(DomainError::RouteUnmodeledFunding));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(overfunded_3leg_route, orig_overfunded_3leg);
+        assert_eq!(preview, orig_preview);
+
+        // 5. Valid multi-leg routes:
+        // 5a. Exact intermediate funding: Leg 1 outputs 500, Leg 2 consumes 500
+        let valid_2leg_exact = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "uniswap_v3".to_string(),
+                    pool_ref: "0xpool1".to_string(),
+                    token_in: token_in.clone(),
+                    token_out: token_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "sushiswap".to_string(),
+                    pool_ref: "0xpool2".to_string(),
+                    token_in: token_mid.clone(),
+                    token_out: token_out.clone(),
+                    amount_in: AtomicAmount::new(500), // 500 <= 500
+                    expected_amount_out: AtomicAmount::new(240),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_out.clone(),
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+        assert!(valid_2leg_exact.validate().is_ok());
+        let validated_exact = preview
+            .validate(&buy_intent, &valid_2leg_exact, now_ms)
+            .expect("exact intermediate funding must validate");
+        assert_eq!(validated_exact.preview(), &preview);
+
+        // 5b. Intermediate underfunding (e.g. fees or partial hop): Leg 1 outputs 500, Leg 2 consumes 480
+        let valid_2leg_underfunding = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "uniswap_v3".to_string(),
+                    pool_ref: "0xpool1".to_string(),
+                    token_in: token_in.clone(),
+                    token_out: token_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "sushiswap".to_string(),
+                    pool_ref: "0xpool2".to_string(),
+                    token_in: token_mid,
+                    token_out: token_out.clone(),
+                    amount_in: AtomicAmount::new(480), // 480 <= 500
+                    expected_amount_out: AtomicAmount::new(240),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_out,
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+        assert!(valid_2leg_underfunding.validate().is_ok());
+        let validated_underfunding = preview
+            .validate(&buy_intent, &valid_2leg_underfunding, now_ms)
+            .expect("intermediate underfunding (amount_in <= expected_amount_out) must validate");
+        assert_eq!(validated_underfunding.preview(), &preview);
     }
 }
