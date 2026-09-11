@@ -1496,6 +1496,9 @@ mod tests {
             },
         };
 
+        // Generic RoutePlan remains valid under pre-P24 token-contiguity semantics...
+        assert_eq!(overfunded_2leg_route.validate(), Ok(()));
+
         let orig_overfunded_2leg = overfunded_2leg_route.clone();
         let res_2leg = preview.validate(&buy_intent, &overfunded_2leg_route, now_ms);
         assert_eq!(res_2leg, Err(DomainError::RouteUnmodeledFunding));
@@ -1549,6 +1552,9 @@ mod tests {
                 sequence: Sequence(1),
             },
         };
+
+        // Generic RoutePlan remains valid under pre-P24 token-contiguity semantics...
+        assert_eq!(overfunded_3leg_route.validate(), Ok(()));
 
         let orig_overfunded_3leg = overfunded_3leg_route.clone();
         let res_3leg = preview.validate(&buy_intent, &overfunded_3leg_route, now_ms);

@@ -458,9 +458,6 @@ impl RoutePlan {
             if window[0].token_out != window[1].token_in {
                 return Err(DomainError::RouteTokenMismatch);
             }
-            if window[1].amount_in > window[0].expected_amount_out {
-                return Err(DomainError::RouteUnmodeledFunding);
-            }
         }
         let last = self.legs.last().unwrap();
         if self.expected_net_output.asset != last.token_out {
@@ -1002,15 +999,6 @@ mod tests {
         let d = asset("WBTC");
         let plan = route_plan(&[(&a, &b, 1_000, 500), (&c, &d, 500, 250)], &d);
         assert_eq!(plan.validate(), Err(DomainError::RouteTokenMismatch));
-    }
-
-    #[test]
-    fn route_plan_intermediate_leg_overfunding_is_rejected() {
-        let a = asset("USDC");
-        let b = asset("TOKEN");
-        let c = asset("ETH");
-        let plan = route_plan(&[(&a, &b, 1_000, 500), (&b, &c, 550, 250)], &c);
-        assert_eq!(plan.validate(), Err(DomainError::RouteUnmodeledFunding));
     }
 
     #[test]
