@@ -1132,3 +1132,405 @@ fn test_serialization_round_trips_for_aggregated_types() {
     assert_eq!(decoded_b.tick_size, bucketed.tick_size);
     assert_eq!(decoded_b.bids, bucketed.bids);
 }
+
+// =========================================================================
+// Group 9: Atomic Unified Aggregation Regressions (P23 Slice A Review-Fix)
+// =========================================================================
+
+fn sample_context(observed_at_ms: i64) -> FeedObservationContext {
+    FeedObservationContext {
+        source_family: ChainFamily::Solana,
+        source_label: FeedSourceLabel::new("solana-direct").unwrap(),
+        finality: FeedFinality::Confirmed,
+        slot_or_block: Some(100),
+        observed_at_ms,
+    }
+}
+
+fn sample_freshness(seq: u64, ts: i64) -> SafeFreshnessMeta {
+    SafeFreshnessMeta {
+        status: FreshnessStatus::Fresh,
+        observed_at_ms: ts,
+        evaluated_at_ms: ts + 100,
+        age_ms: 100,
+        sequence: Sequence(seq),
+    }
+}
+
+#[test]
+fn test_regression_ohlcv_stale_window_leaves_depth_and_ohlcv_strictly_unchanged() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    // Ingest baseline snapshot at seq 1, ts 60_000
+    let snap = sample_snapshot(1, 60_000);
+    let snap_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap),
+    };
+    assert!(matches!(
+        unified.apply_envelope(&snap_env).unwrap(),
+        DeltaClassification::Contiguous {
+            new_sequence: Sequence(1)
+        }
+    ));
+
+    // Capture exact state before the bad delta
+    let initial_depth = unified.depth().clone();
+    let initial_ohlcv = unified.ohlcv().unwrap().clone();
+    assert!(!unified.is_resync_required());
+
+    // Delta 2 has contiguous sequence 2 and valid depth updates, but STALE timestamp 50_000 (< 60_000)
+    let delta = sample_delta(
+        2,
+        2,
+        50_000,
+        vec![DepthLevel::new(price(150.2), qty(12.0))],
+        vec![DepthLevel::new(price(150.8), qty(14.0))],
+    );
+    let bad_delta_env = CanonicalFeedEnvelope {
+        context: sample_context(50_000),
+        freshness: sample_freshness(2, 50_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta),
+    };
+
+    let res = unified.apply_envelope(&bad_delta_env);
+    // 1. Proves no successful result is returned after partial mutation
+    assert_eq!(
+        res,
+        Err(MarketTypeError::StaleCandleWindow {
+            candle_open_ms: 50_000,
+            current_close_ms: 120_000,
+        })
+    );
+
+    // 2. Proves depth sequence, timestamp, book, and resync remain STRICTLY unchanged
+    assert_eq!(unified.depth().sequence(), initial_depth.sequence());
+    assert_eq!(unified.depth().timestamp_ms(), initial_depth.timestamp_ms());
+    assert_eq!(unified.depth().bids(), initial_depth.bids());
+    assert_eq!(unified.depth().asks(), initial_depth.asks());
+    assert!(!unified.depth().is_resync_required());
+
+    // 3. Proves OHLCV state, sequence, timestamp, and resync remain STRICTLY unchanged
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        initial_ohlcv.current_sequence()
+    );
+    assert_eq!(
+        unified.ohlcv().unwrap().last_timestamp_ms(),
+        initial_ohlcv.last_timestamp_ms()
+    );
+    assert_eq!(
+        unified.ohlcv().unwrap().active_window(),
+        initial_ohlcv.active_window()
+    );
+    assert!(!unified.ohlcv().unwrap().is_resync_required());
+    assert!(!unified.is_resync_required());
+}
+
+#[test]
+fn test_regression_ohlcv_timestamp_overflow_leaves_depth_and_ohlcv_strictly_unchanged() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    let snap = sample_snapshot(1, 60_000);
+    let snap_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap),
+    };
+    unified.apply_envelope(&snap_env).unwrap();
+
+    let initial_depth = unified.depth().clone();
+    let initial_ohlcv = unified.ohlcv().unwrap().clone();
+
+    // Delta with i64::MAX timestamp causing checked_add(1) overflow in OHLCV tick
+    let delta = sample_delta(
+        2,
+        2,
+        i64::MAX,
+        vec![DepthLevel::new(price(150.2), qty(5.0))],
+        vec![],
+    );
+    let bad_delta_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(2, 60_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta),
+    };
+
+    let res = unified.apply_envelope(&bad_delta_env);
+    assert_eq!(
+        res,
+        Err(MarketTypeError::ArithmeticOverflow(
+            "timestamp overflow on tick close"
+        ))
+    );
+
+    // Assert complete rollback across both components
+    assert_eq!(unified.depth().sequence(), initial_depth.sequence());
+    assert_eq!(unified.depth().timestamp_ms(), initial_depth.timestamp_ms());
+    assert_eq!(unified.depth().bids(), initial_depth.bids());
+    assert_eq!(unified.depth().asks(), initial_depth.asks());
+    assert!(!unified.depth().is_resync_required());
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        initial_ohlcv.current_sequence()
+    );
+    assert_eq!(
+        unified.ohlcv().unwrap().last_timestamp_ms(),
+        initial_ohlcv.last_timestamp_ms()
+    );
+    assert!(!unified.ohlcv().unwrap().is_resync_required());
+    assert!(!unified.is_resync_required());
+}
+
+#[test]
+fn test_regression_ohlcv_resync_required_leaves_depth_and_ohlcv_strictly_unchanged() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    let snap = sample_snapshot(1, 60_000);
+    let snap_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap),
+    };
+    unified.apply_envelope(&snap_env).unwrap();
+
+    // Latched resync on OHLCV component
+    unified.ohlcv_mut().unwrap().trigger_resync();
+    assert!(unified.is_resync_required());
+
+    let initial_depth = unified.depth().clone();
+    let initial_ohlcv = unified.ohlcv().unwrap().clone();
+
+    // Contiguous delta seq 2 arrives
+    let delta = sample_delta(
+        2,
+        2,
+        61_000,
+        vec![DepthLevel::new(price(150.2), qty(5.0))],
+        vec![DepthLevel::new(price(150.8), qty(5.0))],
+    );
+    let delta_env = CanonicalFeedEnvelope {
+        context: sample_context(61_000),
+        freshness: sample_freshness(2, 61_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta),
+    };
+
+    let res = unified.apply_envelope(&delta_env).unwrap();
+    // Proves ResyncRequired is returned, NOT Contiguous success!
+    assert!(matches!(res, DeltaClassification::ResyncRequired { .. }));
+
+    // Proves depth was NOT mutated despite delta being valid on depth by itself
+    assert_eq!(unified.depth().sequence(), initial_depth.sequence());
+    assert_eq!(unified.depth().timestamp_ms(), initial_depth.timestamp_ms());
+    assert_eq!(unified.depth().bids(), initial_depth.bids());
+    assert_eq!(unified.depth().asks(), initial_depth.asks());
+    assert!(!unified.depth().is_resync_required());
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        initial_ohlcv.current_sequence()
+    );
+    assert!(unified.ohlcv().unwrap().is_resync_required());
+}
+
+#[test]
+fn test_regression_depth_sequence_gap_latches_both_and_snapshot_recovers_both() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    let snap = sample_snapshot(1, 60_000);
+    let snap_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap),
+    };
+    unified.apply_envelope(&snap_env).unwrap();
+
+    let initial_depth_book = unified.depth().bids().to_vec();
+
+    // Delta with gap: sequence 5 (expected 2)
+    let gap_delta = sample_delta(5, 5, 65_000, vec![], vec![]);
+    let gap_env = CanonicalFeedEnvelope {
+        context: sample_context(65_000),
+        freshness: sample_freshness(5, 65_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(gap_delta),
+    };
+
+    let res = unified.apply_envelope(&gap_env).unwrap();
+    assert_eq!(
+        res,
+        DeltaClassification::ResyncRequired {
+            expected: Sequence(2),
+            received: Sequence(5),
+        }
+    );
+
+    // Assert consistent sticky resync across BOTH components
+    assert!(unified.depth().is_resync_required());
+    assert!(unified.ohlcv().unwrap().is_resync_required());
+    assert!(unified.is_resync_required());
+
+    // Assert pre-gap book and sequences are intact
+    assert_eq!(unified.depth().sequence(), Some(Sequence(1)));
+    assert_eq!(unified.depth().bids(), initial_depth_book.as_slice());
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        Some(Sequence(1))
+    );
+
+    // Contiguous delta seq 2 is rejected while in resync
+    let delta_seq2 = sample_delta(2, 2, 62_000, vec![], vec![]);
+    let delta2_env = CanonicalFeedEnvelope {
+        context: sample_context(62_000),
+        freshness: sample_freshness(2, 62_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta_seq2),
+    };
+    let rej = unified.apply_envelope(&delta2_env).unwrap();
+    assert!(matches!(rej, DeltaClassification::ResyncRequired { .. }));
+
+    // Validated recovery snapshot at seq 10 clears sticky resync on BOTH components
+    let recov_snap = sample_snapshot(10, 120_000);
+    let recov_env = CanonicalFeedEnvelope {
+        context: sample_context(120_000),
+        freshness: sample_freshness(10, 120_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(recov_snap),
+    };
+    let recov_res = unified.apply_envelope(&recov_env).unwrap();
+    assert_eq!(
+        recov_res,
+        DeltaClassification::Contiguous {
+            new_sequence: Sequence(10)
+        }
+    );
+
+    assert!(!unified.depth().is_resync_required());
+    assert!(!unified.ohlcv().unwrap().is_resync_required());
+    assert!(!unified.is_resync_required());
+    assert_eq!(unified.depth().sequence(), Some(Sequence(10)));
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        Some(Sequence(10))
+    );
+
+    // Contiguous delta seq 11 is now accepted normally
+    let delta11 = sample_delta(
+        11,
+        11,
+        121_000,
+        vec![DepthLevel::new(price(150.3), qty(8.0))],
+        vec![],
+    );
+    let delta11_env = CanonicalFeedEnvelope {
+        context: sample_context(121_000),
+        freshness: sample_freshness(11, 121_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta11),
+    };
+    let d11_res = unified.apply_envelope(&delta11_env).unwrap();
+    assert_eq!(
+        d11_res,
+        DeltaClassification::Contiguous {
+            new_sequence: Sequence(11)
+        }
+    );
+    assert_eq!(unified.depth().sequence(), Some(Sequence(11)));
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        Some(Sequence(11))
+    );
+}
+
+#[test]
+fn test_regression_snapshot_ohlcv_failure_rolls_back_depth_strictly() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    let snap1 = sample_snapshot(1, 60_000);
+    let snap1_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap1),
+    };
+    unified.apply_envelope(&snap1_env).unwrap();
+
+    let initial_depth = unified.depth().clone();
+    let initial_ohlcv = unified.ohlcv().unwrap().clone();
+
+    // Snapshot with sequence 2 but timestamp i64::MAX causing OHLCV tick overflow
+    let mut bad_snap = sample_snapshot(2, i64::MAX);
+    bad_snap.bids = vec![DepthLevel::new(price(150.5), qty(50.0))];
+    bad_snap.asks = vec![DepthLevel::new(price(151.5), qty(50.0))];
+    let bad_snap_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(2, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(bad_snap),
+    };
+
+    let res = unified.apply_envelope(&bad_snap_env);
+    assert_eq!(
+        res,
+        Err(MarketTypeError::ArithmeticOverflow(
+            "timestamp overflow on tick close"
+        ))
+    );
+
+    // Depth was NOT updated to sequence 2 or price 200.0
+    assert_eq!(unified.depth().sequence(), initial_depth.sequence());
+    assert_eq!(unified.depth().timestamp_ms(), initial_depth.timestamp_ms());
+    assert_eq!(unified.depth().bids(), initial_depth.bids());
+    assert_eq!(unified.depth().asks(), initial_depth.asks());
+    assert!(!unified.depth().is_resync_required());
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        initial_ohlcv.current_sequence()
+    );
+    assert!(!unified.ohlcv().unwrap().is_resync_required());
+}
+
+#[test]
+fn test_regression_unified_reset_with_snapshot_clears_sticky_resync_and_recovers_both() {
+    let inst = sample_instrument();
+    let mut unified = MarketAggregator::for_instrument(inst, CandleTimeframe::M1, 20, 10).unwrap();
+
+    let snap1 = sample_snapshot(1, 60_000);
+    let snap1_env = CanonicalFeedEnvelope {
+        context: sample_context(60_000),
+        freshness: sample_freshness(1, 60_000),
+        payload: CanonicalFeedPayload::OrderBookSnapshot(snap1),
+    };
+    unified.apply_envelope(&snap1_env).unwrap();
+
+    unified.trigger_resync();
+    assert!(unified.is_resync_required());
+    assert!(unified.depth().is_resync_required());
+    assert!(unified.ohlcv().unwrap().is_resync_required());
+
+    // Explicit reset_with_snapshot
+    let recov_snap = sample_snapshot(5, 120_000);
+    unified.reset_with_snapshot(&recov_snap).unwrap();
+
+    assert!(!unified.is_resync_required());
+    assert!(!unified.depth().is_resync_required());
+    assert!(!unified.ohlcv().unwrap().is_resync_required());
+    assert_eq!(unified.depth().sequence(), Some(Sequence(5)));
+    assert_eq!(
+        unified.ohlcv().unwrap().current_sequence(),
+        Some(Sequence(5))
+    );
+
+    // Next delta seq 6 is accepted normally
+    let delta6 = sample_delta(6, 6, 121_000, vec![], vec![]);
+    let delta6_env = CanonicalFeedEnvelope {
+        context: sample_context(121_000),
+        freshness: sample_freshness(6, 121_000),
+        payload: CanonicalFeedPayload::OrderBookDelta(delta6),
+    };
+    assert_eq!(
+        unified.apply_envelope(&delta6_env).unwrap(),
+        DeltaClassification::Contiguous {
+            new_sequence: Sequence(6)
+        }
+    );
+}

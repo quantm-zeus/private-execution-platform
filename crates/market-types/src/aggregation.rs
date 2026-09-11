@@ -1378,25 +1378,108 @@ impl MarketAggregator {
         self.depth.evaluate_freshness(evaluated_at_ms)
     }
 
+    /// Explicitly resets unified book and OHLCV state from a validated fresh snapshot, clearing sticky resync.
+    pub fn reset_with_snapshot(&mut self, snapshot: &DepthSnapshot) -> Result<(), MarketTypeError> {
+        let mut staged_depth = self.depth.clone();
+        let mut staged_ohlcv = self.ohlcv.clone();
+
+        staged_depth.reset_with_snapshot(snapshot)?;
+
+        if let Some(ref mut ohlcv) = staged_ohlcv {
+            let mid = staged_depth
+                .mid_price()
+                .ok_or(MarketTypeError::EmptyDepthLevels)?;
+            let candle = Candle {
+                instrument: ohlcv.instrument().clone(),
+                timeframe: ohlcv.timeframe(),
+                open_time_ms: snapshot.timestamp_ms,
+                close_time_ms: snapshot.timestamp_ms.checked_add(1).ok_or(
+                    MarketTypeError::ArithmeticOverflow("timestamp overflow on tick close"),
+                )?,
+                open: mid,
+                high: mid,
+                low: mid,
+                close: mid,
+                volume: NormalizedQuantity::new(0.0)?,
+                quote_volume: None,
+                trades_count: Some(1),
+            };
+            ohlcv.reset_with_baseline(snapshot.sequence, &candle)?;
+        }
+
+        self.depth = staged_depth;
+        self.ohlcv = staged_ohlcv;
+        Ok(())
+    }
+
     /// Ingests a canonical feed envelope, routing to depth and/or OHLCV aggregators.
+    ///
+    /// Unified depth and OHLCV mutations are atomic and fail-closed: any failure in depth or
+    /// OHLCV (such as arithmetic overflow, window violation, malformed input, or sequence gap)
+    /// leaves both components completely unchanged, and never returns a successful classification
+    /// after partial mutation. Sticky resync semantics and recovery behavior are consistently
+    /// maintained across both components.
     pub fn apply_envelope(
         &mut self,
         envelope: &CanonicalFeedEnvelope,
     ) -> Result<DeltaClassification, MarketTypeError> {
         match &envelope.payload {
             CanonicalFeedPayload::OrderBookSnapshot(snap) => {
-                let class = self.depth.apply_snapshot(snap)?;
-                if let (Some(ref mut ohlcv), Some(mid)) = (&mut self.ohlcv, self.depth.mid_price())
-                {
-                    let _ = ohlcv.apply_tick(
-                        mid,
-                        NormalizedQuantity::new(0.0)?,
-                        snap.timestamp_ms,
-                        Some(snap.sequence),
-                    );
-                }
+                let mut staged_depth = self.depth.clone();
+                let mut staged_ohlcv = self.ohlcv.clone();
+
+                let class = staged_depth.apply_snapshot(snap)?;
                 match class {
                     SnapshotClassification::Accepted { new_sequence } => {
+                        if let Some(ref mut ohlcv) = staged_ohlcv {
+                            let mid = staged_depth
+                                .mid_price()
+                                .ok_or(MarketTypeError::EmptyDepthLevels)?;
+
+                            let is_recovery = self.is_resync_required()
+                                || ohlcv.is_resync_required()
+                                || ohlcv.current_sequence().is_none()
+                                || ohlcv
+                                    .current_sequence()
+                                    .map(|s| snap.sequence > s.next())
+                                    .unwrap_or(false);
+
+                            if is_recovery {
+                                let candle = Candle {
+                                    instrument: ohlcv.instrument().clone(),
+                                    timeframe: ohlcv.timeframe(),
+                                    open_time_ms: snap.timestamp_ms,
+                                    close_time_ms: snap.timestamp_ms.checked_add(1).ok_or(
+                                        MarketTypeError::ArithmeticOverflow(
+                                            "timestamp overflow on tick close",
+                                        ),
+                                    )?,
+                                    open: mid,
+                                    high: mid,
+                                    low: mid,
+                                    close: mid,
+                                    volume: NormalizedQuantity::new(0.0)?,
+                                    quote_volume: None,
+                                    trades_count: Some(1),
+                                };
+                                ohlcv.reset_with_baseline(snap.sequence, &candle)?;
+                            } else {
+                                let tick_class = ohlcv.apply_tick(
+                                    mid,
+                                    NormalizedQuantity::new(0.0)?,
+                                    snap.timestamp_ms,
+                                    Some(snap.sequence),
+                                )?;
+                                if matches!(tick_class, DeltaClassification::ResyncRequired { .. })
+                                {
+                                    return Ok(tick_class);
+                                }
+                            }
+                        }
+
+                        // Atomic commit: only commit when both depth and OHLCV succeed
+                        self.depth = staged_depth;
+                        self.ohlcv = staged_ohlcv;
                         Ok(DeltaClassification::Contiguous { new_sequence })
                     }
                     SnapshotClassification::Duplicate { sequence } => {
@@ -1408,24 +1491,79 @@ impl MarketAggregator {
                 }
             }
             CanonicalFeedPayload::OrderBookDelta(delta) => {
-                let class = self.depth.apply_delta(delta)?;
-                if matches!(class, DeltaClassification::Contiguous { .. }) {
-                    if let (Some(ref mut ohlcv), Some(mid)) =
-                        (&mut self.ohlcv, self.depth.mid_price())
-                    {
-                        let _ = ohlcv.apply_tick(
-                            mid,
-                            NormalizedQuantity::new(0.0)?,
-                            delta.timestamp_ms,
-                            Some(delta.sequence_range.end),
-                        );
+                if self.is_resync_required() {
+                    let expected = self
+                        .depth
+                        .sequence()
+                        .map(|s| s.next())
+                        .unwrap_or(Sequence(1));
+                    return Ok(DeltaClassification::ResyncRequired {
+                        expected,
+                        received: delta.sequence_range.start,
+                    });
+                }
+
+                let mut staged_depth = self.depth.clone();
+                let mut staged_ohlcv = self.ohlcv.clone();
+
+                let class = staged_depth.apply_delta(delta)?;
+                match class {
+                    DeltaClassification::Contiguous { .. } => {
+                        if let Some(ref mut ohlcv) = staged_ohlcv {
+                            let mid = staged_depth
+                                .mid_price()
+                                .ok_or(MarketTypeError::EmptyDepthLevels)?;
+                            let tick_class = ohlcv.apply_tick(
+                                mid,
+                                NormalizedQuantity::new(0.0)?,
+                                delta.timestamp_ms,
+                                Some(delta.sequence_range.end),
+                            )?;
+                            if matches!(tick_class, DeltaClassification::ResyncRequired { .. }) {
+                                return Ok(tick_class);
+                            }
+                        }
+
+                        // Atomic commit: only commit when both depth and OHLCV succeed
+                        self.depth = staged_depth;
+                        self.ohlcv = staged_ohlcv;
+                        Ok(class)
+                    }
+                    DeltaClassification::ResyncRequired { expected, received } => {
+                        // Depth encountered sequence gap/overlap: latch resync across both components
+                        if let Some(ref mut ohlcv) = staged_ohlcv {
+                            ohlcv.trigger_resync();
+                        }
+                        self.depth = staged_depth;
+                        self.ohlcv = staged_ohlcv;
+                        Ok(DeltaClassification::ResyncRequired { expected, received })
+                    }
+                    DeltaClassification::Duplicate { .. } | DeltaClassification::Stale { .. } => {
+                        Ok(class)
                     }
                 }
-                Ok(class)
             }
             CanonicalFeedPayload::Candle(candle) => {
+                if self.is_resync_required() {
+                    let expected = self
+                        .ohlcv
+                        .as_ref()
+                        .and_then(|o| o.current_sequence().map(|s| s.next()))
+                        .unwrap_or(Sequence(1));
+                    let received = envelope.freshness.sequence;
+                    return Ok(DeltaClassification::ResyncRequired { expected, received });
+                }
+
                 if let Some(ref mut ohlcv) = self.ohlcv {
-                    ohlcv.apply_candle(candle, Some(envelope.freshness.sequence))
+                    let mut staged_ohlcv = ohlcv.clone();
+                    let class =
+                        staged_ohlcv.apply_candle(candle, Some(envelope.freshness.sequence))?;
+                    if let DeltaClassification::ResyncRequired { .. } = class {
+                        self.trigger_resync();
+                    } else {
+                        *ohlcv = staged_ohlcv;
+                    }
+                    Ok(class)
                 } else {
                     Err(MarketTypeError::UnsupportedPayloadForTarget(
                         "candle payload on aggregator without ohlcv configured",
