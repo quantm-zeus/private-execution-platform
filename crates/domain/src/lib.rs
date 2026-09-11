@@ -577,6 +577,8 @@ pub enum DomainError {
         "route output and side semantics cannot support an executable net price decision: {0}"
     )]
     InvalidNetPriceDecision(&'static str),
+    #[error("unsupported amount type")]
+    UnsupportedAmountType,
 }
 
 #[cfg(test)]

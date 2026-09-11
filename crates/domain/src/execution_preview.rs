@@ -397,14 +397,23 @@ impl ExecutionPreview {
             }
         }
 
-        // 8. Fill policy: all-or-nothing check for InputAssetAtomic
-        if !intent.allow_partial_fill
-            && intent.amount_type == AmountType::InputAssetAtomic
-            && self.simulated_net_input.amount.get() < intent.amount.get()
-        {
-            return Err(DomainError::InconsistentNetEconomics(
-                "all-or-nothing intent cannot accept partial simulated input",
-            ));
+        // 8. Amount binding and fill policy
+        match intent.amount_type {
+            AmountType::InputAssetAtomic => {
+                if self.simulated_net_input.amount > intent.amount {
+                    return Err(DomainError::InconsistentNetEconomics(
+                        "simulated net input exceeds intent amount",
+                    ));
+                }
+                if !intent.allow_partial_fill && self.simulated_net_input.amount != intent.amount {
+                    return Err(DomainError::InconsistentNetEconomics(
+                        "all-or-nothing intent cannot accept partial simulated input",
+                    ));
+                }
+            }
+            AmountType::OutputAssetAtomic | AmountType::UsdMicros => {
+                return Err(DomainError::UnsupportedAmountType);
+            }
         }
 
         // 9. Exact simulated net limit check (never using gross quote)
@@ -1091,5 +1100,180 @@ mod tests {
         assert_eq!(cross_chain_route_3leg, orig_route_3leg);
         assert_eq!(intent, orig_intent);
         assert_eq!(preview, orig_preview);
+    }
+
+    #[test]
+    fn regression_amount_binding_and_unsupported_types_fail_closed_and_preserve_inputs() {
+        let now_ms = 1_000;
+        let token_in = sample_asset(ChainId::Base, "0xusdc");
+        let token_out = sample_asset(ChainId::Base, "0xtoken");
+        let route = sample_route(&token_in, &token_out, now_ms);
+
+        // 1. Partial fill input overspend: allow_partial_fill is true, but simulated_net_input exceeds intent.amount
+        let mut partial_intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        partial_intent.amount = AtomicAmount::new(1_000);
+        partial_intent.allow_partial_fill = true;
+        let overspend_preview =
+            sample_preview(&partial_intent, 1_001, 240, 250, FreshnessStatus::Fresh);
+
+        let orig_partial_intent = partial_intent.clone();
+        let orig_route = route.clone();
+        let orig_overspend_preview = overspend_preview.clone();
+
+        let res_partial = overspend_preview.validate(&partial_intent, &route, now_ms);
+        assert_eq!(
+            res_partial,
+            Err(DomainError::InconsistentNetEconomics(
+                "simulated net input exceeds intent amount"
+            ))
+        );
+        // Prove rejection leaves inputs unchanged
+        assert_eq!(partial_intent, orig_partial_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(overspend_preview, orig_overspend_preview);
+
+        // Prove free function entry point behaves identically and purely
+        let res_partial_fn =
+            validate_execution_preview(&partial_intent, &route, &overspend_preview, now_ms);
+        assert_eq!(
+            res_partial_fn,
+            Err(DomainError::InconsistentNetEconomics(
+                "simulated net input exceeds intent amount"
+            ))
+        );
+        assert_eq!(partial_intent, orig_partial_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(overspend_preview, orig_overspend_preview);
+
+        // 2. All-or-nothing input overspend: allow_partial_fill is false and simulated_net_input exceeds intent.amount
+        let mut aon_intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        aon_intent.amount = AtomicAmount::new(1_000);
+        aon_intent.allow_partial_fill = false;
+        let aon_overspend_preview =
+            sample_preview(&aon_intent, 1_050, 240, 250, FreshnessStatus::Fresh);
+
+        let orig_aon_intent = aon_intent.clone();
+        let orig_aon_overspend_preview = aon_overspend_preview.clone();
+
+        let res_aon_overspend = aon_overspend_preview.validate(&aon_intent, &route, now_ms);
+        assert_eq!(
+            res_aon_overspend,
+            Err(DomainError::InconsistentNetEconomics(
+                "simulated net input exceeds intent amount"
+            ))
+        );
+        assert_eq!(aon_intent, orig_aon_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(aon_overspend_preview, orig_aon_overspend_preview);
+
+        let res_aon_overspend_fn =
+            validate_execution_preview(&aon_intent, &route, &aon_overspend_preview, now_ms);
+        assert_eq!(
+            res_aon_overspend_fn,
+            Err(DomainError::InconsistentNetEconomics(
+                "simulated net input exceeds intent amount"
+            ))
+        );
+        assert_eq!(aon_intent, orig_aon_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(aon_overspend_preview, orig_aon_overspend_preview);
+
+        // 3. All-or-nothing input under-fill: allow_partial_fill is false and simulated_net_input is less than intent.amount
+        let aon_underfill_preview =
+            sample_preview(&aon_intent, 999, 240, 250, FreshnessStatus::Fresh);
+        let orig_aon_underfill_preview = aon_underfill_preview.clone();
+
+        let res_aon_underfill = aon_underfill_preview.validate(&aon_intent, &route, now_ms);
+        assert_eq!(
+            res_aon_underfill,
+            Err(DomainError::InconsistentNetEconomics(
+                "all-or-nothing intent cannot accept partial simulated input"
+            ))
+        );
+        assert_eq!(aon_intent, orig_aon_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(aon_underfill_preview, orig_aon_underfill_preview);
+
+        let res_aon_underfill_fn =
+            validate_execution_preview(&aon_intent, &route, &aon_underfill_preview, now_ms);
+        assert_eq!(
+            res_aon_underfill_fn,
+            Err(DomainError::InconsistentNetEconomics(
+                "all-or-nothing intent cannot accept partial simulated input"
+            ))
+        );
+        assert_eq!(aon_intent, orig_aon_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(aon_underfill_preview, orig_aon_underfill_preview);
+
+        // 4. All-or-nothing exact equality passes
+        let aon_exact_preview =
+            sample_preview(&aon_intent, 1_000, 240, 250, FreshnessStatus::Fresh);
+        assert!(aon_exact_preview
+            .validate(&aon_intent, &route, now_ms)
+            .is_ok());
+
+        // 5. Partial fill valid under-spend passes
+        let partial_valid_preview =
+            sample_preview(&partial_intent, 500, 240, 250, FreshnessStatus::Fresh);
+        assert!(partial_valid_preview
+            .validate(&partial_intent, &route, now_ms)
+            .is_ok());
+
+        // 6. Partial fill exact equality passes
+        let partial_exact_preview =
+            sample_preview(&partial_intent, 1_000, 240, 250, FreshnessStatus::Fresh);
+        assert!(partial_exact_preview
+            .validate(&partial_intent, &route, now_ms)
+            .is_ok());
+
+        // 7. OutputAssetAtomic amount type rejected fail-closed with UnsupportedAmountType
+        let mut output_amount_intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        output_amount_intent.amount_type = AmountType::OutputAssetAtomic;
+        let preview_for_output = sample_preview(
+            &output_amount_intent,
+            1_000,
+            240,
+            250,
+            FreshnessStatus::Fresh,
+        );
+
+        let orig_output_intent = output_amount_intent.clone();
+        let orig_output_preview = preview_for_output.clone();
+
+        let res_output = preview_for_output.validate(&output_amount_intent, &route, now_ms);
+        assert_eq!(res_output, Err(DomainError::UnsupportedAmountType));
+        assert_eq!(output_amount_intent, orig_output_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(preview_for_output, orig_output_preview);
+
+        let res_output_fn =
+            validate_execution_preview(&output_amount_intent, &route, &preview_for_output, now_ms);
+        assert_eq!(res_output_fn, Err(DomainError::UnsupportedAmountType));
+        assert_eq!(output_amount_intent, orig_output_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(preview_for_output, orig_output_preview);
+
+        // 8. UsdMicros amount type rejected fail-closed with UnsupportedAmountType
+        let mut usd_amount_intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        usd_amount_intent.amount_type = AmountType::UsdMicros;
+        let preview_for_usd =
+            sample_preview(&usd_amount_intent, 1_000, 240, 250, FreshnessStatus::Fresh);
+
+        let orig_usd_intent = usd_amount_intent.clone();
+        let orig_usd_preview = preview_for_usd.clone();
+
+        let res_usd = preview_for_usd.validate(&usd_amount_intent, &route, now_ms);
+        assert_eq!(res_usd, Err(DomainError::UnsupportedAmountType));
+        assert_eq!(usd_amount_intent, orig_usd_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(preview_for_usd, orig_usd_preview);
+
+        let res_usd_fn =
+            validate_execution_preview(&usd_amount_intent, &route, &preview_for_usd, now_ms);
+        assert_eq!(res_usd_fn, Err(DomainError::UnsupportedAmountType));
+        assert_eq!(usd_amount_intent, orig_usd_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(preview_for_usd, orig_usd_preview);
     }
 }
