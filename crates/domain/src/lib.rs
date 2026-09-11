@@ -5,6 +5,13 @@ use market_types::{AssetAmount, AtomicAmount, Bps, Freshness, PriceRatio, Sequen
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod execution_preview;
+
+pub use execution_preview::{
+    cmp_u128_products, mul_u128_wide, validate_execution_preview, ExecutionCostComponents,
+    ExecutionPreview, ValidatedExecutionPreview,
+};
+
 macro_rules! string_id {
     ($name:ident, $kind:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -548,6 +555,28 @@ pub enum DomainError {
     IncoherentSellability,
     #[error("provider identifier must not be empty")]
     EmptyProvider,
+    #[error("intent id does not match preview intent id")]
+    IntentIdMismatch,
+    #[error("output asset does not match expected output asset")]
+    OutputAssetMismatch,
+    #[error("trade side does not match expected trade side")]
+    TradeSideMismatch,
+    #[error("simulated net balance delta must be greater than zero")]
+    ZeroSimulatedDelta,
+    #[error("simulated cost component must be greater than zero")]
+    ZeroCostComponent,
+    #[error("simulated net economics are internally inconsistent: {0}")]
+    InconsistentNetEconomics(&'static str),
+    #[error("local market state is stale")]
+    StaleMarketState,
+    #[error("local market state requires resync")]
+    ResyncRequired,
+    #[error("simulated net price violates limit price constraint")]
+    LimitPriceViolated,
+    #[error(
+        "route output and side semantics cannot support an executable net price decision: {0}"
+    )]
+    InvalidNetPriceDecision(&'static str),
 }
 
 #[cfg(test)]
