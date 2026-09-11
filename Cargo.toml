@@ -19,6 +19,7 @@ members = [
     "apps/trading-core",
     "crates/mcp-adapters",
     "crates/provider-broker",
+    "crates/simulation",
 ]
 
 [workspace.package]
@@ -44,6 +45,7 @@ policy = { path = "crates/policy" }
 privy = { path = "crates/privy" }
 mcp-adapters = { path = "crates/mcp-adapters" }
 provider-broker = { path = "crates/provider-broker" }
+simulation = { path = "crates/simulation" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
