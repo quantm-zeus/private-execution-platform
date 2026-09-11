@@ -456,11 +456,12 @@ impl<T: Clone> ConsumerBatchQueue<T> {
 
         match classification {
             SnapshotClassification::Accepted { .. } => {
-                self.stream_tracker = staged_tracker;
-                self.queue.push_back(item);
-                self.total_enqueued_items = self.total_enqueued_items.checked_add(1).ok_or(
+                let next_total_enqueued = self.total_enqueued_items.checked_add(1).ok_or(
                     MarketTypeError::ArithmeticOverflow("total_enqueued_items overflow"),
                 )?;
+                self.stream_tracker = staged_tracker;
+                self.queue.push_back(item);
+                self.total_enqueued_items = next_total_enqueued;
                 Ok(classification)
             }
             SnapshotClassification::Duplicate { .. } | SnapshotClassification::Stale { .. } => {
@@ -516,13 +517,16 @@ impl<T: Clone> ConsumerBatchQueue<T> {
                     });
                 }
 
-                // Advance tracker and enqueue item
-                self.stream_tracker
-                    .apply_delta_range(item.sequence_range, item.timestamp_ms);
-                self.queue.push_back(item);
-                self.total_enqueued_items = self.total_enqueued_items.checked_add(1).ok_or(
+                let next_total_enqueued = self.total_enqueued_items.checked_add(1).ok_or(
                     MarketTypeError::ArithmeticOverflow("total_enqueued_items overflow"),
                 )?;
+
+                let mut staged_tracker = self.stream_tracker.clone();
+                staged_tracker.apply_delta_range(item.sequence_range, item.timestamp_ms);
+
+                self.stream_tracker = staged_tracker;
+                self.queue.push_back(item);
+                self.total_enqueued_items = next_total_enqueued;
                 Ok(classification)
             }
             DeltaClassification::ResyncRequired { expected, received } => {
@@ -541,20 +545,29 @@ impl<T: Clone> ConsumerBatchQueue<T> {
     ///
     /// All items must be valid and fit within remaining queue capacity.
     /// If any item overflows or fails, all items are rejected and pre-call state is preserved.
+    /// If an item triggers sticky resync, sticky resync is latched fail-closed but queue items,
+    /// tracker cursor, and counters from the batch are not committed.
     pub fn enqueue_batch(
         &mut self,
         items: Vec<ConsumerBatchItem<T>>,
     ) -> Result<Vec<DeltaClassification>, MarketTypeError> {
         let mut staged_queue = self.clone();
         let mut classifications = Vec::with_capacity(items.len());
+        let mut resync_encountered = false;
 
         for item in items {
             let class = staged_queue.enqueue_item(item)?;
             classifications.push(class);
             if matches!(class, DeltaClassification::ResyncRequired { .. }) {
-                // If a gap/overlap occurred, latch was set on staged; break early
+                // If a gap/overlap occurred, break early without committing partial items
+                resync_encountered = true;
                 break;
             }
+        }
+
+        if resync_encountered {
+            self.trigger_resync();
+            return Ok(classifications);
         }
 
         *self = staged_queue;
@@ -588,25 +601,37 @@ impl<T: Clone> ConsumerBatchQueue<T> {
         }
 
         let batch_size = std::cmp::min(self.queue.len(), self.config.max_batch_size);
-        let items: Vec<ConsumerBatchItem<T>> = self.queue.drain(0..batch_size).collect();
 
-        let start_seq = items
-            .first()
+        // Preflight arithmetic and sequence range before draining queue or modifying any state
+        let next_batch_id = self
+            .next_batch_id
+            .checked_add(1)
+            .ok_or(MarketTypeError::ArithmeticOverflow("batch_id overflow"))?;
+
+        let next_delivered = self
+            .total_delivered_items
+            .checked_add(batch_size as u64)
+            .ok_or(MarketTypeError::ArithmeticOverflow(
+                "total_delivered_items overflow",
+            ))?;
+
+        let start_seq = self
+            .queue
+            .front()
             .expect("batch cannot be empty")
             .sequence_range
             .start;
-        let end_seq = items
-            .last()
-            .expect("batch cannot be empty")
+        let end_seq = self
+            .queue
+            .get(batch_size - 1)
+            .expect("batch_size <= queue.len()")
             .sequence_range
             .end;
         let sequence_range = SequenceRange::new(start_seq, end_seq)?;
 
+        // All fallible checks succeeded; execute atomic state transition
         let batch_id = self.next_batch_id;
-        self.next_batch_id = self
-            .next_batch_id
-            .checked_add(1)
-            .ok_or(MarketTypeError::ArithmeticOverflow("batch_id overflow"))?;
+        let items: Vec<ConsumerBatchItem<T>> = self.queue.drain(0..batch_size).collect();
 
         let batch = ConsumerBatch {
             batch_id,
@@ -615,13 +640,9 @@ impl<T: Clone> ConsumerBatchQueue<T> {
             items,
         };
 
+        self.next_batch_id = next_batch_id;
         self.in_flight_batch = Some(batch.clone());
-        self.total_delivered_items = self
-            .total_delivered_items
-            .checked_add(batch_size as u64)
-            .ok_or(MarketTypeError::ArithmeticOverflow(
-                "total_delivered_items overflow",
-            ))?;
+        self.total_delivered_items = next_delivered;
 
         Ok(Some(batch))
     }
@@ -635,31 +656,32 @@ impl<T: Clone> ConsumerBatchQueue<T> {
     /// - Upon match, commits the batch, clears in-flight retention, advances the acknowledged
     ///   cursor, and returns `ConsumerBatchAck`.
     pub fn acknowledge(&mut self, batch_id: u64) -> Result<ConsumerBatchAck, MarketTypeError> {
-        let Some(in_flight) = self.in_flight_batch.take() else {
+        let Some(in_flight) = self.in_flight_batch.as_ref() else {
             return Err(MarketTypeError::NoPendingBatchToAcknowledge);
         };
 
         if in_flight.batch_id != batch_id {
-            // Restore in-flight batch on ID mismatch
-            self.in_flight_batch = Some(in_flight);
             return Err(MarketTypeError::InvalidBatchAcknowledgement {
-                expected: self
-                    .in_flight_batch
-                    .as_ref()
-                    .map(|b| b.batch_id)
-                    .unwrap_or(0),
+                expected: in_flight.batch_id,
                 received: batch_id,
             });
         }
 
-        self.last_acknowledged_batch_id = Some(batch_id);
-        self.last_acknowledged_sequence = Some(in_flight.sequence_range.end);
-        self.total_acknowledged_items = self
+        let next_acknowledged = self
             .total_acknowledged_items
             .checked_add(in_flight.items.len() as u64)
             .ok_or(MarketTypeError::ArithmeticOverflow(
                 "total_acknowledged_items overflow",
             ))?;
+
+        let in_flight = self
+            .in_flight_batch
+            .take()
+            .expect("in_flight_batch verified is_some");
+
+        self.last_acknowledged_batch_id = Some(batch_id);
+        self.last_acknowledged_sequence = Some(in_flight.sequence_range.end);
+        self.total_acknowledged_items = next_acknowledged;
 
         let ack = ConsumerBatchAck {
             batch_id,
@@ -695,12 +717,18 @@ impl<T: Clone> ConsumerBatchQueue<T> {
             return Err(MarketTypeError::InvalidTimestamp(timestamp_ms));
         }
 
-        if let Some(ref item) = baseline_item {
-            item.validate()?;
-            if item.target != self.target {
-                return Err(MarketTypeError::TargetMismatch);
-            }
-        }
+        let next_total_enqueued =
+            if let Some(ref item) = baseline_item {
+                item.validate()?;
+                if item.target != self.target {
+                    return Err(MarketTypeError::TargetMismatch);
+                }
+                self.total_enqueued_items.checked_add(1).ok_or(
+                    MarketTypeError::ArithmeticOverflow("total_enqueued_items overflow"),
+                )?
+            } else {
+                self.total_enqueued_items
+            };
 
         let mut staged_tracker = SequencedStreamTracker::new(self.target.clone());
         let _ = staged_tracker.apply_snapshot_sequence(sequence, timestamp_ms);
@@ -709,15 +737,37 @@ impl<T: Clone> ConsumerBatchQueue<T> {
         self.queue.clear();
         self.in_flight_batch = None;
         self.last_acknowledged_sequence = Some(sequence);
+        self.total_enqueued_items = next_total_enqueued;
 
         if let Some(item) = baseline_item {
             self.queue.push_back(item);
-            self.total_enqueued_items = self.total_enqueued_items.checked_add(1).ok_or(
-                MarketTypeError::ArithmeticOverflow("total_enqueued_items overflow"),
-            )?;
         }
 
         Ok(())
+    }
+
+    /// Test helper to set `total_enqueued_items` for overflow testing.
+    #[doc(hidden)]
+    pub fn set_total_enqueued_items_for_test(&mut self, val: u64) {
+        self.total_enqueued_items = val;
+    }
+
+    /// Test helper to set `next_batch_id` for overflow testing.
+    #[doc(hidden)]
+    pub fn set_next_batch_id_for_test(&mut self, val: u64) {
+        self.next_batch_id = val;
+    }
+
+    /// Test helper to set `total_delivered_items` for overflow testing.
+    #[doc(hidden)]
+    pub fn set_total_delivered_items_for_test(&mut self, val: u64) {
+        self.total_delivered_items = val;
+    }
+
+    /// Test helper to set `total_acknowledged_items` for overflow testing.
+    #[doc(hidden)]
+    pub fn set_total_acknowledged_items_for_test(&mut self, val: u64) {
+        self.total_acknowledged_items = val;
     }
 }
 
@@ -808,19 +858,9 @@ impl MarketConsumerBatcher {
         &self.aggregator
     }
 
-    /// Returns mutable reference to internal aggregator.
-    pub fn aggregator_mut(&mut self) -> &mut MarketAggregator {
-        &mut self.aggregator
-    }
-
     /// Returns reference to internal consumer queue.
     pub fn queue(&self) -> &ConsumerBatchQueue<AggregationOutput> {
         &self.queue
-    }
-
-    /// Returns mutable reference to internal consumer queue.
-    pub fn queue_mut(&mut self) -> &mut ConsumerBatchQueue<AggregationOutput> {
-        &mut self.queue
     }
 
     /// Returns true if either aggregator or consumer queue requires resync.
