@@ -137,19 +137,13 @@ pub fn evaluate_tax_safety(
 
     // 3. Bind observation to intent chain
     if obs.chain != intent.chain {
-        return Err(TaxSafetyError::ChainMismatch {
-            intent_chain: intent.chain.clone(),
-            observation_chain: obs.chain.clone(),
-        });
+        return Err(TaxSafetyError::ChainMismatch);
     }
 
     // Bind observation to the asset actually being assessed
     let assessed_asset = assessed_asset_for_intent(intent);
     if obs.token != *assessed_asset {
-        return Err(TaxSafetyError::AssessedAssetMismatch {
-            expected: assessed_asset.clone(),
-            observed: obs.token.clone(),
-        });
+        return Err(TaxSafetyError::AssessedAssetMismatch);
     }
 
     // 4. Deterministic freshness evaluation
@@ -160,14 +154,12 @@ pub fn evaluate_tax_safety(
         Sequence::new(obs.block_or_slot),
         false,
     )
-    .map_err(TaxSafetyError::FreshnessEvaluationFailed)?;
+    .map_err(|_| TaxSafetyError::FreshnessEvaluationFailed)?;
 
     match freshness_meta.status {
         FreshnessStatus::Fresh => {}
-        FreshnessStatus::Stale => return Err(TaxSafetyError::StaleObservation(freshness_meta)),
-        FreshnessStatus::ResyncRequired => {
-            return Err(TaxSafetyError::ResyncRequired(freshness_meta))
-        }
+        FreshnessStatus::Stale => return Err(TaxSafetyError::StaleObservation),
+        FreshnessStatus::ResyncRequired => return Err(TaxSafetyError::ResyncRequired),
     }
 
     // 5. Require buy_succeeds, sellable, and sell_succeeds all true
@@ -183,16 +175,10 @@ pub fn evaluate_tax_safety(
 
     // 6. Enforce tax caps: buy_tax <= max_buy_tax && sell_tax <= max_sell_tax
     if obs.buy_tax > intent.risk.max_buy_tax {
-        return Err(TaxSafetyError::BuyTaxExceedsCap {
-            observed: obs.buy_tax,
-            max: intent.risk.max_buy_tax,
-        });
+        return Err(TaxSafetyError::BuyTaxExceedsCap);
     }
     if obs.sell_tax > intent.risk.max_sell_tax {
-        return Err(TaxSafetyError::SellTaxExceedsCap {
-            observed: obs.sell_tax,
-            max: intent.risk.max_sell_tax,
-        });
+        return Err(TaxSafetyError::SellTaxExceedsCap);
     }
 
     // 7. Structured local result only

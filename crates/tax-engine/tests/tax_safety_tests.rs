@@ -5,7 +5,7 @@ use domain::{
     AmountType, DomainError, IdempotencyKey, IntentId, OrderType, RiskConstraints, TaxObservation,
     TradeIntent, TradeSide, TradeSource, UserId, WalletRef,
 };
-use market_types::{AtomicAmount, Bps, FreshnessPolicy, FreshnessStatus, SafeFreshnessMeta};
+use market_types::{AtomicAmount, Bps, FreshnessPolicy, FreshnessStatus};
 use tax_engine::{
     assess_tax_safety, assessed_asset_for_intent, evaluate_tax_safety, TaxAssessment,
     TaxSafetyEngine, TaxSafetyError,
@@ -226,13 +226,7 @@ fn test_chain_mismatch_fails_closed() {
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("chain mismatch must fail closed");
 
-    assert_eq!(
-        err,
-        TaxSafetyError::ChainMismatch {
-            intent_chain: ChainId::Base,
-            observation_chain: ChainId::Solana,
-        }
-    );
+    assert_eq!(err, TaxSafetyError::ChainMismatch);
 }
 
 #[test]
@@ -240,19 +234,13 @@ fn test_assessed_token_mismatch_for_buy_intent() {
     let intent = sample_intent(TradeSide::Buy, 500, 500);
     // Buy intent must assess token_out; provide token_in instead
     let wrong_token = intent.token_in.clone();
-    let obs = sample_observation(wrong_token.clone(), 300, 300, true, true, true, 100_000);
+    let obs = sample_observation(wrong_token, 300, 300, true, true, true, 100_000);
     let policy = sample_policy();
 
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("assessed token mismatch for Buy must fail closed");
 
-    assert_eq!(
-        err,
-        TaxSafetyError::AssessedAssetMismatch {
-            expected: intent.token_out.clone(),
-            observed: wrong_token,
-        }
-    );
+    assert_eq!(err, TaxSafetyError::AssessedAssetMismatch);
 }
 
 #[test]
@@ -260,38 +248,26 @@ fn test_assessed_token_mismatch_for_sell_intent() {
     let intent = sample_intent(TradeSide::Sell, 500, 500);
     // Sell intent must assess token_in; provide token_out instead
     let wrong_token = intent.token_out.clone();
-    let obs = sample_observation(wrong_token.clone(), 300, 300, true, true, true, 100_000);
+    let obs = sample_observation(wrong_token, 300, 300, true, true, true, 100_000);
     let policy = sample_policy();
 
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("assessed token mismatch for Sell must fail closed");
 
-    assert_eq!(
-        err,
-        TaxSafetyError::AssessedAssetMismatch {
-            expected: intent.token_in.clone(),
-            observed: wrong_token,
-        }
-    );
+    assert_eq!(err, TaxSafetyError::AssessedAssetMismatch);
 }
 
 #[test]
 fn test_unrelated_assessed_token_fails_closed() {
     let intent = sample_intent(TradeSide::Buy, 500, 500);
     let random_token = sample_asset("0x9999999999999999999999999999999999999999");
-    let obs = sample_observation(random_token.clone(), 300, 300, true, true, true, 100_000);
+    let obs = sample_observation(random_token, 300, 300, true, true, true, 100_000);
     let policy = sample_policy();
 
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("unrelated token must fail closed");
 
-    assert_eq!(
-        err,
-        TaxSafetyError::AssessedAssetMismatch {
-            expected: intent.token_out.clone(),
-            observed: random_token,
-        }
-    );
+    assert_eq!(err, TaxSafetyError::AssessedAssetMismatch);
 }
 
 // =========================================================================
@@ -308,15 +284,7 @@ fn test_stale_observation_timestamp_fails_closed() {
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("stale observation must fail closed");
 
-    match err {
-        TaxSafetyError::StaleObservation(meta) => {
-            assert_eq!(meta.status, FreshnessStatus::Stale);
-            assert_eq!(meta.age_ms, 10_001);
-            assert_eq!(meta.observed_at_ms, 89_999);
-            assert_eq!(meta.evaluated_at_ms, 100_000);
-        }
-        other => panic!("expected StaleObservation, got {:?}", other),
-    }
+    assert_eq!(err, TaxSafetyError::StaleObservation);
 }
 
 #[test]
@@ -366,14 +334,7 @@ fn test_excessive_future_observation_fails_closed() {
     let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
         .expect_err("excessive future skew must fail closed");
 
-    match err {
-        TaxSafetyError::ResyncRequired(meta) => {
-            assert_eq!(meta.status, FreshnessStatus::ResyncRequired);
-            assert_eq!(meta.observed_at_ms, 102_001);
-            assert_eq!(meta.evaluated_at_ms, 100_000);
-        }
-        other => panic!("expected ResyncRequired, got {:?}", other),
-    }
+    assert_eq!(err, TaxSafetyError::ResyncRequired);
 }
 
 // =========================================================================
@@ -461,13 +422,7 @@ fn test_separate_buy_tax_cap_rejection() {
     );
     let err_buy = evaluate_tax_safety(&buy_intent, Some(&obs_buy_exceeds), 100_000, &policy)
         .expect_err("buy_tax > max_buy_tax must fail");
-    assert_eq!(
-        err_buy,
-        TaxSafetyError::BuyTaxExceedsCap {
-            observed: Bps::new(501).unwrap(),
-            max: Bps::new(500).unwrap(),
-        }
-    );
+    assert_eq!(err_buy, TaxSafetyError::BuyTaxExceedsCap);
 
     // Sell intent: both caps must still be enforced!
     let sell_intent = sample_intent(TradeSide::Sell, 500, 600);
@@ -487,13 +442,7 @@ fn test_separate_buy_tax_cap_rejection() {
         &policy,
     )
     .expect_err("buy_tax > max_buy_tax must fail on Sell intent too");
-    assert_eq!(
-        err_sell_intent,
-        TaxSafetyError::BuyTaxExceedsCap {
-            observed: Bps::new(501).unwrap(),
-            max: Bps::new(500).unwrap(),
-        }
-    );
+    assert_eq!(err_sell_intent, TaxSafetyError::BuyTaxExceedsCap);
 }
 
 #[test]
@@ -513,13 +462,7 @@ fn test_separate_sell_tax_cap_rejection() {
     );
     let err_buy = evaluate_tax_safety(&buy_intent, Some(&obs_sell_exceeds), 100_000, &policy)
         .expect_err("sell_tax > max_sell_tax must fail on Buy intent");
-    assert_eq!(
-        err_buy,
-        TaxSafetyError::SellTaxExceedsCap {
-            observed: Bps::new(601).unwrap(),
-            max: Bps::new(600).unwrap(),
-        }
-    );
+    assert_eq!(err_buy, TaxSafetyError::SellTaxExceedsCap);
 
     // Sell intent: sell_tax exceeds cap (601 > 600)
     let sell_intent = sample_intent(TradeSide::Sell, 500, 600);
@@ -539,13 +482,7 @@ fn test_separate_sell_tax_cap_rejection() {
         &policy,
     )
     .expect_err("sell_tax > max_sell_tax must fail on Sell intent");
-    assert_eq!(
-        err_sell,
-        TaxSafetyError::SellTaxExceedsCap {
-            observed: Bps::new(601).unwrap(),
-            max: Bps::new(600).unwrap(),
-        }
-    );
+    assert_eq!(err_sell, TaxSafetyError::SellTaxExceedsCap);
 }
 
 // =========================================================================
@@ -746,39 +683,20 @@ fn test_pure_input_immutability_on_every_rejected_case() {
 
 #[test]
 fn test_no_secret_leakage_in_error_display_and_debug() {
-    let meta = SafeFreshnessMeta {
-        status: FreshnessStatus::Stale,
-        observed_at_ms: 80_000,
-        evaluated_at_ms: 100_000,
-        age_ms: 20_000,
-        sequence: market_types::Sequence::new(123),
-    };
-
     let errors = [
         TaxSafetyError::MissingObservation,
         TaxSafetyError::InvalidTradeIntent(DomainError::Expired),
         TaxSafetyError::InvalidTaxObservation(DomainError::ZeroTradeAmount),
-        TaxSafetyError::ChainMismatch {
-            intent_chain: ChainId::Base,
-            observation_chain: ChainId::Ethereum,
-        },
-        TaxSafetyError::AssessedAssetMismatch {
-            expected: sample_asset("0x1111"),
-            observed: sample_asset("0x2222"),
-        },
-        TaxSafetyError::StaleObservation(meta),
-        TaxSafetyError::ResyncRequired(meta),
+        TaxSafetyError::ChainMismatch,
+        TaxSafetyError::AssessedAssetMismatch,
+        TaxSafetyError::FreshnessEvaluationFailed,
+        TaxSafetyError::StaleObservation,
+        TaxSafetyError::ResyncRequired,
         TaxSafetyError::BuySimulationFailed,
         TaxSafetyError::SellSimulationFailed,
         TaxSafetyError::TokenNotSellable,
-        TaxSafetyError::BuyTaxExceedsCap {
-            observed: Bps::new(500).unwrap(),
-            max: Bps::new(300).unwrap(),
-        },
-        TaxSafetyError::SellTaxExceedsCap {
-            observed: Bps::new(600).unwrap(),
-            max: Bps::new(400).unwrap(),
-        },
+        TaxSafetyError::BuyTaxExceedsCap,
+        TaxSafetyError::SellTaxExceedsCap,
     ];
 
     for err in &errors {
@@ -794,6 +712,252 @@ fn test_no_secret_leakage_in_error_display_and_debug() {
             assert!(!text.contains("password"), "leaked password: {}", text);
             assert!(!text.contains("private_key"), "leaked key: {}", text);
         }
+    }
+}
+
+#[test]
+fn test_regression_redacted_mismatched_asset_ids() {
+    let raw_in = "0x1111111111111111111111111111111111111111";
+    let raw_out = "0x2222222222222222222222222222222222222222";
+    let raw_observed = "0x9999999999999999999999999999999999999999";
+
+    let mut intent = sample_intent(TradeSide::Buy, 500, 500);
+    intent.token_in = sample_asset(raw_in);
+    intent.token_out = sample_asset(raw_out);
+
+    let mismatched_obs = sample_observation(
+        sample_asset(raw_observed),
+        300,
+        300,
+        true,
+        true,
+        true,
+        100_000,
+    );
+    let policy = sample_policy();
+
+    let err = evaluate_tax_safety(&intent, Some(&mismatched_obs), 100_000, &policy)
+        .expect_err("mismatched asset must fail closed");
+
+    assert_eq!(err, TaxSafetyError::AssessedAssetMismatch);
+
+    let display_str = err.to_string();
+    let debug_str = format!("{:?}", err);
+
+    assert_eq!(display_str, "assessed asset mismatch");
+    assert_eq!(debug_str, "AssessedAssetMismatch");
+
+    for s in [&display_str, &debug_str] {
+        assert!(!s.contains(raw_out), "leaked expected asset id: {}", s);
+        assert!(!s.contains(raw_observed), "leaked observed asset id: {}", s);
+        assert!(!s.contains("0x2222"), "leaked asset address snippet: {}", s);
+        assert!(!s.contains("0x9999"), "leaked asset address snippet: {}", s);
+        assert!(!s.contains("22222222"), "leaked address hex: {}", s);
+        assert!(!s.contains("99999999"), "leaked address hex: {}", s);
+    }
+}
+
+#[test]
+fn test_regression_redacted_chain_mismatch() {
+    let intent = sample_intent(TradeSide::Buy, 500, 500);
+    let mut obs = sample_observation(
+        AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap(),
+        300,
+        300,
+        true,
+        true,
+        true,
+        100_000,
+    );
+    obs.chain = ChainId::Solana;
+    let policy = sample_policy();
+
+    let err = evaluate_tax_safety(&intent, Some(&obs), 100_000, &policy)
+        .expect_err("chain mismatch must fail closed");
+
+    assert_eq!(err, TaxSafetyError::ChainMismatch);
+
+    let display_str = err.to_string();
+    let debug_str = format!("{:?}", err);
+
+    assert_eq!(display_str, "chain mismatch");
+    assert_eq!(debug_str, "ChainMismatch");
+
+    for s in [&display_str, &debug_str] {
+        assert!(
+            !s.contains("Solana"),
+            "leaked chain observation data: {}",
+            s
+        );
+        assert!(!s.contains("Base"), "leaked chain observation data: {}", s);
+        assert!(!s.contains("So1111"), "leaked chain address data: {}", s);
+    }
+}
+
+#[test]
+fn test_regression_redacted_non_default_freshness_metadata() {
+    let policy = FreshnessPolicy::new(10_000, 2_000).unwrap();
+    let mut intent = sample_intent(TradeSide::Buy, 500, 500);
+    intent.expiry_ms = None;
+
+    // 1. Stale with distinctive non-default timestamps and sequence
+    let distinct_observed_ms = 12345678;
+    let distinct_eval_ms = 12399999; // age = 54321 > 10000
+    let distinct_slot = 987654321;
+
+    let mut stale_obs = sample_observation(
+        intent.token_out.clone(),
+        300,
+        300,
+        true,
+        true,
+        true,
+        distinct_observed_ms,
+    );
+    stale_obs.block_or_slot = distinct_slot;
+
+    let err_stale = evaluate_tax_safety(&intent, Some(&stale_obs), distinct_eval_ms, &policy)
+        .expect_err("stale observation must fail closed");
+
+    assert_eq!(err_stale, TaxSafetyError::StaleObservation);
+
+    let stale_display = err_stale.to_string();
+    let stale_debug = format!("{:?}", err_stale);
+
+    assert_eq!(stale_display, "tax observation is stale");
+    assert_eq!(stale_debug, "StaleObservation");
+
+    for s in [&stale_display, &stale_debug] {
+        assert!(
+            !s.contains("12345678"),
+            "leaked observed_at timestamp: {}",
+            s
+        );
+        assert!(
+            !s.contains("12399999"),
+            "leaked evaluation timestamp: {}",
+            s
+        );
+        assert!(!s.contains("987654321"), "leaked slot sequence: {}", s);
+        assert!(!s.contains("54321"), "leaked calculated age: {}", s);
+    }
+
+    // 2. Future skew with distinctive non-default timestamps and sequence
+    let distinct_future_obs_ms = 87654321;
+    let distinct_future_eval_ms = 87600000; // future skew = 54321 > 2000
+    let distinct_future_slot = 123987456;
+
+    let mut future_obs = sample_observation(
+        intent.token_out.clone(),
+        300,
+        300,
+        true,
+        true,
+        true,
+        distinct_future_obs_ms,
+    );
+    future_obs.block_or_slot = distinct_future_slot;
+
+    let err_resync =
+        evaluate_tax_safety(&intent, Some(&future_obs), distinct_future_eval_ms, &policy)
+            .expect_err("future skew must fail closed");
+
+    assert_eq!(err_resync, TaxSafetyError::ResyncRequired);
+
+    let resync_display = err_resync.to_string();
+    let resync_debug = format!("{:?}", err_resync);
+
+    assert_eq!(
+        resync_display,
+        "tax observation requires resync or clock skew exceeded policy limit"
+    );
+    assert_eq!(resync_debug, "ResyncRequired");
+
+    for s in [&resync_display, &resync_debug] {
+        assert!(
+            !s.contains("87654321"),
+            "leaked observed_at timestamp: {}",
+            s
+        );
+        assert!(
+            !s.contains("87600000"),
+            "leaked evaluation timestamp: {}",
+            s
+        );
+        assert!(!s.contains("123987456"), "leaked slot sequence: {}", s);
+        assert!(!s.contains("54321"), "leaked calculated skew: {}", s);
+    }
+
+    // 3. FreshnessEvaluationFailed error variant has no wrapped value-bearing payloads
+    let err_eval_failed = TaxSafetyError::FreshnessEvaluationFailed;
+    assert_eq!(err_eval_failed.to_string(), "freshness evaluation failed");
+    assert_eq!(
+        format!("{:?}", err_eval_failed),
+        "FreshnessEvaluationFailed"
+    );
+}
+
+#[test]
+fn test_regression_redacted_distinct_tax_caps() {
+    let policy = sample_policy();
+
+    // Distinct cap numbers: 345 bps max buy, 678 bps max sell
+    let intent = sample_intent(TradeSide::Buy, 345, 678);
+
+    // 1. Buy tax cap exceeded: observed 456 bps vs 345 bps cap
+    let obs_buy = sample_observation(
+        intent.token_out.clone(),
+        456,
+        100,
+        true,
+        true,
+        true,
+        100_000,
+    );
+    let err_buy = evaluate_tax_safety(&intent, Some(&obs_buy), 100_000, &policy)
+        .expect_err("buy tax > max_buy_tax must fail");
+
+    assert_eq!(err_buy, TaxSafetyError::BuyTaxExceedsCap);
+
+    let buy_display = err_buy.to_string();
+    let buy_debug = format!("{:?}", err_buy);
+
+    assert_eq!(buy_display, "buy tax exceeds maximum allowed cap");
+    assert_eq!(buy_debug, "BuyTaxExceedsCap");
+
+    for s in [&buy_display, &buy_debug] {
+        assert!(!s.contains("345"), "leaked max buy tax cap: {}", s);
+        assert!(!s.contains("456"), "leaked observed buy tax: {}", s);
+    }
+
+    // 2. Sell tax cap exceeded: observed 890 bps vs 678 bps cap
+    let obs_sell = sample_observation(
+        intent.token_out.clone(),
+        100,
+        890,
+        true,
+        true,
+        true,
+        100_000,
+    );
+    let err_sell = evaluate_tax_safety(&intent, Some(&obs_sell), 100_000, &policy)
+        .expect_err("sell tax > max_sell_tax must fail");
+
+    assert_eq!(err_sell, TaxSafetyError::SellTaxExceedsCap);
+
+    let sell_display = err_sell.to_string();
+    let sell_debug = format!("{:?}", err_sell);
+
+    assert_eq!(sell_display, "sell tax exceeds maximum allowed cap");
+    assert_eq!(sell_debug, "SellTaxExceedsCap");
+
+    for s in [&sell_display, &sell_debug] {
+        assert!(!s.contains("678"), "leaked max sell tax cap: {}", s);
+        assert!(!s.contains("890"), "leaked observed sell tax: {}", s);
     }
 }
 
