@@ -890,242 +890,65 @@ fn test_property_deterministic_replay_invariance() {
 }
 
 // =========================================================================
-// 11. Regression Tests: Atomic Fail-Closed State Preservation on Overflow
+// 11. Atomic Batch Consumption & Invariant Preservation
 // =========================================================================
 
 #[test]
-fn test_regression_enqueue_snapshot_counter_overflow_preserves_state() {
+fn test_consume_batch_atomic_pull_and_acknowledgement_fifo() {
     let config = ConsumerBatchConfig::new(10, 2).unwrap();
     let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
 
-    // Force total_enqueued_items counter to u64::MAX
-    queue.set_total_enqueued_items_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    let snap = sample_snapshot(1, 1_000);
-    let item = ConsumerBatchItem::from_depth_snapshot(snap).unwrap();
-
-    let res = queue.enqueue_snapshot(item);
-    assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow(
-            "total_enqueued_items overflow"
-        ))
-    );
-
-    // Assert exact consumer state is completely preserved
-    assert_eq!(queue, initial_state);
-    assert_eq!(queue.queue_len(), 0);
-    assert_eq!(queue.current_sequence(), None);
-    assert_eq!(queue.baseline_sequence(), None);
-    assert_eq!(queue.in_flight_len(), 0);
-    assert!(!queue.has_in_flight_batch());
-    assert_eq!(queue.last_acknowledged_batch_id(), None);
-    assert_eq!(queue.last_acknowledged_sequence(), None);
-    assert_eq!(queue.total_enqueued_items(), u64::MAX);
-    assert_eq!(queue.total_delivered_items(), 0);
-    assert_eq!(queue.total_acknowledged_items(), 0);
-    assert!(!queue.is_resync_required());
-}
-
-#[test]
-fn test_regression_enqueue_item_counter_overflow_preserves_state() {
-    let config = ConsumerBatchConfig::new(10, 2).unwrap();
-    let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
-
-    // Establish baseline at sequence 1
     let snap = sample_snapshot(1, 1_000);
     queue
         .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
         .unwrap();
-    assert_eq!(queue.queue_len(), 1);
-    assert_eq!(queue.current_sequence(), Some(Sequence(1)));
-
-    // Force total_enqueued_items counter to u64::MAX
-    queue.set_total_enqueued_items_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    let delta = sample_delta(2, 2, 1_010);
-    let delta_item = ConsumerBatchItem::from_depth_delta(delta).unwrap();
-
-    let res = queue.enqueue_item(delta_item);
-    assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow(
-            "total_enqueued_items overflow"
-        ))
-    );
-
-    // Assert exact consumer state is completely preserved
-    assert_eq!(queue, initial_state);
-    assert_eq!(queue.queue_len(), 1);
-    assert_eq!(queue.current_sequence(), Some(Sequence(1)));
-    assert_eq!(queue.baseline_sequence(), Some(Sequence(1)));
-    assert_eq!(queue.in_flight_len(), 0);
-    assert!(!queue.has_in_flight_batch());
-    assert_eq!(queue.total_enqueued_items(), u64::MAX);
-    assert_eq!(queue.total_delivered_items(), 0);
-    assert_eq!(queue.total_acknowledged_items(), 0);
-    assert!(!queue.is_resync_required());
-}
-
-#[test]
-fn test_regression_reset_with_baseline_counter_overflow_preserves_state() {
-    let config = ConsumerBatchConfig::new(10, 2).unwrap();
-    let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
-
-    // Establish baseline and enqueue delta
-    let snap = sample_snapshot(1, 1_000);
+    let delta2 = sample_delta(2, 2, 1_010);
     queue
-        .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta2).unwrap())
         .unwrap();
-    let delta = sample_delta(2, 2, 1_010);
+    let delta3 = sample_delta(3, 3, 1_020);
     queue
-        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
+        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta3).unwrap())
         .unwrap();
 
-    // Pull batch 1 so in-flight batch exists
-    let b1 = queue.pull_batch().unwrap().unwrap();
+    // Consume first batch of 2 items
+    let b1 = queue
+        .consume_batch()
+        .unwrap()
+        .expect("batch 1 should exist");
     assert_eq!(b1.batch_id(), 1);
-    assert!(queue.has_in_flight_batch());
-    assert_eq!(queue.queue_len(), 0);
-    assert_eq!(queue.in_flight_len(), 2);
-
-    // Force total_enqueued_items counter to u64::MAX
-    queue.set_total_enqueued_items_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    // Attempt reset_with_baseline with baseline item that would overflow total_enqueued_items
-    let recov_snap = sample_snapshot(5, 5_000);
-    let recov_item = ConsumerBatchItem::from_depth_snapshot(recov_snap).unwrap();
-
-    let res = queue.reset_with_baseline(Sequence(5), 5_000, Some(recov_item));
+    assert_eq!(b1.len(), 2);
     assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow(
-            "total_enqueued_items overflow"
-        ))
+        b1.sequence_range(),
+        SequenceRange::new(Sequence(1), Sequence(2)).unwrap()
     );
-
-    // Assert observable state is preserved: in-flight batch is NOT cleared, queue is intact
-    assert_eq!(queue, initial_state);
-    assert!(queue.has_in_flight_batch());
-    assert_eq!(queue.in_flight_batch().unwrap().batch_id(), 1);
-    assert_eq!(queue.in_flight_len(), 2);
-    assert_eq!(queue.queue_len(), 0);
-    assert_eq!(queue.current_sequence(), Some(Sequence(2)));
-    assert_eq!(queue.total_enqueued_items(), u64::MAX);
-}
-
-#[test]
-fn test_regression_pull_batch_batch_id_overflow_preserves_state() {
-    let config = ConsumerBatchConfig::new(10, 2).unwrap();
-    let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
-
-    let snap = sample_snapshot(1, 1_000);
-    queue
-        .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
-        .unwrap();
-    let delta = sample_delta(2, 2, 1_010);
-    queue
-        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
-        .unwrap();
-
-    // Force next_batch_id to u64::MAX
-    queue.set_next_batch_id_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    let res = queue.pull_batch();
-    assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow("batch_id overflow"))
-    );
-
-    // Assert exact queue, tracker, in-flight, batch_id, and counters are untouched
-    assert_eq!(queue, initial_state);
-    assert_eq!(queue.queue_len(), 2);
     assert!(!queue.has_in_flight_batch());
-    assert_eq!(queue.in_flight_len(), 0);
-    assert_eq!(queue.total_delivered_items(), 0);
-    assert_eq!(queue.current_sequence(), Some(Sequence(2)));
-    assert_eq!(queue.last_acknowledged_batch_id(), None);
-}
+    assert_eq!(queue.last_acknowledged_batch_id(), Some(1));
+    assert_eq!(queue.last_acknowledged_sequence(), Some(Sequence(2)));
+    assert_eq!(queue.total_delivered_items(), 2);
+    assert_eq!(queue.total_acknowledged_items(), 2);
+    assert_eq!(queue.queue_len(), 1);
 
-#[test]
-fn test_regression_pull_batch_delivery_counter_overflow_preserves_state() {
-    let config = ConsumerBatchConfig::new(10, 2).unwrap();
-    let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
-
-    let snap = sample_snapshot(1, 1_000);
-    queue
-        .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
-        .unwrap();
-    let delta = sample_delta(2, 2, 1_010);
-    queue
-        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
-        .unwrap();
-
-    // Force total_delivered_items to u64::MAX
-    queue.set_total_delivered_items_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    let res = queue.pull_batch();
+    // Consume second batch of remaining 1 item
+    let b2 = queue
+        .consume_batch()
+        .unwrap()
+        .expect("batch 2 should exist");
+    assert_eq!(b2.batch_id(), 2);
+    assert_eq!(b2.len(), 1);
     assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow(
-            "total_delivered_items overflow"
-        ))
+        b2.sequence_range(),
+        SequenceRange::point(Sequence(3)).unwrap()
     );
-
-    // Assert exact queue, tracker, in-flight, next batch id, and counters are untouched
-    assert_eq!(queue, initial_state);
-    assert_eq!(queue.queue_len(), 2);
     assert!(!queue.has_in_flight_batch());
-    assert_eq!(queue.in_flight_len(), 0);
-    assert_eq!(queue.total_delivered_items(), u64::MAX);
-    assert_eq!(queue.current_sequence(), Some(Sequence(2)));
-    assert_eq!(queue.last_acknowledged_batch_id(), None);
-}
+    assert_eq!(queue.last_acknowledged_batch_id(), Some(2));
+    assert_eq!(queue.last_acknowledged_sequence(), Some(Sequence(3)));
+    assert_eq!(queue.total_delivered_items(), 3);
+    assert_eq!(queue.total_acknowledged_items(), 3);
+    assert_eq!(queue.queue_len(), 0);
 
-#[test]
-fn test_regression_acknowledge_counter_overflow_preserves_state() {
-    let config = ConsumerBatchConfig::new(10, 2).unwrap();
-    let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
-
-    let snap = sample_snapshot(1, 1_000);
-    queue
-        .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
-        .unwrap();
-    let delta = sample_delta(2, 2, 1_010);
-    queue
-        .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
-        .unwrap();
-
-    // Pull batch 1
-    let b1 = queue.pull_batch().unwrap().unwrap();
-    assert_eq!(b1.batch_id(), 1);
-    assert!(queue.has_in_flight_batch());
-
-    // Force total_acknowledged_items to u64::MAX
-    queue.set_total_acknowledged_items_for_test(u64::MAX);
-    let initial_state = queue.clone();
-
-    // Attempt acknowledge
-    let res = queue.acknowledge(1);
-    assert_eq!(
-        res,
-        Err(MarketTypeError::ArithmeticOverflow(
-            "total_acknowledged_items overflow"
-        ))
-    );
-
-    // Assert exact queue, tracker, in-flight batch, and counters are untouched
-    assert_eq!(queue, initial_state);
-    assert!(queue.has_in_flight_batch());
-    assert_eq!(queue.in_flight_batch().unwrap().batch_id(), 1);
-    assert_eq!(queue.last_acknowledged_batch_id(), None);
-    assert_eq!(queue.last_acknowledged_sequence(), None);
-    assert_eq!(queue.total_acknowledged_items(), u64::MAX);
+    // Empty queue consume returns Ok(None)
+    assert_eq!(queue.consume_batch().unwrap(), None);
 }
 
 #[test]

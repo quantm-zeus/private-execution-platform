@@ -697,12 +697,82 @@ impl<T: Clone> ConsumerBatchQueue<T> {
     /// Atomic pull and acknowledgement in a single deterministic step.
     ///
     /// Fails closed if an unacknowledged batch is already in flight or if resync is latched.
+    /// Transactional: preflights all fallible batch-id, delivered, and acknowledged counter
+    /// arithmetic as well as sequence range validation before modifying any state.
+    /// If any error occurs, all queue, stream tracker, in-flight, batch ID, acknowledgement,
+    /// and counter state remains exactly identical to the pre-call state.
     pub fn consume_batch(&mut self) -> Result<Option<ConsumerBatch<T>>, MarketTypeError> {
-        let batch = self.pull_batch()?;
-        if let Some(ref b) = batch {
-            self.acknowledge(b.batch_id)?;
+        if self.is_resync_required() {
+            return Err(MarketTypeError::ResyncRequired {
+                reason: "consumer queue latched in resync mode; recovery snapshot required",
+            });
         }
-        Ok(batch)
+
+        if let Some(ref in_flight) = self.in_flight_batch {
+            return Err(MarketTypeError::UnacknowledgedBatchPending {
+                batch_id: in_flight.batch_id,
+            });
+        }
+
+        if self.queue.is_empty() {
+            return Ok(None);
+        }
+
+        let batch_size = std::cmp::min(self.queue.len(), self.config.max_batch_size);
+
+        // Preflight all fallible arithmetic and sequence range checks before modifying any state
+        let next_batch_id = self
+            .next_batch_id
+            .checked_add(1)
+            .ok_or(MarketTypeError::ArithmeticOverflow("batch_id overflow"))?;
+
+        let next_delivered = self
+            .total_delivered_items
+            .checked_add(batch_size as u64)
+            .ok_or(MarketTypeError::ArithmeticOverflow(
+                "total_delivered_items overflow",
+            ))?;
+
+        let next_acknowledged = self
+            .total_acknowledged_items
+            .checked_add(batch_size as u64)
+            .ok_or(MarketTypeError::ArithmeticOverflow(
+                "total_acknowledged_items overflow",
+            ))?;
+
+        let start_seq = self
+            .queue
+            .front()
+            .expect("batch cannot be empty")
+            .sequence_range
+            .start;
+        let end_seq = self
+            .queue
+            .get(batch_size - 1)
+            .expect("batch_size <= queue.len()")
+            .sequence_range
+            .end;
+        let sequence_range = SequenceRange::new(start_seq, end_seq)?;
+
+        // All checks succeeded; commit state once
+        let batch_id = self.next_batch_id;
+        let items: Vec<ConsumerBatchItem<T>> = self.queue.drain(0..batch_size).collect();
+
+        let batch = ConsumerBatch {
+            batch_id,
+            target: self.target.clone(),
+            sequence_range,
+            items,
+        };
+
+        self.next_batch_id = next_batch_id;
+        self.total_delivered_items = next_delivered;
+        self.total_acknowledged_items = next_acknowledged;
+        self.last_acknowledged_batch_id = Some(batch_id);
+        self.last_acknowledged_sequence = Some(sequence_range.end);
+        self.in_flight_batch = None;
+
+        Ok(Some(batch))
     }
 
     /// Resets queue baseline and clears sticky resync with explicit sequence and optional baseline item.
@@ -744,30 +814,6 @@ impl<T: Clone> ConsumerBatchQueue<T> {
         }
 
         Ok(())
-    }
-
-    /// Test helper to set `total_enqueued_items` for overflow testing.
-    #[doc(hidden)]
-    pub fn set_total_enqueued_items_for_test(&mut self, val: u64) {
-        self.total_enqueued_items = val;
-    }
-
-    /// Test helper to set `next_batch_id` for overflow testing.
-    #[doc(hidden)]
-    pub fn set_next_batch_id_for_test(&mut self, val: u64) {
-        self.next_batch_id = val;
-    }
-
-    /// Test helper to set `total_delivered_items` for overflow testing.
-    #[doc(hidden)]
-    pub fn set_total_delivered_items_for_test(&mut self, val: u64) {
-        self.total_delivered_items = val;
-    }
-
-    /// Test helper to set `total_acknowledged_items` for overflow testing.
-    #[doc(hidden)]
-    pub fn set_total_acknowledged_items_for_test(&mut self, val: u64) {
-        self.total_acknowledged_items = val;
     }
 }
 
@@ -1014,5 +1060,504 @@ impl MarketConsumerBatcher {
         &mut self,
     ) -> Result<Option<ConsumerBatch<AggregationOutput>>, MarketTypeError> {
         self.queue.consume_batch()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CandleTimeframe, CanonicalFeedEnvelope, CanonicalFeedPayload, ChainFamily, DepthDelta,
+        DepthLevel, DepthSnapshot, FeedFinality, FeedObservationContext, FeedSourceLabel,
+        FreshnessStatus, InstrumentId, MarketAggregator, NormalizedPrice, NormalizedQuantity,
+        SafeFreshnessMeta, SequenceRange,
+    };
+    use chain_types::{AssetId, ChainId};
+
+    fn sample_instrument() -> InstrumentId {
+        let base = AssetId::new(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        )
+        .unwrap();
+        let quote = AssetId::new(
+            ChainId::Solana,
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+        .unwrap();
+        InstrumentId::new(base, quote).unwrap()
+    }
+
+    fn sample_target() -> FeedTarget {
+        FeedTarget::Instrument(sample_instrument())
+    }
+
+    fn price(v: f64) -> NormalizedPrice {
+        NormalizedPrice::new(v).unwrap()
+    }
+
+    fn qty(v: f64) -> NormalizedQuantity {
+        NormalizedQuantity::new(v).unwrap()
+    }
+
+    fn sample_snapshot(seq: u64, ts: i64) -> DepthSnapshot {
+        DepthSnapshot {
+            target: sample_target(),
+            sequence: Sequence(seq),
+            timestamp_ms: ts,
+            bids: vec![
+                DepthLevel::new(price(150.0), qty(10.0)),
+                DepthLevel::new(price(149.0), qty(20.0)),
+            ],
+            asks: vec![
+                DepthLevel::new(price(151.0), qty(10.0)),
+                DepthLevel::new(price(152.0), qty(20.0)),
+            ],
+        }
+    }
+
+    fn sample_delta(start: u64, end: u64, ts: i64) -> DepthDelta {
+        DepthDelta {
+            target: sample_target(),
+            sequence_range: SequenceRange::new(Sequence(start), Sequence(end)).unwrap(),
+            timestamp_ms: ts,
+            bids: vec![DepthLevel::new(price(150.0), qty(15.0))],
+            asks: vec![DepthLevel::new(price(151.0), qty(25.0))],
+        }
+    }
+
+    fn make_envelope(payload: CanonicalFeedPayload, seq: u64, ts: i64) -> CanonicalFeedEnvelope {
+        CanonicalFeedEnvelope {
+            context: FeedObservationContext {
+                source_family: ChainFamily::Solana,
+                source_label: FeedSourceLabel::new("solana-direct").unwrap(),
+                finality: FeedFinality::Confirmed,
+                slot_or_block: Some(100),
+                observed_at_ms: ts,
+            },
+            freshness: SafeFreshnessMeta {
+                status: FreshnessStatus::Fresh,
+                observed_at_ms: ts,
+                evaluated_at_ms: ts + 10,
+                age_ms: 10,
+                sequence: Sequence(seq),
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn test_regression_enqueue_snapshot_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        queue.total_enqueued_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let snap = sample_snapshot(1, 1_000);
+        let item = ConsumerBatchItem::from_depth_snapshot(snap).unwrap();
+
+        let res = queue.enqueue_snapshot(item);
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_enqueued_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 0);
+        assert_eq!(queue.current_sequence(), None);
+        assert_eq!(queue.baseline_sequence(), None);
+        assert_eq!(queue.in_flight_len(), 0);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.last_acknowledged_batch_id(), None);
+        assert_eq!(queue.last_acknowledged_sequence(), None);
+        assert_eq!(queue.total_enqueued_items(), u64::MAX);
+        assert_eq!(queue.total_delivered_items(), 0);
+        assert_eq!(queue.total_acknowledged_items(), 0);
+        assert!(!queue.is_resync_required());
+    }
+
+    #[test]
+    fn test_regression_enqueue_item_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        assert_eq!(queue.queue_len(), 1);
+        assert_eq!(queue.current_sequence(), Some(Sequence(1)));
+
+        queue.total_enqueued_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let delta = sample_delta(2, 2, 1_010);
+        let delta_item = ConsumerBatchItem::from_depth_delta(delta).unwrap();
+
+        let res = queue.enqueue_item(delta_item);
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_enqueued_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 1);
+        assert_eq!(queue.current_sequence(), Some(Sequence(1)));
+        assert_eq!(queue.baseline_sequence(), Some(Sequence(1)));
+        assert_eq!(queue.in_flight_len(), 0);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.total_enqueued_items(), u64::MAX);
+        assert_eq!(queue.total_delivered_items(), 0);
+        assert_eq!(queue.total_acknowledged_items(), 0);
+        assert!(!queue.is_resync_required());
+    }
+
+    #[test]
+    fn test_regression_reset_with_baseline_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        let delta = sample_delta(2, 2, 1_010);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
+            .unwrap();
+
+        let b1 = queue.pull_batch().unwrap().unwrap();
+        assert_eq!(b1.batch_id(), 1);
+        assert!(queue.has_in_flight_batch());
+        assert_eq!(queue.queue_len(), 0);
+        assert_eq!(queue.in_flight_len(), 2);
+
+        queue.total_enqueued_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let recov_snap = sample_snapshot(5, 5_000);
+        let recov_item = ConsumerBatchItem::from_depth_snapshot(recov_snap).unwrap();
+
+        let res = queue.reset_with_baseline(Sequence(5), 5_000, Some(recov_item));
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_enqueued_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert!(queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_batch().unwrap().batch_id(), 1);
+        assert_eq!(queue.in_flight_len(), 2);
+        assert_eq!(queue.queue_len(), 0);
+        assert_eq!(queue.current_sequence(), Some(Sequence(2)));
+        assert_eq!(queue.total_enqueued_items(), u64::MAX);
+    }
+
+    #[test]
+    fn test_regression_pull_batch_batch_id_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        let delta = sample_delta(2, 2, 1_010);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
+            .unwrap();
+
+        queue.next_batch_id = u64::MAX;
+        let initial_state = queue.clone();
+
+        let res = queue.pull_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow("batch_id overflow"))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 2);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.total_delivered_items(), 0);
+        assert_eq!(queue.current_sequence(), Some(Sequence(2)));
+        assert_eq!(queue.last_acknowledged_batch_id(), None);
+    }
+
+    #[test]
+    fn test_regression_pull_batch_delivery_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        let delta = sample_delta(2, 2, 1_010);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
+            .unwrap();
+
+        queue.total_delivered_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let res = queue.pull_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_delivered_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 2);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.total_delivered_items(), u64::MAX);
+        assert_eq!(queue.current_sequence(), Some(Sequence(2)));
+        assert_eq!(queue.last_acknowledged_batch_id(), None);
+    }
+
+    #[test]
+    fn test_regression_acknowledge_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        let delta = sample_delta(2, 2, 1_010);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta).unwrap())
+            .unwrap();
+
+        let b1 = queue.pull_batch().unwrap().unwrap();
+        assert_eq!(b1.batch_id(), 1);
+        assert!(queue.has_in_flight_batch());
+
+        queue.total_acknowledged_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let res = queue.acknowledge(1);
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_acknowledged_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert!(queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_batch().unwrap().batch_id(), 1);
+        assert_eq!(queue.last_acknowledged_batch_id(), None);
+        assert_eq!(queue.last_acknowledged_sequence(), None);
+        assert_eq!(queue.total_acknowledged_items(), u64::MAX);
+    }
+
+    #[test]
+    fn test_regression_consume_batch_acknowledged_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+        let delta2 = sample_delta(2, 2, 1_010);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta2).unwrap())
+            .unwrap();
+        let delta3 = sample_delta(3, 3, 1_020);
+        queue
+            .enqueue_item(ConsumerBatchItem::from_depth_delta(delta3).unwrap())
+            .unwrap();
+
+        assert_eq!(queue.queue_len(), 3);
+        assert_eq!(queue.current_sequence(), Some(Sequence(3)));
+        assert_eq!(queue.total_enqueued_items(), 3);
+        assert_eq!(queue.total_delivered_items(), 0);
+        assert_eq!(queue.total_acknowledged_items(), 0);
+        assert_eq!(queue.next_batch_id, 1);
+        assert!(!queue.has_in_flight_batch());
+
+        // Force total_acknowledged_items to u64::MAX
+        queue.total_acknowledged_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        // Attempt consume_batch: MUST fail on total_acknowledged_items overflow
+        let res = queue.consume_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_acknowledged_items overflow"
+            ))
+        );
+
+        // Transactional guarantee: queue, tracker/cursor, in-flight, next batch id,
+        // acknowledgement fields, and all counters must exactly equal the pre-call state.
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 3);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.next_batch_id, 1);
+        assert_eq!(queue.last_acknowledged_batch_id(), None);
+        assert_eq!(queue.last_acknowledged_sequence(), None);
+        assert_eq!(queue.total_enqueued_items(), 3);
+        assert_eq!(queue.total_delivered_items(), 0);
+        assert_eq!(queue.total_acknowledged_items(), u64::MAX);
+        assert_eq!(queue.current_sequence(), Some(Sequence(3)));
+        assert!(!queue.is_resync_required());
+
+        // Restore acknowledged counter to 0 to verify normal FIFO and successful consumption
+        queue.total_acknowledged_items = 0;
+
+        // Batch 1: consumes 2 items (seq 1, seq 2)
+        let batch1 = queue.consume_batch().unwrap().expect("batch 1 exists");
+        assert_eq!(batch1.batch_id(), 1);
+        assert_eq!(batch1.len(), 2);
+        assert_eq!(
+            batch1.sequence_range(),
+            SequenceRange::new(Sequence(1), Sequence(2)).unwrap()
+        );
+        assert_eq!(
+            batch1.items[0].sequence_range,
+            SequenceRange::point(Sequence(1)).unwrap()
+        );
+        assert_eq!(
+            batch1.items[1].sequence_range,
+            SequenceRange::point(Sequence(2)).unwrap()
+        );
+
+        assert_eq!(queue.queue_len(), 1);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.next_batch_id, 2);
+        assert_eq!(queue.last_acknowledged_batch_id(), Some(1));
+        assert_eq!(queue.last_acknowledged_sequence(), Some(Sequence(2)));
+        assert_eq!(queue.total_delivered_items(), 2);
+        assert_eq!(queue.total_acknowledged_items(), 2);
+
+        // Batch 2: consumes remaining 1 item (seq 3)
+        let batch2 = queue.consume_batch().unwrap().expect("batch 2 exists");
+        assert_eq!(batch2.batch_id(), 2);
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(
+            batch2.sequence_range(),
+            SequenceRange::point(Sequence(3)).unwrap()
+        );
+        assert_eq!(
+            batch2.items[0].sequence_range,
+            SequenceRange::point(Sequence(3)).unwrap()
+        );
+
+        assert_eq!(queue.queue_len(), 0);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.next_batch_id, 3);
+        assert_eq!(queue.last_acknowledged_batch_id(), Some(2));
+        assert_eq!(queue.last_acknowledged_sequence(), Some(Sequence(3)));
+        assert_eq!(queue.total_delivered_items(), 3);
+        assert_eq!(queue.total_acknowledged_items(), 3);
+
+        // Batch 3: queue is empty, returns Ok(None)
+        let batch3 = queue.consume_batch().unwrap();
+        assert_eq!(batch3, None);
+    }
+
+    #[test]
+    fn test_regression_consume_batch_delivery_counter_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+
+        queue.total_delivered_items = u64::MAX;
+        let initial_state = queue.clone();
+
+        let res = queue.consume_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_delivered_items overflow"
+            ))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 1);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.total_delivered_items(), u64::MAX);
+    }
+
+    #[test]
+    fn test_regression_consume_batch_batch_id_overflow_preserves_state() {
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut queue = ConsumerBatchQueue::new(sample_target(), config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        queue
+            .enqueue_snapshot(ConsumerBatchItem::from_depth_snapshot(snap).unwrap())
+            .unwrap();
+
+        queue.next_batch_id = u64::MAX;
+        let initial_state = queue.clone();
+
+        let res = queue.consume_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow("batch_id overflow"))
+        );
+
+        assert_eq!(queue, initial_state);
+        assert_eq!(queue.queue_len(), 1);
+        assert!(!queue.has_in_flight_batch());
+        assert_eq!(queue.next_batch_id, u64::MAX);
+    }
+
+    #[test]
+    fn test_regression_market_consumer_batcher_consume_batch_overflow_preserves_state() {
+        let instrument = sample_instrument();
+        let aggregator =
+            MarketAggregator::for_instrument(instrument.clone(), CandleTimeframe::M1, 100, 100)
+                .unwrap();
+        let config = ConsumerBatchConfig::new(10, 2).unwrap();
+        let mut batcher = MarketConsumerBatcher::new(aggregator, config).unwrap();
+
+        let snap = sample_snapshot(1, 1_000);
+        batcher.reset_with_snapshot(&snap).unwrap();
+
+        let delta_env = make_envelope(
+            CanonicalFeedPayload::OrderBookDelta(sample_delta(2, 2, 1_010)),
+            2,
+            1_010,
+        );
+        batcher.apply_envelope(&delta_env).unwrap();
+
+        batcher.queue.total_acknowledged_items = u64::MAX;
+        let initial_state = batcher.clone();
+
+        let res = batcher.consume_batch();
+        assert_eq!(
+            res,
+            Err(MarketTypeError::ArithmeticOverflow(
+                "total_acknowledged_items overflow"
+            ))
+        );
+
+        assert_eq!(batcher, initial_state);
+        assert_eq!(batcher.queue().queue_len(), 2);
+        assert!(!batcher.queue().has_in_flight_batch());
+        assert_eq!(batcher.queue().total_acknowledged_items(), u64::MAX);
     }
 }
