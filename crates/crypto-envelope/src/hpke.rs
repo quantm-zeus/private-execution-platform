@@ -5,7 +5,10 @@
 //! the HPKE exporter and constructs the existing `SendSession`/`ReceiveSession`
 //! pair for each side. All key material is RAM-only and zeroized.
 
-use crate::{CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, KID_LEN};
+use crate::{
+    CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, StreamFrame, StreamFrameError,
+    KID_LEN,
+};
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::SeedableRng,
     Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable,
@@ -146,6 +149,17 @@ impl HpkeInitiatorSession {
         }
         self.receive.receive(envelope)
     }
+
+    pub fn seal_frame(&mut self, frame: &StreamFrame) -> Result<Envelope, StreamFrameError> {
+        self.send.seal_frame(self.kid, frame)
+    }
+
+    pub fn receive_frame(&mut self, envelope: &Envelope) -> Result<StreamFrame, StreamFrameError> {
+        if envelope.kid != self.kid {
+            return Err(StreamFrameError::DecryptFailed);
+        }
+        self.receive.receive_frame(envelope)
+    }
 }
 
 impl std::fmt::Debug for HpkeInitiatorSession {
@@ -180,6 +194,17 @@ impl HpkeResponderSession {
             return Err(CryptoError::KeyIdMismatch);
         }
         self.receive.receive(envelope)
+    }
+
+    pub fn seal_frame(&mut self, frame: &StreamFrame) -> Result<Envelope, StreamFrameError> {
+        self.send.seal_frame(self.kid, frame)
+    }
+
+    pub fn receive_frame(&mut self, envelope: &Envelope) -> Result<StreamFrame, StreamFrameError> {
+        if envelope.kid != self.kid {
+            return Err(StreamFrameError::DecryptFailed);
+        }
+        self.receive.receive_frame(envelope)
     }
 }
 

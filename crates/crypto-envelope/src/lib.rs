@@ -13,6 +13,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod artifact;
+pub mod frame;
 #[path = "hpke.rs"]
 pub mod hpke;
 
@@ -23,6 +24,15 @@ pub use artifact::{
     ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MAX_ARTIFACT_PAYLOAD_LEN, MIN_ARTIFACT_LEN,
     PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN, WORKSPACE_UNLOCK_DOMAIN,
 };
+pub use frame::{
+    Frame, FrameError, FrameKind, StreamFrame, StreamFrameCodec, StreamFrameError, StreamFrameKind,
+    FRAME_HEADER_LEN, FRAME_VERSION, MAX_FRAME_LEN, MAX_FRAME_PAYLOAD_LEN, MIN_CIPHERTEXT_LEN,
+    MIN_FRAME_LEN,
+};
+
+pub mod stream_frame {
+    pub use super::frame::*;
+}
 
 pub const SESSION_KEY_LEN: usize = 32;
 pub const KID_LEN: usize = 16;
@@ -251,6 +261,30 @@ impl SendSession {
         self.cipher.seal(kid, sequence, plaintext)
     }
 
+    /// Return the last sequence number successfully sealed in this session.
+    pub fn last_sequence(&self) -> u64 {
+        self.cipher.last_sequence
+    }
+
+    /// Seal an opaque bounded stream frame, binding inner frame sequence to envelope sequence.
+    pub fn seal_frame(
+        &mut self,
+        kid: [u8; KID_LEN],
+        frame: &frame::StreamFrame,
+    ) -> Result<Envelope, frame::StreamFrameError> {
+        frame::StreamFrameCodec::seal_frame(self, kid, frame)
+    }
+
+    /// Seal an opaque bounded stream frame with explicit envelope sequence binding verification.
+    pub fn seal_frame_bound(
+        &mut self,
+        kid: [u8; KID_LEN],
+        sequence: u64,
+        frame: &frame::StreamFrame,
+    ) -> Result<Envelope, frame::StreamFrameError> {
+        frame::StreamFrameCodec::seal_frame_bound(self, kid, sequence, frame)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_key() -> Self {
         Self {
@@ -291,6 +325,36 @@ impl ReceiveSession {
         let plaintext = SessionCipher::open_with(&self.key, envelope)?;
         self.replay.accept(envelope.sequence)?;
         Ok(plaintext)
+    }
+
+    /// Open and decrypt with session AEAD without advancing the replay window.
+    pub(crate) fn open_only(&self, envelope: &Envelope) -> Result<Vec<u8>, CryptoError> {
+        SessionCipher::open_with(&self.key, envelope)
+    }
+
+    /// Advance replay window state after frame validation succeeds.
+    pub(crate) fn accept_replay(&mut self, sequence: u64) -> Result<(), CryptoError> {
+        self.replay.accept(sequence)
+    }
+
+    /// Receives, authenticates, validates, and decodes an opaque stream frame.
+    ///
+    /// Replay state advances only if authentication and all frame validations succeed.
+    pub fn receive_frame(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<frame::StreamFrame, frame::StreamFrameError> {
+        frame::StreamFrameCodec::receive_frame(self, envelope)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_key() -> Self {
+        Self::new(SessionKey::from_bytes([7u8; SESSION_KEY_LEN]))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn highest_accepted_sequence(&self) -> u64 {
+        self.replay.highest
     }
 }
 
