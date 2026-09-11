@@ -351,8 +351,10 @@ impl ExecutionPreview {
         if route.expected_net_output.asset != self.token_out {
             return Err(DomainError::RouteOutputAssetMismatch);
         }
-        if first_leg.token_in.chain != self.chain || last_leg.token_out.chain != self.chain {
-            return Err(DomainError::ChainMismatch);
+        for leg in &route.legs {
+            if leg.token_in.chain != self.chain || leg.token_out.chain != self.chain {
+                return Err(DomainError::ChainMismatch);
+            }
         }
 
         // 5. Freshness evaluation: local state must be Fresh
@@ -955,5 +957,139 @@ mod tests {
             small_preview.validate(&all_or_nothing, &route, now_ms),
             Err(DomainError::InconsistentNetEconomics(_))
         ));
+    }
+
+    #[test]
+    fn regression_route_chain_consistency_rejects_contiguous_cross_chain_route_and_preserves_inputs(
+    ) {
+        let now_ms = 1_000;
+        let token_base_in = sample_asset(ChainId::Base, "0xusdc");
+        let token_solana_mid = sample_asset(
+            ChainId::Solana,
+            "So11111111111111111111111111111111111111112",
+        );
+        let token_base_out = sample_asset(ChainId::Base, "0xtoken");
+
+        let intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        let preview = sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::Fresh);
+
+        // Contiguous 2-leg cross-chain route:
+        // Leg 1: Base USDC -> Solana SOL
+        // Leg 2: Solana SOL -> Base TOKEN
+        let cross_chain_route = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "cross_bridge_1".to_string(),
+                    pool_ref: "pool-base-sol".to_string(),
+                    token_in: token_base_in.clone(),
+                    token_out: token_solana_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "cross_bridge_2".to_string(),
+                    pool_ref: "pool-sol-base".to_string(),
+                    token_in: token_solana_mid.clone(),
+                    token_out: token_base_out.clone(),
+                    amount_in: AtomicAmount::new(500),
+                    expected_amount_out: AtomicAmount::new(250),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_base_out.clone(),
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+
+        // 1. Generic route plan validation succeeds because legs are contiguous
+        // and individually valid.
+        assert!(cross_chain_route.validate().is_ok());
+
+        // 2. The old flawed check verified only first leg token_in and last leg token_out chains.
+        // Prove that this cross-chain route would have satisfied that old check:
+        let first_leg = cross_chain_route.legs.first().unwrap();
+        let last_leg = cross_chain_route.legs.last().unwrap();
+        assert_eq!(first_leg.token_in.chain, preview.chain);
+        assert_eq!(last_leg.token_out.chain, preview.chain);
+        assert_eq!(first_leg.token_in, preview.token_in);
+        assert_eq!(last_leg.token_out, preview.token_out);
+        assert_eq!(first_leg.token_out.chain, ChainId::Solana);
+        assert_eq!(last_leg.token_in.chain, ChainId::Solana);
+
+        // 3. Snapshot copies before validation to prove inputs remain unmodified.
+        let orig_intent = intent.clone();
+        let orig_route = cross_chain_route.clone();
+        let orig_preview = preview.clone();
+
+        // 4. ExecutionPreview::validate rejects fail-closed with DomainError::ChainMismatch.
+        let res = preview.validate(&intent, &cross_chain_route, now_ms);
+        assert_eq!(res, Err(DomainError::ChainMismatch));
+
+        // Prove failure leaves intent, route, and preview inputs unchanged.
+        assert_eq!(intent, orig_intent);
+        assert_eq!(cross_chain_route, orig_route);
+        assert_eq!(preview, orig_preview);
+
+        // Also verify the free function entrypoint behaves identically and purely.
+        let res2 = validate_execution_preview(&intent, &cross_chain_route, &preview, now_ms);
+        assert_eq!(res2, Err(DomainError::ChainMismatch));
+        assert_eq!(intent, orig_intent);
+        assert_eq!(cross_chain_route, orig_route);
+        assert_eq!(preview, orig_preview);
+
+        // Also verify a 3-leg contiguous route: Base -> Solana -> Solana -> Base
+        let token_solana_mid2 = sample_asset(
+            ChainId::Solana,
+            "So22222222222222222222222222222222222222222",
+        );
+        let cross_chain_route_3leg = RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "bridge_in".to_string(),
+                    pool_ref: "pool-1".to_string(),
+                    token_in: token_base_in.clone(),
+                    token_out: token_solana_mid.clone(),
+                    amount_in: AtomicAmount::new(1_000),
+                    expected_amount_out: AtomicAmount::new(500),
+                },
+                RouteLeg {
+                    venue: "dex_sol".to_string(),
+                    pool_ref: "pool-2".to_string(),
+                    token_in: token_solana_mid.clone(),
+                    token_out: token_solana_mid2.clone(),
+                    amount_in: AtomicAmount::new(500),
+                    expected_amount_out: AtomicAmount::new(400),
+                },
+                RouteLeg {
+                    venue: "bridge_out".to_string(),
+                    pool_ref: "pool-3".to_string(),
+                    token_in: token_solana_mid2.clone(),
+                    token_out: token_base_out.clone(),
+                    amount_in: AtomicAmount::new(400),
+                    expected_amount_out: AtomicAmount::new(250),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token_base_out,
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: now_ms,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        };
+        assert!(cross_chain_route_3leg.validate().is_ok());
+        let orig_route_3leg = cross_chain_route_3leg.clone();
+        let res3 = preview.validate(&intent, &cross_chain_route_3leg, now_ms);
+        assert_eq!(res3, Err(DomainError::ChainMismatch));
+        assert_eq!(cross_chain_route_3leg, orig_route_3leg);
+        assert_eq!(intent, orig_intent);
+        assert_eq!(preview, orig_preview);
     }
 }
