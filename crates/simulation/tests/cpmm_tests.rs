@@ -257,15 +257,22 @@ fn test_zero_and_invalid_inputs_reserves_fees_rejection() {
         simulate_cpmm_swap(&zero_both, &zero_both.token_0, AtomicAmount::new(1_000));
     assert_eq!(res_zero_both, Err(SimulationError::ZeroReserve));
 
-    // 5E: Zero fee basis points
+    // 5E: Zero fee basis points is valid (exact fee = 0, effective input = input)
     let mut zero_fee_pool = base_pool.clone();
     zero_fee_pool.fee_bps = Bps::new(0).unwrap();
-    let res_zero_fee = simulate_cpmm_swap(
+    let quote_zero_fee = simulate_cpmm_swap(
         &zero_fee_pool,
         &zero_fee_pool.token_0,
         AtomicAmount::new(1_000),
-    );
-    assert_eq!(res_zero_fee, Err(SimulationError::ZeroFee));
+    )
+    .expect("zero-fee swap should succeed");
+    assert_eq!(quote_zero_fee.input.amount.get(), 1_000);
+    assert_eq!(quote_zero_fee.pool_fee.amount.get(), 0);
+    assert_eq!(quote_zero_fee.effective_input, quote_zero_fee.input);
+    assert_eq!(quote_zero_fee.output.amount.get(), 999);
+    assert_eq!(quote_zero_fee.resulting_reserve_in.get(), 1_001_000);
+    assert_eq!(quote_zero_fee.resulting_reserve_out.get(), 999_001);
+    assert_eq!(quote_zero_fee.fee_bps.get(), 0);
 
     // 5F: Invalid 100% fee (10_000 bps)
     let mut max_fee_pool = base_pool.clone();
@@ -447,4 +454,65 @@ fn test_directed_swap_helpers() {
     let ratio = quote.quote_price_ratio().unwrap();
     assert_eq!(ratio.numerator_atomic(), 19_743);
     assert_eq!(ratio.denominator_atomic(), 10_000);
+}
+
+// 11. Proving zero-fee CPMM pool economics across both directions
+#[test]
+fn test_zero_fee_pool_quote_economics_both_directions() {
+    let pool = sample_pool(1_000_000, 2_000_000, 0); // fee_bps = 0
+
+    // --- Direction 0 -> 1 ---
+    // amount_in = 10_000
+    // fee = 0
+    // effective_input = 10_000
+    // numerator = 10_000 * 2_000_000 = 20_000_000_000
+    // denominator = 1_000_000 + 10_000 = 1_010_000
+    // amount_out = floor(20_000_000_000 / 1_010_000) = 19_801
+    // resulting_reserve_0 = 1_000_000 + 10_000 = 1_010_000
+    // resulting_reserve_1 = 2_000_000 - 19_801 = 1_980_199
+    let quote_0_to_1 = simulate_cpmm_swap(&pool, &pool.token_0, AtomicAmount::new(10_000)).unwrap();
+
+    assert_eq!(quote_0_to_1.input.asset, pool.token_0);
+    assert_eq!(quote_0_to_1.input.amount.get(), 10_000);
+    assert_eq!(quote_0_to_1.pool_fee.asset, pool.token_0);
+    assert_eq!(quote_0_to_1.pool_fee.amount.get(), 0);
+    assert_eq!(quote_0_to_1.effective_input, quote_0_to_1.input);
+    assert_eq!(quote_0_to_1.output.asset, pool.token_1);
+    assert_eq!(quote_0_to_1.output.amount.get(), 19_801);
+    assert_eq!(quote_0_to_1.fee_bps.get(), 0);
+    assert_eq!(quote_0_to_1.resulting_reserve_0.get(), 1_010_000);
+    assert_eq!(quote_0_to_1.resulting_reserve_1.get(), 1_980_199);
+    assert_eq!(quote_0_to_1.resulting_reserve_in.get(), 1_010_000);
+    assert_eq!(quote_0_to_1.resulting_reserve_out.get(), 1_980_199);
+
+    let k_old = 1_000_000u128 * 2_000_000u128;
+    let k_new = quote_0_to_1.resulting_reserve_0.get() * quote_0_to_1.resulting_reserve_1.get();
+    assert!(k_new >= k_old);
+
+    // --- Direction 1 -> 0 ---
+    // amount_in = 20_000
+    // fee = 0
+    // effective_input = 20_000
+    // numerator = 20_000 * 1_000_000 = 20_000_000_000
+    // denominator = 2_000_000 + 20_000 = 2_020_000
+    // amount_out = floor(20_000_000_000 / 2_020_000) = 9_900
+    // resulting_reserve_0 = 1_000_000 - 9_900 = 990_100
+    // resulting_reserve_1 = 2_000_000 + 20_000 = 2_020_000
+    let quote_1_to_0 = simulate_cpmm_swap(&pool, &pool.token_1, AtomicAmount::new(20_000)).unwrap();
+
+    assert_eq!(quote_1_to_0.input.asset, pool.token_1);
+    assert_eq!(quote_1_to_0.input.amount.get(), 20_000);
+    assert_eq!(quote_1_to_0.pool_fee.asset, pool.token_1);
+    assert_eq!(quote_1_to_0.pool_fee.amount.get(), 0);
+    assert_eq!(quote_1_to_0.effective_input, quote_1_to_0.input);
+    assert_eq!(quote_1_to_0.output.asset, pool.token_0);
+    assert_eq!(quote_1_to_0.output.amount.get(), 9_900);
+    assert_eq!(quote_1_to_0.fee_bps.get(), 0);
+    assert_eq!(quote_1_to_0.resulting_reserve_0.get(), 990_100);
+    assert_eq!(quote_1_to_0.resulting_reserve_1.get(), 2_020_000);
+    assert_eq!(quote_1_to_0.resulting_reserve_in.get(), 2_020_000);
+    assert_eq!(quote_1_to_0.resulting_reserve_out.get(), 990_100);
+
+    let k_new_rev = quote_1_to_0.resulting_reserve_0.get() * quote_1_to_0.resulting_reserve_1.get();
+    assert!(k_new_rev >= k_old);
 }

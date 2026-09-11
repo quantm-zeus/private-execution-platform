@@ -271,9 +271,6 @@ pub fn simulate_cpmm_exact_input(
 
     // 7. Validate fee basis points
     let fee_bps_val = pool.fee_bps.get();
-    if fee_bps_val == 0 {
-        return Err(SimulationError::ZeroFee);
-    }
     if fee_bps_val >= Bps::MAX {
         return Err(SimulationError::InvalidFeeBps(fee_bps_val));
     }

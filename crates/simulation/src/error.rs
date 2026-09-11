@@ -19,10 +19,6 @@ pub enum SimulationError {
     #[error("pool reserves must be greater than zero")]
     ZeroReserve,
 
-    /// The pool fee basis points is zero.
-    #[error("pool fee must be greater than zero")]
-    ZeroFee,
-
     /// The pool fee basis points is invalid (must be strictly less than 10,000 bps).
     #[error("pool fee {0} bps is invalid (must be strictly less than 10000 bps)")]
     InvalidFeeBps(u16),
