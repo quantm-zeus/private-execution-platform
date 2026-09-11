@@ -2673,6 +2673,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tax-engine"
+version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "domain",
+ "market-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "telemetry"
 version = "0.1.0"
 dependencies = [
