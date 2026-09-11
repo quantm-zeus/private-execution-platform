@@ -160,4 +160,18 @@ pub enum MarketTypeError {
     },
     #[error("aggregated buckets count {count} exceeds maximum {max}")]
     AggregatedBucketsExceeded { count: usize, max: usize },
+
+    // --- Consumer batching & backpressure errors ---
+    #[error("consumer queue capacity {count} exceeds maximum {max}")]
+    ConsumerQueueCapacityExceeded { count: usize, max: usize },
+    #[error("consumer batch size {size} exceeds maximum {max}")]
+    ConsumerBatchSizeExceeded { size: usize, max: usize },
+    #[error("invalid consumer configuration: {reason}")]
+    InvalidConsumerConfig { reason: &'static str },
+    #[error("unacknowledged batch {batch_id} is currently in flight")]
+    UnacknowledgedBatchPending { batch_id: u64 },
+    #[error("invalid batch acknowledgement: expected batch {expected}, received {received}")]
+    InvalidBatchAcknowledgement { expected: u64, received: u64 },
+    #[error("no pending in-flight batch to acknowledge")]
+    NoPendingBatchToAcknowledge,
 }
