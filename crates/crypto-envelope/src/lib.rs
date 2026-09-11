@@ -26,8 +26,8 @@ pub use artifact::{
 };
 pub use frame::{
     Frame, FrameError, FrameKind, StreamFrame, StreamFrameCodec, StreamFrameError, StreamFrameKind,
-    FRAME_HEADER_LEN, FRAME_VERSION, MAX_FRAME_LEN, MAX_FRAME_PAYLOAD_LEN, MIN_CIPHERTEXT_LEN,
-    MIN_FRAME_LEN,
+    FRAME_HEADER_LEN, FRAME_VERSION, MAX_CIPHERTEXT_LEN, MAX_FRAME_LEN, MAX_FRAME_PAYLOAD_LEN,
+    MIN_CIPHERTEXT_LEN, MIN_FRAME_LEN,
 };
 
 pub mod stream_frame {
@@ -83,12 +83,27 @@ pub enum CryptoError {
 }
 
 /// Wire envelope: exactly what crosses the boundary, nothing more.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Plaintext and sensitive wire metadata (kid, nonce, ciphertext) are redacted
+/// in `Debug` representations to prevent leakage across logging or boundary surfaces.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub kid: [u8; KID_LEN],
     pub nonce: [u8; NONCE_LEN],
     pub sequence: u64,
     pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Envelope")
+            .field("kid", &"[REDACTED]")
+            .field("nonce", &"[REDACTED]")
+            .field("sequence", &self.sequence)
+            .field("ciphertext_len", &self.ciphertext.len())
+            .field("ciphertext", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// 32-byte session key, zeroized on drop. Never serialized, logged, or
@@ -633,6 +648,24 @@ mod tests {
         let debug = format!("{key:?}");
         assert_eq!(debug, "SessionKey([REDACTED])");
         assert!(!debug.contains('9'));
+    }
+
+    #[test]
+    fn envelope_debug_redacts_kid_nonce_ciphertext() {
+        let env = Envelope {
+            kid: [0x55u8; KID_LEN],
+            nonce: [0xAAu8; NONCE_LEN],
+            sequence: 42,
+            ciphertext: vec![0xBEu8, 0xEFu8, 0xAAu8, 0x55u8],
+        };
+        let debug = format!("{env:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("sequence: 42"));
+        assert!(debug.contains("ciphertext_len: 4"));
+        assert!(!debug.contains("85")); // 0x55
+        assert!(!debug.contains("170")); // 0xAA
+        assert!(!debug.contains("190")); // 0xBE
+        assert!(!debug.contains("239")); // 0xEF
     }
 
     #[test]

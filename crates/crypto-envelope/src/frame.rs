@@ -200,13 +200,13 @@ impl From<CryptoError> for StreamFrameError {
 /// Bounded, versioned opaque market-stream frame.
 ///
 /// Plaintext fields exist strictly inside authenticated ciphertext. Debug
-/// representations strictly redact payload contents.
+/// representations strictly redact payload contents and semantic metadata.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StreamFrame {
-    pub version: u8,
-    pub kind: StreamFrameKind,
-    pub sequence: u64,
-    pub payload: Vec<u8>,
+    version: u8,
+    kind: StreamFrameKind,
+    sequence: u64,
+    payload: Vec<u8>,
 }
 
 pub type Frame = StreamFrame;
@@ -286,17 +286,57 @@ impl StreamFrame {
         &self.payload
     }
 
+    /// Returns the length in bytes of the opaque payload.
+    pub fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
     /// Consumes the frame and returns the owned opaque payload vector.
     pub fn into_payload(self) -> Vec<u8> {
         self.payload
     }
 }
 
+#[cfg(test)]
+impl StreamFrame {
+    /// Internal test helper to construct an unvalidated frame for testing encoder rejection.
+    pub(crate) fn from_parts_for_test(
+        version: u8,
+        kind: StreamFrameKind,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            version,
+            kind,
+            sequence,
+            payload,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn craft_wire_frame_for_test(
+    version: u8,
+    kind: u8,
+    sequence: u64,
+    payload_len: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    buf.push(version);
+    buf.push(kind);
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(&payload_len.to_be_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
 impl fmt::Debug for StreamFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamFrame")
             .field("version", &self.version)
-            .field("kind", &self.kind)
+            .field("kind", &"[REDACTED]")
             .field("sequence", &self.sequence)
             .field("payload_len", &self.payload.len())
             .field("payload", &"[REDACTED]")
@@ -328,28 +368,58 @@ impl StreamFrameCodec {
         }
     }
 
-    /// Constructs a codec with an explicit payload bound.
+    /// Constructs a codec with an explicit payload bound clamped to `MAX_FRAME_PAYLOAD_LEN`.
+    ///
+    /// The operational limit can be lower than `MAX_FRAME_PAYLOAD_LEN` but can never raise
+    /// or bypass the 1 MiB global payload cap.
     pub const fn with_max_payload_len(max_payload_len: usize) -> Self {
-        Self { max_payload_len }
+        let clamped = if max_payload_len > MAX_FRAME_PAYLOAD_LEN {
+            MAX_FRAME_PAYLOAD_LEN
+        } else {
+            max_payload_len
+        };
+        Self {
+            max_payload_len: clamped,
+        }
     }
 
     /// Returns the maximum allowed payload length configured for this codec.
     pub fn max_payload_len(&self) -> usize {
-        self.max_payload_len
+        self.effective_max_payload_len()
+    }
+
+    /// Invariant: effective payload limit is always <= MAX_FRAME_PAYLOAD_LEN.
+    fn effective_max_payload_len(&self) -> usize {
+        if self.max_payload_len > MAX_FRAME_PAYLOAD_LEN {
+            MAX_FRAME_PAYLOAD_LEN
+        } else {
+            self.max_payload_len
+        }
     }
 
     /// Maximum valid frame plaintext length for this codec instance.
     fn max_frame_len(&self) -> Result<usize, StreamFrameError> {
-        FRAME_HEADER_LEN
-            .checked_add(self.max_payload_len)
-            .ok_or(StreamFrameError::FrameTooLarge)
+        let max_len = FRAME_HEADER_LEN
+            .checked_add(self.effective_max_payload_len())
+            .ok_or(StreamFrameError::FrameTooLarge)?;
+        if max_len > MAX_FRAME_LEN {
+            Ok(MAX_FRAME_LEN)
+        } else {
+            Ok(max_len)
+        }
     }
 
     /// Maximum valid ciphertext length for this codec instance.
     fn max_ciphertext_len(&self) -> Result<usize, StreamFrameError> {
-        self.max_frame_len()?
+        let cipher_len = self
+            .max_frame_len()?
             .checked_add(AEAD_TAG_LEN)
-            .ok_or(StreamFrameError::CiphertextOutOfBounds)
+            .ok_or(StreamFrameError::CiphertextOutOfBounds)?;
+        if cipher_len > MAX_CIPHERTEXT_LEN {
+            Ok(MAX_CIPHERTEXT_LEN)
+        } else {
+            Ok(cipher_len)
+        }
     }
 
     /// Encodes a stream frame into a preallocated, bounded byte vector.
@@ -360,7 +430,8 @@ impl StreamFrameCodec {
         if frame.sequence == 0 {
             return Err(StreamFrameError::ZeroSequence);
         }
-        if frame.payload.len() > self.max_payload_len {
+        let effective_limit = self.effective_max_payload_len();
+        if frame.payload.len() > effective_limit || frame.payload.len() > MAX_FRAME_PAYLOAD_LEN {
             return Err(StreamFrameError::PayloadTooLarge);
         }
 
@@ -369,7 +440,7 @@ impl StreamFrameCodec {
             .ok_or(StreamFrameError::FrameTooLarge)?;
 
         let max_frame = self.max_frame_len()?;
-        if total_len > max_frame {
+        if total_len > max_frame || total_len > MAX_FRAME_LEN {
             return Err(StreamFrameError::FrameTooLarge);
         }
 
@@ -392,7 +463,7 @@ impl StreamFrameCodec {
             return Err(StreamFrameError::MalformedFrame);
         }
         let max_frame = self.max_frame_len()?;
-        if bytes.len() > max_frame {
+        if bytes.len() > max_frame || bytes.len() > MAX_FRAME_LEN {
             return Err(StreamFrameError::FrameTooLarge);
         }
 
@@ -416,13 +487,18 @@ impl StreamFrameCodec {
             .map_err(|_| StreamFrameError::MalformedFrame)?;
         let payload_len = u32::from_be_bytes(len_bytes) as usize;
 
-        if payload_len > self.max_payload_len {
+        let effective_limit = self.effective_max_payload_len();
+        if payload_len > effective_limit || payload_len > MAX_FRAME_PAYLOAD_LEN {
             return Err(StreamFrameError::PayloadTooLarge);
         }
 
         let expected_total_len = FRAME_HEADER_LEN
             .checked_add(payload_len)
             .ok_or(StreamFrameError::FrameTooLarge)?;
+
+        if expected_total_len > max_frame || expected_total_len > MAX_FRAME_LEN {
+            return Err(StreamFrameError::FrameTooLarge);
+        }
 
         if bytes.len() != expected_total_len {
             return Err(StreamFrameError::PayloadLengthMismatch);
@@ -468,6 +544,10 @@ impl StreamFrameCodec {
         if frame.sequence != envelope_sequence {
             return Err(StreamFrameError::SequenceMismatch);
         }
+        let effective_limit = self.effective_max_payload_len();
+        if frame.payload.len() > effective_limit || frame.payload.len() > MAX_FRAME_PAYLOAD_LEN {
+            return Err(StreamFrameError::PayloadTooLarge);
+        }
         let encoded = self.encode_frame(frame)?;
         session
             .seal(kid, envelope_sequence, &encoded)
@@ -490,7 +570,10 @@ impl StreamFrameCodec {
             return Err(StreamFrameError::ZeroSequence);
         }
         let max_cipher = self.max_ciphertext_len()?;
-        if envelope.ciphertext.len() < MIN_CIPHERTEXT_LEN || envelope.ciphertext.len() > max_cipher
+        let effective_max_cipher = max_cipher.min(MAX_CIPHERTEXT_LEN);
+        if envelope.ciphertext.len() < MIN_CIPHERTEXT_LEN
+            || envelope.ciphertext.len() > effective_max_cipher
+            || envelope.ciphertext.len() > MAX_CIPHERTEXT_LEN
         {
             return Err(StreamFrameError::CiphertextOutOfBounds);
         }
@@ -656,12 +739,8 @@ mod tests {
         let mut recv = ReceiveSession::with_test_key();
 
         // Encode a frame with sequence 4
-        let inner_frame = StreamFrame {
-            version: FRAME_VERSION,
-            kind: StreamFrameKind::Delta,
-            sequence: 4,
-            payload: b"tampered-seq".to_vec(),
-        };
+        let inner_frame =
+            StreamFrame::new(StreamFrameKind::Delta, 4, b"tampered-seq".to_vec()).unwrap();
         let encoded_inner = inner_frame.encode().unwrap();
 
         // Raw seal under sequence 5
@@ -696,12 +775,12 @@ mod tests {
             Err(StreamFrameError::ZeroSequence)
         );
 
-        let invalid_frame = StreamFrame {
-            version: FRAME_VERSION,
-            kind: StreamFrameKind::Snapshot,
-            sequence: 0,
-            payload: b"data".to_vec(),
-        };
+        let invalid_frame = StreamFrame::from_parts_for_test(
+            FRAME_VERSION,
+            StreamFrameKind::Snapshot,
+            0,
+            b"data".to_vec(),
+        );
         assert_eq!(invalid_frame.encode(), Err(StreamFrameError::ZeroSequence));
 
         let mut send = SendSession::with_test_key();
@@ -802,12 +881,12 @@ mod tests {
             Err(StreamFrameError::PayloadTooLarge)
         );
 
-        let frame = StreamFrame {
-            version: FRAME_VERSION,
-            kind: StreamFrameKind::Snapshot,
-            sequence: 1,
-            payload: oversized,
-        };
+        let frame = StreamFrame::from_parts_for_test(
+            FRAME_VERSION,
+            StreamFrameKind::Snapshot,
+            1,
+            oversized,
+        );
         assert_eq!(frame.encode(), Err(StreamFrameError::PayloadTooLarge));
 
         let mut send = SendSession::with_test_key();
@@ -1000,14 +1079,41 @@ mod tests {
     #[test]
     fn redacted_debug_and_errors() {
         let secret_payload = b"SECRET-MARKET-ORDER-PAYLOAD";
-        let frame =
-            StreamFrame::new(StreamFrameKind::Snapshot, 42, secret_payload.to_vec()).unwrap();
+        let kinds = [
+            (StreamFrameKind::Snapshot, "Snapshot"),
+            (StreamFrameKind::Delta, "Delta"),
+            (StreamFrameKind::Candle, "Candle"),
+            (StreamFrameKind::Heartbeat, "Heartbeat"),
+            (StreamFrameKind::Resync, "Resync"),
+            (StreamFrameKind::Batch, "Batch"),
+        ];
 
-        let debug_str = format!("{frame:?}");
-        assert!(debug_str.contains("[REDACTED]"));
-        assert!(debug_str.contains("payload_len: 27"));
-        assert!(debug_str.contains("sequence: 42"));
-        assert!(!debug_str.contains("SECRET-MARKET-ORDER-PAYLOAD"));
+        for (kind, name) in kinds {
+            let frame = StreamFrame::new(kind, 42, secret_payload.to_vec()).unwrap();
+            let debug_str = format!("{frame:?}");
+            assert!(debug_str.contains("[REDACTED]"));
+            assert!(debug_str.contains("payload_len: 27"));
+            assert!(debug_str.contains("sequence: 42"));
+            assert!(!debug_str.contains("SECRET-MARKET-ORDER-PAYLOAD"));
+            // Redaction must not leak frame kind or semantic metadata
+            assert!(!debug_str.contains(name));
+            assert!(!debug_str.contains(&format!("{kind}")));
+        }
+
+        // Verify Envelope debug redaction
+        let env = Envelope {
+            kid: TEST_KID,
+            nonce: [0x55u8; 12],
+            sequence: 42,
+            ciphertext: vec![0x11, 0x22, 0x33, 0x44],
+        };
+        let env_debug = format!("{env:?}");
+        assert!(env_debug.contains("[REDACTED]"));
+        assert!(env_debug.contains("sequence: 42"));
+        assert!(env_debug.contains("ciphertext_len: 4"));
+        assert!(!env_debug.contains("170")); // TEST_KID 0xAA = 170
+        assert!(!env_debug.contains("85")); // nonce 0x55 = 85
+        assert!(!env_debug.contains("17")); // ciphertext 0x11 = 17
 
         let errors = [
             StreamFrameError::ZeroSequence,
@@ -1042,5 +1148,200 @@ mod tests {
                 assert!(!text.contains("cred"));
             }
         }
+    }
+
+    #[test]
+    fn oversized_codec_limit_clamped_and_hard_cap_non_bypassable() {
+        // 1. Caller passing limit > 1 MiB is clamped to MAX_FRAME_PAYLOAD_LEN
+        let double_codec = StreamFrameCodec::with_max_payload_len(MAX_FRAME_PAYLOAD_LEN * 2);
+        assert_eq!(double_codec.max_payload_len(), MAX_FRAME_PAYLOAD_LEN);
+
+        let max_usize_codec = StreamFrameCodec::with_max_payload_len(usize::MAX);
+        assert_eq!(max_usize_codec.max_payload_len(), MAX_FRAME_PAYLOAD_LEN);
+
+        // 2. Cannot encode payload above 1 MiB even with oversized codec
+        let oversized_frame = StreamFrame::from_parts_for_test(
+            FRAME_VERSION,
+            StreamFrameKind::Snapshot,
+            1,
+            vec![0u8; MAX_FRAME_PAYLOAD_LEN + 1],
+        );
+        assert_eq!(
+            double_codec.encode_frame(&oversized_frame),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+        assert_eq!(
+            max_usize_codec.encode_frame(&oversized_frame),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+
+        // 3. Cannot seal payload above 1 MiB; sender state remains 0
+        let mut send = SendSession::with_test_key();
+        assert_eq!(
+            double_codec.seal(&mut send, TEST_KID, &oversized_frame),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+        assert_eq!(send.last_sequence(), 0);
+
+        assert_eq!(
+            max_usize_codec.seal_bound(&mut send, TEST_KID, 1, &oversized_frame),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+        assert_eq!(send.last_sequence(), 0);
+
+        // 4. Cannot receive ciphertext above MAX_CIPHERTEXT_LEN; replay state remains 0
+        let mut recv = ReceiveSession::with_test_key();
+        let oversized_env = Envelope {
+            kid: TEST_KID,
+            nonce: [0u8; 12],
+            sequence: 1,
+            ciphertext: vec![0u8; MAX_CIPHERTEXT_LEN + 1],
+        };
+        assert_eq!(
+            double_codec.receive(&mut recv, &oversized_env),
+            Err(StreamFrameError::CiphertextOutOfBounds)
+        );
+        assert_eq!(recv.highest_accepted_sequence(), 0);
+
+        assert_eq!(
+            max_usize_codec.receive(&mut recv, &oversized_env),
+            Err(StreamFrameError::CiphertextOutOfBounds)
+        );
+        assert_eq!(recv.highest_accepted_sequence(), 0);
+
+        // 5. Decode rejects wire payload_len claiming > 1 MiB
+        let wire_header_claims_oversized = craft_wire_frame_for_test(
+            FRAME_VERSION,
+            StreamFrameKind::Snapshot.as_u8(),
+            1,
+            (MAX_FRAME_PAYLOAD_LEN + 1) as u32,
+            &[],
+        );
+        assert_eq!(
+            double_codec.decode_frame(&wire_header_claims_oversized),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+        assert_eq!(
+            max_usize_codec.decode_frame(&wire_header_claims_oversized),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn direct_invalid_frame_construction_prevented_and_fail_closed() {
+        // 1. Oversized payload rejected by constructor
+        assert_eq!(
+            StreamFrame::new(
+                StreamFrameKind::Snapshot,
+                1,
+                vec![0u8; MAX_FRAME_PAYLOAD_LEN + 1]
+            ),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+
+        // 2. Zero sequence rejected by constructor
+        assert_eq!(
+            StreamFrame::new(StreamFrameKind::Snapshot, 0, vec![0u8; 10]),
+            Err(StreamFrameError::ZeroSequence)
+        );
+
+        // 3. Invalid version rejected by constructor
+        assert_eq!(
+            StreamFrame::with_version(0, StreamFrameKind::Snapshot, 1, vec![0u8; 10]),
+            Err(StreamFrameError::UnsupportedVersion)
+        );
+        assert_eq!(
+            StreamFrame::with_version(2, StreamFrameKind::Snapshot, 1, vec![0u8; 10]),
+            Err(StreamFrameError::UnsupportedVersion)
+        );
+        assert_eq!(
+            StreamFrame::with_version(
+                FRAME_VERSION,
+                StreamFrameKind::Snapshot,
+                1,
+                vec![0u8; MAX_FRAME_PAYLOAD_LEN + 1]
+            ),
+            Err(StreamFrameError::PayloadTooLarge)
+        );
+
+        // 4. Test helper unvalidated frames fail-closed in encode and seal
+        let zero_seq_frame = StreamFrame::from_parts_for_test(
+            FRAME_VERSION,
+            StreamFrameKind::Delta,
+            0,
+            vec![0u8; 8],
+        );
+        let mut send = SendSession::with_test_key();
+        assert_eq!(
+            StreamFrameCodec::new().encode_frame(&zero_seq_frame),
+            Err(StreamFrameError::ZeroSequence)
+        );
+        assert_eq!(
+            send.seal_frame(TEST_KID, &zero_seq_frame),
+            Err(StreamFrameError::ZeroSequence)
+        );
+        assert_eq!(send.last_sequence(), 0);
+
+        let bad_ver_frame =
+            StreamFrame::from_parts_for_test(99, StreamFrameKind::Delta, 1, vec![0u8; 8]);
+        assert_eq!(
+            StreamFrameCodec::new().encode_frame(&bad_ver_frame),
+            Err(StreamFrameError::UnsupportedVersion)
+        );
+        assert_eq!(
+            send.seal_frame(TEST_KID, &bad_ver_frame),
+            Err(StreamFrameError::UnsupportedVersion)
+        );
+        assert_eq!(send.last_sequence(), 0);
+    }
+
+    #[test]
+    fn receive_ciphertext_bounds_preflight_no_state_mutation() {
+        let mut recv = ReceiveSession::with_test_key();
+
+        // 1. Below MIN_CIPHERTEXT_LEN
+        for len in [0, 1, 14, 29] {
+            let env = Envelope {
+                kid: TEST_KID,
+                nonce: [0u8; 12],
+                sequence: 1,
+                ciphertext: vec![0u8; len],
+            };
+            assert_eq!(
+                recv.receive_frame(&env),
+                Err(StreamFrameError::CiphertextOutOfBounds)
+            );
+            assert_eq!(recv.highest_accepted_sequence(), 0);
+        }
+
+        // 2. Above MAX_CIPHERTEXT_LEN (global cap)
+        for delta in [1, 50, 1024] {
+            let env = Envelope {
+                kid: TEST_KID,
+                nonce: [0u8; 12],
+                sequence: 1,
+                ciphertext: vec![0u8; MAX_CIPHERTEXT_LEN + delta],
+            };
+            assert_eq!(
+                recv.receive_frame(&env),
+                Err(StreamFrameError::CiphertextOutOfBounds)
+            );
+            assert_eq!(recv.highest_accepted_sequence(), 0);
+        }
+
+        // 3. Lower operational limit rejection
+        let low_limit_codec = StreamFrameCodec::with_max_payload_len(20);
+        let max_low_cipher = FRAME_HEADER_LEN + 20 + AEAD_TAG_LEN; // 14 + 20 + 16 = 50
+        let env_low_over = Envelope {
+            kid: TEST_KID,
+            nonce: [0u8; 12],
+            sequence: 1,
+            ciphertext: vec![0u8; max_low_cipher + 1],
+        };
+        assert_eq!(
+            low_limit_codec.receive(&mut recv, &env_low_over),
+            Err(StreamFrameError::CiphertextOutOfBounds)
+        );
+        assert_eq!(recv.highest_accepted_sequence(), 0);
     }
 }
