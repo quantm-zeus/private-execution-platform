@@ -351,6 +351,9 @@ impl ExecutionPreview {
         if route.expected_net_output.asset != self.token_out {
             return Err(DomainError::RouteOutputAssetMismatch);
         }
+        if route.expected_net_output != self.simulated_net_output {
+            return Err(DomainError::RouteOutputAmountMismatch);
+        }
         for leg in &route.legs {
             if leg.token_in.chain != self.chain || leg.token_out.chain != self.chain {
                 return Err(DomainError::ChainMismatch);
@@ -642,8 +645,12 @@ mod tests {
         // Case 1B: Valid BUY where exact net economics pass limit.
         // Net input = 1000 USDC. Gross output = 270 TOKEN. Tax = 10 TOKEN => Net output = 260 TOKEN.
         // Simulated Net price = 1000/260 = 3.846 <= 4.0.
+        let mut valid_buy_route = sample_route(&token_in, &token_out, now_ms);
+        valid_buy_route.expected_net_output.amount = AtomicAmount::new(260);
         let valid_buy = sample_preview(&buy_intent, 1_000, 260, 270, FreshnessStatus::Fresh);
-        let validated_buy = valid_buy.validate(&buy_intent, &route, now_ms).unwrap();
+        let validated_buy = valid_buy
+            .validate(&buy_intent, &valid_buy_route, now_ms)
+            .unwrap();
         assert_eq!(
             validated_buy.executable_net_price().unwrap(),
             PriceRatio::new(1_000, 260).unwrap()
@@ -666,7 +673,8 @@ mod tests {
         let mut sell_intent = sample_intent(TradeSide::Sell, OrderType::Limit, Some(sell_limit));
         sell_intent.token_in = sell_token_in.clone();
         sell_intent.token_out = sell_token_out.clone();
-        let sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        let mut sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        sell_route.expected_net_output.amount = AtomicAmount::new(390);
 
         // Case 1C: Net input = 100 TOKEN.
         // Gross output = 420 USDC (gross price = 420/100 = 4.2 >= 4.0, which passes limit).
@@ -689,9 +697,11 @@ mod tests {
         // Case 1D: Valid SELL where exact net economics pass limit.
         // Net input = 100 TOKEN. Gross output = 430 USDC. Tax = 10 USDC => Net output = 420 USDC.
         // Simulated Net price = 420/100 = 4.2 >= 4.0.
+        let mut valid_sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        valid_sell_route.expected_net_output.amount = AtomicAmount::new(420);
         let valid_sell = sample_preview(&sell_intent, 100, 420, 430, FreshnessStatus::Fresh);
         let validated_sell = valid_sell
-            .validate(&sell_intent, &sell_route, now_ms)
+            .validate(&sell_intent, &valid_sell_route, now_ms)
             .unwrap();
         assert_eq!(
             validated_sell.executable_net_price().unwrap(),
@@ -712,7 +722,7 @@ mod tests {
         let intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
 
         // 2A: Stale local state on preview rejects
-        let stale_local_preview = sample_preview(&intent, 1_000, 250, 250, FreshnessStatus::Stale);
+        let stale_local_preview = sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::Stale);
         let fresh_route = sample_route(&token_in, &token_out, now_ms);
         assert_eq!(
             stale_local_preview.validate(&intent, &fresh_route, now_ms),
@@ -721,14 +731,14 @@ mod tests {
 
         // 2B: ResyncRequired local state on preview rejects
         let resync_local_preview =
-            sample_preview(&intent, 1_000, 250, 250, FreshnessStatus::ResyncRequired);
+            sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::ResyncRequired);
         assert_eq!(
             resync_local_preview.validate(&intent, &fresh_route, now_ms),
             Err(DomainError::ResyncRequired)
         );
 
         // 2C: Stale route state (route observed_at_ms exceeds default max staleness 10s)
-        let fresh_preview = sample_preview(&intent, 1_000, 250, 250, FreshnessStatus::Fresh);
+        let fresh_preview = sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::Fresh);
         let stale_route = sample_route(&token_in, &token_out, now_ms - 20_000);
         assert_eq!(
             fresh_preview.validate(&intent, &stale_route, now_ms),
@@ -928,12 +938,12 @@ mod tests {
         let token_out = sample_asset(ChainId::Base, "0xtoken");
         let intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
         let route = sample_route(&token_in, &token_out, now_ms);
-        let preview = sample_preview(&intent, 1_000, 250, 260, FreshnessStatus::Fresh);
+        let preview = sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::Fresh);
 
         let validated = preview.validate(&intent, &route, now_ms).unwrap();
         assert_eq!(
             validated.executable_net_price().unwrap(),
-            PriceRatio::new(1_000, 250).unwrap()
+            PriceRatio::new(1_000, 240).unwrap()
         );
     }
 
@@ -948,7 +958,7 @@ mod tests {
             amount: AtomicAmount::new(999),
         });
         let route = sample_route(&token_in, &token_out, now_ms);
-        let preview = sample_preview(&intent, 1_000, 250, 260, FreshnessStatus::Fresh);
+        let preview = sample_preview(&intent, 1_000, 240, 250, FreshnessStatus::Fresh);
 
         // Input 1000 exceeds max_total_cost 999
         assert!(matches!(
@@ -961,7 +971,7 @@ mod tests {
         all_or_nothing.allow_partial_fill = false;
         all_or_nothing.amount = AtomicAmount::new(2_000);
         let small_preview =
-            sample_preview(&all_or_nothing, 1_000, 250, 260, FreshnessStatus::Fresh);
+            sample_preview(&all_or_nothing, 1_000, 240, 250, FreshnessStatus::Fresh);
         assert!(matches!(
             small_preview.validate(&all_or_nothing, &route, now_ms),
             Err(DomainError::InconsistentNetEconomics(_))
@@ -1275,5 +1285,105 @@ mod tests {
         assert_eq!(usd_amount_intent, orig_usd_intent);
         assert_eq!(route, orig_route);
         assert_eq!(preview_for_usd, orig_usd_preview);
+    }
+
+    #[test]
+    fn regression_route_output_binding_rejects_amount_mismatch_and_preserves_inputs() {
+        let now_ms = 1_000;
+        let token_in = sample_asset(ChainId::Base, "0xusdc");
+        let token_out = sample_asset(ChainId::Base, "0xtoken");
+
+        // 1. Defect demonstration: Substituted preview simulated_net_output (260) satisfies
+        // BUY limit price 4.0 (1000/260 = 3.846 <= 4.0), while the route's claimed exact
+        // expected_net_output (240) would violate the limit (1000/240 = 4.167 > 4.0).
+        // Validation MUST reject fail-closed with RouteOutputAmountMismatch rather than
+        // letting an arbitrary preview replace the route's claimed output.
+        let buy_limit = LimitPrice {
+            numerator_asset: token_in.clone(),
+            denominator_asset: token_out.clone(),
+            ratio: PriceRatio::new(400, 100).unwrap(), // limit price = 4.0
+        };
+        let buy_intent = sample_intent(TradeSide::Buy, OrderType::Limit, Some(buy_limit));
+        let route = sample_route(&token_in, &token_out, now_ms); // expected_net_output.amount = 240
+        let substituted_favorable_preview =
+            sample_preview(&buy_intent, 1_000, 260, 270, FreshnessStatus::Fresh);
+
+        // Snapshot copies before running validation to prove immutability
+        let orig_intent = buy_intent.clone();
+        let orig_route = route.clone();
+        let orig_preview = substituted_favorable_preview.clone();
+
+        let res = substituted_favorable_preview.validate(&buy_intent, &route, now_ms);
+        assert_eq!(res, Err(DomainError::RouteOutputAmountMismatch));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(substituted_favorable_preview, orig_preview);
+
+        // Prove functional entrypoint behaves identically and preserves inputs
+        let res_fn =
+            validate_execution_preview(&buy_intent, &route, &substituted_favorable_preview, now_ms);
+        assert_eq!(res_fn, Err(DomainError::RouteOutputAmountMismatch));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(substituted_favorable_preview, orig_preview);
+
+        // 2. Under-fill mismatch: simulated_net_output (220) < route.expected_net_output (240)
+        let underfill_preview =
+            sample_preview(&buy_intent, 1_000, 220, 250, FreshnessStatus::Fresh);
+        let orig_underfill = underfill_preview.clone();
+        let res_underfill = underfill_preview.validate(&buy_intent, &route, now_ms);
+        assert_eq!(res_underfill, Err(DomainError::RouteOutputAmountMismatch));
+        assert_eq!(buy_intent, orig_intent);
+        assert_eq!(route, orig_route);
+        assert_eq!(underfill_preview, orig_underfill);
+
+        // 3. SELL order defect case: Substituted preview simulated_net_output (420) satisfies
+        // SELL limit price min 4.0 USDC per TOKEN (420/100 = 4.2 >= 4.0), while route's
+        // expected_net_output (390) would violate the limit (390/100 = 3.9 < 4.0).
+        let sell_token_in = sample_asset(ChainId::Base, "0xtoken");
+        let sell_token_out = sample_asset(ChainId::Base, "0xusdc");
+        let sell_limit = LimitPrice {
+            numerator_asset: sell_token_out.clone(),
+            denominator_asset: sell_token_in.clone(),
+            ratio: PriceRatio::new(400, 100).unwrap(), // limit price = 4.0
+        };
+        let mut sell_intent = sample_intent(TradeSide::Sell, OrderType::Limit, Some(sell_limit));
+        sell_intent.token_in = sell_token_in.clone();
+        sell_intent.token_out = sell_token_out.clone();
+        let mut sell_route = sample_route(&sell_token_in, &sell_token_out, now_ms);
+        sell_route.expected_net_output.amount = AtomicAmount::new(390);
+        let substituted_sell_preview =
+            sample_preview(&sell_intent, 100, 420, 430, FreshnessStatus::Fresh);
+
+        let orig_sell_intent = sell_intent.clone();
+        let orig_sell_route = sell_route.clone();
+        let orig_sell_preview = substituted_sell_preview.clone();
+
+        let res_sell = substituted_sell_preview.validate(&sell_intent, &sell_route, now_ms);
+        assert_eq!(res_sell, Err(DomainError::RouteOutputAmountMismatch));
+        assert_eq!(sell_intent, orig_sell_intent);
+        assert_eq!(sell_route, orig_sell_route);
+        assert_eq!(substituted_sell_preview, orig_sell_preview);
+
+        // 4. Asset mismatch check remains intact and returns RouteOutputAssetMismatch
+        let mut asset_mismatch_route = route.clone();
+        asset_mismatch_route.expected_net_output.asset = sample_asset(ChainId::Base, "0xweth");
+        let orig_asset_mismatch_route = asset_mismatch_route.clone();
+        let res_asset =
+            substituted_favorable_preview.validate(&buy_intent, &asset_mismatch_route, now_ms);
+        assert_eq!(res_asset, Err(DomainError::RouteOutputAssetMismatch));
+        assert_eq!(asset_mismatch_route, orig_asset_mismatch_route);
+
+        // 5. Exact match succeeds cleanly when route expected_net_output matches preview simulated_net_output
+        let exact_match_preview =
+            sample_preview(&buy_intent, 1_000, 240, 260, FreshnessStatus::Fresh);
+        let market_intent = sample_intent(TradeSide::Buy, OrderType::Market, None);
+        let orig_market_intent = market_intent.clone();
+        let validated = exact_match_preview
+            .validate(&market_intent, &route, now_ms)
+            .expect("exact match of route expected_net_output must validate");
+        assert_eq!(validated.preview(), &exact_match_preview);
+        assert_eq!(market_intent, orig_market_intent);
+        assert_eq!(route, orig_route);
     }
 }

@@ -549,6 +549,8 @@ pub enum DomainError {
     RouteTokenMismatch,
     #[error("route expected_net_output asset must equal final leg token_out")]
     RouteOutputAssetMismatch,
+    #[error("route expected_net_output amount must equal preview simulated net output")]
+    RouteOutputAmountMismatch,
     #[error("observation time window is invalid")]
     InvalidObservationWindow,
     #[error("non-sellable observation cannot have successful sell")]
