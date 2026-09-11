@@ -59,4 +59,12 @@ pub enum TaxSafetyError {
     /// Observed sell tax exceeds intent's maximum allowed sell tax cap.
     #[error("sell tax exceeds maximum allowed cap")]
     SellTaxExceedsCap,
+
+    /// Gross output amount is zero.
+    #[error("gross output amount must be greater than zero")]
+    ZeroGrossOutput,
+
+    /// Net output amount is zero after deducting tax.
+    #[error("net output amount must be greater than zero")]
+    ZeroNetOutput,
 }

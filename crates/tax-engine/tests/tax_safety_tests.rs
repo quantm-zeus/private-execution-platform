@@ -697,6 +697,8 @@ fn test_no_secret_leakage_in_error_display_and_debug() {
         TaxSafetyError::TokenNotSellable,
         TaxSafetyError::BuyTaxExceedsCap,
         TaxSafetyError::SellTaxExceedsCap,
+        TaxSafetyError::ZeroGrossOutput,
+        TaxSafetyError::ZeroNetOutput,
     ];
 
     for err in &errors {

@@ -84,6 +84,14 @@ impl TaxAssessment {
     pub fn is_zero_tax(&self) -> bool {
         self.buy_tax.get() == 0 && self.sell_tax.get() == 0
     }
+
+    /// Applies this buy-side assessment to a gross output amount.
+    pub fn apply_buy_tax(
+        &self,
+        gross_output: &market_types::AssetAmount,
+    ) -> Result<crate::buy_output::BuyTaxOutput, TaxSafetyError> {
+        crate::buy_output::apply_buy_tax_to_output(self, gross_output)
+    }
 }
 
 /// Returns the expected assessed asset for a trade intent:
@@ -214,5 +222,21 @@ impl TaxSafetyEngine {
         freshness_policy: &FreshnessPolicy,
     ) -> Result<TaxAssessment, TaxSafetyError> {
         evaluate_tax_safety(intent, observation, evaluation_time_ms, freshness_policy)
+    }
+
+    /// Applies a buy-side assessment to a gross output amount.
+    pub fn apply_buy_tax(
+        assessment: &TaxAssessment,
+        gross_output: &market_types::AssetAmount,
+    ) -> Result<crate::buy_output::BuyTaxOutput, TaxSafetyError> {
+        crate::buy_output::apply_buy_tax_to_output(assessment, gross_output)
+    }
+
+    /// Applies a buy-side assessment to a gross output amount.
+    pub fn apply_buy_tax_to_output(
+        assessment: &TaxAssessment,
+        gross_output: &market_types::AssetAmount,
+    ) -> Result<crate::buy_output::BuyTaxOutput, TaxSafetyError> {
+        crate::buy_output::apply_buy_tax_to_output(assessment, gross_output)
     }
 }
