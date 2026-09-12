@@ -95,46 +95,44 @@ fn test_known_sell_tax_before_pool_fee_vector() {
             .expect("simulation must succeed");
 
     // Explicit gross input economics
-    assert_eq!(result.gross_input().asset, pool.token_0);
-    assert_eq!(result.gross_input().amount.get(), 10_000);
-    assert_eq!(result.tax_cost().asset, pool.token_0);
-    assert_eq!(result.tax_cost().amount.get(), 500);
-    assert_eq!(result.net_transferable_input().asset, pool.token_0);
-    assert_eq!(result.net_transferable_input().amount.get(), 9_500);
-    assert_eq!(result.net_input().amount.get(), 9_500);
+    assert_eq!(result.tax_input.gross_input.asset, pool.token_0);
+    assert_eq!(result.tax_input.gross_input.amount.get(), 10_000);
+    assert_eq!(result.tax_input.tax_cost.asset, pool.token_0);
+    assert_eq!(result.tax_input.tax_cost.amount.get(), 500);
+    assert_eq!(result.tax_input.net_transferable_input.asset, pool.token_0);
+    assert_eq!(result.tax_input.net_transferable_input.amount.get(), 9_500);
 
     // Conservation of input: gross == tax_cost + net_transferable_input
     assert_eq!(
-        result.gross_input().amount.get(),
-        result.tax_cost().amount.get() + result.net_transferable_input().amount.get()
+        result.tax_input.gross_input.amount.get(),
+        result.tax_input.tax_cost.amount.get()
+            + result.tax_input.net_transferable_input.amount.get()
     );
 
     // Quote input must exactly equal the net transferable input
-    assert_eq!(result.cpmm_quote.input, *result.net_transferable_input());
-    assert_eq!(result.input(), result.net_transferable_input());
+    assert_eq!(
+        result.cpmm_quote.input,
+        result.tax_input.net_transferable_input
+    );
     assert_eq!(result.cpmm_quote.input.amount.get(), 9_500);
 
     // Underlying CPMM pool fee and effective input remain untouched
-    assert_eq!(result.pool_fee().asset, pool.token_0);
-    assert_eq!(result.pool_fee().amount.get(), 28);
-    assert_eq!(result.effective_input().asset, pool.token_0);
-    assert_eq!(result.effective_input().amount.get(), 9_472);
+    assert_eq!(result.cpmm_quote.pool_fee.asset, pool.token_0);
+    assert_eq!(result.cpmm_quote.pool_fee.amount.get(), 28);
+    assert_eq!(result.cpmm_quote.effective_input.asset, pool.token_0);
+    assert_eq!(result.cpmm_quote.effective_input.amount.get(), 9_472);
     assert_eq!(
         result.cpmm_quote.input.amount.get(),
-        result.pool_fee().amount.get() + result.effective_input().amount.get()
+        result.cpmm_quote.pool_fee.amount.get() + result.cpmm_quote.effective_input.amount.get()
     );
 
     // CPMM output
-    assert_eq!(result.output().asset, pool.token_1);
-    assert_eq!(result.output().amount.get(), 18_766);
+    assert_eq!(result.cpmm_quote.output.asset, pool.token_1);
+    assert_eq!(result.cpmm_quote.output.amount.get(), 18_766);
 
     // Resulting pool reserves
     assert_eq!(result.cpmm_quote.resulting_reserve_0.get(), 1_009_500);
     assert_eq!(result.cpmm_quote.resulting_reserve_1.get(), 1_981_234);
-
-    // Direct accessors vs underlying struct
-    assert_eq!(result.cpmm_quote().output, result.cpmm_quote.output);
-    assert_eq!(result.tax_input().gross_input, result.tax_input.gross_input);
 
     // --- Direction 1 -> 0: Selling WETH for USDC ---
     // Gross user input = 20_000 WETH
@@ -156,26 +154,33 @@ fn test_known_sell_tax_before_pool_fee_vector() {
     let result_1 = simulate_tax_aware_cpmm_sell_exact_input(&pool, &req_1, &assessment_weth)
         .expect("reverse simulation must succeed");
 
-    assert_eq!(result_1.gross_input().asset, pool.token_1);
-    assert_eq!(result_1.gross_input().amount.get(), 20_000);
-    assert_eq!(result_1.tax_cost().asset, pool.token_1);
-    assert_eq!(result_1.tax_cost().amount.get(), 500);
-    assert_eq!(result_1.net_transferable_input().asset, pool.token_1);
-    assert_eq!(result_1.net_transferable_input().amount.get(), 19_500);
+    assert_eq!(result_1.tax_input.gross_input.asset, pool.token_1);
+    assert_eq!(result_1.tax_input.gross_input.amount.get(), 20_000);
+    assert_eq!(result_1.tax_input.tax_cost.asset, pool.token_1);
+    assert_eq!(result_1.tax_input.tax_cost.amount.get(), 500);
+    assert_eq!(
+        result_1.tax_input.net_transferable_input.asset,
+        pool.token_1
+    );
+    assert_eq!(
+        result_1.tax_input.net_transferable_input.amount.get(),
+        19_500
+    );
 
     assert_eq!(
-        result_1.gross_input().amount.get(),
-        result_1.tax_cost().amount.get() + result_1.net_transferable_input().amount.get()
+        result_1.tax_input.gross_input.amount.get(),
+        result_1.tax_input.tax_cost.amount.get()
+            + result_1.tax_input.net_transferable_input.amount.get()
     );
 
     assert_eq!(
         result_1.cpmm_quote.input,
-        *result_1.net_transferable_input()
+        result_1.tax_input.net_transferable_input
     );
-    assert_eq!(result_1.pool_fee().amount.get(), 58);
-    assert_eq!(result_1.effective_input().amount.get(), 19_442);
-    assert_eq!(result_1.output().asset, pool.token_0);
-    assert_eq!(result_1.output().amount.get(), 9_627);
+    assert_eq!(result_1.cpmm_quote.pool_fee.amount.get(), 58);
+    assert_eq!(result_1.cpmm_quote.effective_input.amount.get(), 19_442);
+    assert_eq!(result_1.cpmm_quote.output.asset, pool.token_0);
+    assert_eq!(result_1.cpmm_quote.output.amount.get(), 9_627);
     assert_eq!(result_1.cpmm_quote.resulting_reserve_1.get(), 2_019_500);
     assert_eq!(result_1.cpmm_quote.resulting_reserve_0.get(), 990_373);
 }
@@ -202,13 +207,13 @@ fn test_zero_sell_tax_success_and_max_tax_zero_net_rejection() {
     let quote = simulate_tax_aware_cpmm_sell_exact_input(&pool, &req, &assessment_zero)
         .expect("zero sell tax simulation must succeed");
 
-    assert_eq!(quote.gross_input().amount.get(), 10_000);
-    assert_eq!(quote.tax_cost().amount.get(), 0);
-    assert_eq!(quote.net_transferable_input().amount.get(), 10_000);
+    assert_eq!(quote.tax_input.gross_input.amount.get(), 10_000);
+    assert_eq!(quote.tax_input.tax_cost.amount.get(), 0);
+    assert_eq!(quote.tax_input.net_transferable_input.amount.get(), 10_000);
     assert_eq!(quote.cpmm_quote.input.amount.get(), 10_000);
     assert_eq!(quote.cpmm_quote.pool_fee.amount.get(), 30);
     assert_eq!(quote.cpmm_quote.effective_input.amount.get(), 9_970);
-    assert_eq!(quote.output().amount.get(), 19_743);
+    assert_eq!(quote.cpmm_quote.output.amount.get(), 19_743);
 
     // 2B: Max-tax (100% tax, 10_000 bps) -> zero net input rejection
     let assessment_100 =
@@ -493,41 +498,45 @@ fn test_large_safe_integer_vector_exact_arithmetic() {
     let result = simulate_tax_aware_cpmm_sell_exact_input(&pool, &req, &assessment)
         .expect("large integer simulation must succeed without overflow");
 
-    assert_eq!(result.gross_input().amount.get(), gross_in);
+    assert_eq!(result.tax_input.gross_input.amount.get(), gross_in);
     assert_eq!(
-        result.tax_cost().amount.get(),
+        result.tax_input.tax_cost.amount.get(),
         750_000_000_000_000_000_000_000
     );
     assert_eq!(
-        result.net_transferable_input().amount.get(),
+        result.tax_input.net_transferable_input.amount.get(),
         9_250_000_000_000_000_000_000_000
     );
 
     // Exact input conservation
     assert_eq!(
-        result.gross_input().amount.get(),
-        result.tax_cost().amount.get() + result.net_transferable_input().amount.get()
+        result.tax_input.gross_input.amount.get(),
+        result.tax_input.tax_cost.amount.get()
+            + result.tax_input.net_transferable_input.amount.get()
     );
 
     // Quote input strictly equals net transferable input
-    assert_eq!(result.cpmm_quote.input, *result.net_transferable_input());
     assert_eq!(
-        result.pool_fee().amount.get(),
+        result.cpmm_quote.input,
+        result.tax_input.net_transferable_input
+    );
+    assert_eq!(
+        result.cpmm_quote.pool_fee.amount.get(),
         23_125_000_000_000_000_000_000
     );
     assert_eq!(
-        result.effective_input().amount.get(),
+        result.cpmm_quote.effective_input.amount.get(),
         9_226_875_000_000_000_000_000_000
     );
 
     // CPMM fee conservation
     assert_eq!(
-        result.net_transferable_input().amount.get(),
-        result.pool_fee().amount.get() + result.effective_input().amount.get()
+        result.tax_input.net_transferable_input.amount.get(),
+        result.cpmm_quote.pool_fee.amount.get() + result.cpmm_quote.effective_input.amount.get()
     );
 
     // Output must be strictly positive and strictly below output reserve
-    let out_val = result.output().amount.get();
+    let out_val = result.cpmm_quote.output.amount.get();
     assert!(out_val > 0);
     assert!(out_val < large_reserve_1);
 
