@@ -719,16 +719,28 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
     let quote_cross_1_down = simulation::simulate_clmm_exact_input(&pool, &req_cross_1_down)
         .expect("0->1 single-tick crossing should succeed");
 
+    // Exact deterministic quote vector:
+    assert_eq!(quote_cross_1_down.input.asset, pool.token_0);
     assert_eq!(quote_cross_1_down.input.amount.get(), 25_000_000);
-    // One-time fee: 25_000_000 * 30 / 10_000 = 75_000
+    assert_eq!(quote_cross_1_down.fee.asset, pool.token_0);
     assert_eq!(quote_cross_1_down.fee.amount.get(), 75_000);
+    assert_eq!(quote_cross_1_down.effective_input.asset, pool.token_0);
     assert_eq!(quote_cross_1_down.effective_input.amount.get(), 24_925_000);
     assert_eq!(
         quote_cross_1_down.fee.amount.get() + quote_cross_1_down.effective_input.amount.get(),
         quote_cross_1_down.input.amount.get()
     );
-    assert!(quote_cross_1_down.output.amount.get() > 0);
-    // Price moved strictly down below tick 0 into [-128, 0)
+    assert_eq!(quote_cross_1_down.output.asset, pool.token_1);
+    assert_eq!(quote_cross_1_down.output.amount.get(), 24_942_609);
+    assert_eq!(quote_cross_1_down.fee_bps, pool.fee_bps);
+    assert_eq!(
+        quote_cross_1_down.resulting_sqrt_price_x64,
+        18_430_261_775_357_090_295
+    );
+    assert_eq!(quote_cross_1_down.resulting_tick, -18);
+    assert_eq!(quote_cross_1_down.resulting_liquidity, 9_995_000_000);
+
+    // Consistency & bounds checks:
     let s_tick_0 = sqrt_price_from_tick_index(0).unwrap();
     let s_tick_neg_128 = sqrt_price_from_tick_index(-128).unwrap();
     assert!(quote_cross_1_down.resulting_sqrt_price_x64 < s_tick_0);
@@ -739,8 +751,6 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         quote_cross_1_down.resulting_tick,
         tick_index_from_sqrt_price(quote_cross_1_down.resulting_sqrt_price_x64).unwrap()
     );
-    // Liquidity updated by -net(0):
-    assert_eq!(quote_cross_1_down.resulting_liquidity, 9_995_000_000);
     assert_eq!(pool, initial_pool);
     assert_eq!(req_cross_1_down, initial_req_down);
 
@@ -757,16 +767,28 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
     let quote_cross_1_up = simulation::simulate_clmm_exact_input(&pool, &req_cross_1_up)
         .expect("1->0 single-tick crossing should succeed");
 
+    // Exact deterministic quote vector:
+    assert_eq!(quote_cross_1_up.input.asset, pool.token_1);
     assert_eq!(quote_cross_1_up.input.amount.get(), 25_000_000);
-    // One-time fee: 25_000_000 * 30 / 10_000 = 75_000
+    assert_eq!(quote_cross_1_up.fee.asset, pool.token_1);
     assert_eq!(quote_cross_1_up.fee.amount.get(), 75_000);
+    assert_eq!(quote_cross_1_up.effective_input.asset, pool.token_1);
     assert_eq!(quote_cross_1_up.effective_input.amount.get(), 24_925_000);
     assert_eq!(
         quote_cross_1_up.fee.amount.get() + quote_cross_1_up.effective_input.amount.get(),
         quote_cross_1_up.input.amount.get()
     );
-    assert!(quote_cross_1_up.output.amount.get() > 0);
-    // Price moved strictly up above tick 64 into [64, 128)
+    assert_eq!(quote_cross_1_up.output.asset, pool.token_0);
+    assert_eq!(quote_cross_1_up.output.amount.get(), 24_783_689);
+    assert_eq!(quote_cross_1_up.fee_bps, pool.fee_bps);
+    assert_eq!(
+        quote_cross_1_up.resulting_sqrt_price_x64,
+        18_522_271_002_508_215_311
+    );
+    assert_eq!(quote_cross_1_up.resulting_tick, 81);
+    assert_eq!(quote_cross_1_up.resulting_liquidity, 9_993_000_000);
+
+    // Consistency & bounds checks:
     let s_tick_64 = sqrt_price_from_tick_index(64).unwrap();
     let s_tick_128 = sqrt_price_from_tick_index(128).unwrap();
     assert!(quote_cross_1_up.resulting_sqrt_price_x64 > s_tick_64);
@@ -777,8 +799,6 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         quote_cross_1_up.resulting_tick,
         tick_index_from_sqrt_price(quote_cross_1_up.resulting_sqrt_price_x64).unwrap()
     );
-    // Liquidity updated by +net(64):
-    assert_eq!(quote_cross_1_up.resulting_liquidity, 9_993_000_000);
     assert_eq!(pool, initial_pool);
     assert_eq!(req_cross_1_up, initial_req_up);
 
@@ -815,13 +835,32 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         amount_in: AtomicAmount::new(80_000_000),
         token_out: None,
     };
+    let initial_multi_up = multi_up_req.clone();
     let multi_up_quote = simulation::simulate_clmm_exact_input(&multi_pool, &multi_up_req)
         .expect("multi-tick crossing up should succeed");
 
+    // Exact deterministic quote vector:
+    assert_eq!(multi_up_quote.input.asset, multi_pool.token_1);
     assert_eq!(multi_up_quote.input.amount.get(), 80_000_000);
-    // fee: 80_000_000 * 20 / 10_000 = 160_000
+    assert_eq!(multi_up_quote.fee.asset, multi_pool.token_1);
     assert_eq!(multi_up_quote.fee.amount.get(), 160_000);
+    assert_eq!(multi_up_quote.effective_input.asset, multi_pool.token_1);
     assert_eq!(multi_up_quote.effective_input.amount.get(), 79_840_000);
+    assert_eq!(
+        multi_up_quote.fee.amount.get() + multi_up_quote.effective_input.amount.get(),
+        multi_up_quote.input.amount.get()
+    );
+    assert_eq!(multi_up_quote.output.asset, multi_pool.token_0);
+    assert_eq!(multi_up_quote.output.amount.get(), 79_207_499);
+    assert_eq!(multi_up_quote.fee_bps, multi_pool.fee_bps);
+    assert_eq!(
+        multi_up_quote.resulting_sqrt_price_x64,
+        18_594_075_501_025_459_409
+    );
+    assert_eq!(multi_up_quote.resulting_tick, 159);
+    assert_eq!(multi_up_quote.resulting_liquidity, 9_990_000_000);
+
+    // Consistency & bounds checks:
     let s_128 = sqrt_price_from_tick_index(128).unwrap();
     let s_192 = sqrt_price_from_tick_index(192).unwrap();
     assert!(multi_up_quote.resulting_sqrt_price_x64 > s_128);
@@ -832,9 +871,8 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         multi_up_quote.resulting_tick,
         tick_index_from_sqrt_price(multi_up_quote.resulting_sqrt_price_x64).unwrap()
     );
-    // Liquidity after crossing 64 and 128: 10_000_000_000 - 4_000_000 - 6_000_000 = 9_990_000_000
-    assert_eq!(multi_up_quote.resulting_liquidity, 9_990_000_000);
     assert_eq!(multi_pool, initial_multi);
+    assert_eq!(multi_up_req, initial_multi_up);
 
     // Multi-cross DOWN (0 -> 1): Starts at 0.
     // Crosses tick 0 downwards: L -= net(0) (3_000_000) -> 9_997_000_000.
@@ -845,13 +883,32 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         amount_in: AtomicAmount::new(50_000_000),
         token_out: None,
     };
+    let initial_multi_down = multi_down_req.clone();
     let multi_down_quote = simulation::simulate_clmm_exact_input(&multi_pool, &multi_down_req)
         .expect("multi-tick crossing down should succeed");
 
+    // Exact deterministic quote vector:
+    assert_eq!(multi_down_quote.input.asset, multi_pool.token_0);
     assert_eq!(multi_down_quote.input.amount.get(), 50_000_000);
-    // fee: 50_000_000 * 20 / 10_000 = 100_000
+    assert_eq!(multi_down_quote.fee.asset, multi_pool.token_0);
     assert_eq!(multi_down_quote.fee.amount.get(), 100_000);
+    assert_eq!(multi_down_quote.effective_input.asset, multi_pool.token_0);
     assert_eq!(multi_down_quote.effective_input.amount.get(), 49_900_000);
+    assert_eq!(
+        multi_down_quote.fee.amount.get() + multi_down_quote.effective_input.amount.get(),
+        multi_down_quote.input.amount.get()
+    );
+    assert_eq!(multi_down_quote.output.asset, multi_pool.token_1);
+    assert_eq!(multi_down_quote.output.amount.get(), 49_652_166);
+    assert_eq!(multi_down_quote.fee_bps, multi_pool.fee_bps);
+    assert_eq!(
+        multi_down_quote.resulting_sqrt_price_x64,
+        18_355_131_043_464_493_861
+    );
+    assert_eq!(multi_down_quote.resulting_tick, -100);
+    assert_eq!(multi_down_quote.resulting_liquidity, 9_999_000_000);
+
+    // Consistency & bounds checks:
     let s_neg_64 = sqrt_price_from_tick_index(-64).unwrap();
     let s_neg_128 = sqrt_price_from_tick_index(-128).unwrap();
     assert!(multi_down_quote.resulting_sqrt_price_x64 < s_neg_64);
@@ -862,9 +919,8 @@ fn test_single_and_multiple_tick_crossing_both_directions() {
         multi_down_quote.resulting_tick,
         tick_index_from_sqrt_price(multi_down_quote.resulting_sqrt_price_x64).unwrap()
     );
-    // Liquidity after crossing 0 and -64 downwards: 10_000_000_000 - 3_000_000 - (-2_000_000) = 9_999_000_000
-    assert_eq!(multi_down_quote.resulting_liquidity, 9_999_000_000);
     assert_eq!(multi_pool, initial_multi);
+    assert_eq!(multi_down_req, initial_multi_down);
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +934,7 @@ fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
     // 10A: Land EXACTLY on tick 64 moving UP.
     let mut zero_fee_pool = pool.clone();
     zero_fee_pool.fee_bps = Bps::new(0).unwrap();
+    let initial_zero_fee = zero_fee_pool.clone();
 
     let s_curr = zero_fee_pool.sqrt_price_x64;
     let s_64 = sqrt_price_from_tick_index(64).unwrap();
@@ -886,19 +943,33 @@ fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
     let rem = lo & 0xFFFF_FFFF_FFFF_FFFF;
     let quot = (lo >> 64) | (hi << 64);
     let exact_input_to_64 = quot + if rem != 0 { 1 } else { 0 };
+    assert_eq!(exact_input_to_64, 16_037_645);
 
     let req_exact_up = ClmmExactInputRequest {
         token_in: zero_fee_pool.token_1.clone(),
         amount_in: AtomicAmount::new(exact_input_to_64),
         token_out: None,
     };
+    let initial_req_exact_up = req_exact_up.clone();
     let quote_exact_up = simulation::simulate_clmm_exact_input(&zero_fee_pool, &req_exact_up)
         .expect("exact boundary arrival moving up should succeed");
 
+    assert_eq!(quote_exact_up.input.asset, zero_fee_pool.token_1);
+    assert_eq!(quote_exact_up.input.amount.get(), 16_037_645);
+    assert_eq!(quote_exact_up.fee.amount.get(), 0);
+    assert_eq!(quote_exact_up.effective_input.amount.get(), 16_037_645);
+    assert_eq!(quote_exact_up.output.asset, zero_fee_pool.token_0);
+    assert_eq!(quote_exact_up.output.amount.get(), 15_960_851);
     assert_eq!(quote_exact_up.resulting_sqrt_price_x64, s_64);
+    assert_eq!(
+        quote_exact_up.resulting_sqrt_price_x64,
+        18_505_865_242_158_250_041
+    );
     assert_eq!(quote_exact_up.resulting_tick, 64);
     // At tick 64, crossed into [64, 128) -> L = 10_000_000_000 + (-7_000_000) = 9_993_000_000
     assert_eq!(quote_exact_up.resulting_liquidity, 9_993_000_000);
+    assert_eq!(zero_fee_pool, initial_zero_fee);
+    assert_eq!(req_exact_up, initial_req_exact_up);
 
     // Follow-on pool from exact boundary state:
     let follow_on_pool_up = ClmmPoolState {
@@ -907,6 +978,7 @@ fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
         liquidity: quote_exact_up.resulting_liquidity,
         ..zero_fee_pool.clone()
     };
+    let initial_follow_on_up = follow_on_pool_up.clone();
 
     // Follow-on UP from tick 64: moves into [64, 128)
     let follow_req_up = ClmmExactInputRequest {
@@ -914,14 +986,26 @@ fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
         amount_in: AtomicAmount::new(100_000),
         token_out: None,
     };
+    let initial_follow_req_up = follow_req_up.clone();
     let follow_quote_up = simulation::simulate_clmm_exact_input(&follow_on_pool_up, &follow_req_up)
         .expect("follow-on quote moving up from exact boundary should succeed");
+    assert_eq!(follow_quote_up.input.amount.get(), 100_000);
+    assert_eq!(follow_quote_up.fee.amount.get(), 0);
+    assert_eq!(follow_quote_up.effective_input.amount.get(), 100_000);
+    assert_eq!(follow_quote_up.output.amount.get(), 99_361);
+    assert_eq!(
+        follow_quote_up.resulting_sqrt_price_x64,
+        18_506_049_838_816_648_015
+    );
     assert!(follow_quote_up.resulting_sqrt_price_x64 > s_64);
     assert_eq!(
         follow_quote_up.resulting_tick,
         tick_index_from_sqrt_price(follow_quote_up.resulting_sqrt_price_x64).unwrap()
     );
-    assert!((64..128).contains(&follow_quote_up.resulting_tick));
+    assert_eq!(follow_quote_up.resulting_tick, 64);
+    assert_eq!(follow_quote_up.resulting_liquidity, 9_993_000_000);
+    assert_eq!(follow_on_pool_up, initial_follow_on_up);
+    assert_eq!(follow_req_up, initial_follow_req_up);
 
     // Follow-on DOWN from tick 64: moves into [0, 64) crossing tick 64 downwards
     let follow_req_down = ClmmExactInputRequest {
@@ -929,40 +1013,103 @@ fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
         amount_in: AtomicAmount::new(100_000),
         token_out: None,
     };
+    let initial_follow_req_down = follow_req_down.clone();
     let follow_quote_down =
         simulation::simulate_clmm_exact_input(&follow_on_pool_up, &follow_req_down)
             .expect("follow-on quote moving down from exact boundary should succeed");
+    assert_eq!(follow_quote_down.input.amount.get(), 100_000);
+    assert_eq!(follow_quote_down.fee.amount.get(), 0);
+    assert_eq!(follow_quote_down.effective_input.amount.get(), 100_000);
+    assert_eq!(follow_quote_down.output.amount.get(), 100_641);
+    assert_eq!(
+        follow_quote_down.resulting_sqrt_price_x64,
+        18_505_679_592_261_780_216
+    );
     assert!(follow_quote_down.resulting_sqrt_price_x64 < s_64);
     assert_eq!(
         follow_quote_down.resulting_tick,
         tick_index_from_sqrt_price(follow_quote_down.resulting_sqrt_price_x64).unwrap()
     );
-    assert!((0..64).contains(&follow_quote_down.resulting_tick));
+    assert_eq!(follow_quote_down.resulting_tick, 63);
     // When crossed back down across tick 64, liquidity restored to 10_000_000_000:
     assert_eq!(follow_quote_down.resulting_liquidity, 10_000_000_000);
+    assert_eq!(follow_on_pool_up, initial_follow_on_up);
+    assert_eq!(follow_req_down, initial_follow_req_down);
 
-    // 10B: Coherent exact boundary state at tick 0 and follow-on in both directions:
+    // 10B: Land EXACTLY on tick 0 moving DOWN, and follow-on in both directions:
+    let req_exact_down = ClmmExactInputRequest {
+        token_in: zero_fee_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(15_986_409),
+        token_out: None,
+    };
+    let initial_req_exact_down = req_exact_down.clone();
+    let quote_exact_down = simulation::simulate_clmm_exact_input(&zero_fee_pool, &req_exact_down)
+        .expect("exact boundary arrival moving down should succeed");
+
+    let s_0 = sqrt_price_from_tick_index(0).unwrap();
+    assert_eq!(quote_exact_down.input.asset, zero_fee_pool.token_0);
+    assert_eq!(quote_exact_down.input.amount.get(), 15_986_409);
+    assert_eq!(quote_exact_down.fee.amount.get(), 0);
+    assert_eq!(quote_exact_down.effective_input.amount.get(), 15_986_409);
+    assert_eq!(quote_exact_down.output.asset, zero_fee_pool.token_1);
+    assert_eq!(quote_exact_down.output.amount.get(), 16_012_005);
+    assert_eq!(quote_exact_down.resulting_sqrt_price_x64, s_0);
+    assert_eq!(
+        quote_exact_down.resulting_sqrt_price_x64,
+        18_446_744_073_709_551_616
+    );
+    assert_eq!(quote_exact_down.resulting_tick, 0);
+    assert_eq!(quote_exact_down.resulting_liquidity, 10_000_000_000);
+    assert_eq!(zero_fee_pool, initial_zero_fee);
+    assert_eq!(req_exact_down, initial_req_exact_down);
+
     let boundary_pool_0 = ClmmPoolState {
-        current_tick: 0,
-        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
-        liquidity: 10_000_000_000,
+        current_tick: quote_exact_down.resulting_tick,
+        sqrt_price_x64: quote_exact_down.resulting_sqrt_price_x64,
+        liquidity: quote_exact_down.resulting_liquidity,
         ..zero_fee_pool.clone()
     };
-    let s_0 = sqrt_price_from_tick_index(0).unwrap();
+    let initial_boundary_0 = boundary_pool_0.clone();
 
     // Follow-on UP from tick 0: moves into [0, 64) with L = 10_000_000_000
     let follow_0_up = simulation::simulate_clmm_exact_input(&boundary_pool_0, &follow_req_up)
         .expect("follow-on quote moving up from tick 0 should succeed");
+    assert_eq!(follow_0_up.input.amount.get(), 100_000);
+    assert_eq!(follow_0_up.fee.amount.get(), 0);
+    assert_eq!(follow_0_up.effective_input.amount.get(), 100_000);
+    assert_eq!(follow_0_up.output.amount.get(), 99_999);
+    assert_eq!(
+        follow_0_up.resulting_sqrt_price_x64,
+        18_446_928_541_150_288_711
+    );
     assert!(follow_0_up.resulting_sqrt_price_x64 > s_0);
-    assert!((0..64).contains(&follow_0_up.resulting_tick));
+    assert_eq!(
+        follow_0_up.resulting_tick,
+        tick_index_from_sqrt_price(follow_0_up.resulting_sqrt_price_x64).unwrap()
+    );
+    assert_eq!(follow_0_up.resulting_tick, 0);
     assert_eq!(follow_0_up.resulting_liquidity, 10_000_000_000);
+    assert_eq!(boundary_pool_0, initial_boundary_0);
 
     // Follow-on DOWN from tick 0: crosses tick 0 downwards into [-128, 0)
     let follow_0_down = simulation::simulate_clmm_exact_input(&boundary_pool_0, &follow_req_down)
         .expect("follow-on quote moving down from tick 0 should succeed");
+    assert_eq!(follow_0_down.input.amount.get(), 100_000);
+    assert_eq!(follow_0_down.fee.amount.get(), 0);
+    assert_eq!(follow_0_down.effective_input.amount.get(), 100_000);
+    assert_eq!(follow_0_down.output.amount.get(), 99_998);
+    assert_eq!(
+        follow_0_down.resulting_sqrt_price_x64,
+        18_446_559_515_835_456_214
+    );
     assert!(follow_0_down.resulting_sqrt_price_x64 < s_0);
-    assert!((-128..0).contains(&follow_0_down.resulting_tick));
+    assert_eq!(
+        follow_0_down.resulting_tick,
+        tick_index_from_sqrt_price(follow_0_down.resulting_sqrt_price_x64).unwrap()
+    );
+    assert_eq!(follow_0_down.resulting_tick, -1);
     assert_eq!(follow_0_down.resulting_liquidity, 9_995_000_000);
+    assert_eq!(boundary_pool_0, initial_boundary_0);
 }
 
 // ---------------------------------------------------------------------------
