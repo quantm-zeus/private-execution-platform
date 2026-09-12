@@ -699,6 +699,8 @@ fn test_no_secret_leakage_in_error_display_and_debug() {
         TaxSafetyError::SellTaxExceedsCap,
         TaxSafetyError::ZeroGrossOutput,
         TaxSafetyError::ZeroNetOutput,
+        TaxSafetyError::ZeroGrossInput,
+        TaxSafetyError::ZeroNetInput,
     ];
 
     for err in &errors {

@@ -67,4 +67,12 @@ pub enum TaxSafetyError {
     /// Net output amount is zero after deducting tax.
     #[error("net output amount must be greater than zero")]
     ZeroNetOutput,
+
+    /// Gross input amount is zero.
+    #[error("gross input amount must be greater than zero")]
+    ZeroGrossInput,
+
+    /// Net transferable input amount is zero after deducting tax.
+    #[error("net transferable input amount must be greater than zero")]
+    ZeroNetInput,
 }

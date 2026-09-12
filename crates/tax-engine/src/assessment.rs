@@ -92,6 +92,22 @@ impl TaxAssessment {
     ) -> Result<crate::buy_output::BuyTaxOutput, TaxSafetyError> {
         crate::buy_output::apply_buy_tax_to_output(self, gross_output)
     }
+
+    /// Applies this sell-side assessment to a gross input amount.
+    pub fn apply_sell_tax(
+        &self,
+        gross_input: &market_types::AssetAmount,
+    ) -> Result<crate::sell_input::SellTaxInput, TaxSafetyError> {
+        crate::sell_input::apply_sell_tax_to_input(self, gross_input)
+    }
+
+    /// Applies this sell-side assessment to a gross input amount.
+    pub fn apply_sell_tax_to_input(
+        &self,
+        gross_input: &market_types::AssetAmount,
+    ) -> Result<crate::sell_input::SellTaxInput, TaxSafetyError> {
+        crate::sell_input::apply_sell_tax_to_input(self, gross_input)
+    }
 }
 
 /// Returns the expected assessed asset for a trade intent:
@@ -238,5 +254,21 @@ impl TaxSafetyEngine {
         gross_output: &market_types::AssetAmount,
     ) -> Result<crate::buy_output::BuyTaxOutput, TaxSafetyError> {
         crate::buy_output::apply_buy_tax_to_output(assessment, gross_output)
+    }
+
+    /// Applies a sell-side assessment to a gross input amount.
+    pub fn apply_sell_tax(
+        assessment: &TaxAssessment,
+        gross_input: &market_types::AssetAmount,
+    ) -> Result<crate::sell_input::SellTaxInput, TaxSafetyError> {
+        crate::sell_input::apply_sell_tax_to_input(assessment, gross_input)
+    }
+
+    /// Applies a sell-side assessment to a gross input amount.
+    pub fn apply_sell_tax_to_input(
+        assessment: &TaxAssessment,
+        gross_input: &market_types::AssetAmount,
+    ) -> Result<crate::sell_input::SellTaxInput, TaxSafetyError> {
+        crate::sell_input::apply_sell_tax_to_input(assessment, gross_input)
     }
 }
