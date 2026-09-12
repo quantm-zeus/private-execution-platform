@@ -945,7 +945,7 @@ fn test_display_and_debug_redaction_comprehensive() {
     let distinct_addr_0 = "So11111111111111111111111111111111111111112";
     let distinct_addr_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
     let distinct_foreign_addr = "0xcccccccccccccccccccccccccccccccccccccccc";
-    let distinct_amount_in = 777_888_999_000_111u128;
+    let distinct_amount_in = 123_456_789u128;
     let distinct_liquidity = 555_666_777_888_999u128;
     let distinct_sqrt_price = 18_476_281_010_653_910_144u128;
     let distinct_observed_ms = 12_345_678i64;
@@ -957,7 +957,7 @@ fn test_display_and_debug_redaction_comprehensive() {
         "So111111",
         "EPjFWdd5",
         "cccccccc",
-        "777888999",
+        "123456789",
         "555666777",
         "18476281010653910144",
         "12345678",
@@ -1030,6 +1030,10 @@ fn test_display_and_debug_redaction_comprehensive() {
     let err_stale = simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &stale_assessment)
         .expect_err("stale must fail");
     assert_redacted(&err_stale, "StaleObservation");
+    assert_eq!(
+        err_stale,
+        TaxAwareClmmSimulationError::Tax(TaxSafetyError::StaleObservation)
+    );
 
     // 5B: Resync assessment error
     let freshness_resync = SafeFreshnessMeta {
@@ -1050,6 +1054,10 @@ fn test_display_and_debug_redaction_comprehensive() {
     let err_resync = simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &resync_assessment)
         .expect_err("resync must fail");
     assert_redacted(&err_resync, "ResyncRequired");
+    assert_eq!(
+        err_resync,
+        TaxAwareClmmSimulationError::Tax(TaxSafetyError::ResyncRequired)
+    );
 
     // 5C: Assessed asset mismatch
     let freshness_fresh = SafeFreshnessMeta {
@@ -1070,6 +1078,10 @@ fn test_display_and_debug_redaction_comprehensive() {
     let err_mismatch = simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &mismatch_assessment)
         .expect_err("mismatch must fail");
     assert_redacted(&err_mismatch, "AssessedAssetMismatch");
+    assert_eq!(
+        err_mismatch,
+        TaxAwareClmmSimulationError::Tax(TaxSafetyError::AssessedAssetMismatch)
+    );
 
     // 5D: Chain mismatch
     let chain_mismatch_assessment = TaxAssessment::new(
@@ -1084,6 +1096,10 @@ fn test_display_and_debug_redaction_comprehensive() {
         simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &chain_mismatch_assessment)
             .expect_err("chain mismatch must fail");
     assert_redacted(&err_chain, "ChainMismatch");
+    assert_eq!(
+        err_chain,
+        TaxAwareClmmSimulationError::Tax(TaxSafetyError::ChainMismatch)
+    );
 
     // 5E: Zero net output (100% tax)
     let max_tax_assessment = TaxAssessment::new(
@@ -1097,6 +1113,10 @@ fn test_display_and_debug_redaction_comprehensive() {
     let err_zero_net = simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &max_tax_assessment)
         .expect_err("zero net must fail");
     assert_redacted(&err_zero_net, "ZeroNetOutput");
+    assert_eq!(
+        err_zero_net,
+        TaxAwareClmmSimulationError::Tax(TaxSafetyError::ZeroNetOutput)
+    );
 
     // 5F: Zero input amount
     let zero_req = ClmmExactInputRequest {
@@ -1115,6 +1135,10 @@ fn test_display_and_debug_redaction_comprehensive() {
     let err_zero_in = simulate_tax_aware_clmm_buy_exact_input(&pool, &zero_req, &normal_assessment)
         .expect_err("zero input must fail");
     assert_redacted(&err_zero_in, "ZeroInputAmount");
+    assert_eq!(
+        err_zero_in,
+        TaxAwareClmmSimulationError::Clmm(ClmmSimulationError::ZeroInputAmount)
+    );
 
     // 5G: Output asset mismatch (directed to unrelated counter-token on Solana)
     let unrelated_solana_asset = AssetId::new(
@@ -1131,6 +1155,10 @@ fn test_display_and_debug_redaction_comprehensive() {
         simulate_tax_aware_clmm_buy_exact_input(&pool, &mismatch_out_req, &normal_assessment)
             .expect_err("output mismatch must fail");
     assert_redacted(&err_out_mismatch, "OutputAssetMismatch");
+    assert_eq!(
+        err_out_mismatch,
+        TaxAwareClmmSimulationError::Clmm(ClmmSimulationError::OutputAssetMismatch)
+    );
 
     // 5H: Scan every single ClmmSimulationError variant
     let clmm_variants = [
