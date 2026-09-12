@@ -268,9 +268,3 @@ pub enum TaxAwareClmmSimulationError {
     #[error("{0}")]
     Tax(#[from] tax_engine::TaxSafetyError),
 }
-
-impl From<MarketTypeError> for TaxAwareClmmSimulationError {
-    fn from(err: MarketTypeError) -> Self {
-        Self::Clmm(ClmmSimulationError::from(err))
-    }
-}

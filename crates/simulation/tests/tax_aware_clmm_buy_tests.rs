@@ -88,19 +88,13 @@ fn test_deterministic_clmm_buy_single_range_both_directions() {
     let initial_pool = pool.clone();
 
     // Direction 0 -> 1: Input SOL (token 0), output USDC (token 1).
-    // Swap 100_000 SOL.
-    // Pool fee: 100_000 * 30 / 10_000 = 300 SOL
-    // Effective input: 99_700 SOL
+    // Swap 100_000 SOL within active range [0, 64).
     let req_0_to_1 = ClmmExactInputRequest {
         token_in: pool.token_0.clone(),
         amount_in: AtomicAmount::new(100_000),
         token_out: None,
     };
     let initial_req_0_to_1 = req_0_to_1.clone();
-
-    // Standalone CLMM simulation to verify exact baseline quote
-    let standalone_quote = simulate_clmm_exact_input(&pool, &req_0_to_1)
-        .expect("standalone CLMM simulation should succeed");
 
     // Tax assessment on output asset (USDC / token 1) with 250 bps buy tax (2.5%)
     let assessment_usdc = sample_assessment(
@@ -115,52 +109,69 @@ fn test_deterministic_clmm_buy_single_range_both_directions() {
         simulate_tax_aware_clmm_buy_exact_input(&pool, &req_0_to_1, &assessment_usdc)
             .expect("tax-aware CLMM buy simulation must succeed");
 
-    // 1. Exact gross CLMM quote preservation
-    assert_eq!(result.clmm_quote, standalone_quote);
+    // 1. Hard-coded literal complete vector checks (Direction 0 -> 1)
+    // Gross input
     assert_eq!(result.clmm_quote.input.asset, pool.token_0);
     assert_eq!(result.clmm_quote.input.amount.get(), 100_000);
+    // Pool fee
     assert_eq!(result.clmm_quote.fee.asset, pool.token_0);
     assert_eq!(result.clmm_quote.fee.amount.get(), 300);
+    // Effective input
     assert_eq!(result.clmm_quote.effective_input.asset, pool.token_0);
     assert_eq!(result.clmm_quote.effective_input.amount.get(), 99_700);
+    // Gross output
+    assert_eq!(result.clmm_quote.output.asset, pool.token_1);
+    assert_eq!(result.clmm_quote.output.amount.get(), 100_018);
+    assert_eq!(result.clmm_quote.fee_bps, pool.fee_bps);
+    // Terminal sqrt price, tick, liquidity
+    assert_eq!(
+        result.clmm_quote.resulting_sqrt_price_x64,
+        18_476_096_509_019_872_497
+    );
+    assert_eq!(result.clmm_quote.resulting_tick, 31);
+    assert_eq!(result.clmm_quote.resulting_liquidity, 10_000_000_000);
+
+    // Buy-tax cost & net output (hard-coded literal values: 250 bps on 100_018)
+    assert_eq!(result.tax_output.gross_output.asset, pool.token_1);
+    assert_eq!(result.tax_output.gross_output.amount.get(), 100_018);
+    assert_eq!(result.tax_output.tax_cost.asset, pool.token_1);
+    assert_eq!(result.tax_output.tax_cost.amount.get(), 2_500);
+    assert_eq!(result.tax_output.net_output.asset, pool.token_1);
+    assert_eq!(result.tax_output.net_output.amount.get(), 97_518);
+
+    // Exact conservation
     assert_eq!(
         result.clmm_quote.fee.amount.get() + result.clmm_quote.effective_input.amount.get(),
-        result.clmm_quote.input.amount.get()
+        100_000
     );
-    assert_eq!(result.clmm_quote.output.asset, pool.token_1);
-    assert_eq!(result.clmm_quote.fee_bps, pool.fee_bps);
-
-    // 2. Tax output economics
-    let gross_out = result.clmm_quote.output.amount.get();
-    let expected_tax = gross_out * 250 / 10_000;
-    let expected_net = gross_out - expected_tax;
-
-    assert_eq!(result.tax_output.gross_output, result.clmm_quote.output);
-    assert_eq!(result.tax_output.tax_cost.asset, pool.token_1);
-    assert_eq!(result.tax_output.tax_cost.amount.get(), expected_tax);
-    assert_eq!(result.tax_output.net_output.asset, pool.token_1);
-    assert_eq!(result.tax_output.net_output.amount.get(), expected_net);
-
-    // 3. Exact conservation: net_output + tax_cost == gross_output
+    assert_eq!(
+        result.tax_output.net_output.amount.get() + result.tax_output.tax_cost.amount.get(),
+        100_018
+    );
     assert_eq!(
         result.tax_output.net_output.amount.get() + result.tax_output.tax_cost.amount.get(),
         result.tax_output.gross_output.amount.get()
     );
 
-    // 4. Input immutability
+    // Limited structural assertions
+    let standalone_quote = simulate_clmm_exact_input(&pool, &req_0_to_1)
+        .expect("standalone CLMM simulation should succeed");
+    assert_eq!(result.clmm_quote, standalone_quote);
+    assert_eq!(result.tax_output.gross_output, result.clmm_quote.output);
+
+    // Input immutability
     assert_eq!(pool, initial_pool);
     assert_eq!(req_0_to_1, initial_req_0_to_1);
     assert_eq!(assessment_usdc, initial_assessment);
 
     // Direction 1 -> 0: Input USDC (token 1), output SOL (token 0).
-    // Swap 100_000 USDC.
+    // Swap 100_000 USDC within active range [0, 64).
     let req_1_to_0 = ClmmExactInputRequest {
         token_in: pool.token_1.clone(),
         amount_in: AtomicAmount::new(100_000),
         token_out: None,
     };
-    let standalone_quote_rev = simulate_clmm_exact_input(&pool, &req_1_to_0)
-        .expect("standalone CLMM 1->0 simulation should succeed");
+    let initial_req_1_to_0 = req_1_to_0.clone();
 
     // Tax assessment on output asset (SOL / token 0) with 500 bps buy tax (5.0%)
     let assessment_sol = sample_assessment(
@@ -169,32 +180,68 @@ fn test_deterministic_clmm_buy_single_range_both_directions() {
         500,
         FreshnessStatus::Fresh,
     );
+    let initial_assessment_sol = assessment_sol.clone();
+
     let result_rev = simulate_tax_aware_clmm_buy_exact_input(&pool, &req_1_to_0, &assessment_sol)
         .expect("tax-aware CLMM buy 1->0 simulation must succeed");
 
-    assert_eq!(result_rev.clmm_quote, standalone_quote_rev);
+    // 2. Hard-coded literal complete vector checks (Direction 1 -> 0)
+    // Gross input
+    assert_eq!(result_rev.clmm_quote.input.asset, pool.token_1);
+    assert_eq!(result_rev.clmm_quote.input.amount.get(), 100_000);
+    // Pool fee
+    assert_eq!(result_rev.clmm_quote.fee.asset, pool.token_1);
+    assert_eq!(result_rev.clmm_quote.fee.amount.get(), 300);
+    // Effective input
+    assert_eq!(result_rev.clmm_quote.effective_input.asset, pool.token_1);
+    assert_eq!(result_rev.clmm_quote.effective_input.amount.get(), 99_700);
+    // Gross output
     assert_eq!(result_rev.clmm_quote.output.asset, pool.token_0);
+    assert_eq!(result_rev.clmm_quote.output.amount.get(), 99_380);
+    assert_eq!(result_rev.clmm_quote.fee_bps, pool.fee_bps);
+    // Terminal sqrt price, tick, liquidity
     assert_eq!(
-        result_rev.tax_output.gross_output,
-        result_rev.clmm_quote.output
+        result_rev.clmm_quote.resulting_sqrt_price_x64,
+        18_476_464_924_692_325_028
     );
+    assert_eq!(result_rev.clmm_quote.resulting_tick, 32);
+    assert_eq!(result_rev.clmm_quote.resulting_liquidity, 10_000_000_000);
 
-    let gross_out_rev = result_rev.clmm_quote.output.amount.get();
-    let expected_tax_rev = gross_out_rev * 500 / 10_000;
-    let expected_net_rev = gross_out_rev - expected_tax_rev;
+    // Buy-tax cost & net output (hard-coded literal values: 500 bps on 99_380)
+    assert_eq!(result_rev.tax_output.gross_output.asset, pool.token_0);
+    assert_eq!(result_rev.tax_output.gross_output.amount.get(), 99_380);
+    assert_eq!(result_rev.tax_output.tax_cost.asset, pool.token_0);
+    assert_eq!(result_rev.tax_output.tax_cost.amount.get(), 4_969);
+    assert_eq!(result_rev.tax_output.net_output.asset, pool.token_0);
+    assert_eq!(result_rev.tax_output.net_output.amount.get(), 94_411);
 
+    // Exact conservation
     assert_eq!(
-        result_rev.tax_output.tax_cost.amount.get(),
-        expected_tax_rev
+        result_rev.clmm_quote.fee.amount.get() + result_rev.clmm_quote.effective_input.amount.get(),
+        100_000
     );
     assert_eq!(
-        result_rev.tax_output.net_output.amount.get(),
-        expected_net_rev
+        result_rev.tax_output.net_output.amount.get() + result_rev.tax_output.tax_cost.amount.get(),
+        99_380
     );
     assert_eq!(
         result_rev.tax_output.net_output.amount.get() + result_rev.tax_output.tax_cost.amount.get(),
         result_rev.tax_output.gross_output.amount.get()
     );
+
+    // Limited structural assertions
+    let standalone_quote_rev = simulate_clmm_exact_input(&pool, &req_1_to_0)
+        .expect("standalone CLMM 1->0 simulation should succeed");
+    assert_eq!(result_rev.clmm_quote, standalone_quote_rev);
+    assert_eq!(
+        result_rev.tax_output.gross_output,
+        result_rev.clmm_quote.output
+    );
+
+    // Input immutability
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_1_to_0, initial_req_1_to_0);
+    assert_eq!(assessment_sol, initial_assessment_sol);
 }
 
 #[test]
@@ -206,12 +253,6 @@ fn test_deterministic_clmm_buy_crossing_ticks_exact_conservation() {
     // Initial active range [0, 64), current tick 32.
     // Crossing tick 0 moving into [-128, 0).
     // Input: 25_000_000 SOL.
-    // Pool fee: 25_000_000 * 30 / 10_000 = 75_000 SOL.
-    // Effective input: 24_925_000 SOL.
-    // Landed standalone quote produces gross output: 24_942_609 USDC.
-    // Resulting sqrt price: 18_430_261_775_357_090_295.
-    // Resulting tick: -18 (crossed tick 0).
-    // Resulting liquidity: 9_995_000_000.
     let req_cross_down = ClmmExactInputRequest {
         token_in: pool.token_0.clone(),
         amount_in: AtomicAmount::new(25_000_000),
@@ -219,14 +260,7 @@ fn test_deterministic_clmm_buy_crossing_ticks_exact_conservation() {
     };
     let initial_req_down = req_cross_down.clone();
 
-    let standalone_quote_down = simulate_clmm_exact_input(&pool, &req_cross_down)
-        .expect("standalone cross-tick CLMM simulation should succeed");
-    assert_eq!(standalone_quote_down.resulting_tick, -18);
-    assert_eq!(standalone_quote_down.output.amount.get(), 24_942_609);
-
-    // Apply buy tax to output USDC: 250 bps (2.5%)
-    // tax_cost = floor(24_942_609 * 250 / 10_000) = floor(6_235_652_250 / 10_000) = 623_565
-    // net_output = 24_942_609 - 623_565 = 24_319_044
+    // Tax assessment on output asset (USDC / token 1) with 250 bps buy tax (2.5%)
     let assessment_usdc = sample_assessment(
         ChainId::Solana,
         pool.token_1.clone(),
@@ -239,93 +273,184 @@ fn test_deterministic_clmm_buy_crossing_ticks_exact_conservation() {
         simulate_tax_aware_clmm_buy_exact_input(&pool, &req_cross_down, &assessment_usdc)
             .expect("tax-aware cross-tick simulation must succeed");
 
-    // Intact preservation of CLMM quote across tick boundary:
-    assert_eq!(result_cross_down.clmm_quote, standalone_quote_down);
+    // 1. Hard-coded literal complete vector checks (Direction 0 -> 1 cross-tick)
+    // Gross input
+    assert_eq!(result_cross_down.clmm_quote.input.asset, pool.token_0);
     assert_eq!(result_cross_down.clmm_quote.input.amount.get(), 25_000_000);
+    // Pool fee
+    assert_eq!(result_cross_down.clmm_quote.fee.asset, pool.token_0);
     assert_eq!(result_cross_down.clmm_quote.fee.amount.get(), 75_000);
+    // Effective input
+    assert_eq!(
+        result_cross_down.clmm_quote.effective_input.asset,
+        pool.token_0
+    );
     assert_eq!(
         result_cross_down.clmm_quote.effective_input.amount.get(),
         24_925_000
     );
+    // Gross output
+    assert_eq!(result_cross_down.clmm_quote.output.asset, pool.token_1);
     assert_eq!(result_cross_down.clmm_quote.output.amount.get(), 24_942_609);
+    assert_eq!(result_cross_down.clmm_quote.fee_bps, pool.fee_bps);
+    // Terminal sqrt price, tick, liquidity
+    assert_eq!(
+        result_cross_down.clmm_quote.resulting_sqrt_price_x64,
+        18_430_261_775_357_090_295
+    );
     assert_eq!(result_cross_down.clmm_quote.resulting_tick, -18);
     assert_eq!(
         result_cross_down.clmm_quote.resulting_liquidity,
         9_995_000_000
     );
-    assert_eq!(
-        result_cross_down.clmm_quote.resulting_sqrt_price_x64,
-        18_430_261_775_357_090_295
-    );
 
-    // Tax output economics:
+    // Buy-tax cost & net output (hard-coded literal values: 250 bps on 24_942_609)
     assert_eq!(
-        result_cross_down.tax_output.gross_output,
-        result_cross_down.clmm_quote.output
+        result_cross_down.tax_output.gross_output.asset,
+        pool.token_1
     );
+    assert_eq!(
+        result_cross_down.tax_output.gross_output.amount.get(),
+        24_942_609
+    );
+    assert_eq!(result_cross_down.tax_output.tax_cost.asset, pool.token_1);
     assert_eq!(result_cross_down.tax_output.tax_cost.amount.get(), 623_565);
+    assert_eq!(result_cross_down.tax_output.net_output.asset, pool.token_1);
     assert_eq!(
         result_cross_down.tax_output.net_output.amount.get(),
         24_319_044
     );
 
-    // Exact output conservation: net + tax == gross
+    // Exact conservation
+    assert_eq!(
+        result_cross_down.clmm_quote.fee.amount.get()
+            + result_cross_down.clmm_quote.effective_input.amount.get(),
+        25_000_000
+    );
+    assert_eq!(
+        result_cross_down.tax_output.net_output.amount.get()
+            + result_cross_down.tax_output.tax_cost.amount.get(),
+        24_942_609
+    );
     assert_eq!(
         result_cross_down.tax_output.net_output.amount.get()
             + result_cross_down.tax_output.tax_cost.amount.get(),
         result_cross_down.tax_output.gross_output.amount.get()
     );
 
-    // Immutability:
+    // Limited structural assertions
+    let standalone_quote_down = simulate_clmm_exact_input(&pool, &req_cross_down)
+        .expect("standalone cross-tick CLMM simulation should succeed");
+    assert_eq!(result_cross_down.clmm_quote, standalone_quote_down);
+    assert_eq!(
+        result_cross_down.tax_output.gross_output,
+        result_cross_down.clmm_quote.output
+    );
+
+    // Immutability
     assert_eq!(pool, initial_pool);
     assert_eq!(req_cross_down, initial_req_down);
     assert_eq!(assessment_usdc, initial_assessment);
 
     // Direction 1 -> 0 crossing tick 64 moving up:
+    // Initial active range [0, 64), current tick 32.
+    // Crossing tick 64 moving into [64, 128).
     // Input: 25_000_000 USDC.
-    // Pool fee: 75_000 USDC.
-    // Effective input: 24_925_000 USDC.
-    // Landed standalone quote produces gross output: 24_783_689 SOL.
-    // Resulting tick: 81 (crossed tick 64).
-    // Resulting liquidity: 9_993_000_000.
     let req_cross_up = ClmmExactInputRequest {
         token_in: pool.token_1.clone(),
         amount_in: AtomicAmount::new(25_000_000),
         token_out: None,
     };
-    let standalone_quote_up = simulate_clmm_exact_input(&pool, &req_cross_up)
-        .expect("standalone cross-tick up simulation should succeed");
-    assert_eq!(standalone_quote_up.resulting_tick, 81);
-    assert_eq!(standalone_quote_up.output.amount.get(), 24_783_689);
+    let initial_req_up = req_cross_up.clone();
 
-    // Apply buy tax to output SOL: 500 bps (5.0%)
-    // tax_cost = floor(24_783_689 * 500 / 10_000) = floor(12_391_844_500 / 10_000) = 1_239_184
-    // net_output = 24_783_689 - 1_239_184 = 23_544_505
+    // Tax assessment on output SOL: 500 bps (5.0%)
     let assessment_sol = sample_assessment(
         ChainId::Solana,
         pool.token_0.clone(),
         500,
         FreshnessStatus::Fresh,
     );
+    let initial_assessment_sol = assessment_sol.clone();
+
     let result_cross_up =
         simulate_tax_aware_clmm_buy_exact_input(&pool, &req_cross_up, &assessment_sol)
             .expect("tax-aware cross-tick up simulation must succeed");
 
-    assert_eq!(result_cross_up.clmm_quote, standalone_quote_up);
+    // 2. Hard-coded literal complete vector checks (Direction 1 -> 0 cross-tick)
+    // Gross input
+    assert_eq!(result_cross_up.clmm_quote.input.asset, pool.token_1);
     assert_eq!(result_cross_up.clmm_quote.input.amount.get(), 25_000_000);
+    // Pool fee
+    assert_eq!(result_cross_up.clmm_quote.fee.asset, pool.token_1);
     assert_eq!(result_cross_up.clmm_quote.fee.amount.get(), 75_000);
+    // Effective input
+    assert_eq!(
+        result_cross_up.clmm_quote.effective_input.asset,
+        pool.token_1
+    );
+    assert_eq!(
+        result_cross_up.clmm_quote.effective_input.amount.get(),
+        24_925_000
+    );
+    // Gross output
+    assert_eq!(result_cross_up.clmm_quote.output.asset, pool.token_0);
     assert_eq!(result_cross_up.clmm_quote.output.amount.get(), 24_783_689);
+    assert_eq!(result_cross_up.clmm_quote.fee_bps, pool.fee_bps);
+    // Terminal sqrt price, tick, liquidity
+    assert_eq!(
+        result_cross_up.clmm_quote.resulting_sqrt_price_x64,
+        18_522_271_002_508_215_311
+    );
     assert_eq!(result_cross_up.clmm_quote.resulting_tick, 81);
+    assert_eq!(
+        result_cross_up.clmm_quote.resulting_liquidity,
+        9_993_000_000
+    );
+
+    // Buy-tax cost & net output (hard-coded literal values: 500 bps on 24_783_689)
+    assert_eq!(result_cross_up.tax_output.gross_output.asset, pool.token_0);
+    assert_eq!(
+        result_cross_up.tax_output.gross_output.amount.get(),
+        24_783_689
+    );
+    assert_eq!(result_cross_up.tax_output.tax_cost.asset, pool.token_0);
     assert_eq!(result_cross_up.tax_output.tax_cost.amount.get(), 1_239_184);
+    assert_eq!(result_cross_up.tax_output.net_output.asset, pool.token_0);
     assert_eq!(
         result_cross_up.tax_output.net_output.amount.get(),
         23_544_505
+    );
+
+    // Exact conservation
+    assert_eq!(
+        result_cross_up.clmm_quote.fee.amount.get()
+            + result_cross_up.clmm_quote.effective_input.amount.get(),
+        25_000_000
+    );
+    assert_eq!(
+        result_cross_up.tax_output.net_output.amount.get()
+            + result_cross_up.tax_output.tax_cost.amount.get(),
+        24_783_689
     );
     assert_eq!(
         result_cross_up.tax_output.net_output.amount.get()
             + result_cross_up.tax_output.tax_cost.amount.get(),
         result_cross_up.tax_output.gross_output.amount.get()
     );
+
+    // Limited structural assertions
+    let standalone_quote_up = simulate_clmm_exact_input(&pool, &req_cross_up)
+        .expect("standalone cross-tick up simulation should succeed");
+    assert_eq!(result_cross_up.clmm_quote, standalone_quote_up);
+    assert_eq!(
+        result_cross_up.tax_output.gross_output,
+        result_cross_up.clmm_quote.output
+    );
+
+    // Immutability
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_cross_up, initial_req_up);
+    assert_eq!(assessment_sol, initial_assessment_sol);
 }
 
 #[test]
@@ -336,47 +461,18 @@ fn test_tax_floor_rounding_sub_unit_remainders_and_conservation_sweep() {
         amount_in: AtomicAmount::new(100_000),
         token_out: None,
     };
-    let standalone = simulate_clmm_exact_input(&pool, &req).unwrap();
-    let gross_out = standalone.output.amount.get();
 
+    // Hard-coded literal tax vectors for gross output 100_018:
+    // (bps, expected_tax, expected_net)
     let tax_vectors: &[(u16, u128, u128)] = &[
-        // (bps, expected_tax, expected_net)
-        (1, gross_out / 10_000, gross_out - (gross_out / 10_000)),
-        (
-            5,
-            gross_out * 5 / 10_000,
-            gross_out - (gross_out * 5 / 10_000),
-        ),
-        (
-            10,
-            gross_out * 10 / 10_000,
-            gross_out - (gross_out * 10 / 10_000),
-        ),
-        (
-            50,
-            gross_out * 50 / 10_000,
-            gross_out - (gross_out * 50 / 10_000),
-        ),
-        (
-            100,
-            gross_out * 100 / 10_000,
-            gross_out - (gross_out * 100 / 10_000),
-        ),
-        (
-            333,
-            gross_out * 333 / 10_000,
-            gross_out - (gross_out * 333 / 10_000),
-        ),
-        (
-            1_000,
-            gross_out * 1_000 / 10_000,
-            gross_out - (gross_out * 1_000 / 10_000),
-        ),
-        (
-            9_999,
-            gross_out * 9_999 / 10_000,
-            gross_out - (gross_out * 9_999 / 10_000),
-        ),
+        (1, 10, 100_008),
+        (5, 50, 99_968),
+        (10, 100, 99_918),
+        (50, 500, 99_518),
+        (100, 1_000, 99_018),
+        (333, 3_330, 96_688),
+        (1_000, 10_001, 90_017),
+        (9_999, 100_007, 11),
     ];
 
     for &(bps, exp_tax, exp_net) in tax_vectors {
@@ -389,6 +485,7 @@ fn test_tax_floor_rounding_sub_unit_remainders_and_conservation_sweep() {
         let quote = simulate_tax_aware_clmm_buy_exact_input(&pool, &req, &assessment)
             .unwrap_or_else(|e| panic!("failed for bps {}: {:?}", bps, e));
 
+        assert_eq!(quote.tax_output.gross_output.amount.get(), 100_018);
         assert_eq!(
             quote.tax_output.tax_cost.amount.get(),
             exp_tax,
@@ -786,12 +883,20 @@ fn test_large_safe_amount_and_bounded_arithmetic() {
         49_850_000_000_000
     );
 
-    let gross_out = result.clmm_quote.output.amount.get();
-    let expected_tax = gross_out * 350 / 10_000;
-    let expected_net = gross_out - expected_tax;
-
-    assert_eq!(result.tax_output.tax_cost.amount.get(), expected_tax);
-    assert_eq!(result.tax_output.net_output.amount.get(), expected_net);
+    // Hard-coded literal complete vector for the large safe input.
+    assert_eq!(result.clmm_quote.output.asset, pool.token_1);
+    assert_eq!(result.clmm_quote.output.amount.get(), 49_541_295_800_542);
+    assert_eq!(
+        result.clmm_quote.resulting_sqrt_price_x64,
+        18_332_509_623_120_482_112
+    );
+    assert_eq!(result.clmm_quote.resulting_tick, -125);
+    assert_eq!(result.clmm_quote.resulting_liquidity, 8_000_000_000_000_000);
+    assert_eq!(result.tax_output.tax_cost.amount.get(), 1_733_945_353_018);
+    assert_eq!(
+        result.tax_output.net_output.amount.get(),
+        47_807_350_447_524
+    );
     assert_eq!(
         result.tax_output.net_output.amount.get() + result.tax_output.tax_cost.amount.get(),
         result.tax_output.gross_output.amount.get()
