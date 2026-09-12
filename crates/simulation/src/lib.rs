@@ -17,7 +17,9 @@ pub use buy_tax::{
     simulate_tax_aware_cpmm_buy_swap, TaxAwareCpmmBuyQuote, TaxAwareCpmmBuyResult,
     TaxAwareCpmmSimulationQuote,
 };
-pub use clmm::{simulate_clmm_exact_input, ClmmExactInputRequest, ClmmSimulationQuote};
+pub use clmm::{
+    simulate_clmm_exact_input, ClmmExactInputRequest, ClmmSimulationQuote, MAX_CLMM_TICK_CROSSES,
+};
 pub use cpmm::{
     cmp_u128_products, div_u256_by_u128_floor, mul_u128_wide, simulate_cpmm_exact_input,
     simulate_cpmm_swap, simulate_cpmm_swap_directed, CpmmExactInputRequest, CpmmQuote,

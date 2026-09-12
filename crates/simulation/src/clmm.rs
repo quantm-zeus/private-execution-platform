@@ -468,10 +468,49 @@ pub fn tick_index_from_sqrt_price(sqrt_price_x64: u128) -> Result<i32, ClmmSimul
     Ok(tick_cand.clamp(MIN_TICK, MAX_TICK))
 }
 
-/// Simulates a direct exact-input swap over a CLMM pool state within its current active range.
+/// Hard cap on the maximum number of initialized tick boundaries that can be crossed in a single simulation.
+pub const MAX_CLMM_TICK_CROSSES: usize = 32;
+
+#[inline]
+fn checked_add_net(liquidity: u128, net: i128) -> Result<u128, ClmmSimulationError> {
+    let new_liq = if net >= 0 {
+        liquidity
+            .checked_add(net as u128)
+            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+    } else {
+        liquidity
+            .checked_sub(net.unsigned_abs())
+            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+    };
+    if new_liq == 0 {
+        return Err(ClmmSimulationError::InvalidLiquidity);
+    }
+    Ok(new_liq)
+}
+
+#[inline]
+fn checked_sub_net(liquidity: u128, net: i128) -> Result<u128, ClmmSimulationError> {
+    let new_liq = if net >= 0 {
+        liquidity
+            .checked_sub(net as u128)
+            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+    } else {
+        liquidity
+            .checked_add(net.unsigned_abs())
+            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+    };
+    if new_liq == 0 {
+        return Err(ClmmSimulationError::InvalidLiquidity);
+    }
+    Ok(new_liq)
+}
+
+/// Simulates a direct exact-input swap over a CLMM pool state across bounded initialized tick ranges.
 ///
-/// Preflights active range and fails closed without producing a quote if price movement
-/// would reach or cross the next initialized tick/range boundary.
+/// Deterministically traverses represented initialized ticks in [`market_types::ClmmPoolState`],
+/// applying one-time input fee accounting and checked signed net-liquidity transitions.
+/// Fails closed before producing a quote if traversal requires crossing beyond represented ticks,
+/// exceeds [`MAX_CLMM_TICK_CROSSES`], encounters zero or overflowing liquidity, or violates invariants.
 pub fn simulate_clmm_exact_input(
     pool: &ClmmPoolState,
     request: &ClmmExactInputRequest,
@@ -567,9 +606,9 @@ pub fn simulate_clmm_exact_input(
         }
     }
 
-    let lower_idx = lower_tick_idx.ok_or(ClmmSimulationError::InvalidRange)?;
-    let t_lower = pool.ticks[lower_idx].index;
-    let t_upper = pool.ticks[lower_idx + 1].index;
+    let mut current_range_idx = lower_tick_idx.ok_or(ClmmSimulationError::InvalidRange)?;
+    let t_lower = pool.ticks[current_range_idx].index;
+    let t_upper = pool.ticks[current_range_idx + 1].index;
 
     let s_lower = sqrt_price_from_tick_index(t_lower)?;
     let s_upper = sqrt_price_from_tick_index(t_upper)?;
@@ -596,140 +635,245 @@ pub fn simulate_clmm_exact_input(
         return Err(ClmmSimulationError::ZeroEffectiveInput);
     }
 
-    let current_s = pool.sqrt_price_x64;
-    let liquidity = pool.liquidity;
+    // 13. Initialize simulation traversal state
+    let mut current_s = pool.sqrt_price_x64;
+    let mut current_tick = pool.current_tick;
+    let mut current_liquidity = pool.liquidity;
+    let mut remaining_input = effective_input_val;
+    let mut total_output: u128 = 0;
+    let mut tick_crosses: usize = 0;
 
-    // 13. Preflight active range and calculate exact output & resulting state
-    let (amount_out_val, resulting_s, resulting_tick) = if is_token_0_in {
-        // Token 0 in -> Token 1 out. Price moves down towards s_lower.
-        if current_s <= s_lower {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
+    // 14. Bounded tick traversal loop
+    while remaining_input > 0 {
+        if is_token_0_in {
+            // Direction: Token 0 in -> Token 1 out. Price moves DOWN towards lower ticks.
+            let range_lower_tick = pool.ticks[current_range_idx].index;
+            let mut s_lower = sqrt_price_from_tick_index(range_lower_tick)?;
+
+            // If already at lower boundary of this range, cross into the range below
+            if current_s == s_lower {
+                if current_range_idx == 0 {
+                    return Err(ClmmSimulationError::TickCrossingExceeded);
+                }
+                if tick_crosses >= MAX_CLMM_TICK_CROSSES {
+                    return Err(ClmmSimulationError::TickCrossingExceeded);
+                }
+                let net = pool.ticks[current_range_idx].liquidity_net;
+                current_liquidity = checked_sub_net(current_liquidity, net)?;
+                tick_crosses += 1;
+                current_range_idx -= 1;
+                s_lower = sqrt_price_from_tick_index(pool.ticks[current_range_idx].index)?;
+            }
+
+            if current_s <= s_lower {
+                return Err(ClmmSimulationError::InvariantViolated);
+            }
+
+            // Max token 0 input to reach lower boundary:
+            // delta_x_max = ceil( (L * 2^64 * (current_s - s_lower)) / (current_s * s_lower) )
+            let delta_s = current_s - s_lower;
+            let num_delta = U512::mul_u128(current_liquidity, delta_s)
+                .shl_64()
+                .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+            let den_delta = U512::mul_u128(current_s, s_lower);
+            let delta_x_max = num_delta
+                .div_ceil(&den_delta)
+                .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+            if U512::from_u128(remaining_input) < delta_x_max {
+                // Next price: s_next = ceil( (L * 2^64 * current_s) / (L * 2^64 + remaining_input * current_s) )
+                let num_price = U512::mul_u128(current_liquidity, current_s)
+                    .shl_64()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+                let l_x64 = U512::from_u128(current_liquidity)
+                    .shl_64()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+                let in_times_s = U512::mul_u128(remaining_input, current_s);
+                let den_price = l_x64
+                    .add(&in_times_s)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let s_next = num_price
+                    .div_ceil(&den_price)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                if s_next <= s_lower || s_next >= current_s {
+                    return Err(ClmmSimulationError::InvariantViolated);
+                }
+
+                // Output token 1: delta_y = floor( (L * (current_s - s_next)) / 2^64 )
+                let delta_s_out = current_s - s_next;
+                let (num_y_hi, num_y_lo) = mul_u128_wide(current_liquidity, delta_s_out);
+                let out_y = (num_y_lo >> 64) | (num_y_hi << 64);
+                if num_y_hi >> 64 != 0 {
+                    return Err(ClmmSimulationError::ArithmeticOverflow);
+                }
+                if out_y == 0 && total_output == 0 {
+                    return Err(ClmmSimulationError::ZeroOutputAmount);
+                }
+
+                total_output = total_output
+                    .checked_add(out_y)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let res_tick = tick_index_from_sqrt_price(s_next)?;
+                if res_tick < pool.ticks[current_range_idx].index {
+                    return Err(ClmmSimulationError::InvariantViolated);
+                }
+
+                current_s = s_next;
+                current_tick = res_tick;
+                break;
+            } else {
+                // Input is sufficient to reach lower boundary s_lower
+                if U512::from_u128(remaining_input) > delta_x_max {
+                    if current_range_idx == 0 {
+                        return Err(ClmmSimulationError::TickCrossingExceeded);
+                    }
+                    if tick_crosses >= MAX_CLMM_TICK_CROSSES {
+                        return Err(ClmmSimulationError::TickCrossingExceeded);
+                    }
+                }
+
+                let input_step = delta_x_max
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let delta_s_out = current_s - s_lower;
+                let (num_y_hi, num_y_lo) = mul_u128_wide(current_liquidity, delta_s_out);
+                let out_y = (num_y_lo >> 64) | (num_y_hi << 64);
+                if num_y_hi >> 64 != 0 {
+                    return Err(ClmmSimulationError::ArithmeticOverflow);
+                }
+
+                total_output = total_output
+                    .checked_add(out_y)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                remaining_input = remaining_input
+                    .checked_sub(input_step)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                current_s = s_lower;
+                current_tick = pool.ticks[current_range_idx].index;
+            }
+        } else {
+            // Direction: Token 1 in -> Token 0 out. Price moves UP towards upper ticks.
+            let range_upper_tick = pool.ticks[current_range_idx + 1].index;
+            let s_upper = sqrt_price_from_tick_index(range_upper_tick)?;
+
+            if current_s >= s_upper {
+                return Err(ClmmSimulationError::InvariantViolated);
+            }
+
+            // Max token 1 input to reach upper boundary:
+            // delta_y_max = ceil( (L * (s_upper - current_s)) / 2^64 )
+            let delta_s = s_upper - current_s;
+            let num_delta = U512::mul_u128(current_liquidity, delta_s);
+            let den_x64 = U512::ONE
+                .shl_64()
+                .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+            let delta_y_max = num_delta
+                .div_ceil(&den_x64)
+                .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+            if U512::from_u128(remaining_input) < delta_y_max {
+                // Next price: delta_s = floor( (remaining_input * 2^64) / L )
+                // s_next = current_s + delta_s
+                let num_price = U512::from_u128(remaining_input)
+                    .shl_64()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+                let den_l = U512::from_u128(current_liquidity);
+                let delta_s_add = num_price
+                    .div_floor(&den_l)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let s_next = current_s
+                    .checked_add(delta_s_add)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                if s_next >= s_upper || s_next <= current_s {
+                    return Err(ClmmSimulationError::InvariantViolated);
+                }
+
+                // Output token 0: delta_x = floor( (L * 2^64 * (s_next - current_s)) / (current_s * s_next) )
+                let delta_s_out = s_next - current_s;
+                let num_x = U512::mul_u128(current_liquidity, delta_s_out)
+                    .shl_64()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+                let den_x = U512::mul_u128(current_s, s_next);
+                let out_x = num_x
+                    .div_floor(&den_x)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                if out_x == 0 && total_output == 0 {
+                    return Err(ClmmSimulationError::ZeroOutputAmount);
+                }
+
+                total_output = total_output
+                    .checked_add(out_x)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let res_tick = tick_index_from_sqrt_price(s_next)?;
+                if res_tick >= pool.ticks[current_range_idx + 1].index {
+                    return Err(ClmmSimulationError::InvariantViolated);
+                }
+
+                current_s = s_next;
+                current_tick = res_tick;
+                break;
+            } else {
+                // Input is sufficient to reach upper boundary s_upper
+                if current_range_idx + 1 >= pool.ticks.len() - 1 {
+                    return Err(ClmmSimulationError::TickCrossingExceeded);
+                }
+                if tick_crosses >= MAX_CLMM_TICK_CROSSES {
+                    return Err(ClmmSimulationError::TickCrossingExceeded);
+                }
+
+                let input_step = delta_y_max
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                let delta_s_out = s_upper - current_s;
+                let num_x = U512::mul_u128(current_liquidity, delta_s_out)
+                    .shl_64()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+                let den_x = U512::mul_u128(current_s, s_upper);
+                let out_x = num_x
+                    .div_floor(&den_x)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?
+                    .as_u128()
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                total_output = total_output
+                    .checked_add(out_x)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                remaining_input = remaining_input
+                    .checked_sub(input_step)
+                    .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
+
+                current_s = s_upper;
+                current_tick = pool.ticks[current_range_idx + 1].index;
+
+                let net = pool.ticks[current_range_idx + 1].liquidity_net;
+                current_liquidity = checked_add_net(current_liquidity, net)?;
+                tick_crosses += 1;
+                current_range_idx += 1;
+            }
         }
+    }
 
-        // Max token 0 input to reach lower boundary:
-        // delta_x_max = ceil( (L * 2^64 * (current_s - s_lower)) / (current_s * s_lower) )
-        let delta_s = current_s - s_lower;
-        let num_delta = U512::mul_u128(liquidity, delta_s)
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let den_delta = U512::mul_u128(current_s, s_lower);
-        let delta_x_max = num_delta
-            .div_ceil(&den_delta)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        if U512::from_u128(effective_input_val) >= delta_x_max {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-
-        // Next price: s_next = ceil( (L * 2^64 * current_s) / (L * 2^64 + effective_input * current_s) )
-        let num_price = U512::mul_u128(liquidity, current_s)
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let l_x64 = U512::from_u128(liquidity)
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let in_times_s = U512::mul_u128(effective_input_val, current_s);
-        let den_price = l_x64
-            .add(&in_times_s)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        let s_next = num_price
-            .div_ceil(&den_price)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
-            .as_u128()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        if s_next <= s_lower {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-        if s_next >= current_s {
-            return Err(ClmmSimulationError::InvariantViolated);
-        }
-
-        // Output token 1: delta_y = floor( (L * (current_s - s_next)) / 2^64 )
-        let delta_s_out = current_s - s_next;
-        let (num_y_hi, num_y_lo) = mul_u128_wide(liquidity, delta_s_out);
-        let out_y = (num_y_lo >> 64) | (num_y_hi << 64);
-        if num_y_hi >> 64 != 0 {
-            return Err(ClmmSimulationError::ArithmeticOverflow);
-        }
-        if out_y == 0 {
-            return Err(ClmmSimulationError::ZeroOutputAmount);
-        }
-
-        let res_tick = tick_index_from_sqrt_price(s_next)?;
-        if res_tick < t_lower {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-
-        (out_y, s_next, res_tick)
-    } else {
-        // Token 1 in -> Token 0 out. Price moves up towards s_upper.
-        if current_s >= s_upper {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-
-        // Max token 1 input to reach upper boundary:
-        // delta_y_max = ceil( (L * (s_upper - current_s)) / 2^64 )
-        let delta_s = s_upper - current_s;
-        let num_delta = U512::mul_u128(liquidity, delta_s);
-        let den_x64 = U512::ONE
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let delta_y_max = num_delta
-            .div_ceil(&den_x64)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        if U512::from_u128(effective_input_val) >= delta_y_max {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-
-        // Next price: delta_s = floor( (effective_input * 2^64) / L )
-        // s_next = current_s + delta_s
-        let num_price = U512::from_u128(effective_input_val)
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let den_l = U512::from_u128(liquidity);
-        let delta_s_add = num_price
-            .div_floor(&den_l)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
-            .as_u128()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        let s_next = current_s
-            .checked_add(delta_s_add)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        if s_next >= s_upper {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-        if s_next <= current_s {
-            return Err(ClmmSimulationError::InvariantViolated);
-        }
-
-        // Output token 0: delta_x = floor( (L * 2^64 * (s_next - current_s)) / (current_s * s_next) )
-        let delta_s_out = s_next - current_s;
-        let num_x = U512::mul_u128(liquidity, delta_s_out)
-            .shl_64()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-        let den_x = U512::mul_u128(current_s, s_next);
-        let out_x = num_x
-            .div_floor(&den_x)
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?
-            .as_u128()
-            .ok_or(ClmmSimulationError::ArithmeticOverflow)?;
-
-        if out_x == 0 {
-            return Err(ClmmSimulationError::ZeroOutputAmount);
-        }
-
-        let res_tick = tick_index_from_sqrt_price(s_next)?;
-        if res_tick >= t_upper {
-            return Err(ClmmSimulationError::TickCrossingExceeded);
-        }
-
-        (out_x, s_next, res_tick)
-    };
+    if total_output == 0 {
+        return Err(ClmmSimulationError::ZeroOutputAmount);
+    }
 
     Ok(ClmmSimulationQuote {
         input: AssetAmount {
@@ -738,7 +882,7 @@ pub fn simulate_clmm_exact_input(
         },
         output: AssetAmount {
             asset: expected_out.clone(),
-            amount: AtomicAmount::new(amount_out_val),
+            amount: AtomicAmount::new(total_output),
         },
         fee: AssetAmount {
             asset: request.token_in.clone(),
@@ -749,8 +893,8 @@ pub fn simulate_clmm_exact_input(
             amount: AtomicAmount::new(effective_input_val),
         },
         fee_bps: pool.fee_bps,
-        resulting_sqrt_price_x64: resulting_s,
-        resulting_tick,
-        resulting_liquidity: pool.liquidity,
+        resulting_sqrt_price_x64: current_s,
+        resulting_tick: current_tick,
+        resulting_liquidity: current_liquidity,
     })
 }

@@ -3,7 +3,9 @@
 use chain_types::{AssetId, ChainId};
 use market_types::{AtomicAmount, Bps, ClmmPoolState, ClmmTick};
 use simulation::clmm::{sqrt_price_from_tick_index, tick_index_from_sqrt_price};
-use simulation::{ClmmExactInputRequest, ClmmSimulationError, ClmmSimulationQuote};
+use simulation::{
+    ClmmExactInputRequest, ClmmSimulationError, ClmmSimulationQuote, MAX_CLMM_TICK_CROSSES,
+};
 
 fn sample_assets() -> (AssetId, AssetId) {
     let sol = AssetId::new(
@@ -265,10 +267,16 @@ fn test_tick_boundary_crossing_rejects_fail_closed() {
     assert_eq!(err_1, ClmmSimulationError::TickCrossingExceeded);
     assert_eq!(pool, initial_pool);
 
-    // 3C: Pool price already at lower boundary tick 0: any 0->1 swap must reject
+    // 3C: Pool price at lowest represented tick 0 (no lower ticks): any 0->1 swap must reject
     let mut boundary_pool_lower = pool.clone();
+    boundary_pool_lower.ticks = vec![
+        ClmmTick::new(0, 20_000_000, 5_000_000),
+        ClmmTick::new(64, 25_000_000, -7_000_000),
+        ClmmTick::new(128, 15_000_000, -8_000_000),
+    ];
     boundary_pool_lower.current_tick = 0;
     boundary_pool_lower.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap();
+    let initial_lower = boundary_pool_lower.clone();
     let req_at_lower = ClmmExactInputRequest {
         token_in: boundary_pool_lower.token_0.clone(),
         amount_in: AtomicAmount::new(1_000),
@@ -278,9 +286,15 @@ fn test_tick_boundary_crossing_rejects_fail_closed() {
         simulation::simulate_clmm_exact_input(&boundary_pool_lower, &req_at_lower).unwrap_err(),
         ClmmSimulationError::TickCrossingExceeded
     );
+    assert_eq!(boundary_pool_lower, initial_lower);
 
-    // 3D: Pool price near upper boundary tick 64: any 1->0 swap crossing upper tick must reject
+    // 3D: Pool price near upper boundary tick 64 (no higher ticks): any 1->0 swap crossing upper tick must reject
     let mut boundary_pool_upper = pool.clone();
+    boundary_pool_upper.ticks = vec![
+        ClmmTick::new(-128, 10_000_000, 10_000_000),
+        ClmmTick::new(0, 20_000_000, 5_000_000),
+        ClmmTick::new(64, 25_000_000, -7_000_000),
+    ];
     boundary_pool_upper.current_tick = 63;
     boundary_pool_upper.sqrt_price_x64 = sqrt_price_from_tick_index(64).unwrap() - 1;
     let initial_upper = boundary_pool_upper.clone();
@@ -657,9 +671,14 @@ fn test_fail_closed_on_current_tick_sqrt_price_desynchronization() {
     // D. Coherent exact boundary control:
     // Reported current_tick (0) agrees with recovered price tick (0) at lower boundary.
     // - Direction 1->0 (moving price up into range) succeeds unambiguously.
-    // - Direction 0->1 (moving price down out of range) rejects with TickCrossingExceeded.
+    // - Direction 0->1 (moving price down out of represented range) rejects with TickCrossingExceeded.
     // -----------------------------------------------------------------------
     let mut coherent_boundary_pool = pool.clone();
+    coherent_boundary_pool.ticks = vec![
+        ClmmTick::new(0, 20_000_000, 5_000_000),
+        ClmmTick::new(64, 25_000_000, -7_000_000),
+        ClmmTick::new(128, 15_000_000, -8_000_000),
+    ];
     coherent_boundary_pool.current_tick = 0;
     coherent_boundary_pool.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap();
     let initial_coherent_boundary = coherent_boundary_pool.clone();
@@ -675,4 +694,569 @@ fn test_fail_closed_on_current_tick_sqrt_price_desynchronization() {
         .expect_err("Coherent lower-boundary swap moving out of range must fail closed");
     assert_eq!(boundary_err_0, ClmmSimulationError::TickCrossingExceeded);
     assert_eq!(coherent_boundary_pool, initial_coherent_boundary);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Bounded tick traversal across single and multiple initialized ticks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_single_and_multiple_tick_crossing_both_directions() {
+    let pool = sample_clmm_pool();
+    let initial_pool = pool.clone();
+
+    // 9A: Direction 0 -> 1 crossing 1 tick (tick 0).
+    // In sample_clmm_pool, current_tick is 32. Ticks: [-128, 0, 64, 128].
+    // Crossing tick 0 moving down: tick 0 has liquidity_net = 5_000_000.
+    // L_initial = 10_000_000_000.
+    // L_post_cross = 10_000_000_000 - 5_000_000 = 9_995_000_000.
+    let req_cross_1_down = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(25_000_000),
+        token_out: None,
+    };
+    let initial_req_down = req_cross_1_down.clone();
+    let quote_cross_1_down = simulation::simulate_clmm_exact_input(&pool, &req_cross_1_down)
+        .expect("0->1 single-tick crossing should succeed");
+
+    assert_eq!(quote_cross_1_down.input.amount.get(), 25_000_000);
+    // One-time fee: 25_000_000 * 30 / 10_000 = 75_000
+    assert_eq!(quote_cross_1_down.fee.amount.get(), 75_000);
+    assert_eq!(quote_cross_1_down.effective_input.amount.get(), 24_925_000);
+    assert_eq!(
+        quote_cross_1_down.fee.amount.get() + quote_cross_1_down.effective_input.amount.get(),
+        quote_cross_1_down.input.amount.get()
+    );
+    assert!(quote_cross_1_down.output.amount.get() > 0);
+    // Price moved strictly down below tick 0 into [-128, 0)
+    let s_tick_0 = sqrt_price_from_tick_index(0).unwrap();
+    let s_tick_neg_128 = sqrt_price_from_tick_index(-128).unwrap();
+    assert!(quote_cross_1_down.resulting_sqrt_price_x64 < s_tick_0);
+    assert!(quote_cross_1_down.resulting_sqrt_price_x64 >= s_tick_neg_128);
+    assert!(quote_cross_1_down.resulting_tick < 0);
+    assert!(quote_cross_1_down.resulting_tick >= -128);
+    assert_eq!(
+        quote_cross_1_down.resulting_tick,
+        tick_index_from_sqrt_price(quote_cross_1_down.resulting_sqrt_price_x64).unwrap()
+    );
+    // Liquidity updated by -net(0):
+    assert_eq!(quote_cross_1_down.resulting_liquidity, 9_995_000_000);
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_cross_1_down, initial_req_down);
+
+    // 9B: Direction 1 -> 0 crossing 1 tick (tick 64).
+    // Crossing tick 64 moving up: tick 64 has liquidity_net = -7_000_000.
+    // L_initial = 10_000_000_000.
+    // L_post_cross = 10_000_000_000 + (-7_000_000) = 9_993_000_000.
+    let req_cross_1_up = ClmmExactInputRequest {
+        token_in: pool.token_1.clone(),
+        amount_in: AtomicAmount::new(25_000_000),
+        token_out: None,
+    };
+    let initial_req_up = req_cross_1_up.clone();
+    let quote_cross_1_up = simulation::simulate_clmm_exact_input(&pool, &req_cross_1_up)
+        .expect("1->0 single-tick crossing should succeed");
+
+    assert_eq!(quote_cross_1_up.input.amount.get(), 25_000_000);
+    // One-time fee: 25_000_000 * 30 / 10_000 = 75_000
+    assert_eq!(quote_cross_1_up.fee.amount.get(), 75_000);
+    assert_eq!(quote_cross_1_up.effective_input.amount.get(), 24_925_000);
+    assert_eq!(
+        quote_cross_1_up.fee.amount.get() + quote_cross_1_up.effective_input.amount.get(),
+        quote_cross_1_up.input.amount.get()
+    );
+    assert!(quote_cross_1_up.output.amount.get() > 0);
+    // Price moved strictly up above tick 64 into [64, 128)
+    let s_tick_64 = sqrt_price_from_tick_index(64).unwrap();
+    let s_tick_128 = sqrt_price_from_tick_index(128).unwrap();
+    assert!(quote_cross_1_up.resulting_sqrt_price_x64 > s_tick_64);
+    assert!(quote_cross_1_up.resulting_sqrt_price_x64 < s_tick_128);
+    assert!(quote_cross_1_up.resulting_tick >= 64);
+    assert!(quote_cross_1_up.resulting_tick < 128);
+    assert_eq!(
+        quote_cross_1_up.resulting_tick,
+        tick_index_from_sqrt_price(quote_cross_1_up.resulting_sqrt_price_x64).unwrap()
+    );
+    // Liquidity updated by +net(64):
+    assert_eq!(quote_cross_1_up.resulting_liquidity, 9_993_000_000);
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_cross_1_up, initial_req_up);
+
+    // 9C: Multiple tick crossing in both directions.
+    let (sol, usdc) = sample_assets();
+    let multi_pool = ClmmPoolState {
+        token_0: sol,
+        token_1: usdc,
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 10_000_000_000,
+        fee_bps: Bps::new(20).unwrap(), // 0.20%
+        ticks: vec![
+            ClmmTick::new(-192, 10_000_000, 10_000_000),
+            ClmmTick::new(-128, 15_000_000, 5_000_000),
+            ClmmTick::new(-64, 20_000_000, -2_000_000),
+            ClmmTick::new(0, 30_000_000, 3_000_000),
+            ClmmTick::new(64, 25_000_000, -4_000_000),
+            ClmmTick::new(128, 20_000_000, -6_000_000),
+            ClmmTick::new(192, 10_000_000, -8_000_000),
+        ],
+    };
+    let initial_multi = multi_pool.clone();
+
+    // Multi-cross UP (1 -> 0): Starts at 0.
+    // Crosses tick 64 (L += -4_000_000 -> 9_996_000_000),
+    // then crosses tick 128 (L += -6_000_000 -> 9_990_000_000),
+    // lands in [128, 192).
+    let multi_up_req = ClmmExactInputRequest {
+        token_in: multi_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(80_000_000),
+        token_out: None,
+    };
+    let multi_up_quote = simulation::simulate_clmm_exact_input(&multi_pool, &multi_up_req)
+        .expect("multi-tick crossing up should succeed");
+
+    assert_eq!(multi_up_quote.input.amount.get(), 80_000_000);
+    // fee: 80_000_000 * 20 / 10_000 = 160_000
+    assert_eq!(multi_up_quote.fee.amount.get(), 160_000);
+    assert_eq!(multi_up_quote.effective_input.amount.get(), 79_840_000);
+    let s_128 = sqrt_price_from_tick_index(128).unwrap();
+    let s_192 = sqrt_price_from_tick_index(192).unwrap();
+    assert!(multi_up_quote.resulting_sqrt_price_x64 > s_128);
+    assert!(multi_up_quote.resulting_sqrt_price_x64 < s_192);
+    assert!(multi_up_quote.resulting_tick >= 128);
+    assert!(multi_up_quote.resulting_tick < 192);
+    assert_eq!(
+        multi_up_quote.resulting_tick,
+        tick_index_from_sqrt_price(multi_up_quote.resulting_sqrt_price_x64).unwrap()
+    );
+    // Liquidity after crossing 64 and 128: 10_000_000_000 - 4_000_000 - 6_000_000 = 9_990_000_000
+    assert_eq!(multi_up_quote.resulting_liquidity, 9_990_000_000);
+    assert_eq!(multi_pool, initial_multi);
+
+    // Multi-cross DOWN (0 -> 1): Starts at 0.
+    // Crosses tick 0 downwards: L -= net(0) (3_000_000) -> 9_997_000_000.
+    // Then crosses tick -64 downwards: L -= net(-64) (-2_000_000) -> 9_999_000_000.
+    // Lands in [-128, -64).
+    let multi_down_req = ClmmExactInputRequest {
+        token_in: multi_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(50_000_000),
+        token_out: None,
+    };
+    let multi_down_quote = simulation::simulate_clmm_exact_input(&multi_pool, &multi_down_req)
+        .expect("multi-tick crossing down should succeed");
+
+    assert_eq!(multi_down_quote.input.amount.get(), 50_000_000);
+    // fee: 50_000_000 * 20 / 10_000 = 100_000
+    assert_eq!(multi_down_quote.fee.amount.get(), 100_000);
+    assert_eq!(multi_down_quote.effective_input.amount.get(), 49_900_000);
+    let s_neg_64 = sqrt_price_from_tick_index(-64).unwrap();
+    let s_neg_128 = sqrt_price_from_tick_index(-128).unwrap();
+    assert!(multi_down_quote.resulting_sqrt_price_x64 < s_neg_64);
+    assert!(multi_down_quote.resulting_sqrt_price_x64 >= s_neg_128);
+    assert!(multi_down_quote.resulting_tick < -64);
+    assert!(multi_down_quote.resulting_tick >= -128);
+    assert_eq!(
+        multi_down_quote.resulting_tick,
+        tick_index_from_sqrt_price(multi_down_quote.resulting_sqrt_price_x64).unwrap()
+    );
+    // Liquidity after crossing 0 and -64 downwards: 10_000_000_000 - 3_000_000 - (-2_000_000) = 9_999_000_000
+    assert_eq!(multi_down_quote.resulting_liquidity, 9_999_000_000);
+    assert_eq!(multi_pool, initial_multi);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Canonical exact-boundary transitions and follow-on quote coherence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_canonical_exact_boundary_transitions_and_follow_on_quotes() {
+    let pool = sample_clmm_pool();
+
+    // 10A: Land EXACTLY on tick 64 moving UP.
+    let mut zero_fee_pool = pool.clone();
+    zero_fee_pool.fee_bps = Bps::new(0).unwrap();
+
+    let s_curr = zero_fee_pool.sqrt_price_x64;
+    let s_64 = sqrt_price_from_tick_index(64).unwrap();
+    let delta_s = s_64 - s_curr;
+    let (hi, lo) = simulation::cpmm::mul_u128_wide(zero_fee_pool.liquidity, delta_s);
+    let rem = lo & 0xFFFF_FFFF_FFFF_FFFF;
+    let quot = (lo >> 64) | (hi << 64);
+    let exact_input_to_64 = quot + if rem != 0 { 1 } else { 0 };
+
+    let req_exact_up = ClmmExactInputRequest {
+        token_in: zero_fee_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(exact_input_to_64),
+        token_out: None,
+    };
+    let quote_exact_up = simulation::simulate_clmm_exact_input(&zero_fee_pool, &req_exact_up)
+        .expect("exact boundary arrival moving up should succeed");
+
+    assert_eq!(quote_exact_up.resulting_sqrt_price_x64, s_64);
+    assert_eq!(quote_exact_up.resulting_tick, 64);
+    // At tick 64, crossed into [64, 128) -> L = 10_000_000_000 + (-7_000_000) = 9_993_000_000
+    assert_eq!(quote_exact_up.resulting_liquidity, 9_993_000_000);
+
+    // Follow-on pool from exact boundary state:
+    let follow_on_pool_up = ClmmPoolState {
+        current_tick: quote_exact_up.resulting_tick,
+        sqrt_price_x64: quote_exact_up.resulting_sqrt_price_x64,
+        liquidity: quote_exact_up.resulting_liquidity,
+        ..zero_fee_pool.clone()
+    };
+
+    // Follow-on UP from tick 64: moves into [64, 128)
+    let follow_req_up = ClmmExactInputRequest {
+        token_in: follow_on_pool_up.token_1.clone(),
+        amount_in: AtomicAmount::new(100_000),
+        token_out: None,
+    };
+    let follow_quote_up = simulation::simulate_clmm_exact_input(&follow_on_pool_up, &follow_req_up)
+        .expect("follow-on quote moving up from exact boundary should succeed");
+    assert!(follow_quote_up.resulting_sqrt_price_x64 > s_64);
+    assert_eq!(
+        follow_quote_up.resulting_tick,
+        tick_index_from_sqrt_price(follow_quote_up.resulting_sqrt_price_x64).unwrap()
+    );
+    assert!((64..128).contains(&follow_quote_up.resulting_tick));
+
+    // Follow-on DOWN from tick 64: moves into [0, 64) crossing tick 64 downwards
+    let follow_req_down = ClmmExactInputRequest {
+        token_in: follow_on_pool_up.token_0.clone(),
+        amount_in: AtomicAmount::new(100_000),
+        token_out: None,
+    };
+    let follow_quote_down =
+        simulation::simulate_clmm_exact_input(&follow_on_pool_up, &follow_req_down)
+            .expect("follow-on quote moving down from exact boundary should succeed");
+    assert!(follow_quote_down.resulting_sqrt_price_x64 < s_64);
+    assert_eq!(
+        follow_quote_down.resulting_tick,
+        tick_index_from_sqrt_price(follow_quote_down.resulting_sqrt_price_x64).unwrap()
+    );
+    assert!((0..64).contains(&follow_quote_down.resulting_tick));
+    // When crossed back down across tick 64, liquidity restored to 10_000_000_000:
+    assert_eq!(follow_quote_down.resulting_liquidity, 10_000_000_000);
+
+    // 10B: Coherent exact boundary state at tick 0 and follow-on in both directions:
+    let boundary_pool_0 = ClmmPoolState {
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 10_000_000_000,
+        ..zero_fee_pool.clone()
+    };
+    let s_0 = sqrt_price_from_tick_index(0).unwrap();
+
+    // Follow-on UP from tick 0: moves into [0, 64) with L = 10_000_000_000
+    let follow_0_up = simulation::simulate_clmm_exact_input(&boundary_pool_0, &follow_req_up)
+        .expect("follow-on quote moving up from tick 0 should succeed");
+    assert!(follow_0_up.resulting_sqrt_price_x64 > s_0);
+    assert!((0..64).contains(&follow_0_up.resulting_tick));
+    assert_eq!(follow_0_up.resulting_liquidity, 10_000_000_000);
+
+    // Follow-on DOWN from tick 0: crosses tick 0 downwards into [-128, 0)
+    let follow_0_down = simulation::simulate_clmm_exact_input(&boundary_pool_0, &follow_req_down)
+        .expect("follow-on quote moving down from tick 0 should succeed");
+    assert!(follow_0_down.resulting_sqrt_price_x64 < s_0);
+    assert!((-128..0).contains(&follow_0_down.resulting_tick));
+    assert_eq!(follow_0_down.resulting_liquidity, 9_995_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Tick crossing cap breach and missing next tick fail closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tick_crossing_cap_breach_and_missing_next_tick_fail_closed() {
+    let (sol, usdc) = sample_assets();
+
+    // 11A: MAX_CLMM_TICK_CROSSES cap enforcement
+    assert_eq!(MAX_CLMM_TICK_CROSSES, 32);
+    let num_ticks = MAX_CLMM_TICK_CROSSES + 4;
+    let ticks: Vec<ClmmTick> = (0..=num_ticks as i32)
+        .map(|i| ClmmTick::new(i * 64, 10_000_000, 0))
+        .collect();
+
+    let cap_pool = ClmmPoolState {
+        token_0: sol.clone(),
+        token_1: usdc.clone(),
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 10_000_000_000,
+        fee_bps: Bps::new(0).unwrap(),
+        ticks,
+    };
+    let initial_cap_pool = cap_pool.clone();
+
+    // Enormous input that traverses beyond 32 tick crossings:
+    let huge_cap_req = ClmmExactInputRequest {
+        token_in: cap_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(10_000_000_000_000),
+        token_out: None,
+    };
+    let initial_cap_req = huge_cap_req.clone();
+
+    let cap_err = simulation::simulate_clmm_exact_input(&cap_pool, &huge_cap_req).unwrap_err();
+    assert_eq!(cap_err, ClmmSimulationError::TickCrossingExceeded);
+    assert_eq!(cap_pool, initial_cap_pool);
+    assert_eq!(huge_cap_req, initial_cap_req);
+
+    // 11B: Missing next tick at upper boundary of represented ticks:
+    let upper_bound_pool = ClmmPoolState {
+        token_0: sol.clone(),
+        token_1: usdc.clone(),
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 64,
+        sqrt_price_x64: sqrt_price_from_tick_index(64).unwrap(),
+        liquidity: 10_000_000_000,
+        fee_bps: Bps::new(0).unwrap(),
+        ticks: vec![
+            ClmmTick::new(0, 10_000_000, 0),
+            ClmmTick::new(64, 10_000_000, 0),
+            ClmmTick::new(128, 10_000_000, 0),
+        ],
+    };
+    let req_cross_upper = ClmmExactInputRequest {
+        token_in: upper_bound_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(1_000_000_000),
+        token_out: None,
+    };
+    let err_upper =
+        simulation::simulate_clmm_exact_input(&upper_bound_pool, &req_cross_upper).unwrap_err();
+    assert_eq!(err_upper, ClmmSimulationError::TickCrossingExceeded);
+
+    // 11C: Missing next tick at lower boundary of represented ticks:
+    let lower_bound_pool = ClmmPoolState {
+        token_0: sol,
+        token_1: usdc,
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 10_000_000_000,
+        fee_bps: Bps::new(0).unwrap(),
+        ticks: vec![
+            ClmmTick::new(0, 10_000_000, 0),
+            ClmmTick::new(64, 10_000_000, 0),
+        ],
+    };
+    let req_cross_lower = ClmmExactInputRequest {
+        token_in: lower_bound_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(1_000_000),
+        token_out: None,
+    };
+    let err_lower =
+        simulation::simulate_clmm_exact_input(&lower_bound_pool, &req_cross_lower).unwrap_err();
+    assert_eq!(err_lower, ClmmSimulationError::TickCrossingExceeded);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Post-cross liquidity zero, overflow, and underflow fail closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_post_cross_liquidity_zero_and_overflow_fail_closed() {
+    let (sol, usdc) = sample_assets();
+
+    // 12A: Net liquidity results in zero active liquidity post-cross moving UP
+    let zero_post_liq_pool = ClmmPoolState {
+        token_0: sol.clone(),
+        token_1: usdc.clone(),
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 5_000_000,
+        fee_bps: Bps::new(0).unwrap(),
+        ticks: vec![
+            ClmmTick::new(-64, 5_000_000, 5_000_000),
+            ClmmTick::new(0, 5_000_000, 0),
+            // At tick 64, net is -5_000_000, so L + (-5_000_000) = 0!
+            ClmmTick::new(64, 5_000_000, -5_000_000),
+            ClmmTick::new(128, 5_000_000, 0),
+        ],
+    };
+    let initial_zero_liq = zero_post_liq_pool.clone();
+    let req_cross = ClmmExactInputRequest {
+        token_in: zero_post_liq_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(50_000_000),
+        token_out: None,
+    };
+    let initial_req = req_cross.clone();
+    let err = simulation::simulate_clmm_exact_input(&zero_post_liq_pool, &req_cross).unwrap_err();
+    assert_eq!(err, ClmmSimulationError::InvalidLiquidity);
+    assert_eq!(zero_post_liq_pool, initial_zero_liq);
+    assert_eq!(req_cross, initial_req);
+
+    // 12B: Downward cross results in zero active liquidity:
+    // At tick 0, net is 5_000_000. Crossing downwards: L - net = 5_000_000 - 5_000_000 = 0!
+    let zero_down_pool = ClmmPoolState {
+        token_0: sol.clone(),
+        token_1: usdc.clone(),
+        decimals_0: 9,
+        decimals_1: 6,
+        tick_spacing: 64,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        liquidity: 5_000_000,
+        fee_bps: Bps::new(0).unwrap(),
+        ticks: vec![
+            ClmmTick::new(-64, 5_000_000, 0),
+            ClmmTick::new(0, 5_000_000, 5_000_000),
+            ClmmTick::new(64, 5_000_000, 0),
+        ],
+    };
+    let initial_down = zero_down_pool.clone();
+    let req_down = ClmmExactInputRequest {
+        token_in: zero_down_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(50_000_000),
+        token_out: None,
+    };
+    let err_down = simulation::simulate_clmm_exact_input(&zero_down_pool, &req_down).unwrap_err();
+    assert_eq!(err_down, ClmmSimulationError::InvalidLiquidity);
+    assert_eq!(zero_down_pool, initial_down);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Malformed ticks and spacing fail closed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_malformed_ticks_and_spacing_fail_closed() {
+    let pool = sample_clmm_pool();
+
+    // 13A: Unsorted ticks
+    let mut unsorted_pool = pool.clone();
+    unsorted_pool.ticks = vec![ClmmTick::new(0, 10_000, 0), ClmmTick::new(-64, 10_000, 0)];
+    let req = ClmmExactInputRequest {
+        token_in: unsorted_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(1000),
+        token_out: None,
+    };
+    let initial_req = req.clone();
+    let initial_unsorted = unsorted_pool.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&unsorted_pool, &req).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(unsorted_pool, initial_unsorted);
+    assert_eq!(req, initial_req);
+
+    // 13B: Duplicate ticks
+    let mut dup_pool = pool.clone();
+    dup_pool.ticks = vec![ClmmTick::new(0, 10_000, 0), ClmmTick::new(0, 10_000, 0)];
+    let initial_dup = dup_pool.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&dup_pool, &req).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(dup_pool, initial_dup);
+
+    // 13C: Tick spacing mismatch
+    let mut spacing_pool = pool.clone();
+    spacing_pool.tick_spacing = 64;
+    spacing_pool.ticks = vec![
+        ClmmTick::new(0, 10_000, 0),
+        ClmmTick::new(33, 10_000, 0), // 33 % 64 != 0
+    ];
+    let initial_spacing = spacing_pool.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&spacing_pool, &req).unwrap_err(),
+        ClmmSimulationError::InvalidTick
+    );
+    assert_eq!(spacing_pool, initial_spacing);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Immutability across success and all failures
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_caller_input_immutability_across_success_and_failures() {
+    let pool = sample_clmm_pool();
+    let initial_pool = pool.clone();
+
+    // 14A: Immutability on single-range success
+    let req_single = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(50_000),
+        token_out: None,
+    };
+    let initial_req_single = req_single.clone();
+    assert!(simulation::simulate_clmm_exact_input(&pool, &req_single).is_ok());
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_single, initial_req_single);
+
+    // 14B: Immutability on multi-range traversal success
+    let req_multi = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(25_000_000),
+        token_out: None,
+    };
+    let initial_req_multi = req_multi.clone();
+    assert!(simulation::simulate_clmm_exact_input(&pool, &req_multi).is_ok());
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_multi, initial_req_multi);
+
+    // 14C: Immutability on tick crossing cap breach failure
+    let ticks: Vec<ClmmTick> = (0..=36)
+        .map(|i| ClmmTick::new(i * 64, 10_000_000, 0))
+        .collect();
+    let cap_pool = ClmmPoolState {
+        ticks,
+        current_tick: 0,
+        sqrt_price_x64: sqrt_price_from_tick_index(0).unwrap(),
+        ..pool.clone()
+    };
+    let initial_cap_pool = cap_pool.clone();
+    let req_cap = ClmmExactInputRequest {
+        token_in: pool.token_1.clone(),
+        amount_in: AtomicAmount::new(10_000_000_000_000),
+        token_out: None,
+    };
+    let initial_req_cap = req_cap.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&cap_pool, &req_cap).unwrap_err(),
+        ClmmSimulationError::TickCrossingExceeded
+    );
+    assert_eq!(cap_pool, initial_cap_pool);
+    assert_eq!(req_cap, initial_req_cap);
+
+    // 14D: Immutability on missing tick failure
+    let req_missing = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(100_000_000_000),
+        token_out: None,
+    };
+    let initial_req_missing = req_missing.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&pool, &req_missing).unwrap_err(),
+        ClmmSimulationError::TickCrossingExceeded
+    );
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_missing, initial_req_missing);
+
+    // 14E: Immutability on zero input failure
+    let req_zero = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(0),
+        token_out: None,
+    };
+    let initial_req_zero = req_zero.clone();
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&pool, &req_zero).unwrap_err(),
+        ClmmSimulationError::ZeroInputAmount
+    );
+    assert_eq!(pool, initial_pool);
+    assert_eq!(req_zero, initial_req_zero);
 }
