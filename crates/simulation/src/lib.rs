@@ -7,6 +7,7 @@
 pub mod buy_tax;
 pub mod cpmm;
 pub mod error;
+pub mod sell_tax;
 
 pub use buy_tax::{
     simulate_cpmm_exact_input_buy_tax, simulate_tax_aware_cpmm_buy,
@@ -23,3 +24,4 @@ pub use error::{
     CpmmErrorClass, CpmmSimulationErrorClass, SimulationError, TaxAwareCpmmBuyError,
     TaxAwareCpmmError, TaxAwareSimulationError,
 };
+pub use sell_tax::{simulate_tax_aware_cpmm_sell_exact_input, TaxAwareCpmmSellQuote};
