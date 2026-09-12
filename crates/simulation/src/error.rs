@@ -2,6 +2,7 @@
 
 use chain_types::AssetId;
 use market_types::MarketTypeError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors produced during deterministic local swap simulation.
@@ -157,5 +158,96 @@ pub type CpmmErrorClass = CpmmSimulationErrorClass;
 impl From<SimulationError> for TaxAwareSimulationError {
     fn from(err: SimulationError) -> Self {
         Self::Cpmm(CpmmSimulationErrorClass::from(err))
+    }
+}
+
+/// Redacted structural error definitions for concentrated liquidity market maker (CLMM) simulation.
+///
+/// Contains no value-bearing payloads, amounts, asset identifiers, prices, ticks,
+/// liquidity values, endpoints, payloads, credentials, or secrets in either
+/// [`Display`](std::fmt::Display) or [`Debug`](std::fmt::Debug).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum ClmmSimulationError {
+    /// The supplied pool state failed its own contract validation.
+    #[error("pool state validation failed")]
+    InvalidPoolState,
+
+    /// Swap input amount is zero.
+    #[error("swap input amount must be greater than zero")]
+    ZeroInputAmount,
+
+    /// Pool liquidity is zero or malformed for active range.
+    #[error("pool liquidity is zero or malformed")]
+    InvalidLiquidity,
+
+    /// Pool fee basis points is invalid.
+    #[error("pool fee is invalid")]
+    InvalidFee,
+
+    /// Pool sqrt price is invalid or zero.
+    #[error("pool price is invalid")]
+    InvalidPrice,
+
+    /// Pool tick is invalid or out of range.
+    #[error("pool tick is invalid")]
+    InvalidTick,
+
+    /// Pool tick range is invalid or inconsistent.
+    #[error("pool range is invalid")]
+    InvalidRange,
+
+    /// Price movement reaches or crosses initialized tick/range boundary.
+    #[error("price movement reaches or crosses tick boundary")]
+    TickCrossingExceeded,
+
+    /// Requested input asset was not found in the pool or direction is invalid.
+    #[error("asset direction is invalid")]
+    InvalidAssetDirection,
+
+    /// Caller-asserted output asset does not match expected counter-token.
+    #[error("output asset mismatch")]
+    OutputAssetMismatch,
+
+    /// Input asset chain does not match pool chain.
+    #[error("chain mismatch: asset chain does not match pool chain")]
+    ChainMismatch,
+
+    /// Effective post-fee input amount was reduced to zero.
+    #[error("effective input amount after fee is zero")]
+    ZeroEffectiveInput,
+
+    /// Simulated output amount is zero.
+    #[error("simulated output amount is zero")]
+    ZeroOutputAmount,
+
+    /// Checked integer arithmetic overflowed during simulation.
+    #[error("arithmetic overflow during simulation calculation")]
+    ArithmeticOverflow,
+
+    /// CLMM invariant or price monotonic invariant was violated.
+    #[error("invariant violated")]
+    InvariantViolated,
+
+    /// State is stale, resync is required, or state is unavailable.
+    #[error("state is stale or unavailable")]
+    StaleOrUnavailableState,
+}
+
+impl From<MarketTypeError> for ClmmSimulationError {
+    fn from(err: MarketTypeError) -> Self {
+        match err {
+            MarketTypeError::ChainMismatch => Self::ChainMismatch,
+            MarketTypeError::ZeroPrice => Self::InvalidPrice,
+            MarketTypeError::TickOutOfRange { .. }
+            | MarketTypeError::TickSpacingMismatch { .. } => Self::InvalidTick,
+            MarketTypeError::ClmmTicksExceeded { .. }
+            | MarketTypeError::UnsortedClmmTicks
+            | MarketTypeError::DuplicateClmmTick(_)
+            | MarketTypeError::InvalidTickLiquidity(_) => Self::InvalidRange,
+            MarketTypeError::ResyncRequired { .. } | MarketTypeError::StaleSequence { .. } => {
+                Self::StaleOrUnavailableState
+            }
+            _ => Self::InvalidPoolState,
+        }
     }
 }

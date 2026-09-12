@@ -5,6 +5,7 @@
 //! external dependencies, or side-effects.
 
 pub mod buy_tax;
+pub mod clmm;
 pub mod cpmm;
 pub mod error;
 pub mod roundtrip_tax;
@@ -16,14 +17,15 @@ pub use buy_tax::{
     simulate_tax_aware_cpmm_buy_swap, TaxAwareCpmmBuyQuote, TaxAwareCpmmBuyResult,
     TaxAwareCpmmSimulationQuote,
 };
+pub use clmm::{simulate_clmm_exact_input, ClmmExactInputRequest, ClmmSimulationQuote};
 pub use cpmm::{
     cmp_u128_products, div_u256_by_u128_floor, mul_u128_wide, simulate_cpmm_exact_input,
     simulate_cpmm_swap, simulate_cpmm_swap_directed, CpmmExactInputRequest, CpmmQuote,
     CpmmSimulationKernel, CpmmSimulationQuote,
 };
 pub use error::{
-    CpmmErrorClass, CpmmSimulationErrorClass, SimulationError, TaxAwareCpmmBuyError,
-    TaxAwareCpmmError, TaxAwareSimulationError,
+    ClmmSimulationError, CpmmErrorClass, CpmmSimulationErrorClass, SimulationError,
+    TaxAwareCpmmBuyError, TaxAwareCpmmError, TaxAwareSimulationError,
 };
 pub use roundtrip_tax::{
     simulate_tax_aware_cpmm_roundtrip_exact_input, TaxAwareCpmmRoundtripQuote,
