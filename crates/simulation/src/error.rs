@@ -251,3 +251,26 @@ impl From<MarketTypeError> for ClmmSimulationError {
         }
     }
 }
+
+/// Redacted error produced during tax-aware CLMM simulation composition.
+///
+/// Combines underlying CLMM simulation failures (as redacted structural classes)
+/// with buy-side tax safety failures (reusing [`TaxSafetyError`](tax_engine::TaxSafetyError)). Neither
+/// [`Display`](std::fmt::Display) nor [`Debug`](std::fmt::Debug) reveals amounts, asset identifiers,
+/// prices, ticks, liquidity values, freshness metadata, endpoints, payloads, credentials, or secrets.
+#[derive(Debug, PartialEq, Eq, Error)]
+pub enum TaxAwareClmmSimulationError {
+    /// Failure during underlying CLMM pool simulation.
+    #[error("{0}")]
+    Clmm(#[from] ClmmSimulationError),
+
+    /// Failure during buy-side tax evaluation.
+    #[error("{0}")]
+    Tax(#[from] tax_engine::TaxSafetyError),
+}
+
+impl From<MarketTypeError> for TaxAwareClmmSimulationError {
+    fn from(err: MarketTypeError) -> Self {
+        Self::Clmm(ClmmSimulationError::from(err))
+    }
+}
