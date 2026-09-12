@@ -540,7 +540,13 @@ pub fn simulate_clmm_exact_input(
         }
     }
 
-    // 10. Find active range bounded by initialized ticks
+    // 10. Validate canonical coherence between current tick and sqrt price
+    let recovered_tick = tick_index_from_sqrt_price(pool.sqrt_price_x64)?;
+    if recovered_tick != pool.current_tick {
+        return Err(ClmmSimulationError::InvalidRange);
+    }
+
+    // 11. Find active range bounded by initialized ticks
     // Initialized ticks in pool.ticks must have at least 2 ticks to form a valid active range.
     if pool.ticks.len() < 2 {
         return Err(ClmmSimulationError::InvalidRange);
@@ -572,12 +578,12 @@ pub fn simulate_clmm_exact_input(
         return Err(ClmmSimulationError::InvalidRange);
     }
 
-    // Price must lie within active range bounds [s_lower, s_upper]
-    if !(s_lower..=s_upper).contains(&pool.sqrt_price_x64) {
+    // Price must lie within active range bounds [s_lower, s_upper)
+    if pool.sqrt_price_x64 < s_lower || pool.sqrt_price_x64 >= s_upper {
         return Err(ClmmSimulationError::InvalidRange);
     }
 
-    // 11. Apply pool fee exactly once before price movement calculation
+    // 12. Apply pool fee exactly once before price movement calculation
     let amount_in_val = request.amount_in.get();
     let (fee_hi, fee_lo) = mul_u128_wide(amount_in_val, fee_bps_val as u128);
     let fee_val = crate::cpmm::div_u256_by_u128_floor(fee_hi, fee_lo, 10_000)
@@ -593,7 +599,7 @@ pub fn simulate_clmm_exact_input(
     let current_s = pool.sqrt_price_x64;
     let liquidity = pool.liquidity;
 
-    // 12. Preflight active range and calculate exact output & resulting state
+    // 13. Preflight active range and calculate exact output & resulting state
     let (amount_out_val, resulting_s, resulting_tick) = if is_token_0_in {
         // Token 0 in -> Token 1 out. Price moves down towards s_lower.
         if current_s <= s_lower {

@@ -279,10 +279,11 @@ fn test_tick_boundary_crossing_rejects_fail_closed() {
         ClmmSimulationError::TickCrossingExceeded
     );
 
-    // 3D: Pool price already at upper boundary tick 64: any 1->0 swap must reject
+    // 3D: Pool price near upper boundary tick 64: any 1->0 swap crossing upper tick must reject
     let mut boundary_pool_upper = pool.clone();
     boundary_pool_upper.current_tick = 63;
-    boundary_pool_upper.sqrt_price_x64 = sqrt_price_from_tick_index(64).unwrap();
+    boundary_pool_upper.sqrt_price_x64 = sqrt_price_from_tick_index(64).unwrap() - 1;
+    let initial_upper = boundary_pool_upper.clone();
     let req_at_upper = ClmmExactInputRequest {
         token_in: boundary_pool_upper.token_1.clone(),
         amount_in: AtomicAmount::new(1_000),
@@ -292,6 +293,7 @@ fn test_tick_boundary_crossing_rejects_fail_closed() {
         simulation::simulate_clmm_exact_input(&boundary_pool_upper, &req_at_upper).unwrap_err(),
         ClmmSimulationError::TickCrossingExceeded
     );
+    assert_eq!(boundary_pool_upper, initial_upper);
 }
 
 // ---------------------------------------------------------------------------
@@ -518,4 +520,159 @@ fn test_tick_math_inversion_and_known_points() {
             "Tick recovery failed for tick {t}: got {recovered_tick}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Fail closed on CLMM current-tick / sqrt-price desynchronization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fail_closed_on_current_tick_sqrt_price_desynchronization() {
+    let pool = sample_clmm_pool();
+
+    // -----------------------------------------------------------------------
+    // A. Confirmed defect regression:
+    // Upper-boundary price with prior-current-tick (current_tick = upper_tick - 1
+    // but sqrt_price_x64 = sqrt_price(upper_tick)).
+    // Must fail closed for BOTH input directions and preserve pool and request unchanged.
+    // -----------------------------------------------------------------------
+    let mut upper_desync_pool = pool.clone();
+    upper_desync_pool.current_tick = 63;
+    upper_desync_pool.sqrt_price_x64 = sqrt_price_from_tick_index(64).unwrap();
+    let initial_upper_pool = upper_desync_pool.clone();
+
+    // A1: Token-0-in request (price moves down) - the confirmed defect path
+    let req_0 = ClmmExactInputRequest {
+        token_in: upper_desync_pool.token_0.clone(),
+        amount_in: AtomicAmount::new(50_000),
+        token_out: None,
+    };
+    let initial_req_0 = req_0.clone();
+    let res_upper_0 = simulation::simulate_clmm_exact_input(&upper_desync_pool, &req_0);
+    assert_eq!(
+        res_upper_0.unwrap_err(),
+        ClmmSimulationError::InvalidRange,
+        "Upper boundary with prior current_tick must reject token-0-in fail-closed"
+    );
+    assert_eq!(upper_desync_pool, initial_upper_pool);
+    assert_eq!(req_0, initial_req_0);
+
+    // A2: Token-1-in request (price moves up)
+    let req_1 = ClmmExactInputRequest {
+        token_in: upper_desync_pool.token_1.clone(),
+        amount_in: AtomicAmount::new(50_000),
+        token_out: None,
+    };
+    let initial_req_1 = req_1.clone();
+    let res_upper_1 = simulation::simulate_clmm_exact_input(&upper_desync_pool, &req_1);
+    assert_eq!(
+        res_upper_1.unwrap_err(),
+        ClmmSimulationError::InvalidRange,
+        "Upper boundary with prior current_tick must reject token-1-in fail-closed"
+    );
+    assert_eq!(upper_desync_pool, initial_upper_pool);
+    assert_eq!(req_1, initial_req_1);
+
+    // -----------------------------------------------------------------------
+    // B. Symmetric lower-boundary / wrong-current-tick cases:
+    // Must fail closed for BOTH input directions and preserve pool and request unchanged.
+    // -----------------------------------------------------------------------
+
+    // B1: Lower-boundary price sqrt_price(0) with prior-current-tick (-1)
+    let mut lower_desync_prior = pool.clone();
+    lower_desync_prior.current_tick = -1;
+    lower_desync_prior.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap();
+    let initial_lower_prior = lower_desync_prior.clone();
+
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_desync_prior, &req_0).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_desync_prior, initial_lower_prior);
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_desync_prior, &req_1).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_desync_prior, initial_lower_prior);
+
+    // B2: Lower-boundary price sqrt_price(0) with next-current-tick (+1)
+    let mut lower_desync_next = pool.clone();
+    lower_desync_next.current_tick = 1;
+    lower_desync_next.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap();
+    let initial_lower_next = lower_desync_next.clone();
+
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_desync_next, &req_0).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_desync_next, initial_lower_next);
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_desync_next, &req_1).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_desync_next, initial_lower_next);
+
+    // B3: Lower-boundary tick 0 with price strictly below lower boundary (sqrt_price(0) - 1)
+    let mut lower_price_under = pool.clone();
+    lower_price_under.current_tick = 0;
+    lower_price_under.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap() - 1;
+    let initial_lower_under = lower_price_under.clone();
+
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_price_under, &req_0).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_price_under, initial_lower_under);
+    assert_eq!(
+        simulation::simulate_clmm_exact_input(&lower_price_under, &req_1).unwrap_err(),
+        ClmmSimulationError::InvalidRange
+    );
+    assert_eq!(lower_price_under, initial_lower_under);
+
+    // -----------------------------------------------------------------------
+    // C. Coherent interior control:
+    // Reported current_tick (32) agrees with recovered price tick (32).
+    // Both directions must succeed and produce valid quotes.
+    // -----------------------------------------------------------------------
+    let coherent_pool = pool.clone();
+    let initial_coherent = coherent_pool.clone();
+
+    let quote_0 = simulation::simulate_clmm_exact_input(&coherent_pool, &req_0)
+        .expect("Coherent interior swap 0->1 must succeed");
+    assert!(quote_0.output.amount.get() > 0);
+    assert!(quote_0.resulting_sqrt_price_x64 < coherent_pool.sqrt_price_x64);
+    assert!((0..64).contains(&quote_0.resulting_tick));
+    assert_eq!(coherent_pool, initial_coherent);
+    assert_eq!(req_0, initial_req_0);
+
+    let quote_1 = simulation::simulate_clmm_exact_input(&coherent_pool, &req_1)
+        .expect("Coherent interior swap 1->0 must succeed");
+    assert!(quote_1.output.amount.get() > 0);
+    assert!(quote_1.resulting_sqrt_price_x64 > coherent_pool.sqrt_price_x64);
+    assert!((0..64).contains(&quote_1.resulting_tick));
+    assert_eq!(coherent_pool, initial_coherent);
+    assert_eq!(req_1, initial_req_1);
+
+    // -----------------------------------------------------------------------
+    // D. Coherent exact boundary control:
+    // Reported current_tick (0) agrees with recovered price tick (0) at lower boundary.
+    // - Direction 1->0 (moving price up into range) succeeds unambiguously.
+    // - Direction 0->1 (moving price down out of range) rejects with TickCrossingExceeded.
+    // -----------------------------------------------------------------------
+    let mut coherent_boundary_pool = pool.clone();
+    coherent_boundary_pool.current_tick = 0;
+    coherent_boundary_pool.sqrt_price_x64 = sqrt_price_from_tick_index(0).unwrap();
+    let initial_coherent_boundary = coherent_boundary_pool.clone();
+
+    let boundary_quote_1 = simulation::simulate_clmm_exact_input(&coherent_boundary_pool, &req_1)
+        .expect("Coherent lower-boundary swap moving into range must succeed");
+    assert!(boundary_quote_1.output.amount.get() > 0);
+    assert!(boundary_quote_1.resulting_sqrt_price_x64 > coherent_boundary_pool.sqrt_price_x64);
+    assert!((0..64).contains(&boundary_quote_1.resulting_tick));
+    assert_eq!(coherent_boundary_pool, initial_coherent_boundary);
+
+    let boundary_err_0 = simulation::simulate_clmm_exact_input(&coherent_boundary_pool, &req_0)
+        .expect_err("Coherent lower-boundary swap moving out of range must fail closed");
+    assert_eq!(boundary_err_0, ClmmSimulationError::TickCrossingExceeded);
+    assert_eq!(coherent_boundary_pool, initial_coherent_boundary);
 }
