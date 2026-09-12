@@ -6,8 +6,10 @@
 use chain_types::AssetId;
 use market_types::{AssetAmount, AtomicAmount, Bps, CpmmPoolState, PriceRatio};
 use serde::{Deserialize, Serialize};
+use tax_engine::TaxAssessment;
 
-use crate::error::SimulationError;
+use crate::buy_tax::{simulate_tax_aware_cpmm_buy_exact_input, TaxAwareCpmmBuyQuote};
+use crate::error::{SimulationError, TaxAwareSimulationError};
 
 /// Exact 256-bit multiplication of two `u128` values: `a * b -> (hi_128, lo_128)`.
 /// Free of floating point, wall clock, or external dependencies.
@@ -108,6 +110,15 @@ impl CpmmExactInputRequest {
     pub fn simulate(&self, pool: &CpmmPoolState) -> Result<CpmmSimulationQuote, SimulationError> {
         simulate_cpmm_exact_input(pool, self)
     }
+
+    /// Simulates this request against the given pool state with buy-side tax deduction.
+    pub fn simulate_with_buy_tax(
+        &self,
+        pool: &CpmmPoolState,
+        assessment: &TaxAssessment,
+    ) -> Result<TaxAwareCpmmBuyQuote, TaxAwareSimulationError> {
+        simulate_tax_aware_cpmm_buy_exact_input(pool, self, assessment)
+    }
 }
 
 /// Deterministic quote produced by CPMM exact-input simulation.
@@ -205,6 +216,15 @@ impl CpmmSimulationKernel {
         request: &CpmmExactInputRequest,
     ) -> Result<CpmmSimulationQuote, SimulationError> {
         simulate_cpmm_exact_input(pool, request)
+    }
+
+    /// Simulates a direct exact-input swap over the supplied CPMM pool state with buy-side tax.
+    pub fn simulate_tax_aware_buy_exact_input(
+        pool: &CpmmPoolState,
+        request: &CpmmExactInputRequest,
+        assessment: &TaxAssessment,
+    ) -> Result<TaxAwareCpmmBuyQuote, TaxAwareSimulationError> {
+        simulate_tax_aware_cpmm_buy_exact_input(pool, request, assessment)
     }
 }
 

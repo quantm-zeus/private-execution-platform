@@ -13,6 +13,7 @@ path = "src/lib.rs"
 chain-types.workspace = true
 market-types.workspace = true
 serde.workspace = true
+tax-engine.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
