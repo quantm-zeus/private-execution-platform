@@ -7,6 +7,7 @@
 pub mod buy_tax;
 pub mod cpmm;
 pub mod error;
+pub mod roundtrip_tax;
 pub mod sell_tax;
 
 pub use buy_tax::{
@@ -23,5 +24,8 @@ pub use cpmm::{
 pub use error::{
     CpmmErrorClass, CpmmSimulationErrorClass, SimulationError, TaxAwareCpmmBuyError,
     TaxAwareCpmmError, TaxAwareSimulationError,
+};
+pub use roundtrip_tax::{
+    simulate_tax_aware_cpmm_roundtrip_exact_input, TaxAwareCpmmRoundtripQuote,
 };
 pub use sell_tax::{simulate_tax_aware_cpmm_sell_exact_input, TaxAwareCpmmSellQuote};
