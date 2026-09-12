@@ -7,6 +7,7 @@
 pub mod buy_tax;
 pub mod clmm;
 pub mod clmm_buy_tax;
+pub mod clmm_roundtrip_tax;
 pub mod clmm_sell_tax;
 pub mod cpmm;
 pub mod error;
@@ -23,6 +24,9 @@ pub use clmm::{
     simulate_clmm_exact_input, ClmmExactInputRequest, ClmmSimulationQuote, MAX_CLMM_TICK_CROSSES,
 };
 pub use clmm_buy_tax::{simulate_tax_aware_clmm_buy_exact_input, TaxAwareClmmBuyQuote};
+pub use clmm_roundtrip_tax::{
+    simulate_tax_aware_clmm_roundtrip_exact_input, TaxAwareClmmRoundtripQuote,
+};
 pub use clmm_sell_tax::{simulate_tax_aware_clmm_sell_exact_input, TaxAwareClmmSellQuote};
 pub use cpmm::{
     cmp_u128_products, div_u256_by_u128_floor, mul_u128_wide, simulate_cpmm_exact_input,
