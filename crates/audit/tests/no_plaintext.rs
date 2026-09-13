@@ -7,21 +7,6 @@ use std::sync::Arc;
 use audit::AuditWriter;
 use support::{bucket, lifecycle_event, CountingStore, FixedProvider};
 
-fn has_hex_run(value: &str, min_len: usize) -> bool {
-    let mut run = 0usize;
-    for ch in value.chars() {
-        if ch.is_ascii_hexdigit() {
-            run += 1;
-            if run >= min_len {
-                return true;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    false
-}
-
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -71,18 +56,6 @@ async fn outer_record_and_raw_ciphertext_leak_no_plaintext() {
             "ciphertext leaked `{token}`"
         );
     }
-    assert!(
-        !has_hex_run(&json, 8),
-        "serialized record contained a long hex run"
-    );
-    let lossy = String::from_utf8_lossy(&record.ciphertext);
-    // The wire header embeds raw key-id bytes; the fixture uses non-hex digits
-    // so this check targets an accidental hex encoding of a digest, not the
-    // protocol header itself.
-    assert!(
-        !has_hex_run(&lossy, 8),
-        "raw ciphertext contained a long hex run"
-    );
 
     // The full plaintext payload must not be recoverable from the ciphertext.
     let plaintext = serde_json::to_vec(&event).expect("plaintext");

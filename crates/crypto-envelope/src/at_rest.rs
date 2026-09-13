@@ -14,9 +14,8 @@
 //! - AAD binds the domain tag, wire version, kid, sequence, schema version, and
 //!   stream blind index, so swapping or splicing records fails authentication.
 //!
-//! Failure is always closed: [`seal_at_rest`] returns an empty vector if
-//! sealing cannot complete (the minimum wire length is
-//! [`AT_REST_MIN_LEN`], so an empty result is unambiguous), and
+//! Failure is always closed: [`seal_at_rest`] returns a typed [`CryptoError`]
+//! when sealing cannot complete instead of an ambiguous empty vector, and
 //! [`open_at_rest`] refuses malformed, truncated, mis-versioned, or
 //! unauthenticated input with a typed [`CryptoError`] that carries no payload.
 
@@ -119,8 +118,9 @@ fn build_aad(
 
 /// Seals `plaintext` into the at-rest wire form.
 ///
-/// Returns an empty vector when sealing cannot complete; callers must treat any
-/// result shorter than [`AT_REST_MIN_LEN`] as a fail-closed seal failure.
+/// Returns a typed [`CryptoError`] when the nonce or ciphertext cannot be
+/// produced. A successful result is always at least [`AT_REST_MIN_LEN`] bytes;
+/// there is no empty-vector failure sentinel.
 pub fn seal_at_rest(
     seal: &SealKey,
     kid: &[u8; AT_REST_KID_LEN],
@@ -128,10 +128,8 @@ pub fn seal_at_rest(
     schema_version: u16,
     stream_blind_index: &[u8],
     plaintext: &[u8],
-) -> Vec<u8> {
-    let Ok(nonce) = derive_nonce(seal, kid, sequence, schema_version, stream_blind_index) else {
-        return Vec::new();
-    };
+) -> Result<Vec<u8>, CryptoError> {
+    let nonce = derive_nonce(seal, kid, sequence, schema_version, stream_blind_index)?;
     let aad = build_aad(
         AT_REST_VERSION,
         kid,
@@ -140,21 +138,21 @@ pub fn seal_at_rest(
         stream_blind_index,
     );
     let cipher = XChaCha20Poly1305::new((&seal.0).into());
-    let Ok(ciphertext) = cipher.encrypt(
-        (&nonce).into(),
-        chacha20poly1305::aead::Payload {
-            msg: plaintext,
-            aad: &aad,
-        },
-    ) else {
-        return Vec::new();
-    };
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::EncryptFailed)?;
     let mut wire = Vec::with_capacity(AT_REST_HEADER_LEN + ciphertext.len());
     wire.push(AT_REST_VERSION);
     wire.extend_from_slice(kid);
     wire.extend_from_slice(&nonce);
     wire.extend_from_slice(&ciphertext);
-    wire
+    Ok(wire)
 }
 
 /// Opens an at-rest wire value, returning the authenticated plaintext.
@@ -235,7 +233,7 @@ mod tests {
     #[test]
     fn round_trip_returns_plaintext() {
         let seal = seal_key(7);
-        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload");
+        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload").expect("seal");
         assert!(wire.len() >= AT_REST_MIN_LEN);
         let opened = open_at_rest(&seal, &KID_A, 1, 1, STREAM, &wire).expect("open");
         assert_eq!(opened, b"payload");
@@ -244,20 +242,20 @@ mod tests {
     #[test]
     fn wire_layout_is_version_kid_nonce_ciphertext() {
         let seal = seal_key(7);
-        let wire = seal_at_rest(&seal, &KID_A, 9, 3, STREAM, b"x");
+        let wire = seal_at_rest(&seal, &KID_A, 9, 3, STREAM, b"x").expect("seal");
         assert_eq!(wire[0], AT_REST_VERSION);
         assert_eq!(&wire[1..1 + AT_REST_KID_LEN], &KID_A);
         assert_eq!(wire_kid(&wire).expect("kid"), KID_A);
         // The derived nonce must be identical for the same bound inputs.
-        let second = seal_at_rest(&seal, &KID_A, 9, 3, STREAM, b"x");
+        let second = seal_at_rest(&seal, &KID_A, 9, 3, STREAM, b"x").expect("seal");
         assert_eq!(wire, second);
     }
 
     #[test]
     fn deterministic_but_sequence_separated() {
         let seal = seal_key(7);
-        let first = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"same");
-        let second = seal_at_rest(&seal, &KID_A, 2, 1, STREAM, b"same");
+        let first = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"same").expect("seal");
+        let second = seal_at_rest(&seal, &KID_A, 2, 1, STREAM, b"same").expect("seal");
         assert_ne!(
             first[1 + AT_REST_KID_LEN..AT_REST_HEADER_LEN],
             second[1 + AT_REST_KID_LEN..AT_REST_HEADER_LEN],
@@ -269,7 +267,7 @@ mod tests {
     #[test]
     fn short_wire_is_rejected() {
         let seal = seal_key(7);
-        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload");
+        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload").expect("seal");
         assert!(matches!(
             open_at_rest(&seal, &KID_A, 1, 1, STREAM, &wire[..AT_REST_MIN_LEN - 1]),
             Err(CryptoError::CiphertextTooShort)
@@ -279,7 +277,7 @@ mod tests {
     #[test]
     fn cross_field_swaps_fail_authentication() {
         let seal = seal_key(7);
-        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload");
+        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload").expect("seal");
         assert!(matches!(
             open_at_rest(&seal, &KID_A, 2, 1, STREAM, &wire),
             Err(CryptoError::DecryptFailed)
@@ -297,7 +295,7 @@ mod tests {
     #[test]
     fn nonce_version_kid_and_ciphertext_tamper_fail_closed() {
         let seal = seal_key(7);
-        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload");
+        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload").expect("seal");
 
         let mut version = wire.clone();
         version[0] ^= 0x01;
@@ -330,7 +328,7 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_closed() {
-        let wire = seal_at_rest(&seal_key(7), &KID_A, 1, 1, STREAM, b"payload");
+        let wire = seal_at_rest(&seal_key(7), &KID_A, 1, 1, STREAM, b"payload").expect("seal");
         assert!(matches!(
             open_at_rest(&seal_key(8), &KID_A, 1, 1, STREAM, &wire),
             Err(CryptoError::DecryptFailed)
@@ -340,8 +338,8 @@ mod tests {
     #[test]
     fn different_kid_derives_different_nonce_and_key_selection_matters() {
         let seal = seal_key(7);
-        let a = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload");
-        let b = seal_at_rest(&seal, &KID_B, 1, 1, STREAM, b"payload");
+        let a = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"payload").expect("seal");
+        let b = seal_at_rest(&seal, &KID_B, 1, 1, STREAM, b"payload").expect("seal");
         assert_ne!(
             a[1 + AT_REST_KID_LEN..AT_REST_HEADER_LEN],
             b[1 + AT_REST_KID_LEN..AT_REST_HEADER_LEN]
@@ -378,7 +376,7 @@ mod tests {
     #[test]
     fn empty_plaintext_round_trips() {
         let seal = seal_key(1);
-        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"");
+        let wire = seal_at_rest(&seal, &KID_A, 1, 1, STREAM, b"").expect("seal");
         assert_eq!(wire.len(), AT_REST_MIN_LEN);
         assert_eq!(
             open_at_rest(&seal, &KID_A, 1, 1, STREAM, &wire).expect("open"),

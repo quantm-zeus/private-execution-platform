@@ -21,7 +21,8 @@ fn sealed_record(event: &ExecutionAuditEvent, stream: &[u8]) -> OpaqueEventRecor
         event.schema_version,
         stream,
         &payload,
-    );
+    )
+    .expect("seal");
     OpaqueEventRecord {
         stream_blind_index: stream.to_vec(),
         sequence: event.sequence,
@@ -81,7 +82,8 @@ async fn same_plaintext_different_sequence_differs_in_nonce_and_ciphertext() {
         event.schema_version,
         &stream,
         &serde_json::to_vec(&event).expect("payload"),
-    );
+    )
+    .expect("seal");
     let second = seal_at_rest(
         &seal,
         &support::KID_A,
@@ -89,7 +91,8 @@ async fn same_plaintext_different_sequence_differs_in_nonce_and_ciphertext() {
         later.schema_version,
         &stream,
         &serde_json::to_vec(&later).expect("payload"),
-    );
+    )
+    .expect("seal");
 
     let first_nonce = &first[17..41];
     let second_nonce = &second[17..41];
@@ -109,7 +112,7 @@ async fn sequence_gap_is_detected_on_replay() {
 
     let writer = AuditWriter::new(Arc::clone(&store), Arc::new(provider));
     let error = writer
-        .replay(AuditLookup::Intent {
+        .replay_current(AuditLookup::Intent {
             chain: base(),
             intent_id: intent_id(INTENT),
         })

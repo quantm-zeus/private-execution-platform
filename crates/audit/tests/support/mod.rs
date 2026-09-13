@@ -1,7 +1,7 @@
 //! Shared fixtures and deterministic doubles for the audit integration tests.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -35,6 +35,9 @@ pub const NET_OUT: u128 = 2_250_000_000;
 pub const DEX_FEE: u128 = 5_000_000;
 pub const TAX_COST: u128 = 250_000_000;
 
+/// Key id that is never present in any provider double.
+pub const UNKNOWN_KID: [u8; 16] = [0x99u8; 16];
+
 pub const INTENT: &str = "intent-alpha";
 pub const IDEMPOTENCY: &str = "idem-alpha";
 pub const USER: &str = "user-alpha";
@@ -67,6 +70,7 @@ pub struct CountingStore {
     append_calls: AtomicUsize,
     read_calls: AtomicUsize,
     fail_next: Mutex<Option<StorageError>>,
+    corrupt_stream_index: AtomicBool,
 }
 
 impl CountingStore {
@@ -84,6 +88,12 @@ impl CountingStore {
 
     pub fn fail_next_append(&self, error: StorageError) {
         *lock(&self.fail_next) = Some(error);
+    }
+
+    /// Makes `read_events` return matching rows under a foreign
+    /// `stream_blind_index`, exercising the replay-side equality check.
+    pub fn corrupt_stream_index(&self) {
+        self.corrupt_stream_index.store(true, Ordering::SeqCst);
     }
 
     pub fn seed(&self, records: Vec<OpaqueEventRecord>) {
@@ -152,6 +162,11 @@ impl OpaqueStore for CountingStore {
             .collect();
         records.sort_by_key(|record| record.sequence);
         records.truncate(limit);
+        if self.corrupt_stream_index.load(Ordering::SeqCst) {
+            for record in &mut records {
+                record.stream_blind_index = vec![0xEEu8; 32];
+            }
+        }
         Ok(records)
     }
 
@@ -221,6 +236,16 @@ impl FixedProvider {
         }
     }
 
+    /// Post-rotation provider: the current key is `KID_B`, while the previous
+    /// key `KID_A` is still reachable through `by_id`.
+    pub fn rotated() -> Self {
+        Self {
+            current: Self::entry(KID_B, SEAL_B, BLIND_B),
+            alternates: vec![Self::entry(KID_A, SEAL_A, BLIND_A)],
+            unavailable: false,
+        }
+    }
+
     /// Same kid and blind key as [`FixedProvider::single`], wrong seal key.
     pub fn wrong_key() -> Self {
         Self {
@@ -259,6 +284,34 @@ impl AuditKeyProvider for FixedProvider {
             .find(|entry| &entry.kid == kid)
             .map(|entry| entry.material())
             .ok_or(audit::AuditError::UnknownKeyId)
+    }
+}
+
+/// Returns `KID_B` material for every request, simulating a provider that
+/// ignores the requested id.
+pub struct MismatchedKidProvider;
+
+impl AuditKeyProvider for MismatchedKidProvider {
+    fn current(&self) -> Result<AuditKeyMaterial, audit::AuditError> {
+        Ok(FixedProvider::entry(KID_B, SEAL_A, BLIND_A).material())
+    }
+
+    fn by_id(&self, _kid: &[u8; 16]) -> Result<AuditKeyMaterial, audit::AuditError> {
+        Ok(FixedProvider::entry(KID_B, SEAL_A, BLIND_A).material())
+    }
+}
+
+/// Always returns `KID_A` material, so `by_id` accepts the addressing id but
+/// returns material whose kid does not match a record's wire kid.
+pub struct StickyKidProvider;
+
+impl AuditKeyProvider for StickyKidProvider {
+    fn current(&self) -> Result<AuditKeyMaterial, audit::AuditError> {
+        Ok(FixedProvider::entry(KID_A, SEAL_A, BLIND_A).material())
+    }
+
+    fn by_id(&self, _kid: &[u8; 16]) -> Result<AuditKeyMaterial, audit::AuditError> {
+        Ok(FixedProvider::entry(KID_A, SEAL_A, BLIND_A).material())
     }
 }
 
@@ -392,6 +445,14 @@ pub fn event_without_signing(sequence: u64) -> ExecutionAuditEvent {
 /// Stream index for an arbitrary intent under the provider's current key.
 pub fn stream_for(provider: &FixedProvider, intent: &str) -> Vec<u8> {
     let material = provider.current().expect("current");
+    audit::stream_blind_index(&material.blind_index, &base(), &intent_id(intent))
+        .expect("stream index")
+        .to_vec()
+}
+
+/// Stream index for an arbitrary intent under an explicit key id.
+pub fn stream_for_kid(provider: &FixedProvider, kid: [u8; 16], intent: &str) -> Vec<u8> {
+    let material = provider.by_id(&kid).expect("key material by id");
     audit::stream_blind_index(&material.blind_index, &base(), &intent_id(intent))
         .expect("stream index")
         .to_vec()

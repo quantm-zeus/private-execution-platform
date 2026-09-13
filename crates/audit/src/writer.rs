@@ -4,14 +4,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chain_types::ChainId;
-use crypto_envelope::at_rest::{open_at_rest, seal_at_rest, wire_kid, AT_REST_MIN_LEN};
-use domain::{ExecutionId, IdempotencyKey, IntentId};
+use crypto_envelope::at_rest::{open_at_rest, seal_at_rest, wire_kid};
+use domain::{ExecutionId, IdempotencyKey, IntentId, UserId};
 use storage::{CreatedBucket, OpaqueEventRecord, OpaqueStore, StorageError};
+use zeroize::Zeroizing;
 
 use crate::blind_index;
 use crate::error::AuditError;
 use crate::event::ExecutionAuditEvent;
-use crate::key::AuditKeyProvider;
+use crate::key::{AuditKeyMaterial, AuditKeyProvider, BlindIndexKey};
 
 /// Maximum records fetched per `read_events` round during replay.
 const REPLAY_BATCH: usize = 256;
@@ -39,6 +40,15 @@ pub enum AuditLookup {
         /// Intent that owns the stream.
         intent_id: IntentId,
     },
+    /// Events on the intent stream that carry this owner.
+    Owner {
+        /// Chain scope of the stream.
+        chain: ChainId,
+        /// Intent that owns the stream.
+        intent_id: IntentId,
+        /// Owner to match.
+        user_id: UserId,
+    },
     /// Events on the intent stream that carry this execution id.
     Execution {
         /// Chain scope of the stream.
@@ -64,6 +74,9 @@ impl AuditLookup {
     fn stream_scope(&self) -> (&ChainId, &IntentId) {
         match self {
             Self::Intent { chain, intent_id }
+            | Self::Owner {
+                chain, intent_id, ..
+            }
             | Self::Execution {
                 chain, intent_id, ..
             }
@@ -73,16 +86,36 @@ impl AuditLookup {
         }
     }
 
-    /// Whether a decrypted event belongs to this lookup's filtered view.
-    fn matches(&self, event: &ExecutionAuditEvent) -> bool {
+    /// Whether the decrypted event belongs to this lookup's filtered view.
+    ///
+    /// Matching is done on the keyed blind-index tokens, not on the plaintext
+    /// identifiers: the event's own class token must equal the token derived
+    /// from the requested identifier under the same blind-index key. A token
+    /// can only match when both were produced by the same key, class domain,
+    /// and identifier, so the lookup is authenticated by the same PRF that
+    /// addresses the stream.
+    fn authenticates(
+        &self,
+        event: &ExecutionAuditEvent,
+        key: &BlindIndexKey,
+    ) -> Result<bool, AuditError> {
         match self {
-            Self::Intent { .. } => true,
+            Self::Intent { .. } => Ok(true),
+            Self::Owner { user_id, .. } => Ok(blind_index::owner_blind_index(key, user_id)?
+                == blind_index::owner_blind_index(key, &event.user_id)?),
             Self::Execution { execution_id, .. } => {
-                event.execution_id.as_ref() == Some(execution_id)
+                let requested = blind_index::execution_blind_index(key, execution_id)?;
+                match &event.execution_id {
+                    Some(stored) => {
+                        Ok(blind_index::execution_blind_index(key, stored)? == requested)
+                    }
+                    None => Ok(false),
+                }
             }
             Self::Idempotency {
                 idempotency_key, ..
-            } => &event.idempotency_key == idempotency_key,
+            } => Ok(blind_index::idempotency_blind_index(key, idempotency_key)?
+                == blind_index::idempotency_blind_index(key, &event.idempotency_key)?),
         }
     }
 }
@@ -91,6 +124,7 @@ impl std::fmt::Debug for AuditLookup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Intent { .. } => f.write_str("AuditLookup::Intent([REDACTED])"),
+            Self::Owner { .. } => f.write_str("AuditLookup::Owner([REDACTED])"),
             Self::Execution { .. } => f.write_str("AuditLookup::Execution([REDACTED])"),
             Self::Idempotency { .. } => f.write_str("AuditLookup::Idempotency([REDACTED])"),
         }
@@ -150,8 +184,10 @@ impl<S: OpaqueStore> AuditWriter<S> {
             }
         }
 
-        let payload = serde_json::to_vec(event)
-            .map_err(|_| AuditError::EventValidationFailed("event serialization failed"))?;
+        let payload = Zeroizing::new(
+            serde_json::to_vec(event)
+                .map_err(|_| AuditError::EventValidationFailed("event serialization failed"))?,
+        );
         let ciphertext = seal_at_rest(
             &material.seal,
             &material.kid,
@@ -159,10 +195,8 @@ impl<S: OpaqueStore> AuditWriter<S> {
             event.schema_version,
             &stream,
             &payload,
-        );
-        if ciphertext.len() < AT_REST_MIN_LEN {
-            return Err(AuditError::SealFailed);
-        }
+        )
+        .map_err(|_| AuditError::SealFailed)?;
         let record = OpaqueEventRecord {
             stream_blind_index: stream.clone(),
             sequence: event.sequence,
@@ -200,24 +234,64 @@ impl<S: OpaqueStore> AuditWriter<S> {
         Ok(())
     }
 
-    /// Authenticates and decrypts every record in the lookup's stream.
+    /// Authenticates and decrypts every record in the lookup's stream using the
+    /// blind-index key identified by `blind_index_kid`.
+    ///
+    /// The key id is explicit because a rotated blind-index key addresses a
+    /// different stream. Resolving the id through [`AuditKeyProvider::by_id`]
+    /// lets a caller replay records written under an older index key, while an
+    /// unknown id fails with [`AuditError::UnknownKeyId`] instead of silently
+    /// returning an empty stream. Callers that only care about the current
+    /// stream should use [`AuditWriter::replay_current`].
     ///
     /// Enforces contiguous sequences starting at one and requires the inner
     /// event's sequence/schema to equal the outer record's. Any tamper, unknown
     /// key id, gap, or malformed record fails closed with no partial plaintext
     /// returned.
-    pub async fn replay(
+    pub async fn replay_with_index_key(
+        &self,
+        lookup: AuditLookup,
+        blind_index_kid: [u8; 16],
+    ) -> Result<Vec<ExecutionAuditEvent>, AuditError> {
+        let material = self.keys.by_id(&blind_index_kid)?;
+        if material.kid != blind_index_kid {
+            return Err(AuditError::KeyIdMismatch);
+        }
+        self.replay_with_material(lookup, &material).await
+    }
+
+    /// Convenience wrapper over [`AuditWriter::replay_with_index_key`] that uses
+    /// the provider's current key.
+    ///
+    /// This only sees streams written under the current blind-index key. After a
+    /// rotation, records written under an older index key are addressed with
+    /// [`AuditWriter::replay_with_index_key`] and that older key id; using this
+    /// method alone would read a different, empty stream.
+    pub async fn replay_current(
         &self,
         lookup: AuditLookup,
     ) -> Result<Vec<ExecutionAuditEvent>, AuditError> {
-        let (chain, intent_id) = lookup.stream_scope();
         let material = self.keys.current()?;
+        self.replay_with_material(lookup, &material).await
+    }
+
+    /// Shared replay body once key material (and therefore the stream index) is
+    /// resolved.
+    async fn replay_with_material(
+        &self,
+        lookup: AuditLookup,
+        material: &AuditKeyMaterial,
+    ) -> Result<Vec<ExecutionAuditEvent>, AuditError> {
+        let (chain, intent_id) = lookup.stream_scope();
         let stream = blind_index::stream_blind_index(&material.blind_index, chain, intent_id)?;
         let events = self.read_and_open(&stream).await?;
-        Ok(events
-            .into_iter()
-            .filter(|event| lookup.matches(event))
-            .collect())
+        let mut filtered = Vec::with_capacity(events.len());
+        for event in events {
+            if lookup.authenticates(&event, &material.blind_index)? {
+                filtered.push(event);
+            }
+        }
+        Ok(filtered)
     }
 
     /// Reads, authenticates, and decodes a contiguous stream from sequence one.
@@ -246,15 +320,17 @@ impl<S: OpaqueStore> AuditWriter<S> {
                 if material.kid != kid {
                     return Err(AuditError::KeyIdMismatch);
                 }
-                let plaintext = open_at_rest(
-                    &material.seal,
-                    &kid,
-                    record.sequence,
-                    record.schema_version,
-                    stream,
-                    &record.ciphertext,
-                )
-                .map_err(|_| AuditError::OpenFailed)?;
+                let plaintext = Zeroizing::new(
+                    open_at_rest(
+                        &material.seal,
+                        &kid,
+                        record.sequence,
+                        record.schema_version,
+                        stream,
+                        &record.ciphertext,
+                    )
+                    .map_err(|_| AuditError::OpenFailed)?,
+                );
                 let event: ExecutionAuditEvent =
                     serde_json::from_slice(&plaintext).map_err(|_| AuditError::RecordMalformed)?;
                 if event.sequence != record.sequence

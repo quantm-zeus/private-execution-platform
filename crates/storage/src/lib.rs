@@ -229,8 +229,12 @@ pub enum StorageValidationError {
     EmptyStreamIndex,
     #[error("sequence must be greater than zero")]
     ZeroSequence,
+    #[error("sequence exceeds backend range")]
+    SequenceOutOfRange,
     #[error("version must be greater than zero")]
     ZeroVersion,
+    #[error("version exceeds backend range")]
+    VersionOutOfRange,
     #[error("schema version must be greater than zero")]
     ZeroSchemaVersion,
     #[error("ciphertext must not be empty")]

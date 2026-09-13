@@ -4,7 +4,9 @@ mod support;
 
 use audit::{AuditError, AuditKeyMaterial, AuditLookup, BlindIndexKey, SigningReference};
 use crypto_envelope::SealKey;
-use support::{base, execution_id, idempotency_key, intent_id, INTENT};
+use support::{
+    base, execution_id, idempotency_key, intent_id, lifecycle_event, user_id, INTENT, USER,
+};
 
 const FORBIDDEN_SUBSTRINGS: &[&str] = &[
     "1000",
@@ -107,4 +109,36 @@ fn key_material_and_lookup_debug_are_redacted() {
         idempotency_key: idempotency_key("idem-alpha"),
     };
     assert_redacted("AuditLookup Idempotency Debug", &format!("{idempotency:?}"));
+
+    let owner = AuditLookup::Owner {
+        chain: base(),
+        intent_id: intent_id(INTENT),
+        user_id: user_id(USER),
+    };
+    assert_redacted("AuditLookup Owner Debug", &format!("{owner:?}"));
+}
+
+#[test]
+fn execution_audit_event_debug_contains_no_payload_ids_or_amounts() {
+    let debug = format!("{:?}", lifecycle_event(1));
+    assert_redacted("ExecutionAuditEvent Debug", &debug);
+    // Only the schema version and sequence are rendered; the payload is opaque.
+    assert!(debug.contains("schema_version: 1"));
+    assert!(debug.contains("sequence: 1"));
+    assert!(debug.contains("[REDACTED]"));
+    for leaked in [
+        "USDC",
+        "TOKEN",
+        "intent-alpha",
+        "idem-alpha",
+        "user-alpha",
+        "wallet-alpha",
+        "exec-alpha",
+        "1000000000",
+    ] {
+        assert!(
+            !debug.contains(leaked),
+            "ExecutionAuditEvent Debug leaked `{leaked}`"
+        );
+    }
 }

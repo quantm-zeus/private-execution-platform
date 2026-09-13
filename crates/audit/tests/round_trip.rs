@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use audit::{AuditLookup, AuditRecordRef, AuditWriter};
 use support::{
-    base, bucket, execution_id, idempotency_key, intent_id, lifecycle_event, CountingStore,
-    FixedProvider, EXECUTION, IDEMPOTENCY, INTENT,
+    base, bucket, execution_id, idempotency_key, intent_id, lifecycle_event, user_id,
+    CountingStore, FixedProvider, EXECUTION, IDEMPOTENCY, INTENT, USER,
 };
 
 #[tokio::test]
@@ -23,7 +23,7 @@ async fn full_lifecycle_round_trips_in_order() {
     assert_eq!(store.append_calls(), 5);
 
     let replayed = writer
-        .replay(AuditLookup::Intent {
+        .replay_current(AuditLookup::Intent {
             chain: base(),
             intent_id: intent_id(INTENT),
         })
@@ -45,7 +45,7 @@ async fn append_returns_sequence_and_bucket_and_updates_replay() {
     assert_eq!(reference.created_bucket, bucket());
 
     let replayed = writer
-        .replay(AuditLookup::Intent {
+        .replay_current(AuditLookup::Intent {
             chain: base(),
             intent_id: intent_id(INTENT),
         })
@@ -66,7 +66,7 @@ async fn execution_and_idempotency_lookups_filter_the_stream() {
         .expect("append");
 
     let by_execution = writer
-        .replay(AuditLookup::Execution {
+        .replay_current(AuditLookup::Execution {
             chain: base(),
             intent_id: intent_id(INTENT),
             execution_id: execution_id(EXECUTION),
@@ -76,7 +76,7 @@ async fn execution_and_idempotency_lookups_filter_the_stream() {
     assert!(by_execution == events);
 
     let by_idempotency = writer
-        .replay(AuditLookup::Idempotency {
+        .replay_current(AuditLookup::Idempotency {
             chain: base(),
             intent_id: intent_id(INTENT),
             idempotency_key: idempotency_key(IDEMPOTENCY),
@@ -86,7 +86,7 @@ async fn execution_and_idempotency_lookups_filter_the_stream() {
     assert!(by_idempotency == events);
 
     let other_idempotency = writer
-        .replay(AuditLookup::Idempotency {
+        .replay_current(AuditLookup::Idempotency {
             chain: base(),
             intent_id: intent_id(INTENT),
             idempotency_key: idempotency_key("other-idem"),
@@ -94,4 +94,37 @@ async fn execution_and_idempotency_lookups_filter_the_stream() {
         .await
         .expect("replay filtered");
     assert!(other_idempotency.is_empty());
+}
+
+#[tokio::test]
+async fn owner_lookup_is_authenticated_by_the_owner_blind_index() {
+    let store = Arc::new(CountingStore::new());
+    let writer = AuditWriter::new(Arc::clone(&store), Arc::new(FixedProvider::single()));
+    let events: Vec<_> = (1..=3).map(lifecycle_event).collect();
+    writer
+        .append_lifecycle(&events, bucket())
+        .await
+        .expect("append");
+
+    let by_owner = writer
+        .replay_current(AuditLookup::Owner {
+            chain: base(),
+            intent_id: intent_id(INTENT),
+            user_id: user_id(USER),
+        })
+        .await
+        .expect("replay owner");
+    assert!(by_owner == events);
+
+    // A different owner id derives a different keyed token, so no event matches
+    // even though the stream is the same.
+    let other_owner = writer
+        .replay_current(AuditLookup::Owner {
+            chain: base(),
+            intent_id: intent_id(INTENT),
+            user_id: user_id("other-user"),
+        })
+        .await
+        .expect("replay other owner");
+    assert!(other_owner.is_empty());
 }

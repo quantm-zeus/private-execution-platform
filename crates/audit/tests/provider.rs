@@ -26,7 +26,7 @@ async fn unavailable_provider_blocks_replay_without_store_calls() {
     let writer = AuditWriter::new(Arc::clone(&store), Arc::new(FixedProvider::unavailable()));
 
     let error = writer
-        .replay(AuditLookup::Intent {
+        .replay_current(AuditLookup::Intent {
             chain: base(),
             intent_id: intent_id(INTENT),
         })

@@ -23,10 +23,12 @@
 //!    Idempotency(IdempotencyKey) }` cannot reconstruct the chain-scoped stream
 //!    key `HMAC(stream_tag || chain_tag || intent_id)`, because a single
 //!    component does not identify the stream. Every [`AuditLookup`] variant
-//!    therefore carries the `(chain, intent_id)` stream scope; `Execution` and
-//!    `Idempotency` additionally filter the decrypted events. This preserves the
-//!    sketch's semantics (equal streams, filtered views) while making the enum
-//!    actually resolvable.
+//!    therefore carries the `(chain, intent_id)` stream scope; `Owner`,
+//!    `Execution`, and `Idempotency` additionally authenticate a filtered view
+//!    by comparing the decrypted event's keyed class token against the token
+//!    derived from the requested identifier. This preserves the sketch's
+//!    semantics (equal streams, filtered views) while making the enum actually
+//!    resolvable.
 //! 2. The event model carries `execution_id` so the `Execution` lookup has
 //!    something to match.
 //! 3. `chain_tag` is a fixed-width 32-byte SHA-256 of the canonical chain
@@ -39,6 +41,12 @@
 //! 5. `chain-types` and `market-types` are direct dependencies because the event
 //!    fields are the canonical `AssetId`, `ChainId`, `AtomicAmount`, and
 //!    `PriceRatio`/`AmountType` domain types.
+//! 6. Replay takes the blind-index key id explicitly
+//!    ([`AuditWriter::replay_with_index_key`]) and resolves it through
+//!    [`AuditKeyProvider::by_id`]. A rotated index key addresses a different
+//!    stream, so an unavailable id fails with [`AuditError::UnknownKeyId`] rather
+//!    than silently reading zero rows. [`AuditWriter::replay_current`] is the
+//!    convenience path that intentionally uses only the current key's stream.
 
 #![forbid(unsafe_code)]
 

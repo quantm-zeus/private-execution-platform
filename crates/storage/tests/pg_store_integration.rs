@@ -289,6 +289,68 @@ async fn malformed_persisted_row_fails_closed() {
 }
 
 #[tokio::test]
+async fn read_events_round_trip_honors_bounds_and_ordering() {
+    let (store, _setup) = fresh_store().await;
+    let index: Vec<u8> = vec![0x5Au8; 32];
+    let event = |seq: u64| storage::OpaqueEventRecord {
+        stream_blind_index: index.clone(),
+        sequence: seq,
+        schema_version: 1,
+        ciphertext: vec![0xE7; 32],
+        created_bucket: CreatedBucket::new(0).unwrap(),
+    };
+    for seq in 1..=5 {
+        store.append_event(event(seq)).await.expect("append");
+    }
+
+    // Unbounded read returns the whole stream in ascending sequence order.
+    let all = store.read_events(&index, 1, 100).await.expect("read all");
+    assert_eq!(
+        all.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert!(all
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
+    assert!(all.iter().all(|record| record.stream_blind_index == index));
+
+    // `from_sequence` is inclusive.
+    let from_three = store.read_events(&index, 3, 100).await.expect("from 3");
+    assert_eq!(
+        from_three
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // `limit` truncates the page while preserving order.
+    let limited = store.read_events(&index, 2, 2).await.expect("limit 2");
+    assert_eq!(
+        limited
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+
+    // Zero limit touches no rows.
+    let zero = store.read_events(&index, 1, 0).await.expect("limit 0");
+    assert!(zero.is_empty());
+
+    // Past the end is an empty page, not an error.
+    let past_end = store.read_events(&index, 99, 10).await.expect("from 99");
+    assert!(past_end.is_empty());
+
+    // A different stream index yields nothing.
+    let other = store
+        .read_events(&[0x11u8; 32], 1, 100)
+        .await
+        .expect("other stream");
+    assert!(other.is_empty());
+}
+
+#[tokio::test]
 async fn health_reports_healthy_and_unavailable() {
     let (store, _setup) = fresh_store().await;
     let healthy = store.health().await;

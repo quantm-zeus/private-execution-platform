@@ -138,7 +138,7 @@ impl crate::OpaqueStore for PostgresStore {
     async fn put_object(&self, object: OpaqueObject) -> Result<(), StorageError> {
         validate_object(&object)?;
         let version = i64::try_from(object.version)
-            .map_err(|_| StorageError::Invalid(StorageValidationError::ZeroVersion))?;
+            .map_err(|_| StorageError::Invalid(StorageValidationError::VersionOutOfRange))?;
         let bucket = object.created_bucket.get();
         // Atomic versioning: the requested `version` is the NEXT version.
         // Version 1 is accepted only when the id is absent; any other version
@@ -225,7 +225,7 @@ impl crate::OpaqueStore for PostgresStore {
         event.validate()?;
         validate_stream_index(&event.stream_blind_index)?;
         let sequence = i64::try_from(event.sequence)
-            .map_err(|_| StorageError::Invalid(StorageValidationError::ZeroSequence))?;
+            .map_err(|_| StorageError::Invalid(StorageValidationError::SequenceOutOfRange))?;
         let schema_version = i16::try_from(event.schema_version)
             .map_err(|_| StorageError::Invalid(StorageValidationError::ZeroSchemaVersion))?;
         let bucket = event.created_bucket.get();
@@ -273,7 +273,7 @@ impl crate::OpaqueStore for PostgresStore {
             return Ok(Vec::new());
         }
         let from_sequence = i64::try_from(from_sequence)
-            .map_err(|_| StorageError::Invalid(StorageValidationError::ZeroSequence))?;
+            .map_err(|_| StorageError::Invalid(StorageValidationError::SequenceOutOfRange))?;
         // A `usize` limit above `i64::MAX` can only mean "unbounded"; clamp to
         // the largest representable row count instead of failing.
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -306,6 +306,13 @@ impl crate::OpaqueStore for PostgresStore {
             // Corrupt/foreign rows are Backend, not caller-validation errors.
             record.validate().map_err(|_| StorageError::Backend)?;
             validate_stream_index(&record.stream_blind_index).map_err(|_| StorageError::Backend)?;
+            // The SQL predicate already restricts `stream_blind_index`, but a
+            // decoded row that cannot belong to the requested stream is a
+            // corrupt/foreign row and must fail closed rather than be returned.
+            debug_assert_eq!(record.stream_blind_index.as_slice(), stream_blind_index);
+            if record.stream_blind_index.as_slice() != stream_blind_index {
+                return Err(StorageError::Backend);
+            }
             records.push(record);
         }
         Ok(records)
