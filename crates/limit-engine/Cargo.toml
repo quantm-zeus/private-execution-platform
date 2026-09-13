@@ -1,0 +1,22 @@
+[package]
+name = "limit-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+chain-types.workspace = true
+domain.workspace = true
+market-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio.workspace = true

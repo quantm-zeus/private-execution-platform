@@ -25,6 +25,7 @@ members = [
     "crates/execution-preview",
     "crates/execution-relay",
     "crates/audit",
+    "crates/limit-engine",
 ]
 
 [workspace.package]
@@ -56,6 +57,7 @@ routing = { path = "crates/routing" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
 audit = { path = "crates/audit" }
+limit-engine = { path = "crates/limit-engine" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
