@@ -605,6 +605,108 @@ async fn crash_after_confirmed_before_fill_applies_fill_once() {
 }
 
 #[tokio::test]
+async fn stale_confirmed_from_prior_attempt_is_never_replayed() {
+    // Regression (P52 review, High): an order that partially filled can re-enter
+    // `Executing` for a new attempt and crash before its `Bound`, leaving the
+    // *previous* attempt's terminal `Confirmed` at the head of the stream.
+    // Recovery must not replay that already-applied fill (RC-3); the current
+    // window is a definitive pre-send failure.
+    let h = build(
+        spec(
+            "p52-stale-confirmed",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        ),
+        vec![AttemptResolution::Filled(realized(1_000, 240))],
+    )
+    .await;
+    append_bound(&h, &h.order_id, 1).await;
+    append_confirmed(&h, &h.order_id, 1, realized(1_000, 240)).await;
+
+    let report = recover(&h).await;
+
+    assert_eq!(report.fills_applied, 0, "the applied fill must not replay");
+    assert_eq!(report.retryable, 1);
+    assert_eq!(report.finalized, 0);
+    assert_eq!(h.handles.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_never_executed(&h);
+
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::FailedRetryable);
+    assert_eq!(stored.filled_input.get(), 1_000);
+    assert_eq!(stored.order.remaining_input.get(), 1_000);
+    assert!(conservation_holds(&stored));
+    assert_eq!(attempts(&h).await.len(), 2);
+
+    // A second pass is a no-op.
+    let second = recover(&h).await;
+    assert_eq!(second.fills_applied, 0);
+    assert_eq!(stored.filled_input.get(), 1_000);
+    assert_eq!(attempts(&h).await.len(), 2);
+}
+
+#[tokio::test]
+async fn stale_confirmed_beyond_remaining_does_not_abort_the_pass() {
+    // Blast-radius variant: a stale fill larger than the new window's remaining
+    // input must not underflow and abort recovery for every other order.
+    let h = build(
+        spec(
+            "p52-stale-confirmed-overflow",
+            OrderStatus::Executing,
+            2_000,
+            500,
+            1_500,
+        ),
+        vec![],
+    )
+    .await;
+    append_bound(&h, &h.order_id, 1).await;
+    append_confirmed(&h, &h.order_id, 1, realized(1_500, 240)).await;
+
+    let report = recover(&h).await;
+
+    assert_eq!(report.fills_applied, 0);
+    assert_eq!(report.retryable, 1);
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::FailedRetryable);
+    assert_eq!(stored.filled_input.get(), 1_500);
+    assert_eq!(stored.order.remaining_input.get(), 500);
+    assert!(conservation_holds(&stored));
+    assert_never_executed(&h);
+}
+
+#[tokio::test]
+async fn durable_signed_and_submitted_phases_reconcile() {
+    // The in-flight phases that may already have reached the chain are all
+    // reconciled through the same mapping, never re-signed.
+    for phase in [AttemptPhase::Signed, AttemptPhase::Submitted] {
+        let h = build(
+            spec(
+                "p52-inflight-phase",
+                OrderStatus::Executing,
+                1_000,
+                1_000,
+                0,
+            ),
+            vec![AttemptResolution::Filled(realized(1_000, 240))],
+        )
+        .await;
+        append_bound(&h, &h.order_id, 1).await;
+        append_phase(&h, &h.order_id, 1, phase).await;
+
+        let report = recover(&h).await;
+
+        assert_eq!(report.reconciled, 1, "phase {phase:?}");
+        assert_eq!(report.fills_applied, 1, "phase {phase:?}");
+        assert_never_executed(&h);
+        assert_eq!(load(&h).await.order.status, OrderStatus::Filled);
+        assert_eq!(attempts(&h).await.len(), 3, "phase {phase:?}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_reconcile_stays_executing_and_is_idempotent() {
     let h = build(
         spec("p52-unknown", OrderStatus::Executing, 1_000, 1_000, 0),

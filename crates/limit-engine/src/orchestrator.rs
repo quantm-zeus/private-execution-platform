@@ -288,6 +288,22 @@ fn record_applied(applied: AppliedResolution, report: &mut RecoveryReport) {
     }
 }
 
+/// Sum of the net input of every `Confirmed` event carrying a sealed fill.
+///
+/// `filled_input` equals the sum of every confirmed fill already applied to the
+/// order, so this total tells recovery whether the `Confirmed` event at the head
+/// of the stream is already reflected in the ledger. `None` signals
+/// checked-arithmetic overflow, which recovery treats as an unrecoverable
+/// record.
+fn confirmed_input_total(events: &[OrderAttemptEvent]) -> Option<u128> {
+    events.iter().try_fold(0u128, |total, event| {
+        match (&event.realized_fill, event.phase) {
+            (Some(fill), AttemptPhase::Confirmed) => total.checked_add(fill.net_input.get()),
+            _ => Some(total),
+        }
+    })
+}
+
 /// Deterministic limit-order orchestrator over the durable store.
 pub struct Orchestrator<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> {
     store: DurableLimitOrderStore<S>,
@@ -626,14 +642,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
         // executor call ever ran, so this is a definitive pre-send failure: close
         // it retryable / final / expired. No attempt event exists to append.
         let Some(latest) = events.last() else {
-            let target = self.pre_send_target(1, now_ms, order.order.expires_at_ms);
-            self.advance(order, target, now_ms).await?;
-            if target == OrderStatus::FailedRetryable {
-                report.retryable += 1;
-            } else {
-                report.finalized += 1;
-            }
-            return Ok(());
+            return self.close_without_attempt(order, 1, now_ms, report).await;
         };
 
         // Every later-phase event continues a `Bound` attempt that must still be
@@ -675,34 +684,67 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                     .await?;
                 record_applied(applied, report);
             }
-            AttemptPhase::Confirmed => match latest.realized_fill.clone() {
-                Some(fill) => {
-                    // Crash-after-Confirmed-before-fill: apply the sealed fill
-                    // exactly once. The phase already exists, so it is not
-                    // re-appended.
-                    let min_out = min_out_for(&bound.intent, &bound.route)?.amount.get();
-                    let applied = self
-                        .apply_resolution(
-                            order,
-                            bound.intent.amount,
-                            min_out,
-                            latest.attempt_seq,
-                            &latest.attempt_key,
-                            Some(AttemptPhase::Confirmed),
-                            AttemptResolution::Filled(fill),
-                            now_ms,
-                        )
-                        .await?;
-                    record_applied(applied, report);
-                }
-                None => {
+            AttemptPhase::Confirmed => {
+                let Some(fill) = latest.realized_fill.clone() else {
                     // Unrecoverable legacy/corrupt record: fail closed with no
                     // ledger mutation.
                     self.advance(order, OrderStatus::FailedFinal, now_ms)
                         .await?;
                     report.finalized += 1;
+                    return Ok(());
+                };
+                // A terminal `Confirmed` at the head of the stream may belong to a
+                // *previous* attempt: an order that partially filled can re-enter
+                // `Executing` for a new attempt and crash before its `Bound`. The
+                // ledger is the discriminator: `filled_input` equals the sum of
+                // every confirmed fill already applied, so when it already covers
+                // this fill the current window reserved no attempt and must close
+                // pre-send instead of replaying a fill (RC-3). When exactly this
+                // fill is outstanding, it is the crash-after-Confirmed-before-fill
+                // window and is applied once.
+                let Some(confirmed_total) = confirmed_input_total(events) else {
+                    self.advance(order, OrderStatus::FailedFinal, now_ms)
+                        .await?;
+                    report.finalized += 1;
+                    return Ok(());
+                };
+                let applied_input = order.filled_input.get();
+                if applied_input >= confirmed_total {
+                    let next_attempt = latest
+                        .attempt_seq
+                        .checked_add(1)
+                        .ok_or(LimitEngineError::ArithmeticOverflow)?;
+                    return self
+                        .close_without_attempt(order, next_attempt, now_ms, report)
+                        .await;
                 }
-            },
+                if confirmed_total - applied_input != fill.net_input.get() {
+                    // An outstanding confirmed total that is not exactly this
+                    // fill is an inconsistent record; never apply a partial
+                    // amount.
+                    self.advance(order, OrderStatus::FailedFinal, now_ms)
+                        .await?;
+                    report.finalized += 1;
+                    return Ok(());
+                }
+                // Crash-after-Confirmed-before-fill: apply the sealed fill
+                // exactly once. The phase already exists, so it is not
+                // re-appended.
+                let min_out = min_out_for(&bound.intent, &bound.route)?.amount.get();
+                let applied = self
+                    .apply_resolution(
+                        order,
+                        bound.intent.amount,
+                        min_out,
+                        latest.attempt_seq,
+                        &latest.attempt_key,
+                        Some(AttemptPhase::Confirmed),
+                        AttemptResolution::Filled(fill),
+                        now_ms,
+                    )
+                    .await?;
+                record_applied(applied, report);
+            }
             AttemptPhase::FailedBeforeSubmit => {
                 let applied = self
                     .apply_resolution(
@@ -733,6 +775,29 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                     .await?;
                 record_applied(applied, report);
             }
+        }
+        Ok(())
+    }
+
+    /// Closes an `Executing` order whose current window reserved no signable
+    /// attempt (`Bound`), as a definitive pre-send failure.
+    ///
+    /// `attempt_seq` is the current window's attempt number: `1` when the stream
+    /// is empty, or `latest + 1` when the head is a previous attempt's terminal
+    /// event. No attempt event is appended.
+    async fn close_without_attempt(
+        &self,
+        order: &StoredLimitOrder,
+        attempt_seq: u64,
+        now_ms: i64,
+        report: &mut RecoveryReport,
+    ) -> Result<(), LimitEngineError> {
+        let target = self.pre_send_target(attempt_seq, now_ms, order.order.expires_at_ms);
+        self.advance(order, target, now_ms).await?;
+        if target == OrderStatus::FailedRetryable {
+            report.retryable += 1;
+        } else {
+            report.finalized += 1;
         }
         Ok(())
     }
