@@ -288,15 +288,10 @@ fn an_explicit_min_max_clamp_is_honored() {
 #[test]
 fn zero_or_negative_durations_do_not_panic() {
     for duration in [0i64, -5] {
-        let plan = TwapPlan::new(
-            amount(1_000),
-            4,
-            amount(1),
-            amount(1_000),
-            duration,
-            1_000,
-            100,
-        );
+        // `TwapPlan::new` floors the duration, so mutate the public field to
+        // actually exercise a negative value.
+        let mut plan = TwapPlan::new(amount(1_000), 4, amount(1), amount(1_000), 0, 1_000, 100);
+        plan.duration_ms = duration;
         let state = TwapState::new(amount(1_000));
         match engine().next(&plan, &state, &fresh(0), 0) {
             TwapDecision::Execute { next_at_ms, .. } => assert!(next_at_ms >= 0),
