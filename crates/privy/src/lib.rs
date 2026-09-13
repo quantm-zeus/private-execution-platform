@@ -135,6 +135,11 @@ impl PrivySigningBoundary {
             let mut seen = self
                 .seen
                 .lock()
+                // Poison recovery is safe here: the guarded value is a plain
+                // `HashMap`, so a panicking holder cannot leave a torn state (at
+                // worst a key is inserted or not). The guard is dropped at the end
+                // of this block, before any `.await`, so no lock is held across a
+                // suspension point.
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match seen.get(request.idempotency_key()) {
                 Some(existing) if existing == request.request_digest() => {
@@ -165,6 +170,8 @@ pub enum PrivyError {
     InvalidExecutionReference,
     #[error("execution does not match policy approval")]
     ApprovalBindingMismatch,
+    #[error("unsupported chain")]
+    UnsupportedChain,
     #[error("policy approval expired")]
     ApprovalExpired,
     #[error("trading disabled")]
@@ -286,5 +293,97 @@ mod tests {
             empty.submit_signing_request(&request).await,
             Err(PrivyError::InvalidExecutionReference)
         );
+    }
+
+    /// Fixture-derived substrings that must never leak through `Display`/`Debug`.
+    const FORBIDDEN_SUBSTRINGS: &[&str] = &[
+        // amounts
+        "1000",
+        "250",
+        "240",
+        // asset addresses
+        "USDC",
+        "USDCX",
+        "TOKEN",
+        // wallet / intent / idempotency / prepared strings
+        "wallet-1",
+        "intent-1",
+        "idem-1",
+        "prepared-1",
+        // endpoint-like substrings
+        "http",
+        "://",
+        "grpc",
+        "tcp",
+        "unix",
+        "0x",
+    ];
+
+    /// Detects a run of at least `min_len` ASCII hex digits, i.e. leaked digest bytes.
+    fn has_hex_run(value: &str, min_len: usize) -> bool {
+        let mut run = 0usize;
+        for ch in value.chars() {
+            if ch.is_ascii_hexdigit() {
+                run += 1;
+                if run >= min_len {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    fn assert_redacted(label: &str, value: &str) {
+        for forbidden in FORBIDDEN_SUBSTRINGS {
+            assert!(
+                !value.contains(forbidden),
+                "redaction leak in `{label}`: `{value}` contains `{forbidden}`"
+            );
+        }
+        assert!(
+            !has_hex_run(value, 8),
+            "redaction leak in `{label}`: `{value}` contains a hex run of length >= 8"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_rendered_surface_is_redacted() {
+        let errors = [
+            PrivyError::SigningUnavailable,
+            PrivyError::InvalidExecutionReference,
+            PrivyError::ApprovalBindingMismatch,
+            PrivyError::UnsupportedChain,
+            PrivyError::ApprovalExpired,
+            PrivyError::TradingDisabled,
+            PrivyError::PreviewRevalidationFailed,
+            PrivyError::MissingPayloadDigest,
+            PrivyError::DuplicateSigningRequest,
+            PrivyError::IdempotencyConflict,
+            PrivyError::SignerRejected,
+        ];
+        for error in errors {
+            assert_redacted("PrivyError Display", &error.to_string());
+            assert_redacted("PrivyError Debug", &format!("{error:?}"));
+        }
+
+        let (boundary, _calls) = counting_boundary();
+        let request = fixtures::signing_request();
+        assert_redacted("SigningRequest Debug", &format!("{request:?}"));
+        assert_redacted(
+            "PayloadDigest Debug",
+            &format!("{:?}", request.payload_digest()),
+        );
+        assert_redacted(
+            "RequestDigest Debug",
+            &format!("{:?}", request.request_digest()),
+        );
+
+        let signed = boundary
+            .submit_signing_request(&request)
+            .await
+            .expect("submit succeeds");
+        assert_redacted("SignedExecutionRef Debug", &format!("{signed:?}"));
     }
 }

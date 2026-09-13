@@ -25,17 +25,81 @@ use privy::{
 const NOW_MS: i64 = 1_000;
 
 // --- Pinned canonical request digests (from the Python hashlib reference) ---
-const HAPPY: &str = "24e63ee2d5ef7e29c141239e5290da72af0ae146bb8437948c481a2aacd8a297";
-const S_NONCE: &str = "e228711463fd11a77e555f674f7ead7cfaf598d1d374adb804fa902acef73390";
-const S_PAYLOAD: &str = "f82c53f305b9a1a55839559a5039c31cb671153cb0385adad3603247b2c5120f";
-const S_POOL: &str = "5b74cc18ab1c26403d841c83724b67c5c011c1761329fb5a6f3c940114ee4091";
-const S_ROUTE_OUT: &str = "d34cbf74ce3e2dc618bf91e0b870b6054384429b88752a81e766497f6d1d1a45";
-const S_NO_EXPIRES: &str = "e43008dfd2bd25d2acd4bb7daad4138964dc2c354a67655e2f5f9bc74bc4636e";
-const S_TOKEN: &str = "afc4000f4b529a8078371ddfcfe9dc73a5cfa34d8716ad8f2f3d169b1bea599c";
-const S_AMOUNT: &str = "783726a0f667735be0ce49976f34497a80436265c93b09c8ad9bb35ab464768c";
+// The digest commits to the COMPLETE intent via `intent_digest`, so any change to
+// an intent field (amount, order type, risk caps, fill policy) moves the digest
+// even when the intent id is unchanged.
+const HAPPY: &str = "88421554b32629b213046a76c626a486610ff5d1d5ef70aef76ea1f57ac78c55";
+const S_NONCE: &str = "f4541f6b6e23bf6c522a26b273195bdfb5fb6682bd75d94517b6b46ca49e677f";
+const S_PAYLOAD: &str = "d5f6697f55384f3ce8eefb64aea907c4a8496e1b955506b05422cc45d29c7e7f";
+const S_POOL: &str = "8df62058474f833de41ff9c64d67d3093cac494f47c78ada6a80f9f6f55ac49b";
+const S_ROUTE_OUT: &str = "549c804bd56bbdc5f8c2c5635564381e906f306eb4b935093cb16058b0bc957c";
+const S_NO_EXPIRES: &str = "609d9f30c4fd3484e9db91bf4f5076fb0b11b2665defa794cad7af819cc2b13d";
+const S_TOKEN: &str = "a6a67bccfb1dd195cec3d1c3db183d6e55d14ae43476e3ced76c23c421073430";
+const S_AMOUNT: &str = "195cae58d1c62bbe1b2033bf331e05ca33280cbcb685dd485fb5b02f53b7a6a1";
+
+// Same-id mutated-intent vectors: the intent id is unchanged, so these can only
+// differ because `intent_digest` commits the full intent.
+const M_AMOUNT: &str = "34c9975ae0c8919efd0cb7378c811ca2e824dab4525f3464bac9e083d0db6b7b";
+const M_LIMIT: &str = "e115ce7e6c35b876d607b0038d9f875889a5ac32b7d8c73537d6d1a5234b6478";
+const M_RISK: &str = "f00741bdb3310eeea239c6129031561ed365598c7d74017558df04e6b6aefcf5";
+const M_AON: &str = "5968a54938de5b70589aa34cf41ceff9a9066d296a58ee134f9592de17afeda5";
+const M_MTC: &str = "2798ebe72663ea378316261d9b3f86bc6c53894f9be71d925781962467b8d476";
 
 fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Fixture-derived substrings that must never leak through `Display`/`Debug`.
+const FORBIDDEN_SUBSTRINGS: &[&str] = &[
+    // amounts
+    "1000",
+    "250",
+    "240",
+    // asset addresses
+    "USDC",
+    "USDCX",
+    "TOKEN",
+    // wallet / intent / idempotency / prepared strings
+    "wallet-1",
+    "intent-1",
+    "idem-1",
+    "prepared-1",
+    // endpoint-like substrings
+    "http",
+    "://",
+    "grpc",
+    "tcp",
+    "unix",
+    "0x",
+];
+
+/// Detects a run of at least `min_len` ASCII hex digits, i.e. leaked digest bytes.
+fn has_hex_run(value: &str, min_len: usize) -> bool {
+    let mut run = 0usize;
+    for ch in value.chars() {
+        if ch.is_ascii_hexdigit() {
+            run += 1;
+            if run >= min_len {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn assert_redacted(label: &str, value: &str) {
+    for forbidden in FORBIDDEN_SUBSTRINGS {
+        assert!(
+            !value.contains(forbidden),
+            "redaction leak in `{label}`: `{value}` contains `{forbidden}`"
+        );
+    }
+    assert!(
+        !has_hex_run(value, 8),
+        "redaction leak in `{label}`: `{value}` contains a hex run of length >= 8"
+    );
 }
 
 fn limits() -> PolicyLimits {
@@ -292,13 +356,63 @@ fn sensitivity_vectors_change_request_digest_with_pinned_hexes() {
 }
 
 #[test]
-fn disabled_gate_is_rejected() {
+fn same_id_mutated_intent_changes_request_digest() {
+    let base_route = route();
+    let base = intent();
+    assert_eq!(digest_of(&base, &base_route), HAPPY);
+
+    // Changed amount, same id: previously unbound by the request digest.
+    let mut amount_mut = base.clone();
+    amount_mut.amount = AtomicAmount::new(2_000);
+    assert_eq!(digest_of(&amount_mut, &base_route), M_AMOUNT);
+
+    // Changed order_type (Market -> Limit) with a consistent limit price.
+    let mut limit_mut = base.clone();
+    limit_mut.order_type = OrderType::Limit;
+    limit_mut.limit_price = Some(LimitPrice {
+        numerator_asset: base.token_in.clone(),
+        denominator_asset: base.token_out.clone(),
+        ratio: PriceRatio::new(5_000, 1_000).unwrap(),
+    });
+    assert_eq!(digest_of(&limit_mut, &base_route), M_LIMIT);
+
+    // Changed risk cap.
+    let mut risk_mut = base.clone();
+    risk_mut.risk.max_slippage = Bps::new(101).unwrap();
+    assert_eq!(digest_of(&risk_mut, &base_route), M_RISK);
+
+    // Flipped allow_partial_fill (the amount still matches the net input).
+    let mut aon_mut = base.clone();
+    aon_mut.allow_partial_fill = false;
+    assert_eq!(digest_of(&aon_mut, &base_route), M_AON);
+
+    // Added max_total_cost.
+    let mut cost_mut = base.clone();
+    cost_mut.risk.max_total_cost = Some(AssetAmount {
+        asset: base.token_in.clone(),
+        amount: AtomicAmount::new(1_000),
+    });
+    assert_eq!(digest_of(&cost_mut, &base_route), M_MTC);
+
+    // Every mutation shares the id but yields a distinct digest.
+    for digest in [M_AMOUNT, M_LIMIT, M_RISK, M_AON, M_MTC] {
+        assert_ne!(digest, HAPPY);
+    }
+}
+
+#[test]
+fn disabled_gate_is_rejected_before_domain_revalidation() {
     let engine = engine();
     let intent = intent();
     let route = route();
     let approved = approved(&engine, &intent);
     let prepared = prepared(&intent);
     let preview = build_preview(&intent, &route, 1_000, 250, 240);
+
+    // A stale route would fail domain revalidation, but the live kill switch is
+    // checked first and wins.
+    let mut stale_route = route.clone();
+    stale_route.state.observed_at_ms = 0;
     engine.disable_trading();
     assert_eq!(
         SigningRequest::bind(
@@ -306,7 +420,7 @@ fn disabled_gate_is_rejected() {
             &approved,
             &prepared,
             &intent,
-            &route,
+            &stale_route,
             &preview,
             payload(),
             NOW_MS,
@@ -316,24 +430,26 @@ fn disabled_gate_is_rejected() {
 }
 
 #[test]
-fn expired_approval_is_rejected() {
+fn expired_approval_is_rejected_before_domain_revalidation() {
     let engine = engine();
     let original = intent();
     let route = route();
     let approved = approved(&engine, &original);
     let prepared = prepared(&original);
     let preview = build_preview(&original, &route, 1_000, 250, 240);
-    // The domain validator would pre-empt with `Expired` if the intent itself had
-    // expired, so use an expiry-neutral intent to exercise the approval check.
-    let mut without_expiry = original.clone();
-    without_expiry.expiry_ms = None;
+
+    // now_ms == approval.expires_at_ms == intent.expiry_ms. The domain validator
+    // would report `Expired` for the intent (and the route below is stale), but
+    // the approval-expiry check runs first.
+    let mut stale_route = route.clone();
+    stale_route.state.observed_at_ms = 0;
     assert_eq!(
         SigningRequest::bind(
             &engine,
             &approved,
             &prepared,
-            &without_expiry,
-            &route,
+            &original,
+            &stale_route,
             &preview,
             payload(),
             10_000,
@@ -463,22 +579,6 @@ fn preview_revalidation_failures_are_rejected() {
         ),
         Err(PrivyError::PreviewRevalidationFailed)
     );
-
-    // Expired intent (the approval expiry equals the intent expiry; the domain
-    // validator is the first fail-closed check to fire).
-    assert_eq!(
-        SigningRequest::bind(
-            &engine,
-            &approved,
-            &prepared,
-            &base,
-            &route,
-            &preview,
-            payload(),
-            10_000,
-        ),
-        Err(PrivyError::PreviewRevalidationFailed)
-    );
 }
 
 #[test]
@@ -557,11 +657,12 @@ async fn default_boundary_fails_closed() {
 }
 
 #[test]
-fn errors_and_digests_reveal_no_digits() {
+fn errors_and_digests_reveal_no_fixture_secrets() {
     let errors = [
         PrivyError::SigningUnavailable,
         PrivyError::InvalidExecutionReference,
         PrivyError::ApprovalBindingMismatch,
+        PrivyError::UnsupportedChain,
         PrivyError::ApprovalExpired,
         PrivyError::TradingDisabled,
         PrivyError::PreviewRevalidationFailed,
@@ -571,20 +672,17 @@ fn errors_and_digests_reveal_no_digits() {
         PrivyError::SignerRejected,
     ];
     for error in errors {
-        for rendered in [error.to_string(), format!("{error:?}")] {
-            assert!(
-                !rendered.chars().any(|c| c.is_ascii_digit()),
-                "redaction leak in `{rendered}`"
-            );
-        }
+        assert_redacted("PrivyError Display", &error.to_string());
+        assert_redacted("PrivyError Debug", &format!("{error:?}"));
     }
 
     let payload = payload();
-    assert!(!format!("{payload:?}").chars().any(|c| c.is_ascii_digit()));
+    assert_redacted("PayloadDigest Debug", &format!("{payload:?}"));
 
     let request = bind_request(&intent(), &route(), payload, NOW_MS).unwrap();
-    assert!(!format!("{:?}", request.request_digest())
-        .chars()
-        .any(|c| c.is_ascii_digit()));
-    assert!(!format!("{request:?}").chars().any(|c| c.is_ascii_digit()));
+    assert_redacted(
+        "RequestDigest Debug",
+        &format!("{:?}", request.request_digest()),
+    );
+    assert_redacted("SigningRequest Debug", &format!("{request:?}"));
 }

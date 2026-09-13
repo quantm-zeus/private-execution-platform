@@ -31,6 +31,45 @@
 //!   u128-be expected_net_output.amount
 //! ```
 //!
+//! ### `intent_digest = SHA-256(intent_bytes)`
+//!
+//! The request commits to the COMPLETE [`TradeIntent`] so that a mutated public
+//! intent sharing the same id (dropped limit price, changed amount, order type,
+//! risk caps, or partial-fill policy) cannot keep the same request digest.
+//!
+//! ```text
+//! intent_bytes =
+//!   b"privy.signing.intent.v1"
+//!   lp(id)
+//!   u8 source (Web = 0, Mcp = 1, Telegram = 2, Internal = 3)
+//!   lp(user_id)
+//!   lp(wallet_ref)
+//!   chain_tag(chain)
+//!   asset(token_in)
+//!   asset(token_out)
+//!   u8 side (Buy = 0, Sell = 1)
+//!   u8 amount_type (InputAssetAtomic = 0, OutputAssetAtomic = 1, UsdMicros = 2)
+//!   u128-be amount
+//!   u8 order_type (Market = 0, Limit = 1)
+//!   i8 has_limit_price (0 | 1)
+//!   asset(limit_price.numerator_asset)      (only when has_limit_price = 1)
+//!   asset(limit_price.denominator_asset)    (only when has_limit_price = 1)
+//!   u128-be limit_price.ratio.numerator_atomic   (only when has_limit_price = 1)
+//!   u128-be limit_price.ratio.denominator_atomic (only when has_limit_price = 1)
+//!   u16-be risk.max_buy_tax
+//!   u16-be risk.max_sell_tax
+//!   u16-be risk.max_price_impact
+//!   u16-be risk.max_slippage
+//!   i8 has_max_total_cost (0 | 1)
+//!   asset(risk.max_total_cost.asset)        (only when has_max_total_cost = 1)
+//!   u128-be risk.max_total_cost.amount      (only when has_max_total_cost = 1)
+//!   u8 allow_partial_fill (0 | 1)
+//!   i8 has_expiry (0 | 1)
+//!   i64-be expiry_ms                        (only when has_expiry = 1)
+//!   u64-be nonce
+//!   lp(idempotency_key)
+//! ```
+//!
 //! ### `request_digest = SHA-256(request_bytes)`
 //!
 //! ```text
@@ -55,11 +94,13 @@
 //!   u64-be approval.approved_trade_usd
 //!   lp(prepared.reference())
 //!   [32 bytes] route_digest
+//!   [32 bytes] intent_digest
 //! ```
 //!
 //! `chain_tag`: Solana = 0, Base = 1, BnbChain = 2, Ethereum = 3,
 //! RobinhoodAssociated = 4. Operator-defined ([`ChainId::Other`]) chains have no
-//! canonical tag and are rejected fail-closed rather than assigned an invented
+//! canonical tag and are rejected fail-closed with
+//! [`crate::PrivyError::UnsupportedChain`] rather than assigned an invented
 //! encoding.
 //!
 //! The [`PayloadDigest`] is an internal binding token, not the chain's own
@@ -69,8 +110,8 @@ use std::fmt;
 
 use chain_types::{AssetId, ChainId};
 use domain::{
-    IdempotencyKey, IntentId, RoutePlan, TradeIntent, TradeSide, ValidatedExecutionPreview,
-    WalletRef,
+    AmountType, IdempotencyKey, IntentId, OrderType, RoutePlan, TradeIntent, TradeSide,
+    TradeSource, ValidatedExecutionPreview, WalletRef,
 };
 use policy::{ApprovedExecution, PolicyEngine};
 use sha2::{Digest, Sha256};
@@ -79,6 +120,7 @@ use crate::{PreparedExecutionRef, PrivyError};
 
 const ROUTE_TAG: &[u8] = b"privy.signing.route.v1";
 const REQUEST_TAG: &[u8] = b"privy.signing.request.v1";
+const INTENT_TAG: &[u8] = b"privy.signing.intent.v1";
 const SCHEMA_VERSION: u16 = 1;
 
 /// SHA-256 digest of the unsigned transaction payload.
@@ -155,9 +197,12 @@ impl SigningRequest {
     /// 3. idempotency key agrees across intent / approval / prepared, and the
     ///    prepared intent matches;
     /// 4. preview token pair and side match the intent;
-    /// 5. the locked preview validator re-runs;
-    /// 6. the trading gate is enabled;
-    /// 7. the approval has not expired (absent or strictly in the future);
+    /// 5. the trading gate is enabled (the live kill switch is checked *before*
+    ///    domain revalidation so it always wins and is reachable);
+    /// 6. the approval has not expired (absent or strictly in the future, checked
+    ///    before domain revalidation so an expired approval yields
+    ///    `ApprovalExpired`, not the domain `Expired`);
+    /// 7. the locked preview validator re-runs;
     /// 8. the payload digest is present (non-zero).
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
@@ -195,25 +240,29 @@ impl SigningRequest {
         {
             return Err(PrivyError::PreviewRevalidationFailed);
         }
-        // 5. Re-run the locked deterministic validator. Any domain failure is a
+        // 5. Global kill switch. Checked before domain revalidation so the
+        // live kill switch always wins and stays reachable.
+        if !policy.is_trading_enabled() {
+            return Err(PrivyError::TradingDisabled);
+        }
+        // 6. Approval expiry (an absent expiry never expires). Checked before
+        // domain revalidation so an expired approval yields `ApprovalExpired`
+        // rather than the domain `Expired`.
+        if matches!(approval.expires_at_ms(), Some(expires) if expires <= now_ms) {
+            return Err(PrivyError::ApprovalExpired);
+        }
+        // 7. Re-run the locked deterministic validator. Any domain failure is a
         // revalidation failure; no payload is attached.
         preview
             .validate(intent, route, now_ms)
             .map_err(|_| PrivyError::PreviewRevalidationFailed)?;
-        // 6. Global kill switch.
-        if !policy.is_trading_enabled() {
-            return Err(PrivyError::TradingDisabled);
-        }
-        // 7. Approval expiry (an absent expiry never expires).
-        if matches!(approval.expires_at_ms(), Some(expires) if expires <= now_ms) {
-            return Err(PrivyError::ApprovalExpired);
-        }
         // 8. A zero digest is an absent payload.
         if payload_digest.is_zero() {
             return Err(PrivyError::MissingPayloadDigest);
         }
 
         let route_digest = compute_route_digest(route)?;
+        let intent_digest = compute_intent_digest(intent)?;
         let request_digest = compute_request_digest(
             approval,
             prepared,
@@ -221,6 +270,7 @@ impl SigningRequest {
             preview,
             &payload_digest,
             &route_digest,
+            &intent_digest,
         )?;
 
         Ok(Self {
@@ -335,7 +385,39 @@ fn chain_tag(chain: &ChainId) -> Result<u8, PrivyError> {
         ChainId::BnbChain => Ok(2),
         ChainId::Ethereum => Ok(3),
         ChainId::RobinhoodAssociated => Ok(4),
-        ChainId::Other(_) => Err(PrivyError::ApprovalBindingMismatch),
+        ChainId::Other(_) => Err(PrivyError::UnsupportedChain),
+    }
+}
+
+/// Canonical enum tags for the intent encoding (declaration order).
+fn trade_source_tag(source: TradeSource) -> u8 {
+    match source {
+        TradeSource::Web => 0,
+        TradeSource::Mcp => 1,
+        TradeSource::Telegram => 2,
+        TradeSource::Internal => 3,
+    }
+}
+
+fn amount_type_tag(amount_type: AmountType) -> u8 {
+    match amount_type {
+        AmountType::InputAssetAtomic => 0,
+        AmountType::OutputAssetAtomic => 1,
+        AmountType::UsdMicros => 2,
+    }
+}
+
+fn order_type_tag(order_type: OrderType) -> u8 {
+    match order_type {
+        OrderType::Market => 0,
+        OrderType::Limit => 1,
+    }
+}
+
+fn side_tag(side: TradeSide) -> u8 {
+    match side {
+        TradeSide::Buy => 0,
+        TradeSide::Sell => 1,
     }
 }
 
@@ -376,6 +458,58 @@ fn compute_route_digest(route: &RoutePlan) -> Result<RequestDigest, PrivyError> 
     Ok(RequestDigest(sha256(&bytes)))
 }
 
+/// `intent_digest = SHA-256(intent_bytes)`, committing the request to the
+/// COMPLETE intent so a mutated public intent with the same id cannot reuse the
+/// digest. See the module-level layout.
+fn compute_intent_digest(intent: &TradeIntent) -> Result<RequestDigest, PrivyError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(INTENT_TAG);
+    push_len_prefixed(&mut bytes, intent.id.as_str().as_bytes())?;
+    bytes.push(trade_source_tag(intent.source));
+    push_len_prefixed(&mut bytes, intent.user_id.as_str().as_bytes())?;
+    push_len_prefixed(&mut bytes, intent.wallet_ref.as_str().as_bytes())?;
+    bytes.push(chain_tag(&intent.chain)?);
+    push_asset(&mut bytes, &intent.token_in)?;
+    push_asset(&mut bytes, &intent.token_out)?;
+    bytes.push(side_tag(intent.side));
+    bytes.push(amount_type_tag(intent.amount_type));
+    bytes.extend_from_slice(&intent.amount.get().to_be_bytes());
+    bytes.push(order_type_tag(intent.order_type));
+    match &intent.limit_price {
+        Some(limit) => {
+            bytes.push(1);
+            push_asset(&mut bytes, &limit.numerator_asset)?;
+            push_asset(&mut bytes, &limit.denominator_asset)?;
+            bytes.extend_from_slice(&limit.ratio.numerator_atomic().to_be_bytes());
+            bytes.extend_from_slice(&limit.ratio.denominator_atomic().to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(&intent.risk.max_buy_tax.get().to_be_bytes());
+    bytes.extend_from_slice(&intent.risk.max_sell_tax.get().to_be_bytes());
+    bytes.extend_from_slice(&intent.risk.max_price_impact.get().to_be_bytes());
+    bytes.extend_from_slice(&intent.risk.max_slippage.get().to_be_bytes());
+    match &intent.risk.max_total_cost {
+        Some(total) => {
+            bytes.push(1);
+            push_asset(&mut bytes, &total.asset)?;
+            bytes.extend_from_slice(&total.amount.get().to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.push(u8::from(intent.allow_partial_fill));
+    match intent.expiry_ms {
+        Some(expiry) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&expiry.to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+    bytes.extend_from_slice(&intent.nonce.to_be_bytes());
+    push_len_prefixed(&mut bytes, intent.idempotency_key.as_str().as_bytes())?;
+    Ok(RequestDigest(sha256(&bytes)))
+}
+
 fn compute_request_digest(
     approval: &ApprovedExecution,
     prepared: &PreparedExecutionRef,
@@ -383,6 +517,7 @@ fn compute_request_digest(
     preview: &ValidatedExecutionPreview,
     payload_digest: &PayloadDigest,
     route_digest: &RequestDigest,
+    intent_digest: &RequestDigest,
 ) -> Result<RequestDigest, PrivyError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(REQUEST_TAG);
@@ -392,10 +527,7 @@ fn compute_request_digest(
     push_len_prefixed(&mut bytes, intent.wallet_ref.as_str().as_bytes())?;
     bytes.push(chain_tag(&intent.chain)?);
     bytes.extend_from_slice(&intent.nonce.to_be_bytes());
-    bytes.push(match intent.side {
-        TradeSide::Buy => 0,
-        TradeSide::Sell => 1,
-    });
+    bytes.push(side_tag(intent.side));
     push_asset(&mut bytes, &intent.token_in)?;
     push_asset(&mut bytes, &intent.token_out)?;
     bytes.extend_from_slice(&preview.simulated_net_input.amount.get().to_be_bytes());
@@ -413,6 +545,7 @@ fn compute_request_digest(
     bytes.extend_from_slice(&approval.approved_trade_usd().get().to_be_bytes());
     push_len_prefixed(&mut bytes, prepared.reference().as_bytes())?;
     bytes.extend_from_slice(route_digest.as_bytes());
+    bytes.extend_from_slice(intent_digest.as_bytes());
     Ok(RequestDigest(sha256(&bytes)))
 }
 
@@ -680,6 +813,18 @@ mod tests {
                 fixtures::NOW_MS,
             ),
             Err(PrivyError::MissingPayloadDigest)
+        );
+    }
+
+    #[test]
+    fn operator_defined_chain_is_unsupported() {
+        // Operator-defined chains have no canonical tag, so encoding fails closed
+        // with a dedicated payload-free error rather than a binding mismatch.
+        let mut intent = fixtures::intent();
+        intent.chain = ChainId::Other("custom-chain".to_string());
+        assert_eq!(
+            compute_intent_digest(&intent),
+            Err(PrivyError::UnsupportedChain)
         );
     }
 }
