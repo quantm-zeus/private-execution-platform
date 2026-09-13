@@ -1431,6 +1431,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "market-execution"
+version = "0.1.0"
+dependencies = [
+ "agent-backend",
+ "async-trait",
+ "chain-types",
+ "domain",
+ "execution-preview",
+ "execution-relay",
+ "market-types",
+ "policy",
+ "privy",
+ "routing",
+ "simulation",
+ "tax-engine",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "market-types"
 version = "0.1.0"
 dependencies = [

@@ -29,6 +29,7 @@ members = [
     "crates/agent-commands",
     "crates/mcp-server",
     "crates/agent-backend",
+    "crates/market-execution",
     "crates/telegram-bot",
     "crates/social-intel",
     "crates/adaptive-exec",
@@ -68,6 +69,7 @@ limit-engine = { path = "crates/limit-engine" }
 agent-commands = { path = "crates/agent-commands" }
 mcp-server = { path = "crates/mcp-server" }
 agent-backend = { path = "crates/agent-backend" }
+market-execution = { path = "crates/market-execution" }
 telegram-bot = { path = "crates/telegram-bot" }
 social-intel = { path = "crates/social-intel" }
 adaptive-exec = { path = "crates/adaptive-exec" }

@@ -799,3 +799,32 @@ async fn definitive_query_observation_wins_and_reconcile_is_not_called() {
     );
     assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn policy_accessor_borrows_the_same_gate_the_relay_enforces() {
+    // Disabled relay: the accessor must report the disabled gate and expose the
+    // same engine `execute` consults (which fails closed as `TradingDisabled`).
+    let disabled = RelayHarness::build(
+        support::engine(false),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+        MockStore::new(),
+        MockAdapter::accepting(),
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+    assert!(
+        !disabled.relay.policy().is_trading_enabled(),
+        "the accessor must reflect a disabled gate"
+    );
+    let outcome = disabled.relay.execute(disabled.input(NOW_MS)).await;
+    assert_eq!(outcome, Err(RelayError::TradingDisabled));
+    assert_eq!(disabled.adapter.submits.load(Ordering::SeqCst), 0);
+    assert_eq!(disabled.signing.calls.load(Ordering::SeqCst), 0);
+
+    // Enabled relay: the accessor reports the enabled gate.
+    let enabled = RelayHarness::standard();
+    assert!(
+        enabled.relay.policy().is_trading_enabled(),
+        "the accessor must reflect an enabled gate"
+    );
+}

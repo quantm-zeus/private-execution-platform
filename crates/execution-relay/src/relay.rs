@@ -293,6 +293,18 @@ where
         &self.breaker
     }
 
+    /// Borrows the policy engine that gates this relay (read-only; diagnostics/composition only).
+    ///
+    /// This is the same engine `execute` consults for the live kill switch and
+    /// that `SigningRequest::bind` re-verifies. A composition layer (for example
+    /// the market-execution port) uses it to run the authority check on the
+    /// *same* engine that will gate the relay, rather than on a second engine
+    /// that could drift.
+    #[doc(hidden)]
+    pub fn policy(&self) -> &PolicyEngine {
+        &self.policy
+    }
+
     /// Persists the terminal/in-flight outcome, best-effort.
     ///
     /// A store write failure is deliberately swallowed: `record_outcome` runs
