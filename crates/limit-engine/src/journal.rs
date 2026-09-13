@@ -81,7 +81,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use chain_types::ChainId;
 use crypto_envelope::at_rest::{open_at_rest, seal_at_rest, wire_kid, SealKey};
-use domain::{IdempotencyKey, OrderId, OrderStatus, UserId};
+use domain::{IdempotencyKey, IntentId, OrderId, OrderStatus, UserId};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -261,6 +261,25 @@ pub enum AttemptAppendOutcome {
     /// An identical `(attempt_seq, phase)` event already exists; nothing was
     /// re-sealed and nothing was re-appended.
     AlreadyApplied(OrderAttemptEvent),
+}
+
+/// Deterministic identity of the next attempt for an order.
+///
+/// Derived from the authoritative attempt stream, never from
+/// [`StoredLimitOrder::attempt_seq`] (which stays vestigial at its stored value
+/// per the Phase-5 design note). A restarted caller therefore derives the same
+/// identity and never re-signs an attempt it already reserved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptIdentity {
+    /// 1-based attempt sequence (`latest_attempt_seq + 1`).
+    pub attempt_seq: u64,
+    /// Deterministic per-attempt intent id.
+    pub intent_id: IntentId,
+    /// Deterministic per-attempt idempotency key.
+    pub idempotency_key: IdempotencyKey,
+    /// Opaque, deterministic reference the execution seam uses to build a
+    /// `privy::PreparedExecutionRef` for this attempt.
+    pub prepared_reference: String,
 }
 
 /// One open order whose latest attempt may already have reached the chain.
@@ -1035,6 +1054,49 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         order_id: &OrderId,
     ) -> Result<Option<OrderAttemptEvent>, LimitEngineError> {
         Ok(self.read_attempts(order_id).await?.pop())
+    }
+
+    /// Derives the next attempt identity from the authoritative attempt stream.
+    ///
+    /// `attempt_seq = latest_attempt_seq + 1` (1 when no attempt exists); the
+    /// intent id, idempotency key, and prepared reference are the deterministic
+    /// per-attempt derivations, so a restarted caller derives the same identity
+    /// and never re-signs an attempt it already reserved.
+    pub async fn next_attempt_identity(
+        &self,
+        order_id: &OrderId,
+    ) -> Result<AttemptIdentity, LimitEngineError> {
+        let material = self.keys.current()?;
+        let attempt_seq = self
+            .read_attempts(order_id)
+            .await?
+            .pop()
+            .map(|event| event.attempt_seq)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(LimitEngineError::ArithmeticOverflow)?;
+        let blind_index = &material.blind_index;
+        Ok(AttemptIdentity {
+            attempt_seq,
+            intent_id: crate::attempt::attempt_intent_id(
+                blind_index,
+                &self.chain,
+                order_id,
+                attempt_seq,
+            )?,
+            idempotency_key: crate::attempt::attempt_key(
+                blind_index,
+                &self.chain,
+                order_id,
+                attempt_seq,
+            )?,
+            prepared_reference: crate::attempt::attempt_prepared_reference(
+                blind_index,
+                &self.chain,
+                order_id,
+                attempt_seq,
+            )?,
+        })
     }
 
     /// Appends one attempt-lifecycle event idempotently.

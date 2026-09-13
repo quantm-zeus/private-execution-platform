@@ -24,6 +24,12 @@ pub const ATTEMPT_STREAM_DOMAIN: &[u8] = b"limit.attempt.stream.v1";
 pub const ATTEMPT_KEY_DOMAIN: &[u8] = b"limit.attempt.key.v1";
 /// Domain label for the deterministic per-attempt intent id.
 pub const ATTEMPT_INTENT_DOMAIN: &[u8] = b"limit.attempt.intent.v1";
+/// Domain label for the deterministic opaque prepared-execution reference.
+///
+/// The reference is never a signing capability: it is a stable, opaque handle
+/// the injected execution seam may use to build a `privy::PreparedExecutionRef`
+/// for exactly one `(order, attempt_seq)`.
+pub const ATTEMPT_PREPARED_DOMAIN: &[u8] = b"limit.attempt.prepared.v1";
 
 /// Lifecycle phase of one execution attempt.
 ///
@@ -314,6 +320,31 @@ pub fn attempt_key(
         ],
     )?;
     IdempotencyKey::new(to_hex(&mac)).map_err(|_| LimitEngineError::RecordMalformed)
+}
+
+/// `hex(HMAC(key, "limit.attempt.prepared.v1" || chain_tag || order_id || u64be(attempt_seq)))`.
+///
+/// The prepared-execution reference is opaque, deterministic, and
+/// restart-stable: the same order and attempt sequence always derive the same
+/// reference, so a restarted caller reconstructs the same binding without
+/// re-signing. It carries no key material and grants no signing capability.
+pub fn attempt_prepared_reference(
+    key: &BlindIndexKey,
+    chain: &chain_types::ChainId,
+    order_id: &OrderId,
+    attempt_seq: u64,
+) -> Result<String, LimitEngineError> {
+    let tag = chain_tag(chain);
+    let mac = derive(
+        key,
+        ATTEMPT_PREPARED_DOMAIN,
+        &[
+            &tag,
+            order_id.as_str().as_bytes(),
+            &attempt_seq.to_be_bytes(),
+        ],
+    )?;
+    Ok(to_hex(&mac))
 }
 
 /// `hex(HMAC(key, "limit.attempt.intent.v1" || chain_tag || order_id || u64be(attempt_seq)))`.

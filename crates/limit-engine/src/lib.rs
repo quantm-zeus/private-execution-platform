@@ -74,24 +74,30 @@ pub mod error;
 pub mod fill;
 pub mod fsm;
 pub mod journal;
+pub mod orchestrator;
 pub mod order;
 pub mod prepare;
 pub mod store;
 pub mod trigger;
 
 pub use attempt::{
-    attempt_intent_id, attempt_key, attempt_stream_blind_index, ApprovalSnapshot, AttemptPhase,
-    BoundAttempt, OrderAttemptEvent, ATTEMPT_SCHEMA_VERSION,
+    attempt_intent_id, attempt_key, attempt_prepared_reference, attempt_stream_blind_index,
+    ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, ATTEMPT_PREPARED_DOMAIN,
+    ATTEMPT_SCHEMA_VERSION,
 };
 pub use error::LimitEngineError;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use journal::{
     class_blind_index, object_id, order_id_for_creation, owner_blind_index, recover_in_flight,
-    recover_open, stream_blind_index, AttemptAppendOutcome, AttemptRecoveryOutcome, BlindIndexKey,
-    DurableLimitOrderStore, DurableOrderRecord, InFlightAttempt, OrderKeyMaterial,
-    OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder, RecoveryOutcome,
-    UnavailableOrderKeyProvider,
+    recover_open, stream_blind_index, AttemptAppendOutcome, AttemptIdentity,
+    AttemptRecoveryOutcome, BlindIndexKey, DurableLimitOrderStore, DurableOrderRecord,
+    InFlightAttempt, OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder,
+    RecoveryOutcome, UnavailableOrderKeyProvider,
+};
+pub use orchestrator::{
+    AttemptExecutor, AttemptLimits, AttemptResolution, Orchestrator, RealizedFill, TickInput,
+    TickOutcome,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 pub use prepare::{
