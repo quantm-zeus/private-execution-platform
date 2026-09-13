@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_postgres::{error::SqlState, NoTls};
 
 use crate::{
-    ComponentHealth, CreatedBucket, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot,
-    StorageError, StorageValidationError,
+    ClassListCursor, ComponentHealth, CreatedBucket, HealthProbe, OpaqueEventRecord, OpaqueObject,
+    OpaqueSnapshot, StorageError, StorageValidationError,
 };
 
 /// Upper bound for blind-index / id byte sizes accepted by this layer.
@@ -85,6 +85,38 @@ fn validate_stream_index(index: &[u8]) -> Result<(), StorageError> {
 /// wrapping.
 fn db_u64(raw: i64) -> Result<u64, StorageError> {
     u64::try_from(raw).map_err(|_| StorageError::Backend)
+}
+
+/// Decodes and validates object rows, rejecting corrupt or foreign rows as an
+/// opaque [`StorageError::Backend`].
+fn decode_object_rows(
+    rows: Vec<tokio_postgres::Row>,
+    class_blind_index: &[u8],
+) -> Result<Vec<OpaqueObject>, StorageError> {
+    let mut objects = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get(0).map_err(|_| StorageError::Backend)?;
+        let owner_blind_index: Vec<u8> = row.try_get(1).map_err(|_| StorageError::Backend)?;
+        let stored_class: Vec<u8> = row.try_get(2).map_err(|_| StorageError::Backend)?;
+        let version: i64 = row.try_get(3).map_err(|_| StorageError::Backend)?;
+        let ciphertext: Vec<u8> = row.try_get(4).map_err(|_| StorageError::Backend)?;
+        let bucket: i64 = row.try_get(5).map_err(|_| StorageError::Backend)?;
+        let object = OpaqueObject {
+            id,
+            owner_blind_index,
+            class_blind_index: stored_class,
+            version: db_u64(version)?,
+            ciphertext,
+            created_bucket: CreatedBucket::new(bucket).ok_or(StorageError::Backend)?,
+        };
+        // Corrupt/foreign rows are Backend, not caller-validation errors.
+        validate_object(&object).map_err(|_| StorageError::Backend)?;
+        if object.class_blind_index.as_slice() != class_blind_index {
+            return Err(StorageError::Backend);
+        }
+        objects.push(object);
+    }
+    Ok(objects)
 }
 
 impl PostgresStore {
@@ -226,6 +258,16 @@ impl crate::OpaqueStore for PostgresStore {
         class_blind_index: &[u8],
         limit: usize,
     ) -> Result<Vec<OpaqueObject>, StorageError> {
+        self.list_objects_by_class_page(class_blind_index, None, limit)
+            .await
+    }
+
+    async fn list_objects_by_class_page(
+        &self,
+        class_blind_index: &[u8],
+        cursor: Option<&ClassListCursor>,
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
         validate_index(class_blind_index, StorageValidationError::EmptyClassIndex)?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -235,49 +277,51 @@ impl crate::OpaqueStore for PostgresStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         // Newest version per id, class-scoped, ordered for a deterministic,
         // bounded listing. The join back onto (id, version) is the primary key,
-        // and the class predicate is served by idx_objects_class.
-        let rows = self
-            .next_client()
-            .query(
-                "SELECT o.id, o.owner_blind_index, o.class_blind_index, o.version, o.ciphertext, o.created_bucket
-                 FROM objects o
-                 JOIN (
-                     SELECT id, max(version) AS version
-                     FROM objects
-                     WHERE class_blind_index = $1
-                     GROUP BY id
-                 ) newest ON o.id = newest.id AND o.version = newest.version
-                 WHERE o.class_blind_index = $1
-                 ORDER BY o.created_bucket DESC, o.id ASC
-                 LIMIT $2",
-                &[&class_blind_index, &limit],
-            )
-            .await
-            .map_err(map_error)?;
-        let mut objects = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: String = row.try_get(0).map_err(|_| StorageError::Backend)?;
-            let owner_blind_index: Vec<u8> = row.try_get(1).map_err(|_| StorageError::Backend)?;
-            let stored_class: Vec<u8> = row.try_get(2).map_err(|_| StorageError::Backend)?;
-            let version: i64 = row.try_get(3).map_err(|_| StorageError::Backend)?;
-            let ciphertext: Vec<u8> = row.try_get(4).map_err(|_| StorageError::Backend)?;
-            let bucket: i64 = row.try_get(5).map_err(|_| StorageError::Backend)?;
-            let object = OpaqueObject {
-                id,
-                owner_blind_index,
-                class_blind_index: stored_class,
-                version: db_u64(version)?,
-                ciphertext,
-                created_bucket: CreatedBucket::new(bucket).ok_or(StorageError::Backend)?,
-            };
-            // Corrupt/foreign rows are Backend, not caller-validation errors.
-            validate_object(&object).map_err(|_| StorageError::Backend)?;
-            if object.class_blind_index.as_slice() != class_blind_index {
-                return Err(StorageError::Backend);
+        // and the class predicate is served by idx_objects_class. The cursor
+        // predicate continues strictly after the last returned
+        // `(created_bucket, id)` pair without replaying or skipping a page.
+        let rows = match cursor {
+            None => self
+                .next_client()
+                .query(
+                    "SELECT o.id, o.owner_blind_index, o.class_blind_index, o.version, o.ciphertext, o.created_bucket
+                     FROM objects o
+                     JOIN (
+                         SELECT id, max(version) AS version
+                         FROM objects
+                         WHERE class_blind_index = $1
+                         GROUP BY id
+                     ) newest ON o.id = newest.id AND o.version = newest.version
+                     WHERE o.class_blind_index = $1
+                     ORDER BY o.created_bucket DESC, o.id ASC
+                     LIMIT $2",
+                    &[&class_blind_index, &limit],
+                )
+                .await
+                .map_err(map_error)?,
+            Some(cursor) => {
+                let bucket = cursor.created_bucket.get();
+                self.next_client()
+                    .query(
+                        "SELECT o.id, o.owner_blind_index, o.class_blind_index, o.version, o.ciphertext, o.created_bucket
+                         FROM objects o
+                         JOIN (
+                             SELECT id, max(version) AS version
+                             FROM objects
+                             WHERE class_blind_index = $1
+                             GROUP BY id
+                         ) newest ON o.id = newest.id AND o.version = newest.version
+                         WHERE o.class_blind_index = $1
+                           AND (o.created_bucket < $2 OR (o.created_bucket = $2 AND o.id > $3))
+                         ORDER BY o.created_bucket DESC, o.id ASC
+                         LIMIT $4",
+                        &[&class_blind_index, &bucket, &cursor.id, &limit],
+                    )
+                    .await
+                    .map_err(map_error)?
             }
-            objects.push(object);
-        }
-        Ok(objects)
+        };
+        decode_object_rows(rows, class_blind_index)
     }
 
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError> {

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! P44 — Phase 5 L1: limit-order state machine and fill ledger.
 //!
 //! This crate is the pure, deterministic L1 core for limit orders. It owns the
@@ -82,7 +83,8 @@ pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use journal::{
     class_blind_index, object_id, order_id_for_creation, owner_blind_index, recover_open,
     stream_blind_index, BlindIndexKey, DurableLimitOrderStore, DurableOrderRecord,
-    OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, UnavailableOrderKeyProvider,
+    OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder, RecoveryOutcome,
+    UnavailableOrderKeyProvider,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 pub use store::{AppendOutcome, CreateOutcome, InMemoryLimitOrderStore, LimitOrderStore};

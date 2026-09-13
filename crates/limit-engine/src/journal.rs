@@ -30,7 +30,10 @@
 //! `(object_id bytes, object version)`. Those scopes are domain-separated (32
 //! random bytes vs. ASCII hex) and each sequence monotonically increases, so
 //! `at_rest`'s deterministic nonce is never reused for different plaintext at
-//! the same `(scope, sequence)`.
+//! the same `(scope, sequence)`. The read-check-seal-CAS sequence is serialized
+//! by a process-global async mutex so two racing writers cannot both seal
+//! different plaintext at one pair before the compare-and-swap discards the
+//! loser; the CAS is a backstop, not the only guard.
 //!
 //! # Adaptations forced by the real APIs
 //! 1. `OpaqueStore::list_objects_by_class` is added with a fail-closed default
@@ -38,7 +41,8 @@
 //!    would break the in-memory `OpaqueStore` fakes in `crates/audit`, which
 //!    this slice must not modify; the default keeps every existing
 //!    implementation compiling while still failing closed on stores that cannot
-//!    list. `PostgresStore` implements the real query.
+//!    list. `list_objects_by_class_page` adds the same fail-closed default for
+//!    cursor paging, and `PostgresStore` implements the real queries.
 //! 2. The P44 [`crate::store::LimitOrderStore::load`] signature carries no
 //!    chain, but the spec binds `chain_tag` into the object id. The durable
 //!    store therefore holds the single chain it serves, fixed at construction.
@@ -55,7 +59,7 @@
 //!    `OrderId` with [`order_id_for_creation`], and `create` rejects a record
 //!    whose id disagrees so the same creation key can never fork a stream.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use chain_types::ChainId;
@@ -64,7 +68,10 @@ use domain::{IdempotencyKey, OrderId, OrderStatus, UserId};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use storage::{CreatedBucket, OpaqueEventRecord, OpaqueObject, OpaqueStore, StorageError};
+use storage::{
+    ClassListCursor, CreatedBucket, OpaqueEventRecord, OpaqueObject, OpaqueStore, StorageError,
+};
+use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::LimitEngineError;
@@ -86,8 +93,14 @@ pub const ORDER_ID_DOMAIN: &[u8] = b"limit.order.id.v1";
 /// Domain label for the fixed-width chain tag.
 pub const CHAIN_TAG_DOMAIN: &[u8] = b"limit.order.chain_tag.v1";
 
-/// Maximum objects fetched during a single bounded listing/recovery pass.
+/// Objects fetched per page during a bounded listing/recovery pass.
 pub const RECOVERY_LIST_LIMIT: usize = 1024;
+/// Hard cap on objects examined during one listing/recovery pass.
+///
+/// Enumeration pages until the class is exhausted, but never examines more than
+/// this many objects. A pass that stops here reports truncation rather than
+/// silently omitting older orders.
+pub const RECOVERY_MAX_OBJECTS: usize = 4096;
 /// Maximum event records fetched per `read_events` round.
 pub const REPLAY_BATCH: usize = 256;
 /// Maximum object compare-and-swap attempts before admitting a conflict.
@@ -96,6 +109,25 @@ pub const MAX_OBJECT_CAS_ATTEMPTS: u32 = 4;
 pub const BUCKET_WIDTH_MS: i64 = 86_400_000;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Serializes the read-check-seal-CAS critical section for every durable store
+/// in this process.
+///
+/// `at_rest` derives the nonce deterministically from
+/// `(key, scope, sequence, schema)`, so two writers must never seal different
+/// plaintext at the same pair: that would reuse a nonce. The compare-and-swap
+/// alone discards the loser, but only *after* it has already sealed, so the
+/// invariant would hold by accident. Holding this lock across the whole
+/// read-check-seal-CAS sequence makes the invariant structural, independent of
+/// how many store instances share one `OpaqueStore`.
+///
+/// The lock is process-global and bounded (one cell, no per-scope map to grow).
+/// It deliberately also covers recovery, whose object repair seals at the same
+/// `(object_id, version)` scope as a concurrent append.
+fn seal_guard() -> &'static AsyncMutex<()> {
+    static GUARD: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| AsyncMutex::new(()))
+}
 
 /// 32-byte keyed-PRF key for order blind indexes.
 ///
@@ -201,6 +233,37 @@ pub struct OrderTransitionEvent {
     pub transition: OrderTransition,
     /// Exact caller-supplied time; ciphertext-only.
     pub occurred_at_ms: i64,
+}
+
+/// One order skipped by recovery because its durable records could not be
+/// trusted.
+///
+/// `object_id` is the opaque keyed blind-index hex, never an order id, and
+/// `reason` is a redacted [`LimitEngineError`] class, so the quarantine list
+/// carries no plaintext and no foreign record content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuarantinedOrder {
+    /// Opaque object id of the quarantined order.
+    pub object_id: String,
+    /// Redacted failure class that caused the quarantine.
+    pub reason: LimitEngineError,
+}
+
+/// Result of a recovery pass.
+///
+/// Healthy, non-terminal orders are returned in `open`; every order whose
+/// records could not be trusted is returned in `quarantined` instead of
+/// aborting the whole pass. `truncated` is set when the hard object cap
+/// ([`RECOVERY_MAX_OBJECTS`]) was reached, so the caller knows older orders may
+/// not have been examined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    /// Healthy orders that are not terminal.
+    pub open: Vec<StoredLimitOrder>,
+    /// Orders skipped as untrustworthy, with a redacted reason.
+    pub quarantined: Vec<QuarantinedOrder>,
+    /// Whether enumeration stopped at the hard object cap.
+    pub truncated: bool,
 }
 
 /// Fixed-width canonical chain tag (unkeyed; the outer HMAC keys the result).
@@ -479,6 +542,66 @@ fn open_event(
     Ok(event)
 }
 
+/// Enumerates every object of `class` by paging the deterministic class
+/// ordering, stopping at [`RECOVERY_MAX_OBJECTS`].
+///
+/// Returns the objects and whether the hard cap was reached, so callers can
+/// surface truncation instead of silently omitting older orders. A page
+/// shorter than the requested size means the class was exhausted.
+async fn enumerate_class<S: OpaqueStore>(
+    store: &S,
+    class: &[u8],
+) -> Result<(Vec<OpaqueObject>, bool), LimitEngineError> {
+    let mut cursor: Option<ClassListCursor> = None;
+    let mut objects: Vec<OpaqueObject> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let remaining = RECOVERY_MAX_OBJECTS.saturating_sub(objects.len());
+        if remaining == 0 {
+            // At the cap: one more probe distinguishes "exactly the cap" from
+            // "more objects exist".
+            let extra = store
+                .list_objects_by_class_page(class, cursor.as_ref(), 1)
+                .await
+                .map_err(map_storage)?;
+            truncated = !extra.is_empty();
+            break;
+        }
+        let limit = remaining.min(RECOVERY_LIST_LIMIT);
+        let page = store
+            .list_objects_by_class_page(class, cursor.as_ref(), limit)
+            .await
+            .map_err(map_storage)?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(|object| ClassListCursor {
+            created_bucket: object.created_bucket,
+            id: object.id.clone(),
+        });
+        let page_len = page.len();
+        objects.extend(page);
+        if page_len < limit {
+            break;
+        }
+    }
+    Ok((objects, truncated))
+}
+
+/// Whether a per-order recovery failure is a record fault that can be
+/// quarantined rather than an environmental fault that must abort the pass.
+///
+/// A single corrupt, foreign, or inconsistent order must not block recovery of
+/// every healthy order. A lost store or an unusable key provider, by contrast,
+/// affects every order and cannot be fixed by skipping one, so those stay
+/// fatal and fail the whole pass closed.
+fn is_per_order_fault(error: LimitEngineError) -> bool {
+    !matches!(
+        error,
+        LimitEngineError::PersistenceUnavailable | LimitEngineError::KeyUnavailable
+    )
+}
+
 /// Durable, encrypted [`LimitOrderStore`] over an [`OpaqueStore`].
 ///
 /// The store is bound to one [`ChainId`] because the P44 `load(order_id)` API
@@ -645,6 +768,10 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
         }
         let object_id = object_id(&material.blind_index, &self.chain, &order.order.id)?;
 
+        // Serialize read-check-seal-CAS: two creates with the same creation key
+        // must not both seal a v1 object under the same deterministic nonce.
+        let _guard = seal_guard().lock().await;
+
         if let Some(existing) = self.read_record(&object_id).await? {
             if existing.baseline != order {
                 return Err(LimitEngineError::IdempotencyConflict);
@@ -701,6 +828,11 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
         let object_id = object_id(&material.blind_index, &self.chain, &transition.order_id)?;
         let stream = stream_blind_index(&material.blind_index, &self.chain, &transition.order_id)?;
 
+        // Serialize read-check-seal-CAS: a racing writer for the same sequence
+        // must observe the winner and take the idempotent/conflict path before
+        // it seals a different event under the same deterministic nonce.
+        let _guard = seal_guard().lock().await;
+
         let Some(initial) = self.read_record(&object_id).await? else {
             return Err(LimitEngineError::StoreInvalid);
         };
@@ -721,7 +853,12 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
                 }
                 _ => return Err(LimitEngineError::StoreInvalid),
             }
-            return Ok(AppendOutcome::AlreadyApplied(initial.current));
+            // The event stream is authoritative. Return the replayed head
+            // rather than a materialized object that may lag the stream.
+            let authoritative = self
+                .replay_from(&transition.order_id, transition.transition_seq)
+                .await?;
+            return Ok(AppendOutcome::AlreadyApplied(authoritative));
         }
 
         if expected_version != initial.current.version {
@@ -845,11 +982,13 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
     async fn list_open(&self) -> Result<Vec<StoredLimitOrder>, LimitEngineError> {
         let material = self.keys.current()?;
         let class = class_blind_index(&material.blind_index)?;
-        let objects = self
-            .store
-            .list_objects_by_class(&class, RECOVERY_LIST_LIMIT)
-            .await
-            .map_err(map_storage)?;
+        // Page the whole class instead of reading a single truncated page. The
+        // trait cannot return a has-more flag, so a pass that reaches the hard
+        // cap fails closed rather than silently omitting older orders.
+        let (objects, truncated) = enumerate_class(self.store.as_ref(), &class).await?;
+        if truncated {
+            return Err(LimitEngineError::RecoveryFailed);
+        }
         let mut open = Vec::new();
         for object in objects {
             let record = open_record(self.keys.as_ref(), &object)?;
@@ -945,37 +1084,76 @@ async fn reconcile_lagging<S: OpaqueStore>(
 }
 
 /// Enumerates durable open orders, repairs any object that lags its event
-/// stream, and returns the reconstructed non-terminal states.
+/// stream, and returns the reconstructed non-terminal states plus a quarantine
+/// list.
 ///
 /// Recovery is read-authoritative: the event stream wins and the object is
 /// rewritten. It performs no signing and no submission; an order with an
 /// in-flight attempt is surfaced for reconciliation, never resubmitted.
+///
+/// A single corrupt, foreign, or inconsistent order is quarantined and the pass
+/// continues, so it can never block recovery of every healthy order. An
+/// environmental failure (a lost store or an unusable key provider) still fails
+/// the whole pass closed because skipping one order cannot fix it.
 pub async fn recover_open<S: OpaqueStore>(
     store: &S,
     keys: &dyn OrderKeyProvider,
-) -> Result<Vec<StoredLimitOrder>, LimitEngineError> {
+) -> Result<RecoveryOutcome, LimitEngineError> {
     let material = keys.current()?;
     let class = class_blind_index(&material.blind_index)?;
-    let objects = store
-        .list_objects_by_class(&class, RECOVERY_LIST_LIMIT)
-        .await
-        .map_err(map_storage)?;
+
+    // Recovery seals object repairs, so it shares the sealing critical section
+    // with create/append.
+    let _guard = seal_guard().lock().await;
+
+    let (objects, truncated) = enumerate_class(store, &class).await?;
     let mut open = Vec::new();
+    let mut quarantined = Vec::new();
     for object in objects {
+        let object_id = object.id.clone();
         if object.class_blind_index.as_slice() != class.as_slice() {
-            return Err(LimitEngineError::RecordMalformed);
+            quarantined.push(QuarantinedOrder {
+                object_id,
+                reason: LimitEngineError::RecordMalformed,
+            });
+            continue;
         }
-        let record = open_record(keys, &object)?;
-        let stream = stream_blind_index(
+        let record = match open_record(keys, &object) {
+            Ok(record) => record,
+            Err(reason) if is_per_order_fault(reason) => {
+                quarantined.push(QuarantinedOrder { object_id, reason });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let stream = match stream_blind_index(
             &material.blind_index,
             &record.current.order.chain,
             &record.current.order.id,
-        )?;
-        let state = reconcile_lagging(store, keys, &stream, &object.id, &record).await?;
-        if !is_terminal(state.order.status) {
-            open.push(state);
+        ) {
+            Ok(stream) => stream,
+            Err(reason) if is_per_order_fault(reason) => {
+                quarantined.push(QuarantinedOrder { object_id, reason });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match reconcile_lagging(store, keys, &stream, &object_id, &record).await {
+            Ok(state) => {
+                if !is_terminal(state.order.status) {
+                    open.push(state);
+                }
+            }
+            Err(reason) if is_per_order_fault(reason) => {
+                quarantined.push(QuarantinedOrder { object_id, reason });
+            }
+            Err(error) => return Err(error),
         }
     }
     open.sort_by(|left, right| left.order.id.as_str().cmp(right.order.id.as_str()));
-    Ok(open)
+    Ok(RecoveryOutcome {
+        open,
+        quarantined,
+        truncated,
+    })
 }

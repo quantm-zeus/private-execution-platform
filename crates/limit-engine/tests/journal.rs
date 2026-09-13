@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chain_types::ChainId;
@@ -668,5 +668,169 @@ fn unavailable_provider_fails_closed() {
     assert_eq!(
         provider.by_id(&[0u8; 16]).err(),
         Some(LimitEngineError::KeyUnavailable)
+    );
+}
+
+/// Asserts that no two seal attempts target the same `(scope, sequence)` with
+/// different ciphertext. The deterministic nonce makes that pair a nonce, so
+/// any disagreement is a nonce-reuse defect even if the CAS later discards one.
+fn assert_no_conflicting_seals(fake: &Fake) {
+    let mut events: HashMap<(Vec<u8>, u64), Vec<u8>> = HashMap::new();
+    for attempt in fake.event_attempts() {
+        let key = (attempt.stream_blind_index.clone(), attempt.sequence);
+        if let Some(existing) = events.get(&key) {
+            assert_eq!(
+                existing, &attempt.ciphertext,
+                "two event seal attempts share one (scope, sequence) with different plaintext"
+            );
+        } else {
+            events.insert(key, attempt.ciphertext);
+        }
+    }
+    let mut objects: HashMap<(String, u64), Vec<u8>> = HashMap::new();
+    for attempt in fake.put_attempts() {
+        let key = (attempt.id.clone(), attempt.version);
+        if let Some(existing) = objects.get(&key) {
+            assert_eq!(
+                existing, &attempt.ciphertext,
+                "two object seal attempts share one (scope, sequence) with different plaintext"
+            );
+        } else {
+            objects.insert(key, attempt.ciphertext);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_writers_never_seal_conflicting_plaintext_at_one_sequence() {
+    let fake = fake();
+    let keys = keys();
+    let store = Arc::new(durable_store(&fake, &keys));
+    let order = durable_order(&keys, "race-seal", OrderStatus::Created, 1_000, 1_000, 0);
+    store.create(order.clone()).await.expect("create");
+    // Force an interleaving point between every internal read and its write.
+    fake.enable_read_yield();
+
+    let active = apply_transition(&order, OrderStatus::Active, None, 10).expect("active");
+    let cancelled = apply_transition(&order, OrderStatus::Cancelled, None, 10).expect("cancelled");
+    let transition_active = OrderTransition {
+        order_id: order.order.id.clone(),
+        from: OrderStatus::Created,
+        to: OrderStatus::Active,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+    let transition_cancelled = OrderTransition {
+        order_id: order.order.id.clone(),
+        from: OrderStatus::Created,
+        to: OrderStatus::Cancelled,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (transition, next) in [
+        (transition_active, active.clone()),
+        (transition_cancelled, cancelled.clone()),
+    ] {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.append_transition(1, &transition, &next).await
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(handle.await.expect("join"));
+    }
+
+    let applied = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(AppendOutcome::Applied(_))))
+        .count();
+    assert_eq!(
+        applied, 1,
+        "exactly one racing writer may apply: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(LimitEngineError::PersistenceConflict))),
+        "the loser must fail fast with the existing conflict path: {outcomes:?}"
+    );
+
+    assert_no_conflicting_seals(&fake);
+
+    let object_id =
+        limit_engine::object_id(&keys.blind_key(), &ChainId::Base, &order.order.id).expect("id");
+    assert_eq!(
+        fake.latest_object(&object_id).map(|object| object.version),
+        Some(2)
+    );
+    assert_eq!(fake.events().len(), 1, "exactly one event persists");
+
+    let expected = outcomes
+        .into_iter()
+        .find_map(|outcome| match outcome {
+            Ok(AppendOutcome::Applied(state)) => Some(state),
+            _ => None,
+        })
+        .expect("one applied state");
+    assert_eq!(
+        store.load(&order.order.id).await.expect("load"),
+        Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn already_applied_returns_the_authoritative_stream_head() {
+    let fake = fake();
+    let keys = keys();
+    let store = durable_store(&fake, &keys);
+    let order = durable_order(&keys, "auth-head", OrderStatus::Created, 1_000, 1_000, 0);
+    store.create(order.clone()).await.expect("create");
+    let active = step(
+        &store,
+        order.order.id.as_str(),
+        OrderStatus::Active,
+        None,
+        10,
+    )
+    .await;
+    let candidate = step(
+        &store,
+        order.order.id.as_str(),
+        OrderStatus::TriggerCandidate,
+        None,
+        20,
+    )
+    .await;
+    assert_eq!(candidate.order.status, OrderStatus::TriggerCandidate);
+
+    // Materialize the object only up to the first transition, so it lags the
+    // authoritative event stream by one step.
+    let object_id =
+        limit_engine::object_id(&keys.blind_key(), &ChainId::Base, &order.order.id).expect("id");
+    fake.truncate_object_versions(&object_id, active.version);
+
+    let replay = OrderTransition {
+        order_id: order.order.id.clone(),
+        from: OrderStatus::Created,
+        to: OrderStatus::Active,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+    assert_eq!(
+        store
+            .append_transition(active.version, &replay, &active)
+            .await
+            .expect("replay"),
+        AppendOutcome::AlreadyApplied(candidate),
+        "an in-range replay must return the replayed head, not the lagging object"
     );
 }

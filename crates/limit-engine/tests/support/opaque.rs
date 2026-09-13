@@ -14,8 +14,8 @@ use limit_engine::journal::{
 use limit_engine::{LimitEngineError, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 use market_types::AtomicAmount;
 use storage::{
-    ComponentHealth, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot, OpaqueStore,
-    StorageError, StorageValidationError,
+    ClassListCursor, ComponentHealth, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot,
+    OpaqueStore, StorageError, StorageValidationError,
 };
 
 use super::{idempotency_key, limit_order};
@@ -33,7 +33,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Inner {
     objects: Vec<OpaqueObject>,
     events: Vec<OpaqueEventRecord>,
+    /// Every `put_object` call, including those rejected as conflicts. A seal
+    /// attempt is visible here even when the CAS discards it.
+    put_attempts: Vec<OpaqueObject>,
+    /// Every `append_event` call, including conflicting ones.
+    event_attempts: Vec<OpaqueEventRecord>,
     put_conflicts: u32,
+    /// When set, `get_object` yields once after reading, forcing a racing
+    /// writer to interleave between read and write.
+    yield_reads: bool,
 }
 
 /// Minimal in-memory [`OpaqueStore`] with CAS semantics and injectable
@@ -62,6 +70,53 @@ impl InMemoryOpaqueStore {
     /// Every stored event record, in insertion order.
     pub fn events(&self) -> Vec<OpaqueEventRecord> {
         lock(&self.inner).events.clone()
+    }
+
+    /// Every `put_object` attempt, including CAS-rejected ones.
+    pub fn put_attempts(&self) -> Vec<OpaqueObject> {
+        lock(&self.inner).put_attempts.clone()
+    }
+
+    /// Every `append_event` attempt, including conflicted ones.
+    pub fn event_attempts(&self) -> Vec<OpaqueEventRecord> {
+        lock(&self.inner).event_attempts.clone()
+    }
+
+    /// Makes `get_object` yield once after reading, so a racing writer can
+    /// interleave between the read and the subsequent write.
+    pub fn enable_read_yield(&self) {
+        lock(&self.inner).yield_reads = true;
+    }
+
+    /// The newest version of each object in `class`, ordered by the
+    /// deterministic class listing order.
+    fn newest_by_class(&self, class_blind_index: &[u8]) -> Result<Vec<OpaqueObject>, StorageError> {
+        if class_blind_index.is_empty() {
+            return Err(StorageError::Invalid(
+                StorageValidationError::EmptyClassIndex,
+            ));
+        }
+        let inner = lock(&self.inner);
+        let mut newest: Vec<OpaqueObject> = Vec::new();
+        for object in inner
+            .objects
+            .iter()
+            .filter(|object| object.class_blind_index == class_blind_index)
+        {
+            match newest.iter_mut().find(|stored| stored.id == object.id) {
+                Some(stored) if object.version > stored.version => *stored = object.clone(),
+                Some(_) => {}
+                None => newest.push(object.clone()),
+            }
+        }
+        newest.sort_by(|left, right| {
+            right
+                .created_bucket
+                .get()
+                .cmp(&left.created_bucket.get())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(newest)
     }
 
     /// The newest version of `id`, if present.
@@ -96,6 +151,7 @@ impl OpaqueStore for InMemoryOpaqueStore {
     async fn put_object(&self, object: OpaqueObject) -> Result<(), StorageError> {
         object.validate()?;
         let mut inner = lock(&self.inner);
+        inner.put_attempts.push(object.clone());
         if inner.put_conflicts > 0 {
             inner.put_conflicts -= 1;
             return Err(StorageError::Conflict);
@@ -120,12 +176,22 @@ impl OpaqueStore for InMemoryOpaqueStore {
         if id.trim().is_empty() {
             return Err(StorageError::Invalid(StorageValidationError::EmptyId));
         }
-        Ok(lock(&self.inner)
-            .objects
-            .iter()
-            .filter(|object| object.id == id)
-            .max_by_key(|object| object.version)
-            .cloned())
+        let (found, yield_reads) = {
+            let inner = lock(&self.inner);
+            (
+                inner
+                    .objects
+                    .iter()
+                    .filter(|object| object.id == id)
+                    .max_by_key(|object| object.version)
+                    .cloned(),
+                inner.yield_reads,
+            )
+        };
+        if yield_reads {
+            tokio::task::yield_now().await;
+        }
+        Ok(found)
     }
 
     async fn list_objects_by_class(
@@ -133,34 +199,32 @@ impl OpaqueStore for InMemoryOpaqueStore {
         class_blind_index: &[u8],
         limit: usize,
     ) -> Result<Vec<OpaqueObject>, StorageError> {
-        if class_blind_index.is_empty() {
-            return Err(StorageError::Invalid(
-                StorageValidationError::EmptyClassIndex,
-            ));
-        }
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let inner = lock(&self.inner);
-        let mut newest: Vec<OpaqueObject> = Vec::new();
-        for object in inner
-            .objects
-            .iter()
-            .filter(|object| object.class_blind_index == class_blind_index)
-        {
-            match newest.iter_mut().find(|stored| stored.id == object.id) {
-                Some(stored) if object.version > stored.version => *stored = object.clone(),
-                Some(_) => {}
-                None => newest.push(object.clone()),
-            }
+        let mut newest = self.newest_by_class(class_blind_index)?;
+        newest.truncate(limit);
+        Ok(newest)
+    }
+
+    async fn list_objects_by_class_page(
+        &self,
+        class_blind_index: &[u8],
+        cursor: Option<&ClassListCursor>,
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-        newest.sort_by(|left, right| {
-            right
-                .created_bucket
-                .get()
-                .cmp(&left.created_bucket.get())
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        let mut newest = self.newest_by_class(class_blind_index)?;
+        if let Some(cursor) = cursor {
+            let cursor_bucket = cursor.created_bucket.get();
+            newest.retain(|object| {
+                let bucket = object.created_bucket.get();
+                bucket < cursor_bucket
+                    || (bucket == cursor_bucket && object.id.as_str() > cursor.id.as_str())
+            });
+        }
         newest.truncate(limit);
         Ok(newest)
     }
@@ -168,6 +232,7 @@ impl OpaqueStore for InMemoryOpaqueStore {
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError> {
         event.validate()?;
         let mut inner = lock(&self.inner);
+        inner.event_attempts.push(event.clone());
         let expected = inner
             .events
             .iter()

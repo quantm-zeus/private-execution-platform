@@ -77,6 +77,19 @@ impl OpaqueObject {
     }
 }
 
+/// Cursor into the deterministic class listing order.
+///
+/// The listing order is `created_bucket` descending, then `id` ascending. A
+/// cursor names the last element of a page; a page request continues strictly
+/// after that element, so pages never overlap and never skip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassListCursor {
+    /// Bucket of the last object already returned.
+    pub created_bucket: CreatedBucket,
+    /// Id of the last object already returned, used to break bucket ties.
+    pub id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpaqueEventRecord {
     pub stream_blind_index: Vec<u8>,
@@ -285,6 +298,31 @@ pub trait OpaqueStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<OpaqueObject>, StorageError> {
         let _ = (class_blind_index, limit);
+        Err(StorageError::Unavailable)
+    }
+    /// Lists the newest version of each object whose `class_blind_index` equals
+    /// `class_blind_index`, continuing strictly after `cursor` in the same
+    /// deterministic order as [`OpaqueStore::list_objects_by_class`]
+    /// (`created_bucket` descending, then `id` ascending), at most `limit`
+    /// objects.
+    ///
+    /// `cursor == None` starts at the newest object. A page shorter than
+    /// `limit` means the class was exhausted. `limit == 0` yields an empty
+    /// result without touching the backend. Implementations must fail closed
+    /// rather than returning foreign rows, replaying an already-returned page,
+    /// or returning a silently wrong subset.
+    ///
+    /// The default body fails closed. It exists so that stores which cannot
+    /// page a class listing (for example, the encryption-agnostic in-memory
+    /// fakes used by other crates) keep compiling without pretending to serve
+    /// a listing they cannot produce.
+    async fn list_objects_by_class_page(
+        &self,
+        class_blind_index: &[u8],
+        cursor: Option<&ClassListCursor>,
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
+        let _ = (class_blind_index, cursor, limit);
         Err(StorageError::Unavailable)
     }
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError>;
@@ -602,6 +640,26 @@ mod tests {
     async fn default_class_listing_fails_closed() {
         assert_eq!(
             DefaultListStore.list_objects_by_class(&[1, 2, 3], 10).await,
+            Err(StorageError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_class_paging_fails_closed() {
+        let cursor = ClassListCursor {
+            created_bucket: CreatedBucket::new(0).unwrap(),
+            id: "o1".to_string(),
+        };
+        assert_eq!(
+            DefaultListStore
+                .list_objects_by_class_page(&[1, 2, 3], None, 10)
+                .await,
+            Err(StorageError::Unavailable)
+        );
+        assert_eq!(
+            DefaultListStore
+                .list_objects_by_class_page(&[1, 2, 3], Some(&cursor), 10)
+                .await,
             Err(StorageError::Unavailable)
         );
     }

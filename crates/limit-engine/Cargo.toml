@@ -23,6 +23,7 @@ sha2 = "0.11"
 storage.workspace = true
 tax-engine.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
