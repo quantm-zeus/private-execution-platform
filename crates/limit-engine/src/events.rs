@@ -18,6 +18,15 @@
 //!
 //! Nothing in this module signs, reads a clock, or performs I/O; the store
 //! method owns the reads and the injected [`storage::EventBus`] owns delivery.
+//!
+//! # Residual (LOW-2): publication-failure observability
+//!
+//! Publication is best-effort and silent: neither `tick` nor `recover` reports
+//! how many envelopes a bus rejected, so a persistently failing bus is only
+//! observable through the lagging `published_seq` watermark and the eventual
+//! republish. This is accepted for P54 rather than widening [`crate::TickOutcome`]
+//! with transport concerns; a future delivery report can surface the count
+//! without changing the state machine.
 
 use domain::OrderStatus;
 use storage::{EventSubject, InternalEventEnvelope};
@@ -75,12 +84,20 @@ pub fn order_event_id(
 }
 
 /// A sealed, ready-to-publish envelope plus its transition sequence.
+///
+/// The envelope's [`InternalEventEnvelope::occurred_at_ms`] is the **coarse
+/// one-day bucket ordinal** the event was sealed under (the record's
+/// `created_bucket`), *not* epoch milliseconds. The exact transition instant
+/// stays inside the ciphertext so the outer envelope never reveals precise
+/// wall-clock time; changing this value would change the privacy contract and
+/// the oracle assertions in `tests/order_events.rs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingOrderEvent {
     /// Transition sequence this envelope corresponds to; strictly greater than
     /// the watermark that produced it.
     pub transition_seq: u64,
     /// The envelope to hand to the [`storage::EventBus`]. Its `payload` is the
-    /// raw sealed [`crate::journal::OrderTransitionEvent`] ciphertext.
+    /// raw sealed [`crate::journal::OrderTransitionEvent`] ciphertext, and its
+    /// `occurred_at_ms` is the coarse bucket ordinal described above.
     pub envelope: InternalEventEnvelope,
 }

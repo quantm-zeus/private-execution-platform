@@ -679,8 +679,10 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     /// live tick and a restart cannot drift.
     ///
     /// When an event bus is injected, every open order's durable pending events
-    /// are published best-effort after all recovery writes complete. A
-    /// publication failure never fails or rolls back recovery.
+    /// are published best-effort after all recovery writes complete, and the
+    /// whole order class is drained once more so a terminal order whose final
+    /// event never published is retried too. A publication failure never fails
+    /// or rolls back recovery.
     pub async fn recover(&self, now_ms: i64) -> Result<RecoveryReport, LimitEngineError> {
         let outcome = self.store.recover().await?;
         let mut report = RecoveryReport {
@@ -716,6 +718,19 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
         // reconciliation. A failure is retried by the next recover/tick.
         for order in &outcome.open {
             self.publish_best_effort(&order.order.id).await;
+        }
+
+        // Terminal orders are absent from `outcome.open`, so a terminal order
+        // whose final `Filled`/`FailedFinal` event failed to publish would be
+        // unreachable on restart. Drain the whole class once, terminal orders
+        // included. This is still best-effort: a bus failure is swallowed and a
+        // per-order record fault is skipped, so it can never fail or roll back
+        // the recovery above (OE-2).
+        if let Some(bus) = &self.bus {
+            let _ = self
+                .store
+                .drain_all_pending(bus.as_ref(), DEFAULT_PUBLISH_BATCH)
+                .await;
         }
         Ok(report)
     }

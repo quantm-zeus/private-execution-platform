@@ -250,7 +250,7 @@ async fn legacy_record_without_published_seq_decodes_as_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// Deliverable B — pending_events / publish_pending / mark_published.
+// Deliverable B — pending_events / publish_pending.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -517,15 +517,33 @@ async fn replay_from_after_publication_returns_the_current_head() {
 }
 
 #[tokio::test]
-async fn mark_published_rejects_a_watermark_past_the_materialized_head() {
-    let (_, _, order_id, store) = seeded_store("p54-guard").await;
-    let record = load(&store, &order_id).await;
+async fn publish_pending_never_advances_past_the_materialized_head() {
+    let (backend, keys, order_id, store) = seeded_store("p54-guard").await;
+    let object_id_hex = object_id(&keys.blind_key(), &ChainId::Base, &order_id).expect("object id");
+    // Three durable events land in the stream, but the object is rewound to
+    // materialize only the first (object version 2 -> seq 1).
+    drive(&store, &order_id, OrderStatus::Active, NOW).await;
+    drive(&store, &order_id, OrderStatus::TriggerCandidate, NOW + 1).await;
+    drive(&store, &order_id, OrderStatus::Quoting, NOW + 2).await;
+    backend.truncate_object_versions(&object_id_hex, 2);
+    assert_eq!(load(&store, &order_id).await.last_transition_seq, 1);
+
+    // The watermark lives on the materialized object, so the pump may advance
+    // only to that head (1), never to the stream head (3). The private
+    // `mark_published` guard is therefore reached only through this capped path.
+    let bus = RecordingBus::new();
+    assert_eq!(store.publish_pending(&order_id, &bus, 32).await.unwrap(), 1);
+    assert_eq!(bus.envelopes().len(), 1);
     assert_eq!(
-        store.mark_published(&order_id, record.version, 1).await,
-        Err(LimitEngineError::StoreInvalid)
+        bus.envelopes()[0].subject,
+        event_subject(OrderStatus::Active)
     );
-    // The object is still readable and unchanged.
-    assert_eq!(load(&store, &order_id).await, record);
+    assert_eq!(load(&store, &order_id).await.published_seq, 1);
+
+    // The two unrepaired stream events stay unpublished until recovery repairs
+    // the lagging object; no later pump can jump the head.
+    assert_eq!(store.publish_pending(&order_id, &bus, 32).await.unwrap(), 0);
+    assert_eq!(load(&store, &order_id).await.published_seq, 1);
 }
 
 #[tokio::test]
@@ -969,6 +987,124 @@ async fn recover_republishes_pending_events() {
             .published_seq,
         1
     );
+}
+
+#[tokio::test]
+async fn recover_drains_a_terminal_orders_unpublished_final_event() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = Arc::new(TestOrderKeys::deterministic(7));
+    let order_id = create_order(&backend, &keys, "p54-terminal-drain", OrderStatus::Active).await;
+    let store = durable_store(&backend, &keys);
+
+    // The bus rejects the final `Filled` event (0-based publish ordinal 4), so
+    // the tick reaches `Filled` durably but leaves that envelope unpublished.
+    let bus = Arc::new(RecordingBus::new());
+    bus.fail_attempt(4);
+    let orchestrator = Orchestrator::new(
+        durable_store(&backend, &keys),
+        ConstantProvider,
+        FakeExecutor::new(vec![realized(1000, 240)]),
+        policy(true),
+        AttemptLimits {
+            max_attempts_per_order: 4,
+        },
+    )
+    .with_event_bus(Some(bus.clone()));
+
+    let trust = trust(NOW);
+    let outcome = orchestrator
+        .tick(TickInput {
+            order_id: &order_id,
+            signal: true,
+            source: TradeSource::Web,
+            trust: &trust,
+            now_ms: NOW,
+        })
+        .await
+        .expect("tick");
+    assert!(
+        matches!(outcome, TickOutcome::Filled { attempt_seq: 1, .. }),
+        "got {outcome:?}"
+    );
+
+    // Four of five envelopes published; the final `Filled` is owed.
+    assert_eq!(bus.envelopes().len(), 4);
+    assert_eq!(bus.attempts(), 5);
+    assert_eq!(
+        transition_records(&backend, &transition_stream(&keys, &order_id)).len(),
+        5
+    );
+    let before_recover = load(&store, &order_id).await;
+    assert_eq!(before_recover.order.status, OrderStatus::Filled);
+    assert_eq!(before_recover.published_seq, 4);
+
+    // `recover` finds no open order (the order is terminal), yet its whole-class
+    // drain must still publish the owed terminal event and return Ok.
+    let report = orchestrator.recover(NOW).await.expect("recover");
+    assert_eq!(report.open, 0);
+    let envelopes = bus.envelopes();
+    assert_eq!(envelopes.len(), 5, "terminal event published by recovery");
+    assert_eq!(envelopes[4].subject, event_subject(OrderStatus::Filled));
+
+    let after = load(&store, &order_id).await;
+    assert_eq!(after.published_seq, 5);
+    assert_eq!(after.order.status, OrderStatus::Filled);
+    // Recovery advanced only the out-of-band watermark; order state is intact.
+    assert!(same_order_state(&after, &before_recover));
+}
+
+#[tokio::test]
+async fn drain_all_pending_skips_a_corrupt_order_and_drains_a_healthy_one() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = Arc::new(TestOrderKeys::deterministic(11));
+    let store = durable_store(&backend, &keys);
+
+    let mut healthy = durable_order(
+        &keys,
+        "p54-drain-healthy",
+        OrderStatus::Created,
+        1000,
+        1000,
+        0,
+    );
+    healthy.order.expires_at_ms = LATE_EXPIRY_MS;
+    let healthy_id = healthy.order.id.clone();
+    store.create(healthy).await.expect("create healthy");
+    drive(&store, &healthy_id, OrderStatus::Active, NOW).await;
+
+    let mut corrupt = durable_order(
+        &keys,
+        "p54-drain-corrupt",
+        OrderStatus::Created,
+        1000,
+        1000,
+        0,
+    );
+    corrupt.order.expires_at_ms = LATE_EXPIRY_MS;
+    let corrupt_id = corrupt.order.id.clone();
+    store.create(corrupt).await.expect("create corrupt");
+    drive(&store, &corrupt_id, OrderStatus::Active, NOW).await;
+
+    // Corrupt only the second order's sealed event: its record still
+    // enumerates, but its stream can no longer be authenticated.
+    let corrupt_stream = transition_stream(&keys, &corrupt_id);
+    assert!(backend.tamper_event(&corrupt_stream, 1));
+
+    let bus = RecordingBus::new();
+    let published = store
+        .drain_all_pending(&bus, 32)
+        .await
+        .expect("best-effort drain");
+    assert_eq!(published, 1, "only the healthy order publishes");
+    assert_eq!(bus.envelopes().len(), 1);
+    assert_eq!(
+        bus.envelopes()[0].subject,
+        event_subject(OrderStatus::Active)
+    );
+
+    // The corrupt order was skipped without aborting the pass.
+    assert_eq!(load(&store, &healthy_id).await.published_seq, 1);
+    assert_eq!(load(&store, &corrupt_id).await.published_seq, 0);
 }
 
 #[tokio::test]

@@ -968,6 +968,66 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         recover_in_flight(self.store.as_ref(), self.keys.as_ref()).await
     }
 
+    /// Publishes every durable order's pending outbox events, terminal orders
+    /// included.
+    ///
+    /// Per-open-order recovery cannot reach a terminal order whose final
+    /// `Filled`/`FailedFinal` event failed to publish, because
+    /// [`DurableLimitOrderStore::recover`] only returns non-terminal orders.
+    /// This bounded pass enumerates the whole order class and drains each
+    /// order's outbox, so a terminal order's owed event is retried on restart.
+    ///
+    /// The pass is best-effort and read-mostly: a per-order fault (a malformed
+    /// record or a gapped/tampered event stream) skips that order and continues,
+    /// and a bus error stops only that order's batch (it is contained by
+    /// [`DurableLimitOrderStore::publish_pending`]). An environmental fault (an
+    /// unavailable store or key provider) still fails the whole pass closed,
+    /// because skipping one order cannot fix it. Publication always follows the
+    /// durable repair/append performed earlier in the same pass (OE-1), and no
+    /// failure here can roll back order state (OE-2).
+    ///
+    /// Enumeration stops at [`RECOVERY_MAX_OBJECTS`]; reaching the cap drains
+    /// what was enumerated and returns [`LimitEngineError::RecoveryFailed`], so
+    /// the caller can tell that older orders were not examined. Returns the
+    /// total number of envelopes the bus accepted otherwise.
+    pub async fn drain_all_pending(
+        &self,
+        bus: &dyn EventBus,
+        max_per_order: usize,
+    ) -> Result<u32, LimitEngineError> {
+        let material = self.keys.current()?;
+        let class = class_blind_index(&material.blind_index)?;
+        let (objects, truncated) = enumerate_class(self.store.as_ref(), &class).await?;
+        let mut published: u32 = 0;
+        for object in objects {
+            // A foreign-class object is a per-order fault: skip it rather than
+            // abort every healthy order's drain.
+            if object.class_blind_index.as_slice() != class.as_slice() {
+                continue;
+            }
+            let record = match open_record(self.keys.as_ref(), &object) {
+                Ok(record) => record,
+                Err(reason) if is_per_order_fault(reason) => continue,
+                Err(error) => return Err(error),
+            };
+            match self
+                .publish_pending(&record.current.order.id, bus, max_per_order)
+                .await
+            {
+                Ok(count) => published = published.saturating_add(count),
+                // A malformed/gapped stream for one order is skipped; a bus
+                // error already stopped only that order's batch inside
+                // `publish_pending` and is not an error here.
+                Err(reason) if is_per_order_fault(reason) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if truncated {
+            return Err(LimitEngineError::RecoveryFailed);
+        }
+        Ok(published)
+    }
+
     async fn read_record(
         &self,
         object_id: &str,
@@ -1083,7 +1143,12 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
     /// sealing path by the process seal lock and retried a bounded number of
     /// times on CAS conflict. A watermark already at or past the request is an
     /// idempotent no-op.
-    pub async fn mark_published(
+    ///
+    /// Crate-private on purpose: the outbox watermark must only ever advance
+    /// from [`DurableLimitOrderStore::publish_pending`], which caps the target
+    /// at the events the bus actually accepted. Exposing it would let a caller
+    /// assert a sequence the stream never delivered.
+    pub(crate) async fn mark_published(
         &self,
         order_id: &OrderId,
         expected_version: u64,
@@ -1214,6 +1279,9 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
                     event_id: order_event_id(&material.blind_index, &stream, record.sequence)?,
                     subject: event_subject(opened.order.order.status),
                     schema_version: DEFAULT_SCHEMA_VERSION,
+                    // Coarse one-day bucket *ordinal*, not epoch ms: the exact
+                    // transition instant stays inside the sealed ciphertext
+                    // (privacy design; see `events::PendingOrderEvent`).
                     occurred_at_ms: record.created_bucket.get(),
                     payload: record.ciphertext,
                 },
