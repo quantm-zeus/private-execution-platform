@@ -290,7 +290,9 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     /// Every policy-bearing field comes from [`TradingBackendConfig`]; the
     /// command contributes only the asset pair, side, and explicit input amount.
     /// A requested slippage/impact cap tighter than the wallet's hard cap is
-    /// honored; a request to *exceed* the hard cap fails closed.
+    /// honored; a requested `0` (the router's unbounded-impact sentinel,
+    /// ambiguous for slippage) and any request *above* the hard cap both fail
+    /// closed with [`BackendError::Denied`].
     #[allow(clippy::too_many_arguments)]
     fn preview_intent(
         &self,
@@ -770,13 +772,18 @@ fn partial_fill_floor(
 
 /// Resolves a requested slippage/impact cap against the wallet hard cap.
 ///
-/// A tighter request is honored; a request to exceed the hard cap fails closed
-/// with [`BackendError::Denied`]. The trusted cap is used when no request is
-/// made.
+/// A request of `0` fails closed: the router treats `max_price_impact == 0` as
+/// "no cap / unbounded", and `0` is ambiguous for slippage, so forwarding it
+/// would silently disable the wallet's trusted cap. A request above the hard
+/// cap also fails closed with [`BackendError::Denied`]. The trusted cap is used
+/// when no request is made; otherwise a tighter request in `1..=trusted` is
+/// honored.
 fn effective_cap(trusted: Bps, requested: Option<u16>) -> Result<Bps, BackendError> {
     match requested {
         None => Ok(trusted),
-        Some(value) if value <= trusted.get() => Bps::new(value).map_err(|_| BackendError::Denied),
+        Some(value) if value > 0 && value <= trusted.get() => {
+            Bps::new(value).map_err(|_| BackendError::Denied)
+        }
         Some(_) => Err(BackendError::Denied),
     }
 }

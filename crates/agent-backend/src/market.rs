@@ -118,6 +118,12 @@ pub enum MarketPreviewError {
 /// `quote` is the locked, contract-validated route and full-wallet-debit net
 /// delta; `score` is the gas-aware score of the selected candidate; `truncated`
 /// records whether bounded enumeration clipped the candidate set.
+///
+/// `max_slippage` is carried into the constructed [`TradeIntent`]'s
+/// `risk` for the downstream pre-sign revalidation gate
+/// (`execution_preview::revalidate_pre_sign`), but the router itself does not
+/// filter candidates on slippage: the preview reflects the exact route
+/// economics rather than a slippage-filtered result.
 #[derive(Clone, Serialize)]
 pub struct MarketPreview {
     /// Selected route, per-hop exact economics, and normalized net delta.
@@ -166,19 +172,14 @@ pub fn plan_market_preview(
         gas_price_in_output: snapshot.gas_price_in_output,
     };
     let decision = plan_single_path(&request).map_err(classify)?;
-    let score = decision
-        .candidates
-        .first()
-        .map(|candidate| candidate.score.clone())
-        .ok_or(MarketPreviewError::NoViableRoute)?;
-    match decision.selected {
-        Some(quote) => Ok(MarketPreview {
-            quote,
-            score,
-            truncated: decision.truncated,
-        }),
-        None => Err(MarketPreviewError::NoViableRoute),
-    }
+    let Some(best) = decision.candidates.first() else {
+        return Err(MarketPreviewError::NoViableRoute);
+    };
+    Ok(MarketPreview {
+        quote: best.quote.clone(),
+        score: best.score.clone(),
+        truncated: decision.truncated,
+    })
 }
 
 /// Collapses the router taxonomy into the two redacted preview classes.
@@ -200,11 +201,7 @@ fn classify(error: RoutingError) -> MarketPreviewError {
         | StaleState
         | StalePoolState
         | ResyncRequired
-        | EmptyPoolSet
-        | UnsupportedPoolKind
-        | UnsupportedBinTaxComposition
-        | PoolChainMismatch
-        | PoolStateInvalid => MarketPreviewError::NoViableRoute,
+        | EmptyPoolSet => MarketPreviewError::NoViableRoute,
         _ => MarketPreviewError::Unavailable,
     }
 }

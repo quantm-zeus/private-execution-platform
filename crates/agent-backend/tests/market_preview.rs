@@ -104,6 +104,32 @@ fn pool() -> PoolDescriptor {
     }
 }
 
+/// A thin CPMM pool where the pinned preview amount has a ~4992 bps impact,
+/// well above the trusted 300 bps impact cap. Kept separate from [`pool`] so
+/// the pinned-economics tests keep their exact reference state.
+fn high_impact_pool() -> PoolDescriptor {
+    PoolDescriptor {
+        envelope: PoolStateEnvelope {
+            pool_id: PoolId::new(ChainId::Base, "pool-2").expect("pool id"),
+            sequence: Sequence(1),
+            observed_at_ms: NOW,
+            state: PoolKindState::Cpmm(CpmmPoolState {
+                token_0: usdc(),
+                token_1: token(),
+                decimals_0: 6,
+                decimals_1: 18,
+                reserve_0: AtomicAmount::new(1_000_000_000),
+                reserve_1: AtomicAmount::new(10_000_000_000_000),
+                total_lp_supply: None,
+                fee_bps: Bps::new(30).expect("fee"),
+            }),
+        },
+        venue: VenueLabel::new("uniswap").expect("venue"),
+        leg_pool_ref: PoolRefLabel::new("pool-2").expect("pool ref"),
+        impact_override_bps: None,
+    }
+}
+
 fn assessment(asset: AssetId, buy_tax: u16, sell_tax: u16) -> TaxAssessment {
     TaxAssessment::new(
         asset,
@@ -425,6 +451,11 @@ async fn preview_enforces_trusted_caps() {
         run(&backend, capped(200, 301)).await,
         BackendOutcome::Denied
     );
+    // A requested zero is the router's unbounded-impact sentinel (and is
+    // ambiguous for slippage), so it fails closed for both caps.
+    assert_eq!(run(&backend, capped(0, 300)).await, BackendOutcome::Denied);
+    assert_eq!(run(&backend, capped(200, 0)).await, BackendOutcome::Denied);
+    assert_eq!(run(&backend, capped(0, 0)).await, BackendOutcome::Denied);
     // Exactly at and below the cap: honored.
     assert!(matches!(
         run(&backend, capped(200, 300)).await,
@@ -440,6 +471,43 @@ async fn preview_enforces_trusted_caps() {
     assert_eq!(seen[0].risk.max_price_impact, Bps::new(300).expect("bps"));
     assert_eq!(seen[1].risk.max_slippage, Bps::new(100).expect("bps"));
     assert_eq!(seen[1].risk.max_price_impact, Bps::new(50).expect("bps"));
+}
+
+#[tokio::test]
+async fn preview_zero_impact_cap_cannot_disable_the_trusted_cap() {
+    // A high-impact route (~4992 bps) against the trusted 300 bps impact cap.
+    let mut source = StaticSnapshot::new(assessment(token(), 0, 0));
+    source.descriptors = vec![high_impact_pool()];
+    let backend = backend_with(Arc::new(source));
+    let capped = |slippage: Option<u16>, impact: Option<u16>| TradeCommand::PreviewMarketOrder {
+        token_in: AssetRef::new(ChainId::Base, "USDC").expect("in"),
+        token_out: AssetRef::new(ChainId::Base, "TOKEN").expect("out"),
+        side: TradeSide::Buy,
+        amount: AmountSpec::TokenAtomic(AMOUNT),
+        max_slippage_bps: slippage,
+        max_price_impact_bps: impact,
+    };
+
+    // The trusted cap alone rejects the route.
+    assert_eq!(
+        run(&backend, capped(None, None)).await,
+        BackendOutcome::Denied
+    );
+    // An explicit cap at the trusted limit still rejects the route...
+    assert_eq!(
+        run(&backend, capped(None, Some(300))).await,
+        BackendOutcome::Denied
+    );
+    // ...and a zero request must not be forwarded as "unbounded".
+    assert_eq!(
+        run(&backend, capped(None, Some(0))).await,
+        BackendOutcome::Denied
+    );
+    // A zero slippage request is likewise rejected before any routing.
+    assert_eq!(
+        run(&backend, capped(Some(0), None)).await,
+        BackendOutcome::Denied
+    );
 }
 
 #[tokio::test]
