@@ -4,6 +4,7 @@
 //! [`market_types::CpmmPoolState`] without floating-point arithmetic, wall-clock time,
 //! external dependencies, or side-effects.
 
+pub mod bin;
 pub mod buy_tax;
 pub mod clmm;
 pub mod clmm_buy_tax;
@@ -14,6 +15,9 @@ pub mod error;
 pub mod roundtrip_tax;
 pub mod sell_tax;
 
+pub use bin::{
+    simulate_bin_exact_input, BinExactInputRequest, BinSimulationQuote, MAX_BIN_CROSSES,
+};
 pub use buy_tax::{
     simulate_cpmm_exact_input_buy_tax, simulate_tax_aware_cpmm_buy,
     simulate_tax_aware_cpmm_buy_directed, simulate_tax_aware_cpmm_buy_exact_input,
@@ -34,8 +38,9 @@ pub use cpmm::{
     CpmmSimulationKernel, CpmmSimulationQuote,
 };
 pub use error::{
-    ClmmSimulationError, CpmmErrorClass, CpmmSimulationErrorClass, SimulationError,
-    TaxAwareClmmSimulationError, TaxAwareCpmmBuyError, TaxAwareCpmmError, TaxAwareSimulationError,
+    BinSimulationError, ClmmSimulationError, CpmmErrorClass, CpmmSimulationErrorClass,
+    SimulationError, TaxAwareClmmSimulationError, TaxAwareCpmmBuyError, TaxAwareCpmmError,
+    TaxAwareSimulationError,
 };
 pub use roundtrip_tax::{
     simulate_tax_aware_cpmm_roundtrip_exact_input, TaxAwareCpmmRoundtripQuote,

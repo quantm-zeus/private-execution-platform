@@ -252,6 +252,90 @@ impl From<MarketTypeError> for ClmmSimulationError {
     }
 }
 
+/// Redacted structural error definitions for Bin/DLMM (Liquidity Book) simulation.
+///
+/// Contains no value-bearing payloads, amounts, asset identifiers, bin ids, prices,
+/// reserves, endpoints, payloads, credentials, or secrets in either
+/// [`Display`](std::fmt::Display) or [`Debug`](std::fmt::Debug).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error, Serialize, Deserialize)]
+pub enum BinSimulationError {
+    /// The supplied pool state failed its own contract validation.
+    #[error("pool state validation failed")]
+    InvalidPoolState,
+
+    /// Swap input amount is zero.
+    #[error("swap input amount must be greater than zero")]
+    ZeroInputAmount,
+
+    /// Pool fee basis points is invalid.
+    #[error("pool fee is invalid")]
+    InvalidFee,
+
+    /// Pool bin step is invalid.
+    #[error("pool bin step is invalid")]
+    InvalidBinStep,
+
+    /// Pool bin range is invalid or the active bin is not represented.
+    #[error("pool range is invalid")]
+    InvalidRange,
+
+    /// Traversal exhausted represented bins or exceeded the bin-crossing budget.
+    #[error("bin crossing limit exceeded")]
+    BinCrossingExceeded,
+
+    /// Requested input asset was not found in the pool or direction is invalid.
+    #[error("asset direction is invalid")]
+    InvalidAssetDirection,
+
+    /// Caller-asserted output asset does not match the expected counter-token.
+    #[error("output asset mismatch")]
+    OutputAssetMismatch,
+
+    /// Input asset chain does not match the pool chain.
+    #[error("chain mismatch: asset chain does not match pool chain")]
+    ChainMismatch,
+
+    /// Effective post-fee input amount was reduced to zero.
+    #[error("effective input amount after fee is zero")]
+    ZeroEffectiveInput,
+
+    /// Simulated output amount is zero.
+    #[error("simulated output amount is zero")]
+    ZeroOutputAmount,
+
+    /// Checked integer arithmetic overflowed during simulation.
+    #[error("arithmetic overflow during simulation calculation")]
+    ArithmeticOverflow,
+
+    /// Bin traversal invariant was violated.
+    #[error("invariant violated")]
+    InvariantViolated,
+
+    /// State is stale, resync is required, or state is unavailable.
+    #[error("state is stale or unavailable")]
+    StaleOrUnavailableState,
+}
+
+impl From<MarketTypeError> for BinSimulationError {
+    fn from(err: MarketTypeError) -> Self {
+        match err {
+            MarketTypeError::ChainMismatch => Self::ChainMismatch,
+            MarketTypeError::InvalidBinStep(_) | MarketTypeError::BinOutOfRange { .. } => {
+                Self::InvalidBinStep
+            }
+            MarketTypeError::BinsExceeded { .. }
+            | MarketTypeError::UnsortedBins
+            | MarketTypeError::DuplicateBin(_)
+            | MarketTypeError::EmptyBin(_)
+            | MarketTypeError::BinReserveSideViolation { .. } => Self::InvalidRange,
+            MarketTypeError::ResyncRequired { .. } | MarketTypeError::StaleSequence { .. } => {
+                Self::StaleOrUnavailableState
+            }
+            _ => Self::InvalidPoolState,
+        }
+    }
+}
+
 /// Redacted error produced during tax-aware CLMM simulation composition.
 ///
 /// Combines underlying CLMM simulation failures (as redacted structural classes)
