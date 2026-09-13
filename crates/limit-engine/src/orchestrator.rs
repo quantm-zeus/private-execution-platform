@@ -288,20 +288,26 @@ fn record_applied(applied: AppliedResolution, report: &mut RecoveryReport) {
     }
 }
 
-/// Sum of the net input of every `Confirmed` event carrying a sealed fill.
+/// Sum of the net input of every `Confirmed` event's sealed fill.
 ///
 /// `filled_input` equals the sum of every confirmed fill already applied to the
 /// order, so this total tells recovery whether the `Confirmed` event at the head
-/// of the stream is already reflected in the ledger. `None` signals
-/// checked-arithmetic overflow, which recovery treats as an unrecoverable
-/// record.
+/// of the stream is already reflected in the ledger. `None` signals an
+/// unrecoverable record: checked-arithmetic overflow, or *any* `Confirmed` event
+/// without a sealed fill. A legacy P51 `Confirmed` (written before the fill was
+/// persisted) makes the applied total unknowable, so recovery must fail closed
+/// rather than under-count and mistake an outstanding head fill for one that was
+/// already applied.
 fn confirmed_input_total(events: &[OrderAttemptEvent]) -> Option<u128> {
-    events.iter().try_fold(0u128, |total, event| {
-        match (&event.realized_fill, event.phase) {
-            (Some(fill), AttemptPhase::Confirmed) => total.checked_add(fill.net_input.get()),
+    events
+        .iter()
+        .try_fold(0u128, |total, event| match event.phase {
+            AttemptPhase::Confirmed => {
+                let fill = event.realized_fill.as_ref()?;
+                total.checked_add(fill.net_input.get())
+            }
             _ => Some(total),
-        }
-    })
+        })
 }
 
 /// Deterministic limit-order orchestrator over the durable store.
@@ -640,9 +646,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     ) -> Result<(), LimitEngineError> {
         // P51 crash window: `Executing` persisted with no attempt event. No
         // executor call ever ran, so this is a definitive pre-send failure: close
-        // it retryable / final / expired. No attempt event exists to append.
+        // it retryable / final / expired. Zero attempts were reserved (the crash
+        // predates the first `Bound`), so this window does not consume the
+        // attempt budget. No attempt event exists to append.
         let Some(latest) = events.last() else {
-            return self.close_without_attempt(order, 1, now_ms, report).await;
+            return self.close_without_attempt(order, 0, now_ms, report).await;
         };
 
         // Every later-phase event continues a `Bound` attempt that must still be
@@ -710,12 +718,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 };
                 let applied_input = order.filled_input.get();
                 if applied_input >= confirmed_total {
-                    let next_attempt = latest
-                        .attempt_seq
-                        .checked_add(1)
-                        .ok_or(LimitEngineError::ArithmeticOverflow)?;
+                    // The stale head belongs to a prior *reserved* attempt; the
+                    // crashed window reserved nothing, so the number of attempts
+                    // already reserved is `latest.attempt_seq` (not `+ 1`).
                     return self
-                        .close_without_attempt(order, next_attempt, now_ms, report)
+                        .close_without_attempt(order, latest.attempt_seq, now_ms, report)
                         .await;
                 }
                 if confirmed_total - applied_input != fill.net_input.get() {
@@ -782,9 +789,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     /// Closes an `Executing` order whose current window reserved no signable
     /// attempt (`Bound`), as a definitive pre-send failure.
     ///
-    /// `attempt_seq` is the current window's attempt number: `1` when the stream
-    /// is empty, or `latest + 1` when the head is a previous attempt's terminal
-    /// event. No attempt event is appended.
+    /// `attempt_seq` is the number of attempts already reserved: `0` when the
+    /// stream is empty (the crash predates the first `Bound`) or
+    /// `latest.attempt_seq` when the head is a previous attempt's terminal
+    /// event. The failed window reserved nothing, so it is not counted. No
+    /// attempt event is appended.
     async fn close_without_attempt(
         &self,
         order: &StoredLimitOrder,
@@ -880,6 +889,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     }
 
     /// Chooses the retryable/terminal target for a definitive pre-send failure.
+    ///
+    /// `attempt_seq` is the number of attempts already reserved: a new attempt is
+    /// allowed iff `attempt_seq < max_attempts_per_order`. The count excludes the
+    /// window that just failed, so a crashed window that never reserved a `Bound`
+    /// passes the number of prior reservations (or `0` when the stream is empty).
     ///
     /// A retryable failure in an open window becomes `FailedRetryable`; one with
     /// no attempts left is final; a retryable failure past the deadline is

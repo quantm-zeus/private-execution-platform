@@ -683,6 +683,86 @@ async fn stale_confirmed_beyond_remaining_does_not_abort_the_pass() {
 }
 
 #[tokio::test]
+async fn legacy_confirmed_without_fill_in_mixed_stream_fails_closed() {
+    // Regression (P52 review, High): a P51-era `Confirmed` without a sealed fill
+    // makes the applied total unknowable. In a mixed stream the head
+    // `Confirmed{Some}` may still be outstanding, so recovery must fail closed
+    // instead of under-counting the applied total and discarding the real fill.
+    let h = build(
+        spec(
+            "p52-legacy-mixed",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        ),
+        vec![AttemptResolution::Filled(realized(1_000, 240))],
+    )
+    .await;
+    append_bound(&h, &h.order_id, 1).await;
+    // Legacy P51 record: `Confirmed` with no sealed fill.
+    append_phase(&h, &h.order_id, 1, AttemptPhase::Confirmed).await;
+    append_bound(&h, &h.order_id, 2).await;
+    append_confirmed(&h, &h.order_id, 2, realized(1_000, 240)).await;
+
+    let report = recover(&h).await;
+
+    assert_eq!(report.fills_applied, 0, "must not guess an applied total");
+    assert_eq!(report.finalized, 1);
+    assert_eq!(report.retryable, 0);
+    assert_eq!(report.reconciled, 0);
+    assert_eq!(h.handles.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_never_executed(&h);
+
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::FailedFinal);
+    assert_eq!(stored.filled_input.get(), 1_000, "ledger is unchanged");
+    assert_eq!(stored.order.remaining_input.get(), 1_000);
+    assert!(conservation_holds(&stored));
+    assert_eq!(attempts(&h).await.len(), 4);
+}
+
+#[tokio::test]
+async fn sealed_mixed_stream_replays_only_the_outstanding_fill() {
+    // Control for the fail-closed legacy rule: when every `Confirmed` carries a
+    // sealed fill, a re-entry stream whose head fill is still outstanding must
+    // still apply exactly that one fill and no other.
+    let h = build(
+        spec(
+            "p52-sealed-mixed",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        ),
+        vec![],
+    )
+    .await;
+    append_bound(&h, &h.order_id, 1).await;
+    append_confirmed(&h, &h.order_id, 1, realized(1_000, 240)).await;
+    append_bound(&h, &h.order_id, 2).await;
+    append_confirmed(&h, &h.order_id, 2, realized(1_000, 240)).await;
+
+    let report = recover(&h).await;
+
+    assert_eq!(
+        report.fills_applied, 1,
+        "only the outstanding head fill applies"
+    );
+    assert_eq!(report.finalized, 0);
+    assert_eq!(report.retryable, 0);
+    assert_eq!(h.handles.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_never_executed(&h);
+
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::Filled);
+    assert_eq!(stored.filled_input.get(), 2_000);
+    assert_eq!(stored.order.remaining_input.get(), 0);
+    assert!(conservation_holds(&stored));
+    assert_eq!(attempts(&h).await.len(), 4);
+}
+
+#[tokio::test]
 async fn durable_signed_and_submitted_phases_reconcile() {
     // The in-flight phases that may already have reached the chain are all
     // reconciled through the same mapping, never re-signed.
@@ -818,6 +898,137 @@ async fn latest_failed_before_submit_advances_without_reconcile() {
     assert_eq!(load(&h).await.order.status, OrderStatus::FailedRetryable);
     assert_eq!(attempts(&h).await.len(), 2);
     assert_never_executed(&h);
+}
+
+#[tokio::test]
+async fn stale_failed_before_submit_uses_reserved_attempt_count() {
+    // Control pinning the stale-head convention: the `FailedBeforeSubmit` arm
+    // passes `latest.attempt_seq` (the number of attempts already reserved). With
+    // a prior attempt 1 and max=2, one reservation remains, so the order is
+    // retryable. The stale-`Confirmed` branch must agree for the same window.
+    let h = build(
+        spec(
+            "p52-stale-fbs-cap",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        )
+        .with_attempts(2),
+        vec![],
+    )
+    .await;
+    append_bound(&h, &h.order_id, 1).await;
+    append_phase(&h, &h.order_id, 1, AttemptPhase::FailedBeforeSubmit).await;
+
+    let report = recover(&h).await;
+
+    assert_eq!(report.retryable, 1);
+    assert_eq!(report.finalized, 0);
+    assert_eq!(report.reconciled, 0);
+    assert_eq!(h.handles.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(load(&h).await.order.status, OrderStatus::FailedRetryable);
+    assert_never_executed(&h);
+}
+
+#[tokio::test]
+async fn stale_confirmed_attempt_cap_counts_only_reserved_attempts() {
+    // The stale-`Confirmed` window reserved nothing, so the number of attempts
+    // already reserved is the prior attempt's `attempt_seq` (1). With max=2 one
+    // retry remains; with max=1 the budget is exhausted.
+    let retryable = build(
+        spec(
+            "p52-stale-cap-retry",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        )
+        .with_attempts(2),
+        vec![],
+    )
+    .await;
+    append_bound(&retryable, &retryable.order_id, 1).await;
+    append_confirmed(&retryable, &retryable.order_id, 1, realized(1_000, 240)).await;
+    let report = recover(&retryable).await;
+    assert_eq!(report.retryable, 1);
+    assert_eq!(report.finalized, 0);
+    assert_eq!(
+        load(&retryable).await.order.status,
+        OrderStatus::FailedRetryable
+    );
+    assert_never_executed(&retryable);
+
+    let exhausted = build(
+        spec(
+            "p52-stale-cap-final",
+            OrderStatus::Executing,
+            2_000,
+            1_000,
+            1_000,
+        )
+        .with_attempts(1),
+        vec![],
+    )
+    .await;
+    append_bound(&exhausted, &exhausted.order_id, 1).await;
+    append_confirmed(&exhausted, &exhausted.order_id, 1, realized(1_000, 240)).await;
+    let report = recover(&exhausted).await;
+    assert_eq!(report.finalized, 1);
+    assert_eq!(report.retryable, 0);
+    assert_eq!(
+        load(&exhausted).await.order.status,
+        OrderStatus::FailedFinal
+    );
+    assert_never_executed(&exhausted);
+}
+
+#[tokio::test]
+async fn empty_stream_attempt_cap_starts_at_zero_reserved() {
+    // A crash before the first `Bound` reserved nothing, so max=1 still leaves
+    // the order its one attempt; max=0 is already exhausted.
+    let retryable = build(
+        spec(
+            "p52-empty-cap-retry",
+            OrderStatus::Executing,
+            1_000,
+            1_000,
+            0,
+        )
+        .with_attempts(1),
+        vec![],
+    )
+    .await;
+    let report = recover(&retryable).await;
+    assert_eq!(report.retryable, 1);
+    assert_eq!(report.finalized, 0);
+    assert_eq!(
+        load(&retryable).await.order.status,
+        OrderStatus::FailedRetryable
+    );
+    assert!(attempts(&retryable).await.is_empty());
+    assert_never_executed(&retryable);
+
+    let exhausted = build(
+        spec(
+            "p52-empty-cap-final",
+            OrderStatus::Executing,
+            1_000,
+            1_000,
+            0,
+        )
+        .with_attempts(0),
+        vec![],
+    )
+    .await;
+    let report = recover(&exhausted).await;
+    assert_eq!(report.finalized, 1);
+    assert_eq!(report.retryable, 0);
+    assert_eq!(
+        load(&exhausted).await.order.status,
+        OrderStatus::FailedFinal
+    );
+    assert_never_executed(&exhausted);
 }
 
 #[tokio::test]
