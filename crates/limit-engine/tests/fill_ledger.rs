@@ -99,6 +99,27 @@ fn fill_on_a_non_fill_transition_is_rejected() {
 }
 
 #[test]
+fn fill_required_targets_reject_a_missing_fill() {
+    let order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    for to in [OrderStatus::PartiallyFilled, OrderStatus::Filled] {
+        let snapshot = order.clone();
+        assert_eq!(
+            apply_transition(&order, to, None, 10),
+            Err(LimitEngineError::FillMismatch),
+            "{to:?} without a fill must be rejected"
+        );
+        assert_eq!(order, snapshot, "input mutated by {to:?} without a fill");
+    }
+
+    // Even a fully consumed order cannot reach Filled without a delta.
+    let drained = stored("o1", OrderStatus::Executing, 1_000, 0, 1_000);
+    assert_eq!(
+        apply_transition(&drained, OrderStatus::Filled, None, 10),
+        Err(LimitEngineError::FillMismatch)
+    );
+}
+
+#[test]
 fn partially_filled_to_filled_without_a_fill_cannot_complete() {
     let order = stored("o1", OrderStatus::PartiallyFilled, 1_000, 600, 400);
     assert_eq!(

@@ -55,3 +55,19 @@ fn terminal_targets_bypass_the_deadline_gate() {
         Err(LimitEngineError::Expired)
     );
 }
+
+#[test]
+fn early_expiry_is_a_legal_fsm_transition() {
+    // The spec gates transitions *at or after* the deadline; it does not add a
+    // "deadline reached" precondition to the `-> Expired` edge itself, and the
+    // domain FSM accepts Created/Active/... -> Expired before the window.
+    // L1 therefore permits it; it produces a historical terminal record.
+    // (`domain::LimitOrder::validate` would flag `ExpiredStatusBeforeWindow`,
+    // so a later persistence slice that requires a domain-valid record must
+    // apply that policy check; it is out of L1's FSM/ledger scope.)
+    let order = stored("o1", OrderStatus::Active, 1_000, 1_000, 0);
+    let early = apply_transition(&order, OrderStatus::Expired, None, EXPIRY_MS - 1)
+        .expect("expire before deadline");
+    assert_eq!(early.order.status, OrderStatus::Expired);
+    assert!(conservation_holds(&early));
+}

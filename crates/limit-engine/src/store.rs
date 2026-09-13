@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use domain::{IdempotencyKey, OrderId};
 
 use crate::error::LimitEngineError;
+use crate::fill::conservation_holds;
 use crate::fsm::{apply_transition, is_terminal};
 use crate::order::{OrderTransition, StoredLimitOrder};
 
@@ -105,6 +106,9 @@ impl InMemoryLimitOrderStore {
 #[async_trait]
 impl LimitOrderStore for InMemoryLimitOrderStore {
     async fn create(&self, order: StoredLimitOrder) -> Result<CreateOutcome, LimitEngineError> {
+        if !conservation_holds(&order) {
+            return Err(LimitEngineError::InvalidOrder);
+        }
         let mut inner = self.lock()?;
         if let Some(existing_id) = inner.by_idempotency.get(&order.order_idempotency_key) {
             let existing = inner
@@ -150,6 +154,16 @@ impl LimitOrderStore for InMemoryLimitOrderStore {
 
         if expected_version != current.version {
             return Err(LimitEngineError::PersistenceConflict);
+        }
+        // Sequences are contiguous: the log may not skip a step, otherwise
+        // `last_transition_seq` and the recorded sequence diverge and replay
+        // can return the wrong state.
+        let expected_seq = current
+            .last_transition_seq
+            .checked_add(1)
+            .ok_or(LimitEngineError::StoreInvalid)?;
+        if transition.transition_seq != expected_seq {
+            return Err(LimitEngineError::StoreInvalid);
         }
         if next.order.id != transition.order_id {
             return Err(LimitEngineError::StoreInvalid);

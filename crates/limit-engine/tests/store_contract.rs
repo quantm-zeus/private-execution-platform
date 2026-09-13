@@ -282,6 +282,72 @@ async fn mismatched_from_field_is_store_invalid() {
     );
 }
 
+#[tokio::test]
+async fn gapped_transition_sequence_is_store_invalid() {
+    let store = InMemoryLimitOrderStore::new();
+    store
+        .create(stored("o1", OrderStatus::Created, 1_000, 1_000, 0))
+        .await
+        .expect("create");
+    let current = store
+        .load(&order_id("o1"))
+        .await
+        .expect("load")
+        .expect("present");
+    let next = apply_transition(&current, OrderStatus::Active, None, 10).expect("derive");
+
+    // A sequence that skips a step must not be recorded, otherwise the log and
+    // `last_transition_seq` diverge.
+    let gapped = OrderTransition {
+        order_id: order_id("o1"),
+        from: OrderStatus::Created,
+        to: OrderStatus::Active,
+        transition_seq: 2,
+        fill: None,
+        at_ms: 10,
+    };
+    assert_eq!(
+        store
+            .append_transition(current.version, &gapped, &next)
+            .await,
+        Err(LimitEngineError::StoreInvalid)
+    );
+    assert_eq!(
+        store.load(&order_id("o1")).await.expect("load"),
+        Some(current.clone()),
+        "a rejected gap must not advance the record"
+    );
+
+    // The contiguous sequence still applies, and the log stays replayable.
+    let contiguous = OrderTransition {
+        order_id: order_id("o1"),
+        from: OrderStatus::Created,
+        to: OrderStatus::Active,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+    assert!(matches!(
+        store
+            .append_transition(current.version, &contiguous, &next)
+            .await
+            .expect("append"),
+        AppendOutcome::Applied(_)
+    ));
+    assert_eq!(
+        store.replay_from(&order_id("o1"), 1).await.expect("replay"),
+        next
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_an_inconsistent_ledger() {
+    let store = InMemoryLimitOrderStore::new();
+    let bad = stored("bad", OrderStatus::Executing, 1_000, 900, 0);
+    assert_eq!(store.create(bad).await, Err(LimitEngineError::InvalidOrder));
+    assert!(store.list_open().await.expect("list open").is_empty());
+}
+
 async fn drive_to_filled(store: &InMemoryLimitOrderStore) -> StoredLimitOrder {
     store
         .create(stored("o1", OrderStatus::Created, 1_000, 1_000, 0))

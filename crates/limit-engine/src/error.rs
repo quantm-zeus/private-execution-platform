@@ -93,3 +93,43 @@ impl LimitEngineError {
         Self::StoreInvalid,
     ];
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LimitEngineError;
+
+    /// Exhaustive match: adding a variant without naming it here fails to
+    /// compile, which forces the author to look at (and extend) `ALL`.
+    fn variant_name(error: &LimitEngineError) -> &'static str {
+        match error {
+            LimitEngineError::InvalidTransition => "InvalidTransition",
+            LimitEngineError::InvalidOrder => "InvalidOrder",
+            LimitEngineError::Expired => "Expired",
+            LimitEngineError::LimitPriceViolated => "LimitPriceViolated",
+            LimitEngineError::NoSafeFill => "NoSafeFill",
+            LimitEngineError::AmountBelowMinFill => "AmountBelowMinFill",
+            LimitEngineError::PartialFillNotAllowed => "PartialFillNotAllowed",
+            LimitEngineError::RemainingUnderflow => "RemainingUnderflow",
+            LimitEngineError::FillMismatch => "FillMismatch",
+            LimitEngineError::StaleState => "StaleState",
+            LimitEngineError::ResyncRequired => "ResyncRequired",
+            LimitEngineError::QuoteUnavailable => "QuoteUnavailable",
+            LimitEngineError::PersistenceConflict => "PersistenceConflict",
+            LimitEngineError::PersistenceUnavailable => "PersistenceUnavailable",
+            LimitEngineError::IdempotencyConflict => "IdempotencyConflict",
+            LimitEngineError::RecoveryFailed => "RecoveryFailed",
+            LimitEngineError::RecoveryInconsistent => "RecoveryInconsistent",
+            LimitEngineError::ArithmeticOverflow => "ArithmeticOverflow",
+            LimitEngineError::StoreInvalid => "StoreInvalid",
+        }
+    }
+
+    #[test]
+    fn roster_names_every_variant_once() {
+        let mut names: Vec<&'static str> = LimitEngineError::ALL.iter().map(variant_name).collect();
+        assert_eq!(names.len(), 19);
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 19, "ALL duplicates a variant");
+    }
+}

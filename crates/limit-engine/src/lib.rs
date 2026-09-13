@@ -36,10 +36,23 @@
 //!    lists `Filled`/`Cancelled`/`Expired`/`FailedFinal` as the terminal
 //!    states). Transitioning an open order to one of those terminal states is
 //!    therefore allowed at or after expiry; every transition to a non-terminal
-//!    state is rejected with [`LimitEngineError::Expired`].
+//!    state is rejected with [`LimitEngineError::Expired`]. The spec does not
+//!    add a deadline precondition to the `-> Expired` edge itself, so a caller
+//!    may still terminate an order into `Expired` before the window (the
+//!    domain FSM permits it); a later persistence slice that requires a
+//!    domain-valid record must apply `ExpiredStatusBeforeWindow` itself.
 //! 5. The store is a normal public `InMemoryLimitOrderStore`, not a
 //!    `#[cfg(test)]` item, so the integration tests under `tests/` can exercise
 //!    the trait contract directly. It carries no production dependency.
+//! 6. `create` rejects a record that violates the fill-ledger conservation
+//!    invariant, and `append_transition` requires a contiguous
+//!    `transition_seq == last_transition_seq + 1` in addition to the version
+//!    CAS; both are store-integrity checks the spec's trait sketch implies but
+//!    does not spell out.
+//! 7. A transition to `PartiallyFilled` or `Filled` *requires* a
+//!    [`fill::FillDelta`]; a missing delta is rejected with
+//!    [`LimitEngineError::FillMismatch`] rather than silently advancing the
+//!    status without a ledger change.
 
 pub mod error;
 pub mod fill;

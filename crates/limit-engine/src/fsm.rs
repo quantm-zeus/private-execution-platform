@@ -72,6 +72,11 @@ pub fn apply_transition(
             }
             apply_fill(current, fill)?
         }
+        // A fill-required target with no fill is a protocol error, not a
+        // no-op: it must never advance the status.
+        (OrderStatus::PartiallyFilled | OrderStatus::Filled, None) => {
+            return Err(LimitEngineError::FillMismatch);
+        }
         (_, None) => current.clone(),
         (_, Some(_)) => return Err(LimitEngineError::FillMismatch),
     };
