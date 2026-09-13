@@ -17,10 +17,12 @@ domain.workspace = true
 limit-engine.workspace = true
 market-types.workspace = true
 mcp-server.workspace = true
+routing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
 storage.workspace = true
+tax-engine.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

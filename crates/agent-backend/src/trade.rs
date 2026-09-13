@@ -6,10 +6,12 @@
 //! owner-scoped composition.
 //!
 //! ## Boundaries
-//! - **Limit orders and cancellation only.** `place_limit_order` creates a
-//!   durable `Created` record (no signing, no submission, no funds movement);
-//!   `cancel_order` appends a validated `Cancelled` transition. Market-order
-//!   preview/execute have no landed market pipeline and fail closed
+//! - **Limit orders and cancellation only for writes.** `place_limit_order`
+//!   creates a durable `Created` record (no signing, no submission, no funds
+//!   movement); `cancel_order` appends a validated `Cancelled` transition.
+//!   `preview_market_order` is served read-only through an injected exact
+//!   [`MarketSnapshotSource`] (see [`crate::market`]); `execute_market_order`
+//!   still has no landed market execution pipeline and fails closed
 //!   [`BackendOutcome::Unavailable`].
 //! - **Trusted identity and policy.** The owner, wallet, chain, risk caps, and
 //!   minimum partial-fill floor come from the injected [`TradingBackendConfig`];
@@ -21,30 +23,35 @@
 //!   a retried identical placement returns the existing record rather than
 //!   creating a second order, and no derived id carries token/amount semantics.
 //! - **Fail closed.** Invalid, foreign-owner, terminal, or cross-chain requests
-//!   return the redacted [`BackendError::Denied`]; a store fault collapses to
-//!   [`BackendError::Unavailable`]. No logging, no signing, no network.
+//!   return the redacted [`BackendError::Denied`]; a store or market fault
+//!   collapses to [`BackendError::Unavailable`]. No logging, no signing, no
+//!   network.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
 
 use std::sync::Arc;
 
-use agent_commands::{AmountSpec, LimitPriceSpec, TradeCommand};
+use agent_commands::{AgentChannel, AmountSpec, LimitPriceSpec, TradeCommand};
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use domain::{
-    IdempotencyKey, IntentId, LimitOrder, LimitPrice, OrderId, OrderStatus, RiskConstraints,
-    TradeSide, UserId, WalletRef,
+    AmountType, IdempotencyKey, IntentId, LimitOrder, LimitPrice, OrderId, OrderStatus, OrderType,
+    RiskConstraints, TradeIntent, TradeSide, TradeSource, UserId, WalletRef,
 };
 use limit_engine::{
     apply_transition, is_terminal, AppendOutcome, CreateOutcome, LimitEngineError, LimitOrderStore,
     OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION,
 };
-use market_types::{AssetAmount, AtomicAmount};
+use market_types::{AssetAmount, AtomicAmount, Bps};
 use mcp_server::{AgentBackend, BackendOutcome};
+use routing::GasEstimator;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::backend::AgentReadBackend;
 use crate::error::BackendError;
+use crate::market::{
+    plan_market_preview, MarketPreviewError, MarketSnapshotSource, UnavailableMarketSnapshot,
+};
 use crate::order::{OrderReadModel, OrderSummary};
 use crate::portfolio::PortfolioReadModel;
 
@@ -52,6 +59,10 @@ use crate::portfolio::PortfolioReadModel;
 const IDEMPOTENCY_DOMAIN: &[u8] = b"agent.limit.order.idem.v1";
 /// Domain separation for the derived internal intent id.
 const INTENT_ID_DOMAIN: &[u8] = b"agent.limit.order.intent.v1";
+/// Domain separation for the derived preview-intent idempotency key.
+const PREVIEW_IDEMPOTENCY_DOMAIN: &[u8] = b"agent.market.preview.idem.v1";
+/// Domain separation for the derived preview-intent id.
+const PREVIEW_INTENT_DOMAIN: &[u8] = b"agent.market.preview.intent.v1";
 
 /// Trusted clock used to stamp order deadlines and transition times.
 ///
@@ -141,17 +152,25 @@ impl std::fmt::Debug for TradingBackendConfig {
 ///
 /// Reads are delegated to the same [`AgentReadBackend`] used by the read-only
 /// composition; limit-order placement and cancellation are served by the
-/// injected durable store. Market-order commands fail closed.
+/// injected durable store; `preview_market_order` is quoted exactly through the
+/// injected [`MarketSnapshotSource`] and gas model. `execute_market_order` fails
+/// closed until a market execution pipeline lands.
 pub struct TradingAgentBackend<O: OrderReadModel, P: PortfolioReadModel, S> {
     reads: AgentReadBackend<O, P>,
     store: Arc<S>,
     config: TradingBackendConfig,
     clock: Arc<dyn TrustedClock>,
     valuation: Arc<dyn OrderValuation>,
+    market: Arc<dyn MarketSnapshotSource>,
+    gas: Option<Arc<dyn GasEstimator>>,
 }
 
 impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     /// Wires the write backend from its trusted ports.
+    ///
+    /// The market preview port defaults to fail-closed
+    /// ([`UnavailableMarketSnapshot`]) and the gas model to absent; use
+    /// [`Self::with_market_snapshot`] and [`Self::with_gas_estimator`] to opt in.
     pub fn new(
         reads: AgentReadBackend<O, P>,
         store: Arc<S>,
@@ -165,7 +184,21 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             config,
             clock,
             valuation,
+            market: Arc::new(UnavailableMarketSnapshot),
+            gas: None,
         }
+    }
+
+    /// Installs the trusted market-state source used for exact previews.
+    pub fn with_market_snapshot(mut self, source: Arc<dyn MarketSnapshotSource>) -> Self {
+        self.market = source;
+        self
+    }
+
+    /// Installs the deterministic gas model used by preview scoring.
+    pub fn with_gas_estimator(mut self, gas: Arc<dyn GasEstimator>) -> Self {
+        self.gas = Some(gas);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -217,6 +250,156 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             self.config.risk.max_slippage.get().to_be_bytes().to_vec(),
         ]
     }
+
+    /// Canonical creation identity for one preview request.
+    ///
+    /// No timestamp is included, so an identical preview request yields an
+    /// identical derived intent/idempotency identity. The effective risk caps
+    /// are part of the identity because they bound the quoted route.
+    fn preview_parts(
+        &self,
+        token_in: &agent_commands::AssetRef,
+        token_out: &agent_commands::AssetRef,
+        side: TradeSide,
+        amount_in: AtomicAmount,
+        max_slippage: Bps,
+        max_price_impact: Bps,
+    ) -> Vec<Vec<u8>> {
+        vec![
+            self.config.owner.as_str().as_bytes().to_vec(),
+            self.config.wallet_ref.as_str().as_bytes().to_vec(),
+            chain_code(&self.config.chain).into_bytes(),
+            chain_code(&token_in.chain).into_bytes(),
+            token_in.address.as_bytes().to_vec(),
+            chain_code(&token_out.chain).into_bytes(),
+            token_out.address.as_bytes().to_vec(),
+            vec![match side {
+                TradeSide::Buy => 1,
+                TradeSide::Sell => 2,
+            }],
+            amount_in.get().to_be_bytes().to_vec(),
+            max_slippage.get().to_be_bytes().to_vec(),
+            max_price_impact.get().to_be_bytes().to_vec(),
+            self.config.risk.max_buy_tax.get().to_be_bytes().to_vec(),
+            self.config.risk.max_sell_tax.get().to_be_bytes().to_vec(),
+        ]
+    }
+
+    /// Builds the trusted intent for one market preview.
+    ///
+    /// Every policy-bearing field comes from [`TradingBackendConfig`]; the
+    /// command contributes only the asset pair, side, and explicit input amount.
+    /// A requested slippage/impact cap tighter than the wallet's hard cap is
+    /// honored; a request to *exceed* the hard cap fails closed.
+    #[allow(clippy::too_many_arguments)]
+    fn preview_intent(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: &AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+    ) -> Result<(TradeIntent, AtomicAmount), BackendError> {
+        // Bind the command to the configured chain before any state is built.
+        if token_in.chain != self.config.chain || token_out.chain != self.config.chain {
+            return Err(BackendError::Denied);
+        }
+        let asset_in = token_in.to_asset_id().map_err(|_| BackendError::Denied)?;
+        let asset_out = token_out.to_asset_id().map_err(|_| BackendError::Denied)?;
+        if asset_in == asset_out {
+            return Err(BackendError::Denied);
+        }
+        // Only explicit atomic input amounts are accepted; a USD amount needs a
+        // trusted conversion this layer does not perform, so it fails closed.
+        let amount_in = match amount {
+            AmountSpec::TokenAtomic(value) | AmountSpec::StablecoinAtomic(value) if *value > 0 => {
+                AtomicAmount::new(*value)
+            }
+            _ => return Err(BackendError::Denied),
+        };
+        let max_slippage = effective_cap(self.config.risk.max_slippage, max_slippage_bps)?;
+        let max_price_impact =
+            effective_cap(self.config.risk.max_price_impact, max_price_impact_bps)?;
+
+        let parts = self.preview_parts(
+            &token_in,
+            &token_out,
+            side,
+            amount_in,
+            max_slippage,
+            max_price_impact,
+        );
+        let derived = DerivedIdentity::preview(&parts);
+        let risk = RiskConstraints {
+            max_buy_tax: self.config.risk.max_buy_tax,
+            max_sell_tax: self.config.risk.max_sell_tax,
+            max_price_impact,
+            max_slippage,
+            // The trusted per-trade notional cap is enforced by the dispatcher's
+            // trusted valuation for mutating commands. A preview moves no funds,
+            // and the config cap (when set) is asset-bound to `token_in`, so
+            // applying it would false-deny a cross-asset preview; omit it.
+            max_total_cost: None,
+        };
+        let intent = TradeIntent {
+            id: IntentId::new(derived.intent_id.as_str()).map_err(|_| BackendError::Denied)?,
+            source: channel_source(channel),
+            user_id: self.config.owner.clone(),
+            wallet_ref: self.config.wallet_ref.clone(),
+            chain: self.config.chain.clone(),
+            token_in: asset_in,
+            token_out: asset_out,
+            side,
+            amount_type: AmountType::InputAssetAtomic,
+            amount: amount_in,
+            order_type: OrderType::Market,
+            limit_price: None,
+            risk,
+            allow_partial_fill: false,
+            expiry_ms: None,
+            nonce: 0,
+            idempotency_key: IdempotencyKey::new(derived.idempotency_key.as_str())
+                .map_err(|_| BackendError::Denied)?,
+        };
+        Ok((intent, amount_in))
+    }
+
+    /// Quotes an exact market preview, returning the fully composed result.
+    #[allow(clippy::too_many_arguments)]
+    fn quote_market_preview(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+    ) -> Result<crate::market::MarketPreview, BackendError> {
+        let (intent, amount_in) = self.preview_intent(
+            channel,
+            token_in,
+            token_out,
+            side,
+            &amount,
+            max_slippage_bps,
+            max_price_impact_bps,
+        )?;
+        let now_ms = self.clock.now_ms();
+        plan_market_preview(
+            self.market.as_ref(),
+            self.gas.as_deref(),
+            &intent,
+            amount_in,
+            now_ms,
+        )
+        .map_err(|error| match error {
+            MarketPreviewError::Unavailable => BackendError::Unavailable,
+            MarketPreviewError::NoViableRoute => BackendError::Denied,
+        })
+    }
 }
 
 impl<O: OrderReadModel, P: PortfolioReadModel, S> std::fmt::Debug for TradingAgentBackend<O, P, S> {
@@ -245,7 +428,7 @@ where
                     .execute(channel, agent_commands::AgentCommand::Read(read))
                     .await
             }
-            agent_commands::AgentCommand::Trade(trade) => self.execute_trade(trade).await,
+            agent_commands::AgentCommand::Trade(trade) => self.execute_trade(channel, trade).await,
         }
     }
 
@@ -282,8 +465,28 @@ where
     P: PortfolioReadModel,
     S: LimitOrderStore,
 {
-    async fn execute_trade(&self, command: TradeCommand) -> BackendOutcome {
+    async fn execute_trade(&self, channel: AgentChannel, command: TradeCommand) -> BackendOutcome {
         match command {
+            TradeCommand::PreviewMarketOrder {
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+            } => match self.quote_market_preview(
+                channel,
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+            ) {
+                Ok(preview) => BackendOutcome::Value(json!({ "preview": preview })),
+                Err(BackendError::Denied) => BackendOutcome::Denied,
+                Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
+            },
             TradeCommand::PlaceLimitOrder {
                 token_in,
                 token_out,
@@ -320,10 +523,9 @@ where
             TradeCommand::CancelOrder { order_id } => {
                 outcome_for(self.cancel_order(&order_id).await)
             }
-            // No market pipeline: fail closed rather than guess.
-            TradeCommand::PreviewMarketOrder { .. } | TradeCommand::ExecuteMarketOrder { .. } => {
-                BackendOutcome::Unavailable
-            }
+            // Market execution has no landed pipeline: fail closed rather than
+            // guess. (Preview is served above through the exact router.)
+            TradeCommand::ExecuteMarketOrder { .. } => BackendOutcome::Unavailable,
         }
     }
 
@@ -498,9 +700,19 @@ struct DerivedIdentity {
 
 impl DerivedIdentity {
     fn from_parts(parts: &[Vec<u8>]) -> Self {
+        Self::derive(IDEMPOTENCY_DOMAIN, INTENT_ID_DOMAIN, parts)
+    }
+
+    /// Preview identity, domain-separated from the durable-order identity so a
+    /// preview-derived id can never collide with a placement identity.
+    fn preview(parts: &[Vec<u8>]) -> Self {
+        Self::derive(PREVIEW_IDEMPOTENCY_DOMAIN, PREVIEW_INTENT_DOMAIN, parts)
+    }
+
+    fn derive(idempotency_domain: &[u8], intent_domain: &[u8], parts: &[Vec<u8>]) -> Self {
         Self {
-            idempotency_key: prefixed_hex(IDEMPOTENCY_DOMAIN, "idem", parts),
-            intent_id: prefixed_hex(INTENT_ID_DOMAIN, "intent", parts),
+            idempotency_key: prefixed_hex(idempotency_domain, "idem", parts),
+            intent_id: prefixed_hex(intent_domain, "intent", parts),
         }
     }
 }
@@ -554,6 +766,27 @@ fn partial_fill_floor(
         return max_input;
     }
     configured
+}
+
+/// Resolves a requested slippage/impact cap against the wallet hard cap.
+///
+/// A tighter request is honored; a request to exceed the hard cap fails closed
+/// with [`BackendError::Denied`]. The trusted cap is used when no request is
+/// made.
+fn effective_cap(trusted: Bps, requested: Option<u16>) -> Result<Bps, BackendError> {
+    match requested {
+        None => Ok(trusted),
+        Some(value) if value <= trusted.get() => Bps::new(value).map_err(|_| BackendError::Denied),
+        Some(_) => Err(BackendError::Denied),
+    }
+}
+
+/// Maps an agent channel to the canonical intent source.
+fn channel_source(channel: AgentChannel) -> TradeSource {
+    match channel {
+        AgentChannel::Mcp => TradeSource::Mcp,
+        AgentChannel::Telegram => TradeSource::Telegram,
+    }
 }
 
 fn outcome_for(result: Result<StoredLimitOrder, BackendError>) -> BackendOutcome {
