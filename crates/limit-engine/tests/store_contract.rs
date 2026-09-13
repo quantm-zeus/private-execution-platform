@@ -8,7 +8,7 @@ use limit_engine::{
     LimitEngineError, LimitOrderStore, OrderTransition, StoredLimitOrder,
 };
 use market_types::AtomicAmount;
-use support::{apply_and_append_for, idempotency_key, order_id, stored};
+use support::{apply_and_append_for, idempotency_key, order_id, stored, EXPIRY_MS};
 
 fn fill(input: u128, output: u128, remaining_after: u128) -> FillDelta {
     FillDelta {
@@ -48,6 +48,37 @@ async fn same_id_with_a_different_key_conflicts() {
         store.create(other).await,
         Err(LimitEngineError::IdempotencyConflict)
     );
+}
+
+#[tokio::test]
+async fn same_key_with_a_different_order_or_content_conflicts() {
+    // M4: a repeated key is only idempotent for the identical creation payload.
+    let store = InMemoryLimitOrderStore::new();
+    let order = stored("o1", OrderStatus::Created, 1_000, 1_000, 0);
+    store.create(order.clone()).await.expect("create");
+
+    // Same key, different order id -> conflict, never a silent alias.
+    let mut different_id = stored("o2", OrderStatus::Created, 1_000, 1_000, 0);
+    different_id.order_idempotency_key = order.order_idempotency_key.clone();
+    assert_eq!(
+        store.create(different_id).await,
+        Err(LimitEngineError::IdempotencyConflict)
+    );
+
+    // Same key, same id, different content -> conflict.
+    let mut different_content = order.clone();
+    different_content.next_eligible_at_ms = Some(42);
+    assert_eq!(
+        store.create(different_content).await,
+        Err(LimitEngineError::IdempotencyConflict)
+    );
+
+    // The original payload still maps to the one stored order.
+    assert_eq!(
+        store.create(order.clone()).await.expect("retry"),
+        CreateOutcome::Existing(order)
+    );
+    assert_eq!(store.list_open().await.expect("list open").len(), 1);
 }
 
 #[tokio::test]
@@ -153,6 +184,38 @@ async fn duplicate_fill_append_does_not_double_decrement() {
     assert_eq!(loaded.order.remaining_input, AtomicAmount::new(600));
     assert_eq!(loaded.filled_input, AtomicAmount::new(400));
     assert_eq!(loaded.version, 2);
+}
+
+#[tokio::test]
+async fn coerced_mid_flight_fill_persists_and_replays_as_expired() {
+    // A confirmed fill that arrives past the deadline is recorded and the order
+    // is persisted as `Expired`; replay reproduces the same record.
+    let store = InMemoryLimitOrderStore::new();
+    store
+        .create(stored("o1", OrderStatus::Executing, 1_000, 1_000, 0))
+        .await
+        .expect("create");
+
+    let next = apply_and_append_for(
+        &store,
+        "o1",
+        OrderStatus::PartiallyFilled,
+        Some(fill(400, 95, 600)),
+        EXPIRY_MS,
+    )
+    .await;
+    assert_eq!(next.order.status, OrderStatus::Expired);
+    assert_eq!(next.filled_input, AtomicAmount::new(400));
+    assert_eq!(next.order.remaining_input, AtomicAmount::new(600));
+
+    assert_eq!(
+        store.replay_from(&order_id("o1"), 1).await.expect("replay"),
+        next
+    );
+    assert!(
+        store.list_open().await.expect("list open").is_empty(),
+        "an expired order must not be listed as open"
+    );
 }
 
 #[tokio::test]

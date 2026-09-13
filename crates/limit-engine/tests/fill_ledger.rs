@@ -129,6 +129,110 @@ fn partially_filled_to_filled_without_a_fill_cannot_complete() {
 }
 
 #[test]
+fn partially_filled_to_filled_with_a_fill_completes() {
+    // M1: finishing the remainder is a legal fill edge.
+    let order = stored("o1", OrderStatus::PartiallyFilled, 1_000, 600, 400);
+    let next = apply_transition(&order, OrderStatus::Filled, Some(&delta(600, 150, 0)), 10)
+        .expect("finish remainder");
+    assert_eq!(next.order.status, OrderStatus::Filled);
+    assert_eq!(next.filled_input, AtomicAmount::new(1_000));
+    assert!(next.order.remaining_input.is_zero());
+    assert!(conservation_holds(&next));
+}
+
+#[test]
+fn partially_filled_target_with_zero_remaining_is_rejected() {
+    // H2: a fill consuming all remaining must target `Filled`, never
+    // `PartiallyFilled` (accelerator line 739).
+    let order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    let snapshot = order.clone();
+    assert_eq!(
+        apply_transition(
+            &order,
+            OrderStatus::PartiallyFilled,
+            Some(&delta(1_000, 240, 0)),
+            10
+        ),
+        Err(LimitEngineError::FillMismatch)
+    );
+    assert_eq!(
+        order, snapshot,
+        "input mutated by a zero-remaining partial fill"
+    );
+
+    // The same delta targets `Filled` successfully.
+    let filled = apply_transition(&order, OrderStatus::Filled, Some(&delta(1_000, 240, 0)), 10)
+        .expect("full fill");
+    assert_eq!(filled.order.status, OrderStatus::Filled);
+}
+
+#[test]
+fn partial_fill_on_all_or_nothing_order_is_rejected() {
+    // M3: an all-or-nothing order may only fill in full.
+    let mut order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    order.order.allow_partial_fill = false;
+    order.order.min_fill = AtomicAmount::new(1_000);
+    assert_eq!(
+        apply_transition(
+            &order,
+            OrderStatus::PartiallyFilled,
+            Some(&delta(400, 95, 600)),
+            10
+        ),
+        Err(LimitEngineError::PartialFillNotAllowed)
+    );
+    // A full fill is still accepted.
+    let filled = apply_transition(&order, OrderStatus::Filled, Some(&delta(1_000, 240, 0)), 10)
+        .expect("all-or-nothing full fill");
+    assert_eq!(filled.order.status, OrderStatus::Filled);
+}
+
+#[test]
+fn fill_below_min_fill_is_rejected() {
+    let mut order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    order.order.min_fill = AtomicAmount::new(100);
+    assert_eq!(
+        apply_transition(
+            &order,
+            OrderStatus::PartiallyFilled,
+            Some(&delta(50, 10, 950)),
+            10
+        ),
+        Err(LimitEngineError::AmountBelowMinFill)
+    );
+}
+
+#[test]
+fn zero_input_fill_is_rejected() {
+    let order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    assert_eq!(
+        apply_transition(
+            &order,
+            OrderStatus::PartiallyFilled,
+            Some(&delta(0, 0, 1_000)),
+            10
+        ),
+        Err(LimitEngineError::AmountBelowMinFill)
+    );
+}
+
+#[test]
+fn partial_fill_leaving_a_remainder_below_min_fill_is_rejected() {
+    // Accelerator line 871: a non-full chunk must leave a fillable remainder.
+    let mut order = stored("o1", OrderStatus::Executing, 1_000, 1_000, 0);
+    order.order.min_fill = AtomicAmount::new(400);
+    assert_eq!(
+        apply_transition(
+            &order,
+            OrderStatus::PartiallyFilled,
+            Some(&delta(700, 160, 300)),
+            10
+        ),
+        Err(LimitEngineError::AmountBelowMinFill)
+    );
+}
+
+#[test]
 fn inconsistent_stored_ledger_is_invalid_order() {
     let order = stored("o1", OrderStatus::Executing, 1_000, 900, 0);
     assert!(!conservation_holds(&order));

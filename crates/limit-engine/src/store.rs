@@ -24,7 +24,10 @@ use crate::order::{OrderTransition, StoredLimitOrder};
 pub enum CreateOutcome {
     /// The order was inserted.
     Created(StoredLimitOrder),
-    /// The idempotency key already mapped to this (or an equal) order.
+    /// The idempotency key already mapped to an identical creation payload;
+    /// the caller receives the current (possibly advanced) record. A different
+    /// order id or content under the same key is
+    /// [`LimitEngineError::IdempotencyConflict`], never `Existing`.
     Existing(StoredLimitOrder),
 }
 
@@ -111,11 +114,24 @@ impl LimitOrderStore for InMemoryLimitOrderStore {
         }
         let mut inner = self.lock()?;
         if let Some(existing_id) = inner.by_idempotency.get(&order.order_idempotency_key) {
+            let existing_id = existing_id.clone();
             let existing = inner
                 .orders
-                .get(existing_id)
+                .get(&existing_id)
                 .cloned()
                 .ok_or(LimitEngineError::StoreInvalid)?;
+            // The key names one creation payload. The baseline (not the
+            // possibly-advanced current record) is the idempotent identity, so
+            // an identical retry returns the current state while a different
+            // order id or content under the same key is a hard conflict.
+            let baseline = inner
+                .baseline
+                .get(&existing_id)
+                .cloned()
+                .ok_or(LimitEngineError::StoreInvalid)?;
+            if baseline != order {
+                return Err(LimitEngineError::IdempotencyConflict);
+            }
             return Ok(CreateOutcome::Existing(existing));
         }
         if inner.orders.contains_key(&order.order.id) {

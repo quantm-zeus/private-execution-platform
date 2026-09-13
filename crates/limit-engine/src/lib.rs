@@ -31,28 +31,33 @@
 //!    `ArithmeticOverflow`.
 //! 3. The spec lists `chain-types` as a dependency but the L1 surface names no
 //!    chain type directly; it is kept as a declared workspace dependency.
-//! 4. "Reject expiry for any non-terminal transition" is interpreted as a
-//!    transition whose *target* is non-terminal (the spec's own vocabulary
-//!    lists `Filled`/`Cancelled`/`Expired`/`FailedFinal` as the terminal
-//!    states). Transitioning an open order to one of those terminal states is
-//!    therefore allowed at or after expiry; every transition to a non-terminal
-//!    state is rejected with [`LimitEngineError::Expired`]. The spec does not
-//!    add a deadline precondition to the `-> Expired` edge itself, so a caller
-//!    may still terminate an order into `Expired` before the window (the
-//!    domain FSM permits it); a later persistence slice that requires a
-//!    domain-valid record must apply `ExpiredStatusBeforeWindow` itself.
-//! 5. The store is a normal public `InMemoryLimitOrderStore`, not a
+//! 4. Expiry is a deadline on *starting* work, not on finishing an in-flight
+//!    attempt. `-> Expired` requires `at_ms >= expires_at_ms`
+//!    (`ExpiredStatusBeforeWindow` in domain terms), while every other
+//!    non-terminal target requires the window to still be open. Terminal
+//!    `Filled`/`Cancelled`/`FailedFinal` may be reached at any time, and an
+//!    `Executing` order may remain in flight past the deadline.
+//! 5. A confirmed mid-flight partial fill at/after the deadline cannot persist
+//!    a domain-invalid `PartiallyFilled` (domain expiry-gates it), so
+//!    [`apply_transition`] deterministically redirects the post-state to
+//!    `Expired` (recording the fill) when the remainder is non-zero, and to
+//!    `Filled` when the fill completed the order.
+//! 6. The store is a normal public `InMemoryLimitOrderStore`, not a
 //!    `#[cfg(test)]` item, so the integration tests under `tests/` can exercise
 //!    the trait contract directly. It carries no production dependency.
-//! 6. `create` rejects a record that violates the fill-ledger conservation
-//!    invariant, and `append_transition` requires a contiguous
-//!    `transition_seq == last_transition_seq + 1` in addition to the version
-//!    CAS; both are store-integrity checks the spec's trait sketch implies but
-//!    does not spell out.
-//! 7. A transition to `PartiallyFilled` or `Filled` *requires* a
-//!    [`fill::FillDelta`]; a missing delta is rejected with
-//!    [`LimitEngineError::FillMismatch`] rather than silently advancing the
-//!    status without a ledger change.
+//! 7. `create` rejects a record that violates the fill-ledger conservation
+//!    invariant; a repeated key is idempotent only for an identical creation
+//!    payload, and a different order id or content under the same key is
+//!    [`LimitEngineError::IdempotencyConflict`]. `append_transition` requires a
+//!    contiguous `transition_seq == last_transition_seq + 1` in addition to the
+//!    version CAS; both are store-integrity checks the spec's trait sketch
+//!    implies but does not spell out.
+//! 8. A transition that carries a [`fill::FillDelta`] is accepted on
+//!    `Executing -> PartiallyFilled | Filled | Expired` and
+//!    `PartiallyFilled -> Filled | Expired`; the non-`Expired` edges require a
+//!    delta and the `Expired` edges accept an optional one. A `PartiallyFilled`
+//!    target with zero remaining, an all-or-nothing partial fill, and a fill
+//!    that is zero or below `min_fill` are all rejected fail-closed.
 
 pub mod error;
 pub mod fill;

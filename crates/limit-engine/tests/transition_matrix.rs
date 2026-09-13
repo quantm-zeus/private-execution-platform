@@ -4,7 +4,7 @@ mod support;
 
 use domain::OrderStatus;
 use limit_engine::{apply_transition, is_terminal, validate_transition, LimitEngineError};
-use support::{stored, ALL_STATUSES, OPEN_STATUSES, TERMINAL_STATUSES};
+use support::{stored, ALL_STATUSES, EXPIRY_MS, OPEN_STATUSES, TERMINAL_STATUSES};
 
 #[test]
 fn transition_table_matches_domain_authority() {
@@ -97,7 +97,13 @@ fn every_legal_transition_applies_to_a_fresh_order() {
             if needs_fill {
                 continue;
             }
-            let result = apply_transition(&order, to, None, 1);
+            // `-> Expired` is only legal once the deadline has been reached.
+            let at_ms = if to == OrderStatus::Expired {
+                EXPIRY_MS
+            } else {
+                1
+            };
+            let result = apply_transition(&order, to, None, at_ms);
             assert!(result.is_ok(), "{from:?} -> {to:?} failed: {result:?}");
             assert_eq!(result.expect("applied").order.status, to);
         }
