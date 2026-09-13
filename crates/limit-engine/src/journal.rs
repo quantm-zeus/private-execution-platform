@@ -31,9 +31,26 @@
 //! random bytes vs. ASCII hex) and each sequence monotonically increases, so
 //! `at_rest`'s deterministic nonce is never reused for different plaintext at
 //! the same `(scope, sequence)`. The read-check-seal-CAS sequence is serialized
-//! by a process-global async mutex so two racing writers cannot both seal
-//! different plaintext at one pair before the compare-and-swap discards the
-//! loser; the CAS is a backstop, not the only guard.
+//! by a process-global async mutex, and the pre-seal check reads the
+//! *authoritative event stream* -- never the materialized object -- to decide
+//! whether the target sequence is free. A writer therefore never seals an event
+//! at an occupied `(stream, sequence)`, even when the materialized object lags
+//! behind the stream. The append-event compare-and-swap is a backstop, not the
+//! only guard.
+//!
+//! # Single-writer assumption and cross-process uniqueness
+//! The store assumes a **single writer per order stream in-process**: the
+//! process-global lock serializes every durable store sharing one
+//! [`OpaqueStore`], so the read-stream -> check -> seal -> append path is
+//! atomic within the process. Across processes, persisted-record uniqueness
+//! relies on the `append_event` contiguity gate: a racing append either lands
+//! exactly the next `(stream, sequence)` or conflicts, so only one ciphertext
+//! is ever persisted per `(stream, sequence)`. A conflicting writer re-reads
+//! the stream and takes the idempotent/conflict path without re-sealing a
+//! different plaintext. A durable single-writer or database advisory lock that
+//! would additionally make the *discarded* cross-process seal attempts
+//! nonce-safe is deferred; until it lands, two processes racing at one sequence
+//! can still each seal once, though only the winner's ciphertext is persisted.
 //!
 //! # Adaptations forced by the real APIs
 //! 1. `OpaqueStore::list_objects_by_class` is added with a fail-closed default
@@ -720,7 +737,13 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
                         return Err(LimitEngineError::PersistenceUnavailable);
                     };
                     if reloaded.current.last_transition_seq >= transition.transition_seq {
-                        return Ok(AppendOutcome::AlreadyApplied(reloaded.current));
+                        // The object advanced under us. Return the replayed
+                        // authoritative head, not the materialized record we
+                        // just read, which may itself lag the event stream.
+                        let authoritative = self
+                            .replay_from(&transition.order_id, transition.transition_seq)
+                            .await?;
+                        return Ok(AppendOutcome::AlreadyApplied(authoritative));
                     }
                     let expected_seq = reloaded
                         .current
@@ -828,49 +851,66 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
         let object_id = object_id(&material.blind_index, &self.chain, &transition.order_id)?;
         let stream = stream_blind_index(&material.blind_index, &self.chain, &transition.order_id)?;
 
-        // Serialize read-check-seal-CAS: a racing writer for the same sequence
-        // must observe the winner and take the idempotent/conflict path before
-        // it seals a different event under the same deterministic nonce.
+        // Serialize the whole authoritative-read -> check -> seal -> append-CAS
+        // path. A racing writer for the same sequence must observe the winner
+        // and take the idempotent/conflict path before it seals a different
+        // event under the same deterministic nonce.
         let _guard = seal_guard().lock().await;
+
+        // The event stream is authoritative for contiguity and idempotency and
+        // is read before sealing anything. The materialized object may lag the
+        // stream, so keying the pre-seal check off it could seal a different
+        // plaintext at an already-occupied `(stream, sequence)`.
+        let events = self.read_stream(&stream).await?;
+        let stream_head = events.last().map(|event| event.transition_seq).unwrap_or(0);
+        let expected_seq = stream_head
+            .checked_add(1)
+            .ok_or(LimitEngineError::ArithmeticOverflow)?;
+
+        // The target sequence is already occupied by the authoritative stream:
+        // this is an idempotent replay or a genuine conflict. Never seal.
+        if transition.transition_seq <= stream_head {
+            let present = events
+                .iter()
+                .find(|event| event.transition_seq == transition.transition_seq)
+                .ok_or(LimitEngineError::StoreInvalid)?;
+            if present.transition != *transition || present.order != *next {
+                return Err(LimitEngineError::PersistenceConflict);
+            }
+            // Replayed authoritative head. Repair a lagging materialized object
+            // from the stream (object scope only; the event is never re-sealed)
+            // so a partial materialization cannot wedge the stream.
+            let Some(record) = self.read_record(&object_id).await? else {
+                return Err(LimitEngineError::StoreInvalid);
+            };
+            let authoritative = reconcile_lagging(
+                self.store.as_ref(),
+                self.keys.as_ref(),
+                &stream,
+                &object_id,
+                &record,
+            )
+            .await?;
+            return Ok(AppendOutcome::AlreadyApplied(authoritative));
+        }
+
+        // Only the next free sequence may be sealed; anything further is a gap.
+        if transition.transition_seq != expected_seq {
+            return Err(LimitEngineError::StoreInvalid);
+        }
 
         let Some(initial) = self.read_record(&object_id).await? else {
             return Err(LimitEngineError::StoreInvalid);
         };
-
-        // Idempotency first: a sequence at or below the stored one is a replay.
-        if transition.transition_seq <= initial.current.last_transition_seq {
-            let existing = self
-                .store
-                .read_events(&stream, transition.transition_seq, 1)
-                .await
-                .map_err(map_storage)?;
-            match existing.first() {
-                Some(record) if record.sequence == transition.transition_seq => {
-                    let event = open_event(self.keys.as_ref(), &stream, record)?;
-                    if event.transition != *transition || event.order != *next {
-                        return Err(LimitEngineError::PersistenceConflict);
-                    }
-                }
-                _ => return Err(LimitEngineError::StoreInvalid),
-            }
-            // The event stream is authoritative. Return the replayed head
-            // rather than a materialized object that may lag the stream.
-            let authoritative = self
-                .replay_from(&transition.order_id, transition.transition_seq)
-                .await?;
-            return Ok(AppendOutcome::AlreadyApplied(authoritative));
+        // The materialized object must agree with the authoritative head so the
+        // caller's expected version describes the state the transition applies
+        // to. A lagging object is repaired by replay or recovery, not by
+        // deriving a forward transition from stale state.
+        if initial.current.last_transition_seq != stream_head {
+            return Err(LimitEngineError::RecoveryInconsistent);
         }
-
         if expected_version != initial.current.version {
             return Err(LimitEngineError::PersistenceConflict);
-        }
-        let expected_seq = initial
-            .current
-            .last_transition_seq
-            .checked_add(1)
-            .ok_or(LimitEngineError::ArithmeticOverflow)?;
-        if transition.transition_seq != expected_seq {
-            return Err(LimitEngineError::StoreInvalid);
         }
         if next.order.id != transition.order_id || transition.from != initial.current.order.status {
             return Err(LimitEngineError::StoreInvalid);
@@ -886,9 +926,8 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
             return Err(LimitEngineError::StoreInvalid);
         }
 
-        // (1) Append the authoritative event. A conflicting append is a replay
-        // only when the already-present event is byte-for-byte the same
-        // transition and post-state.
+        // (1) Append the authoritative event. The stream confirmed the target
+        // sequence is free, so this is the only seal at this pair in-process.
         let event = OrderTransitionEvent {
             schema_version: DEFAULT_SCHEMA_VERSION,
             transition_seq: transition.transition_seq,
@@ -906,6 +945,9 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
         match self.store.append_event(event_record).await {
             Ok(()) => {}
             Err(StorageError::Conflict) => {
+                // A cross-process writer landed this sequence first. Re-read the
+                // stream and take the idempotent/conflict path; never seal a
+                // second event at this sequence.
                 let existing = self
                     .store
                     .read_events(&stream, transition.transition_seq, 1)
@@ -917,6 +959,10 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
                         if present.transition != *transition || present.order != *next {
                             return Err(LimitEngineError::PersistenceConflict);
                         }
+                        let authoritative = self
+                            .replay_from(&transition.order_id, transition.transition_seq)
+                            .await?;
+                        return Ok(AppendOutcome::AlreadyApplied(authoritative));
                     }
                     _ => return Err(LimitEngineError::PersistenceConflict),
                 }

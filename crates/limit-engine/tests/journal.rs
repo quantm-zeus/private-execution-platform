@@ -10,7 +10,7 @@ use crypto_envelope::at_rest::{AT_REST_HEADER_LEN, AT_REST_KID_LEN, AT_REST_NONC
 use domain::{
     LimitOrder, LimitPrice, OrderId, OrderStatus, RiskConstraints, TradeSide, UserId, WalletRef,
 };
-use limit_engine::journal::{order_id_for_creation, BlindIndexKey};
+use limit_engine::journal::{order_id_for_creation, BlindIndexKey, MAX_OBJECT_CAS_ATTEMPTS};
 use limit_engine::{
     apply_transition, conservation_holds, AppendOutcome, CreateOutcome, DurableLimitOrderStore,
     FillDelta, LimitEngineError, LimitOrderStore, OrderKeyProvider, OrderTransition,
@@ -341,8 +341,9 @@ async fn object_cas_conflict_retries_and_succeeds() {
 
 #[tokio::test]
 async fn event_conflict_with_identical_transition_is_repaired() {
-    // The event stream is authoritative: an object that lags must catch up on
-    // the next append even though the event already exists.
+    // The event stream is authoritative: an object that lags must be repaired
+    // from the stream, and an identical replay at an occupied sequence is
+    // idempotent rather than a fresh append.
     let fake = fake();
     let keys = keys();
     let store = durable_store(&fake, &keys);
@@ -373,14 +374,17 @@ async fn event_conflict_with_identical_transition_is_repaired() {
         .append_transition(1, &transition, &active)
         .await
         .expect("append");
-    assert!(
-        matches!(outcome, AppendOutcome::Applied(_)),
-        "a lagging object must be repaired: {outcome:?}"
+    assert_eq!(
+        outcome,
+        AppendOutcome::AlreadyApplied(active.clone()),
+        "an identical replay at an occupied sequence must be idempotent"
     );
+    // The replay repaired the lagging object from the authoritative stream.
     assert_eq!(
         store.load(&order.order.id).await.expect("load"),
         Some(active)
     );
+    assert_eq!(fake.events().len(), 1, "the event stream did not grow");
 }
 
 #[tokio::test]
@@ -783,6 +787,99 @@ async fn racing_writers_never_seal_conflicting_plaintext_at_one_sequence() {
     assert_eq!(
         store.load(&order.order.id).await.expect("load"),
         Some(expected)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_cas_exhaustion_never_seals_conflicting_plaintext_at_one_sequence() {
+    // Reviewer probe: exhaust the bounded object CAS attempts so the winner's
+    // materialized object is left behind the authoritative event stream, then
+    // race two appends at the same sequence with different target transitions.
+    // The second writer must key its pre-seal check off the stream, not the
+    // lagging object, so it never seals a different plaintext at the same
+    // `(stream, sequence)`.
+    let fake = fake();
+    let keys = keys();
+    let store = Arc::new(durable_store(&fake, &keys));
+    let order = durable_order(&keys, "race-cas", OrderStatus::Created, 1_000, 1_000, 0);
+    store.create(order.clone()).await.expect("create");
+    fake.enable_read_yield();
+    // Force the winner's `write_object_cas` to exhaust every attempt, leaving
+    // the object one version behind the persisted event.
+    fake.inject_put_conflicts(MAX_OBJECT_CAS_ATTEMPTS);
+
+    let active = apply_transition(&order, OrderStatus::Active, None, 10).expect("active");
+    let cancelled = apply_transition(&order, OrderStatus::Cancelled, None, 10).expect("cancelled");
+    let transition_active = OrderTransition {
+        order_id: order.order.id.clone(),
+        from: OrderStatus::Created,
+        to: OrderStatus::Active,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+    let transition_cancelled = OrderTransition {
+        order_id: order.order.id.clone(),
+        from: OrderStatus::Created,
+        to: OrderStatus::Cancelled,
+        transition_seq: 1,
+        fill: None,
+        at_ms: 10,
+    };
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for (transition, next) in [
+        (transition_active, active.clone()),
+        (transition_cancelled, cancelled.clone()),
+    ] {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.append_transition(1, &transition, &next).await
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        outcomes.push(handle.await.expect("join"));
+    }
+
+    // Only one transition may persist, and at most one writer may report it.
+    assert_eq!(
+        fake.events().len(),
+        1,
+        "exactly one event may be persisted: {outcomes:?}"
+    );
+    let applied = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                Ok(AppendOutcome::Applied(_) | AppendOutcome::AlreadyApplied(_))
+            )
+        })
+        .count();
+    assert!(applied <= 1, "at most one writer may apply: {outcomes:?}");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(LimitEngineError::PersistenceConflict))),
+        "the loser must take the conflict path: {outcomes:?}"
+    );
+
+    // The core nonce invariant: no two seal attempts at one `(scope, sequence)`
+    // -- event or object -- carried different plaintext.
+    assert_no_conflicting_seals(&fake);
+
+    let object_id =
+        limit_engine::object_id(&keys.blind_key(), &ChainId::Base, &order.order.id).expect("id");
+    // The object may lag because the injected conflicts exhausted CAS, but it
+    // must never outrun the single persisted transition.
+    let version = fake.latest_object(&object_id).map(|object| object.version);
+    assert!(
+        version.is_none_or(|version| version <= 2),
+        "object must not outrun the stream: {version:?}"
     );
 }
 
