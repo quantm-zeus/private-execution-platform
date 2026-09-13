@@ -24,7 +24,9 @@ pub struct SocialMeta {
     pub cache_state: CacheState,
     /// Why the response is degraded, if it is.
     pub degraded_reason: Option<DegradedReason>,
-    /// Age of the served value, when it came from cache.
+    /// Age of the served value when the cache path exposes it. `None` for a
+    /// fresh provider fetch and for a negative-cache stale fallback (whose age is
+    /// not recoverable from the lookup).
     pub freshness_ms: Option<u64>,
     /// Cost assigned to this request; charged to the budget only when the
     /// provider is actually called (never on a cache hit or gate rejection).
@@ -325,7 +327,9 @@ fn fallback_or_degraded(
 ) -> SocialResponse {
     match fallback {
         Some((value, age_ms)) => SocialResponse {
-            value: (*value).clone(),
+            // Sanitize again as defense-in-depth: every cached value is already
+            // bounded at insert, but a fallback must never trust that.
+            value: sanitize((*value).clone()),
             meta: SocialMeta {
                 cache_state: CacheState::StaleServed,
                 degraded_reason: reason,
