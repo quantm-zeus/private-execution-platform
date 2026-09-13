@@ -3,10 +3,13 @@
 mod support;
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use chain_types::ChainId;
 use domain::{IdempotencyKey, OrderStatus};
-use execution_relay::{RelayError, RelayOutcome, SubmissionState};
+use execution_relay::{
+    ChainHealth, RelayError, RelayExecutionInput, RelayOutcome, SubmissionState,
+};
 use support::{
     other_payload, payload, MockAdapter, MockBehavior, MockSigning, MockSource, MockStore,
     RelayHarness, NOW_MS,
@@ -357,4 +360,280 @@ async fn pre_tripped_breaker_blocks_execution() {
     assert_eq!(result, Err(RelayError::ChainHealthUnavailable));
     assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 0);
     assert_eq!(harness.store.reserve_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pre_submit_failure_does_not_burn_half_open_probe() {
+    let breaker = execution_relay::ChainHealthBreaker::new(2, 5_000);
+    breaker.record_failure(&ChainId::Base, 100);
+    breaker.record_failure(&ChainId::Base, 200);
+    let source = MockSource::standard();
+    source.set_fail_pre(true);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        breaker,
+        MockStore::new(),
+        MockAdapter::accepting(),
+        source,
+        MockSigning::ok(),
+    );
+
+    let blocked = harness.relay.execute(harness.input(5_300)).await;
+    assert_eq!(blocked, Err(RelayError::MissingSignedPayload));
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 0);
+
+    // The failed attempt never reached the adapter, so the probe is intact and
+    // a later attempt can still consume it.
+    harness.source.set_fail_pre(false);
+    let outcome = harness
+        .relay
+        .execute(harness.input(5_300))
+        .await
+        .expect("probe execution");
+    assert!(matches!(outcome, RelayOutcome::Submitted { .. }));
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_reservation_does_not_burn_half_open_probe() {
+    let breaker = execution_relay::ChainHealthBreaker::new(2, 5_000);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        breaker,
+        MockStore::new(),
+        MockAdapter::accepting(),
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let first = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("first");
+    assert!(matches!(first, RelayOutcome::Submitted { .. }));
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+
+    // Open the breaker after the successful attempt.
+    let chain = ChainId::Base;
+    harness.relay.breaker().record_failure(&chain, 100);
+    harness.relay.breaker().record_failure(&chain, 200);
+
+    // The duplicate returns its stored outcome before probe admission.
+    let duplicate = harness
+        .relay
+        .execute(harness.input(5_300))
+        .await
+        .expect("duplicate");
+    assert_eq!(duplicate, first);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+    assert!(
+        harness.relay.breaker().admit_probe(&chain, 5_300),
+        "a duplicate reservation must not consume the half-open probe"
+    );
+}
+
+#[tokio::test]
+async fn half_open_probe_success_closes_breaker() {
+    let breaker = execution_relay::ChainHealthBreaker::new(2, 5_000);
+    breaker.record_failure(&ChainId::Base, 100);
+    breaker.record_failure(&ChainId::Base, 200);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        breaker,
+        MockStore::new(),
+        MockAdapter::accepting(),
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let outcome = harness
+        .relay
+        .execute(harness.input(5_300))
+        .await
+        .expect("probe");
+    assert!(matches!(outcome, RelayOutcome::Submitted { .. }));
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.relay.breaker().health(&ChainId::Base, 5_301),
+        ChainHealth::Healthy
+    );
+}
+
+#[tokio::test]
+async fn half_open_probe_failure_reopens_breaker() {
+    let breaker = execution_relay::ChainHealthBreaker::new(2, 5_000);
+    breaker.record_failure(&ChainId::Base, 100);
+    breaker.record_failure(&ChainId::Base, 200);
+    let adapter = MockAdapter::new(
+        MockBehavior::Timeout,
+        execution_relay::ChainObservation::Unknown,
+    );
+    let harness = RelayHarness::build(
+        support::engine(true),
+        breaker,
+        MockStore::new(),
+        adapter,
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let outcome = harness
+        .relay
+        .execute(harness.input(5_300))
+        .await
+        .expect("probe");
+    assert_eq!(outcome, RelayOutcome::Unknown);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.relay.breaker().health(&ChainId::Base, 5_301),
+        ChainHealth::Unavailable
+    );
+    assert!(!harness
+        .relay
+        .breaker()
+        .check_allowed(&ChainId::Base, 10_000));
+}
+
+#[tokio::test]
+async fn transport_unavailable_yields_unknown_not_failed_before_submit() {
+    // The adapter reports itself healthy, so the relay reaches `submit`; the
+    // transport-level error must still be treated as an unknown outcome.
+    let adapter = MockAdapter::new(
+        MockBehavior::Unavailable,
+        execution_relay::ChainObservation::Unknown,
+    );
+    let harness = RelayHarness::build(
+        support::engine(true),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+        MockStore::new(),
+        adapter,
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let outcome = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("execute");
+    assert_eq!(outcome, RelayOutcome::Unknown);
+    assert_eq!(outcome.order_status(), OrderStatus::Executing);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+
+    // The unknown outcome is sticky and never resubmits.
+    let duplicate = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("duplicate");
+    assert_eq!(duplicate, RelayOutcome::Unknown);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reconcile_falls_through_when_query_returns_unknown() {
+    let adapter = MockAdapter::accepting();
+    adapter.set_query_observation(execution_relay::ChainObservation::Unknown);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+        MockStore::new(),
+        adapter,
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let submitted = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("execute");
+    assert!(matches!(submitted, RelayOutcome::Submitted { .. }));
+
+    let confirmed = harness
+        .relay
+        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        confirmed,
+        RelayOutcome::Confirmed {
+            reference: "confirmed-ref".to_string()
+        }
+    );
+    assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.adapter.reconcilers.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reconcile_falls_through_when_query_errors() {
+    let adapter = MockAdapter::accepting();
+    adapter.set_fail_query(true);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+        MockStore::new(),
+        adapter,
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let submitted = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("execute");
+    assert!(matches!(submitted, RelayOutcome::Submitted { .. }));
+
+    let confirmed = harness
+        .relay
+        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        confirmed,
+        RelayOutcome::Confirmed {
+            reference: "confirmed-ref".to_string()
+        }
+    );
+    assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.adapter.reconcilers.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn production_composition_fails_closed_without_submit() {
+    let store = MockStore::new();
+    let source = MockSource::standard();
+    let relay = execution_relay::ExecutionRelay::production(
+        support::engine(true),
+        Arc::clone(&store),
+        Arc::clone(&source),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+    );
+
+    let creator = support::engine(true);
+    let intent = support::intent();
+    let context = support::policy_context();
+    let approved = support::approved(&creator, &intent);
+    let prepared = support::prepared(&intent);
+    let route = support::route();
+    let preview = support::preview(&intent, &route);
+    let input = RelayExecutionInput {
+        intent: &intent,
+        policy_context: &context,
+        prepared: &prepared,
+        approved: &approved,
+        route: &route,
+        preview: &preview,
+        now_ms: NOW_MS,
+    };
+
+    // `UnavailableChainAdapter::health` is always `Unavailable`, so production
+    // composition blocks before any reservation, sign, or submit.
+    let result = relay.execute(input).await;
+    assert_eq!(result, Err(RelayError::ChainHealthUnavailable));
+    assert_eq!(store.reserve_calls.load(Ordering::SeqCst), 0);
 }

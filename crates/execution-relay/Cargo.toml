@@ -13,8 +13,6 @@ path = "src/lib.rs"
 async-trait.workspace = true
 chain-types.workspace = true
 domain.workspace = true
-execution-preview.workspace = true
-market-types.workspace = true
 policy.workspace = true
 privy.workspace = true
 serde.workspace = true
@@ -22,4 +20,5 @@ sha2 = "0.11"
 thiserror.workspace = true
 
 [dev-dependencies]
+market-types.workspace = true
 tokio.workspace = true

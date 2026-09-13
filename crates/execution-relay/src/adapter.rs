@@ -16,7 +16,7 @@ use crate::health::ChainHealth;
 use crate::plan::{SignedExecutionRef, SubmitRequest};
 
 /// Observation of an attempt's actual chain state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChainObservation {
     /// The chain confirmed the attempt.
@@ -29,14 +29,35 @@ pub enum ChainObservation {
     Unknown,
 }
 
+impl std::fmt::Debug for ChainObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Omit the opaque chain reference and the adapter final reason.
+        match self {
+            Self::Confirmed { .. } => formatter.write_str("Confirmed"),
+            Self::Pending => formatter.write_str("Pending"),
+            Self::Rejected { .. } => formatter.write_str("Rejected"),
+            Self::Unknown => formatter.write_str("Unknown"),
+        }
+    }
+}
+
 /// Acknowledgement returned by a successful submission.
 ///
 /// This is an acknowledgement only, NOT confirmation: confirmation requires a
 /// subsequent [`ChainSubmissionAdapter::reconcile`] observation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubmissionReceipt {
     /// Opaque chain acknowledgement reference.
     pub reference: String,
+}
+
+impl std::fmt::Debug for SubmissionReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Omit the opaque acknowledgement reference.
+        formatter
+            .debug_struct("SubmissionReceipt")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SubmissionReceipt {
@@ -147,6 +168,14 @@ impl ChainSubmissionAdapter for UnavailableChainAdapter {
 /// `PrivySigningBoundary` output into the relay's own
 /// [`SignedExecutionRef`]. Any signing failure is collapsed to the redacted
 /// [`RelayError::SigningFailed`].
+///
+/// # Security
+///
+/// This trait is a test/integration seam. A caller that can supply a signer
+/// here can bypass Privy's exactly-once backstop, so production wiring MUST use
+/// [`PrivySigningBoundaryAdapter`] (installed by
+/// [`ExecutionRelay::production`](crate::ExecutionRelay::production)) rather
+/// than a custom implementation.
 #[async_trait]
 pub trait SigningBoundary: Send + Sync {
     /// Signs a fully bound request at most once.

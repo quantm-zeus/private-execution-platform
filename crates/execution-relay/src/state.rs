@@ -1,8 +1,9 @@
 //! Reservation state machine and attempt-outcome types.
 //!
-//! The reservation store is the durable, authoritative exactly-once guard: the
-//! relay claims an attempt before signing and refuses to sign, fetch, or submit
-//! again for the same `(idempotency_key, request_digest)`.
+//! The reservation store is the authoritative exactly-once guard for a running
+//! relay: the relay claims an attempt before signing and refuses to sign, fetch,
+//! or submit again for the same `(idempotency_key, request_digest)`. The shipped
+//! implementations are process-local; durable storage is deferred.
 
 use std::fmt;
 
@@ -98,9 +99,10 @@ pub enum Reservation {
     Conflict,
 }
 
-/// Durable exactly-once reservation store.
+/// Exactly-once reservation store.
 ///
-/// Implementations must be deterministic for a given input sequence and must
+/// The shipped implementation is process-local (durable storage is deferred),
+/// but implementations must be deterministic for a given input sequence and must
 /// never permit a second reservation of the same `(key, digest)` to be treated
 /// as a fresh attempt.
 pub trait AttemptReservationStore: Send + Sync {

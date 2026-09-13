@@ -23,9 +23,11 @@ use crate::state::{AttemptReservationStore, RelayOutcome, Reservation, Submissio
 
 /// Trusted inputs for a single relay execution attempt.
 ///
-/// Every field is borrowed and never mutated. `policy_context` is carried for
-/// caller provenance; the approval it produced is supplied as `approved` and is
-/// re-verified by `SigningRequest::bind` against the live policy engine.
+/// Every field is borrowed and never mutated. `policy_context` is retained as
+/// caller/audit provenance only: the relay does **not** re-run turnover, size,
+/// or venue limits at relay time. The only policy checks on this path are the
+/// live kill switch (`PolicyEngine::is_trading_enabled`) and the deterministic
+/// approval/preview binding re-verified inside `SigningRequest::bind`.
 pub struct RelayExecutionInput<'a> {
     pub intent: &'a TradeIntent,
     pub policy_context: &'a PolicyContext,
@@ -58,8 +60,19 @@ where
     P: SignedPayloadSource,
     G: SigningBoundary,
 {
-    /// Wires the relay from its trusted policy engine and injected seams.
-    pub fn new(
+    /// Wires the relay from a caller-supplied signing seam.
+    ///
+    /// # Security
+    ///
+    /// This is a test/integration seam, not a production constructor. A caller
+    /// with a valid approval can inject an arbitrary [`SigningBoundary`], which
+    /// **bypasses Privy's exactly-once signing backstop**. Production wiring
+    /// MUST use [`ExecutionRelay::production`] (or explicitly install
+    /// [`PrivySigningBoundaryAdapter`]) so the real Privy boundary owns signing.
+    /// This constructor exists only so integration tests can drive the relay
+    /// state machine without a live signer.
+    #[doc(hidden)]
+    pub fn new_with_seams(
         policy: PolicyEngine,
         store: S,
         adapter: A,
@@ -174,7 +187,18 @@ where
         };
         self.journal_insert(key, &request);
 
-        // 10. Submit at most once. There is no retry loop anywhere.
+        // 10. Admit the submit exactly once. `check_allowed` above is a
+        //     read-only gate, so any failure before this point leaves the
+        //     half-open probe untouched; only this admission consumes it.
+        if !self.breaker.admit_probe(chain, input.now_ms) {
+            // A concurrent attempt consumed the probe between the gate and the
+            // submit: fail closed without sending. No chain call occurred, so
+            // this is a definitive pre-send failure.
+            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+            return Err(RelayError::ChainHealthUnavailable);
+        }
+
+        // 11. Submit at most once. There is no retry loop anywhere.
         match self.adapter.submit(&request).await {
             Ok(receipt) => {
                 self.breaker.record_success(chain);
@@ -197,14 +221,11 @@ where
                 self.record_outcome(key, &request_digest, outcome.clone());
                 Ok(outcome)
             }
-            Err(RelayError::AdapterUnavailable) => {
-                self.breaker.record_failure(chain, input.now_ms);
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
-                Ok(RelayOutcome::FailedBeforeSubmit)
-            }
             Err(_) => {
-                // Timeout or any other ambiguous failure: the send may have
-                // happened, so the safe terminal state is Unknown.
+                // Any other transport-level failure (`AdapterUnavailable`,
+                // `AdapterTimeout`, or an undocumented error) may have sent
+                // before failing, so the relay cannot assume "no send". Store
+                // and return Unknown: reconciliation is required, never a retry.
                 self.breaker.record_failure(chain, input.now_ms);
                 self.record_outcome(key, &request_digest, RelayOutcome::Unknown);
                 Ok(RelayOutcome::Unknown)
@@ -238,6 +259,12 @@ where
         Ok(outcome)
     }
 
+    /// Borrows the chain health breaker (diagnostics and tests only).
+    #[doc(hidden)]
+    pub fn breaker(&self) -> &ChainHealthBreaker {
+        &self.breaker
+    }
+
     fn record_outcome(&self, key: &IdempotencyKey, digest: &RequestDigest, outcome: RelayOutcome) {
         let _ = self.store.record_outcome(key, digest, outcome);
     }
@@ -258,15 +285,20 @@ where
     S: AttemptReservationStore,
     P: SignedPayloadSource,
 {
-    /// Production composition: fail-closed chain adapter and the real
-    /// (currently unavailable) Privy signing boundary.
+    /// **Production entry point.**
+    ///
+    /// Fail-closed composition: [`UnavailableChainAdapter`] performs no network
+    /// I/O and rejects every submission, and [`PrivySigningBoundaryAdapter`]
+    /// wraps the real P40 Privy boundary (whose public constructor installs an
+    /// always-unavailable transport). Use this rather than
+    /// [`ExecutionRelay::new_with_seams`] for any non-test wiring.
     pub fn production(
         policy: PolicyEngine,
         store: S,
         payload_source: P,
         breaker: ChainHealthBreaker,
     ) -> Self {
-        Self::new(
+        Self::new_with_seams(
             policy,
             store,
             UnavailableChainAdapter::new(),

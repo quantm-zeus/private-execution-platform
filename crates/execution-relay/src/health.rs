@@ -63,19 +63,53 @@ impl ChainHealthBreaker {
         }
     }
 
-    /// Returns whether a request is admitted for `chain` at `now_ms`.
+    /// Read-only gate: returns whether a request is admitted for `chain` at
+    /// `now_ms` *without* consuming a half-open probe.
     ///
-    /// A healthy or (pre-trip) degraded chain is admitted. An unavailable chain
-    /// is blocked until its cooldown elapses; the first call at/after that point
-    /// transitions to a single half-open probe.
+    /// A healthy chain is always admitted. A degraded chain is admitted while no
+    /// probe is in flight. An unavailable chain is admitted only once its
+    /// cooldown has elapsed, i.e. when a half-open probe would be admissible.
+    ///
+    /// This method never mutates the breaker. The caller must subsequently call
+    /// [`Self::admit_probe`] immediately before submitting so that a pre-submit
+    /// failure cannot strand a half-open probe.
     pub fn check_allowed(&self, chain: &ChainId, now_ms: i64) -> bool {
+        let states = crate::lock(&self.states);
+        match states.get(chain) {
+            None => true,
+            Some(entry) => match entry.state {
+                ChainHealth::Healthy => true,
+                ChainHealth::Degraded => !entry.probe_in_flight,
+                ChainHealth::Unavailable => {
+                    now_ms >= entry.cooldown_until_ms && !entry.probe_in_flight
+                }
+            },
+        }
+    }
+
+    /// Atomically consumes a submission admission for `chain` at `now_ms`.
+    ///
+    /// Call this immediately before `adapter.submit`: it is the only method that
+    /// sets `probe_in_flight`, so any earlier failure returns before a probe is
+    /// consumed. A healthy chain is admitted without consuming a probe; an
+    /// unavailable chain whose cooldown has elapsed transitions to a single
+    /// half-open probe; a degraded chain admits while no probe is in flight.
+    /// Returns `false` when no admission is currently available.
+    pub fn admit_probe(&self, chain: &ChainId, now_ms: i64) -> bool {
         let mut states = crate::lock(&self.states);
         let entry = states.entry(chain.clone()).or_default();
         match entry.state {
             ChainHealth::Healthy => true,
-            ChainHealth::Degraded => !entry.probe_in_flight,
+            ChainHealth::Degraded => {
+                if entry.probe_in_flight {
+                    false
+                } else {
+                    entry.probe_in_flight = true;
+                    true
+                }
+            }
             ChainHealth::Unavailable => {
-                if now_ms < entry.cooldown_until_ms {
+                if now_ms < entry.cooldown_until_ms || entry.probe_in_flight {
                     false
                 } else {
                     entry.state = ChainHealth::Degraded;

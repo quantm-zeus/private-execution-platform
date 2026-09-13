@@ -724,7 +724,6 @@ dependencies = [
  "async-trait",
  "chain-types",
  "domain",
- "execution-preview",
  "market-types",
  "policy",
  "privy",

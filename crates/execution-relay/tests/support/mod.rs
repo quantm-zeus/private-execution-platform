@@ -274,7 +274,10 @@ pub struct MockAdapter {
     pub queries: Arc<AtomicUsize>,
     pub reconcilers: Arc<AtomicUsize>,
     behavior: Mutex<MockBehavior>,
-    observation: Mutex<ChainObservation>,
+    query_observation: Mutex<ChainObservation>,
+    reconcile_observation: Mutex<ChainObservation>,
+    fail_query: Mutex<bool>,
+    fail_reconcile: Mutex<bool>,
     health: Mutex<ChainHealth>,
 }
 
@@ -285,7 +288,10 @@ impl MockAdapter {
             queries: Arc::new(AtomicUsize::new(0)),
             reconcilers: Arc::new(AtomicUsize::new(0)),
             behavior: Mutex::new(behavior),
-            observation: Mutex::new(observation),
+            query_observation: Mutex::new(observation.clone()),
+            reconcile_observation: Mutex::new(observation),
+            fail_query: Mutex::new(false),
+            fail_reconcile: Mutex::new(false),
             health: Mutex::new(ChainHealth::Healthy),
         })
     }
@@ -304,8 +310,26 @@ impl MockAdapter {
         *self.behavior.lock().expect("behavior lock") = behavior;
     }
 
+    /// Sets the observation returned by both `query` and `reconcile`.
     pub fn set_observation(&self, observation: ChainObservation) {
-        *self.observation.lock().expect("observation lock") = observation;
+        *self.query_observation.lock().expect("query lock") = observation.clone();
+        *self.reconcile_observation.lock().expect("reconcile lock") = observation;
+    }
+
+    pub fn set_query_observation(&self, observation: ChainObservation) {
+        *self.query_observation.lock().expect("query lock") = observation;
+    }
+
+    pub fn set_reconcile_observation(&self, observation: ChainObservation) {
+        *self.reconcile_observation.lock().expect("reconcile lock") = observation;
+    }
+
+    pub fn set_fail_query(&self, fail: bool) {
+        *self.fail_query.lock().expect("query fail lock") = fail;
+    }
+
+    pub fn set_fail_reconcile(&self, fail: bool) {
+        *self.fail_reconcile.lock().expect("reconcile fail lock") = fail;
     }
 
     pub fn set_health(&self, health: ChainHealth) {
@@ -334,7 +358,14 @@ impl ChainSubmissionAdapter for MockAdapter {
         _now_ms: i64,
     ) -> Result<ChainObservation, RelayError> {
         self.queries.fetch_add(1, Ordering::SeqCst);
-        Ok(self.observation.lock().expect("observation lock").clone())
+        if *self.fail_query.lock().expect("query fail lock") {
+            return Err(RelayError::AdapterUnavailable);
+        }
+        Ok(self
+            .query_observation
+            .lock()
+            .expect("query observation lock")
+            .clone())
     }
 
     async fn reconcile(
@@ -343,7 +374,14 @@ impl ChainSubmissionAdapter for MockAdapter {
         _now_ms: i64,
     ) -> Result<ChainObservation, RelayError> {
         self.reconcilers.fetch_add(1, Ordering::SeqCst);
-        Ok(self.observation.lock().expect("observation lock").clone())
+        if *self.fail_reconcile.lock().expect("reconcile fail lock") {
+            return Err(RelayError::AdapterUnavailable);
+        }
+        Ok(self
+            .reconcile_observation
+            .lock()
+            .expect("reconcile observation lock")
+            .clone())
     }
 
     fn health(&self, _now_ms: i64) -> ChainHealth {
@@ -355,6 +393,7 @@ pub struct MockSource {
     default_payload: SignedPayload,
     queue: Mutex<VecDeque<SignedPayload>>,
     post_override: Mutex<Option<SignedPayload>>,
+    fail_pre: Mutex<bool>,
     fail_post: Mutex<bool>,
     pub pre_calls: Arc<AtomicUsize>,
     pub post_calls: Arc<AtomicUsize>,
@@ -366,6 +405,7 @@ impl MockSource {
             default_payload,
             queue: Mutex::new(VecDeque::new()),
             post_override: Mutex::new(None),
+            fail_pre: Mutex::new(false),
             fail_post: Mutex::new(false),
             pre_calls: Arc::new(AtomicUsize::new(0)),
             post_calls: Arc::new(AtomicUsize::new(0)),
@@ -393,6 +433,10 @@ impl MockSource {
         *self.post_override.lock().expect("override lock") = Some(payload);
     }
 
+    pub fn set_fail_pre(&self, fail: bool) {
+        *self.fail_pre.lock().expect("pre fail lock") = fail;
+    }
+
     pub fn set_fail_post(&self, fail: bool) {
         *self.fail_post.lock().expect("fail lock") = fail;
     }
@@ -406,6 +450,9 @@ impl SignedPayloadSource for MockSource {
         _intent_id: &IntentId,
     ) -> Result<SignedPayload, RelayError> {
         self.pre_calls.fetch_add(1, Ordering::SeqCst);
+        if *self.fail_pre.lock().expect("pre fail lock") {
+            return Err(RelayError::MissingSignedPayload);
+        }
         let mut queue = self.queue.lock().expect("queue lock");
         Ok(queue
             .pop_front()
@@ -526,7 +573,7 @@ impl RelayHarness {
         let prepared = prepared(&intent);
         let route = route();
         let preview = preview(&intent, &route);
-        let relay = ExecutionRelay::new(
+        let relay = ExecutionRelay::new_with_seams(
             relay_engine,
             Arc::clone(&store),
             Arc::clone(&adapter),

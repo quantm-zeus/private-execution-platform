@@ -27,15 +27,50 @@ fn breaker_opens_after_threshold_and_half_open_recovers() {
     assert!(!breaker.check_allowed(&chain, 5_199));
 
     // Cooldown elapses at 5,200: exactly one half-open probe is admitted.
+    assert!(
+        breaker.check_allowed(&chain, 5_300),
+        "the read-only gate admits once the cooldown has elapsed"
+    );
     assert!(breaker.check_allowed(&chain, 5_300));
+    assert!(breaker.admit_probe(&chain, 5_300), "probe admitted");
     assert!(
         !breaker.check_allowed(&chain, 5_300),
         "a second concurrent probe must be blocked"
+    );
+    assert!(
+        !breaker.admit_probe(&chain, 5_300),
+        "only one in-flight probe is permitted"
     );
 
     breaker.record_success(&chain);
     assert_eq!(breaker.health(&chain, 5_301), ChainHealth::Healthy);
     assert!(breaker.check_allowed(&chain, 5_301));
+    assert!(breaker.admit_probe(&chain, 5_301));
+}
+
+#[test]
+fn check_allowed_is_read_only_and_admit_probe_consumes() {
+    let breaker = ChainHealthBreaker::new(2, 5_000);
+    let chain = ChainId::Base;
+
+    breaker.record_failure(&chain, 100);
+    breaker.record_failure(&chain, 200);
+    assert_eq!(breaker.health(&chain, 200), ChainHealth::Unavailable);
+
+    // Repeated read-only gates do not burn the half-open probe.
+    assert!(breaker.check_allowed(&chain, 5_300));
+    assert!(breaker.check_allowed(&chain, 5_300));
+    assert!(breaker.check_allowed(&chain, 5_300));
+
+    // Only an explicit admission consumes it.
+    assert!(breaker.admit_probe(&chain, 5_300));
+    assert!(!breaker.admit_probe(&chain, 5_300));
+    assert!(!breaker.check_allowed(&chain, 5_300));
+    assert_eq!(
+        breaker.health(&chain, 5_300),
+        ChainHealth::Degraded,
+        "an admitted probe leaves the breaker half-open"
+    );
 }
 
 #[test]
@@ -48,7 +83,8 @@ fn probe_failure_reopens_the_breaker() {
     assert_eq!(breaker.health(&chain, 200), ChainHealth::Unavailable);
     assert!(!breaker.check_allowed(&chain, 4_100));
 
-    assert!(breaker.check_allowed(&chain, 4_300), "probe admitted");
+    assert!(breaker.check_allowed(&chain, 4_300), "probe gate admits");
+    assert!(breaker.admit_probe(&chain, 4_300), "probe admitted");
     breaker.record_failure(&chain, 4_350);
     assert_eq!(breaker.health(&chain, 4_350), ChainHealth::Unavailable);
     assert!(!breaker.check_allowed(&chain, 5_000));

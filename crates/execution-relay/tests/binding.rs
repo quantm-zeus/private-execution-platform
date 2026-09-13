@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use chain_types::ChainId;
 use execution_relay::{
-    AttemptReservationStore, ChainSubmissionAdapter, ExecutionRelay, RelayError, SignedPayload,
-    SignedPayloadSource, SigningBoundary, SubmitRequest, MAX_SIGNED_PAYLOAD_BYTES,
+    AttemptReservationStore, ChainHealth, ChainObservation, ChainSubmissionAdapter, ExecutionRelay,
+    RelayError, SignedPayload, SignedPayloadSource, SigningBoundary, SubmissionReceipt,
+    SubmitRequest, UnavailableChainAdapter, MAX_SIGNED_PAYLOAD_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -201,6 +202,46 @@ fn payload_reference_and_request_debug_are_redacted() {
 }
 
 #[test]
+fn receipt_and_observation_debug_are_redacted() {
+    let receipt = SubmissionReceipt::new("receipt-ref").expect("receipt");
+    assert_redacted("SubmissionReceipt Debug", &format!("{receipt:?}"));
+
+    let confirmed = ChainObservation::Confirmed {
+        reference: "confirmed-ref".to_string(),
+    };
+    assert_redacted("ChainObservation Debug", &format!("{confirmed:?}"));
+
+    let rejected = ChainObservation::Rejected {
+        final_reason: "rejected-final-reason".to_string(),
+    };
+    assert_redacted("ChainObservation Debug", &format!("{rejected:?}"));
+}
+
+#[tokio::test]
+async fn unavailable_chain_adapter_fails_closed_on_every_method() {
+    let request = signing_request();
+    let signed = signed_ref_for(&request, "signed-ref");
+    let good = payload();
+    let bound =
+        SubmitRequest::bind(&request, &signed, &good, &ChainId::Base).expect("valid binding");
+
+    let adapter = UnavailableChainAdapter::new();
+    assert_eq!(
+        adapter.submit(&bound).await,
+        Err(RelayError::AdapterUnavailable)
+    );
+    assert_eq!(
+        adapter.query(&bound, 0).await,
+        Err(RelayError::AdapterUnavailable)
+    );
+    assert_eq!(
+        adapter.reconcile(&bound, 0).await,
+        Err(RelayError::AdapterUnavailable)
+    );
+    assert_eq!(adapter.health(0), ChainHealth::Unavailable);
+}
+
+#[test]
 fn relay_and_traits_are_send_sync_and_object_safe() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<
@@ -216,7 +257,7 @@ fn relay_and_traits_are_send_sync_and_object_safe() {
     let adapter: Arc<dyn ChainSubmissionAdapter> = MockAdapter::accepting();
     let source: Arc<dyn SignedPayloadSource> = MockSource::standard();
     let signing: Arc<dyn SigningBoundary> = MockSigning::ok();
-    let _relay = ExecutionRelay::new(
+    let _relay = ExecutionRelay::new_with_seams(
         support::engine(true),
         store,
         adapter,

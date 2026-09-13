@@ -82,6 +82,12 @@ pub struct SignedExecutionRef {
 
 impl SignedExecutionRef {
     /// Builds an attestation, rejecting an empty reference.
+    ///
+    /// This is a raw test seam: it attests to a signing request without proof
+    /// that Privy signed it, so production code must obtain this type from
+    /// [`PrivySigningBoundaryAdapter`](crate::PrivySigningBoundaryAdapter)
+    /// instead of constructing it directly.
+    #[doc(hidden)]
     pub fn new(
         reference: impl Into<String>,
         request_digest: RequestDigest,
