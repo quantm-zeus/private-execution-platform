@@ -244,10 +244,8 @@ fn a_partial_fill_never_leaves_an_unfillable_remainder() {
         let mut order = stored("partial", OrderStatus::Executing, max, max, 0);
         order.order.min_fill = AtomicAmount::new(min);
         let rem = order.order.remaining_input.get();
+        // `min <= max/2` by construction, so `max_partial >= min` always.
         let max_partial = rem.saturating_sub(min);
-        if max_partial < min {
-            continue;
-        }
         let net = rng.range(min, max_partial + 1);
         let candidate = fill(net, rem - net);
         let next = apply_transition(

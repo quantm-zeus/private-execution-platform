@@ -10,7 +10,7 @@ use chain_types::{AssetId, ChainId};
 use market_types::{AtomicAmount, BinPoolState, Bps, CpmmPoolState, LiquidityBin};
 use simulation::{
     div_u256_by_u128_floor, mul_u128_wide, simulate_bin_exact_input, simulate_cpmm_swap,
-    BinExactInputRequest, MAX_BIN_CROSSES,
+    BinExactInputRequest, BinSimulationError, SimulationError, MAX_BIN_CROSSES,
 };
 
 /// Deterministic splitmix64 generator (well-mixed output bits).
@@ -138,7 +138,10 @@ fn cpmm_exact_input_random_sweep_preserves_invariants() {
 #[test]
 fn cpmm_zero_and_zero_fee_edge_cases_are_typed() {
     let pool = cpmm_pool(1_000_000, 2_000_000, 30);
-    assert!(simulate_cpmm_swap(&pool, &pool.token_0, AtomicAmount::new(0)).is_err());
+    assert_eq!(
+        simulate_cpmm_swap(&pool, &pool.token_0, AtomicAmount::new(0)),
+        Err(SimulationError::ZeroInputAmount)
+    );
     let zero_fee = cpmm_pool(1_000_000, 2_000_000, 0);
     let quote = simulate_cpmm_swap(&zero_fee, &zero_fee.token_0, AtomicAmount::new(1_000))
         .expect("zero-fee swap succeeds");
@@ -166,6 +169,13 @@ fn cpmm_sweep_is_deterministic_for_identical_inputs() {
         let first = simulate_cpmm_swap(&a, &a.token_0, AtomicAmount::new(amount));
         let second = simulate_cpmm_swap(&b, &b.token_0, AtomicAmount::new(amount));
         assert_eq!(first, second);
+        // The error path must be deterministic too.
+        let zero_first = simulate_cpmm_swap(&a, &a.token_0, AtomicAmount::new(0));
+        assert_eq!(
+            zero_first,
+            simulate_cpmm_swap(&b, &b.token_0, AtomicAmount::new(0))
+        );
+        assert_eq!(zero_first, Err(SimulationError::ZeroInputAmount));
         if first != simulate_cpmm_swap(&a, &a.token_0, AtomicAmount::new(amount + 1)) {
             differences += 1;
         }
@@ -269,5 +279,33 @@ fn bin_zero_amount_is_typed() {
     let (mut rng, fee_bps) = (Lcg::new(0x1234), 30u16);
     let pool = wide_bin_pool(&mut rng, fee_bps);
     let request = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(0));
-    assert!(simulate_bin_exact_input(&pool, &request).is_err());
+    assert_eq!(
+        simulate_bin_exact_input(&pool, &request),
+        Err(BinSimulationError::ZeroInputAmount)
+    );
+}
+
+#[test]
+fn bin_crossing_budget_is_enforced() {
+    // The crossing budget is a secondary bound: exact rational bin prices can
+    // fail closed with `ArithmeticOverflow` before the budget is reached
+    // (documented in `bin.rs`). Pin the budget value and require a deep
+    // traversal to fail closed either way rather than silently truncating.
+    assert_eq!(MAX_BIN_CROSSES, 32);
+    let mut bins = Vec::new();
+    for id in -40i32..=0 {
+        let (reserve_0, reserve_1) = if id == 0 { (1, 1) } else { (0, 1_000) };
+        bins.push((id, reserve_0, reserve_1));
+    }
+    let pool = bin_pool(&bins, 0, 1, 30);
+    let request = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(1_000_000_000));
+    let outcome = simulate_bin_exact_input(&pool, &request);
+    assert!(
+        matches!(
+            outcome,
+            Err(BinSimulationError::BinCrossingExceeded)
+                | Err(BinSimulationError::ArithmeticOverflow)
+        ),
+        "deep traversal must fail closed, got {outcome:?}"
+    );
 }
