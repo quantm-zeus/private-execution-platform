@@ -17,8 +17,8 @@
 //!   queries, or order identifiers can appear in a response or error frame.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
 //!
-//! The stdio/HTTP listener, real backend wiring, and Telegram transport are
-//! later slices.
+//! The stdio listener ([`StdioServer`]) is the Phase 6 S3 transport wrapper;
+//! real backend wiring, HTTP/SSE, and Telegram transport are later slices.
 
 #![forbid(unsafe_code)]
 
@@ -26,7 +26,9 @@ mod backend;
 mod error;
 mod schema;
 mod server;
+mod stdio;
 
 pub use backend::{AgentBackend, BackendOutcome, UnavailableBackend};
 pub use error::McpError;
 pub use server::McpServer;
+pub use stdio::{StdioLimits, StdioServer};

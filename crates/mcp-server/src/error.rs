@@ -23,6 +23,12 @@ pub enum McpError {
     /// The method is not part of the served surface (`-32601`).
     #[error("unknown method")]
     MethodNotFound,
+
+    /// The underlying reader/writer failed with an I/O error. Produced only by
+    /// the stdio transport, never by the pure dispatcher; the underlying
+    /// failure is intentionally discarded so no I/O detail can leak.
+    #[error("transport error")]
+    Transport,
 }
 
 impl McpError {
@@ -33,6 +39,7 @@ impl McpError {
             Self::InvalidRequest => -32600,
             Self::InvalidParams => -32602,
             Self::MethodNotFound => -32601,
+            Self::Transport => -32603,
         }
     }
 }

@@ -15,7 +15,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std"] }
 
 [dev-dependencies]
 chain-types.workspace = true
-tokio = { workspace = true }
