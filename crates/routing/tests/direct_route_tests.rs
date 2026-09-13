@@ -197,10 +197,10 @@ fn bin_pool_a(token_0: AssetId, token_1: AssetId) -> BinPoolState {
     }
 }
 
-fn tax_assessment(asset: AssetId, buy_tax: u16, sell_tax: u16) -> TaxAssessment {
+fn tax_assessment_on(chain: ChainId, asset: AssetId, buy_tax: u16, sell_tax: u16) -> TaxAssessment {
     TaxAssessment::new(
         asset,
-        ChainId::Base,
+        chain,
         Bps::new(buy_tax).expect("buy tax"),
         Bps::new(sell_tax).expect("sell tax"),
         SafeFreshnessMeta {
@@ -212,6 +212,22 @@ fn tax_assessment(asset: AssetId, buy_tax: u16, sell_tax: u16) -> TaxAssessment 
         },
         1,
     )
+}
+
+fn tax_assessment(asset: AssetId, buy_tax: u16, sell_tax: u16) -> TaxAssessment {
+    tax_assessment_on(ChainId::Base, asset, buy_tax, sell_tax)
+}
+
+/// Zero-tax assessment bound to the intent's assessed asset.
+///
+/// The planner requires an explicit assessment, so untaxed-economics tests use
+/// this fixture instead of `None`. The zero rates keep gross == net.
+fn zero_tax_for(intent: &TradeIntent) -> TaxAssessment {
+    let assessed = match intent.side {
+        TradeSide::Buy => intent.token_out.clone(),
+        TradeSide::Sell => intent.token_in.clone(),
+    };
+    tax_assessment_on(intent.chain.clone(), assessed, 0, 0)
 }
 
 fn plan_with<'a>(
@@ -255,6 +271,7 @@ fn cpmm_direct_buy_zero_tax_is_pinned() {
     );
     let trade = base_intent(TradeSide::Buy, token_in.clone(), token_out.clone(), 10_000);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
 
     let leg = simulate_leg(&candidate, &trade, trade.amount, None, &policy, NOW_MS).expect("leg");
     assert_eq!(leg.amount_in.get(), 10_000);
@@ -274,7 +291,7 @@ fn cpmm_direct_buy_zero_tax_is_pinned() {
     let decision = plan_with(
         &trade,
         std::slice::from_ref(&candidate),
-        None,
+        Some(&zero_tax),
         &policy,
         &config,
     )
@@ -408,6 +425,7 @@ fn clmm_direct_records_fee_and_net_equals_gross() {
         100_000,
     );
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
 
     let leg = simulate_leg(&candidate, &trade, trade.amount, None, &policy, NOW_MS).expect("leg");
     assert_eq!(leg.gross_output, leg.net_output);
@@ -425,7 +443,7 @@ fn clmm_direct_records_fee_and_net_equals_gross() {
     let decision = plan_with(
         &trade,
         std::slice::from_ref(&candidate),
-        None,
+        Some(&zero_tax),
         &policy,
         &config,
     )
@@ -456,6 +474,7 @@ fn bin_direct_vector_a_zero_tax() {
     );
     let trade = base_intent(TradeSide::Buy, token_0.clone(), token_1.clone(), 1_010);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
 
     let leg = simulate_leg(&candidate, &trade, trade.amount, None, &policy, NOW_MS).expect("leg");
     assert_eq!(leg.amount_in.get(), 1_010);
@@ -468,7 +487,7 @@ fn bin_direct_vector_a_zero_tax() {
     let decision = plan_with(
         &trade,
         std::slice::from_ref(&candidate),
-        None,
+        Some(&zero_tax),
         &policy,
         &config,
     )
@@ -588,6 +607,223 @@ fn bin_sell_tax_composes_on_input_before_swap_with_conservation() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. Tax-aware CPMM Buy: buy tax applied to gross output, conservation asserted
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cpmm_buy_tax_composes_on_gross_output_with_conservation() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    let pool = cpmm_pool(
+        token_in.clone(),
+        token_out.clone(),
+        1_000_000,
+        2_000_000,
+        30,
+    );
+    let candidate = candidate(
+        "uniswap_v2",
+        "pool-cpmm-buy-tax",
+        PoolKindState::Cpmm(pool),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in.clone(), token_out.clone(), 10_000);
+    let tax = tax_assessment(token_out.clone(), 500, 0);
+    let policy = policy();
+
+    let leg = simulate_leg(
+        &candidate,
+        &trade,
+        trade.amount,
+        Some(&tax),
+        &policy,
+        NOW_MS,
+    )
+    .expect("leg");
+    // Gross output 19_743, buy tax floor(19_743 * 500 / 10_000) = 987, net 18_756.
+    assert_eq!(leg.amount_in.get(), 10_000);
+    assert_eq!(leg.gross_output.get(), 19_743);
+    assert_eq!(leg.net_output.get(), 18_756);
+    assert_eq!(leg.expected_amount_out.get(), 18_756);
+    assert_eq!(
+        leg.dex_fee,
+        Some(AssetAmount {
+            asset: token_in.clone(),
+            amount: AtomicAmount::new(30),
+        })
+    );
+    assert_eq!(
+        leg.tax_cost,
+        Some(AssetAmount {
+            asset: token_out.clone(),
+            amount: AtomicAmount::new(987),
+        })
+    );
+    assert_eq!(
+        leg.gross_output.get(),
+        leg.net_output.get() + leg.tax_cost.as_ref().expect("tax").amount.get()
+    );
+
+    let config = config(64);
+    let decision = plan_with(
+        &trade,
+        std::slice::from_ref(&candidate),
+        Some(&tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
+    assert_eq!(decision.plan.expected_net_output.amount.get(), 18_756);
+    assert_eq!(decision.score.gross_output.amount.get(), 19_743);
+    assert_eq!(decision.score.simulated_net_output.amount.get(), 18_756);
+    assert_eq!(
+        decision.score.tax_cost.as_ref().expect("tax").amount.get(),
+        987
+    );
+    assert!(decision.plan.validate().is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// 6c. Tax-aware CLMM Buy and Sell branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clmm_buy_tax_composes_on_gross_output_with_conservation() {
+    let pool = sample_clmm_pool();
+    let token_in = pool.token_0.clone();
+    let token_out = pool.token_1.clone();
+    let candidate = candidate(
+        "orca",
+        "pool-clmm-buy-tax",
+        PoolKindState::Clmm(pool),
+        fresh_freshness(),
+    );
+    let trade = intent_with_chain(
+        ChainId::Solana,
+        TradeSide::Buy,
+        token_in.clone(),
+        token_out.clone(),
+        100_000,
+    );
+    let tax = tax_assessment_on(ChainId::Solana, token_out.clone(), 250, 0);
+    let policy = policy();
+
+    let leg = simulate_leg(
+        &candidate,
+        &trade,
+        trade.amount,
+        Some(&tax),
+        &policy,
+        NOW_MS,
+    )
+    .expect("leg");
+    // Gross 100_018, buy tax floor(100_018 * 250 / 10_000) = 2_500, net 97_518.
+    assert_eq!(leg.amount_in.get(), 100_000);
+    assert_eq!(leg.gross_output.get(), 100_018);
+    assert_eq!(leg.net_output.get(), 97_518);
+    assert_eq!(leg.expected_amount_out.get(), 97_518);
+    assert_eq!(
+        leg.dex_fee,
+        Some(AssetAmount {
+            asset: token_in.clone(),
+            amount: AtomicAmount::new(300),
+        })
+    );
+    assert_eq!(
+        leg.tax_cost,
+        Some(AssetAmount {
+            asset: token_out.clone(),
+            amount: AtomicAmount::new(2_500),
+        })
+    );
+    assert_eq!(
+        leg.gross_output.get(),
+        leg.net_output.get() + leg.tax_cost.as_ref().expect("tax").amount.get()
+    );
+
+    let config = config(64);
+    let decision = plan_with(
+        &trade,
+        std::slice::from_ref(&candidate),
+        Some(&tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
+    assert_eq!(decision.plan.expected_net_output.amount.get(), 97_518);
+    assert_eq!(decision.score.gross_output.amount.get(), 100_018);
+    assert!(decision.plan.validate().is_ok());
+}
+
+#[test]
+fn clmm_sell_tax_composes_on_input_before_swap_with_conservation() {
+    let pool = sample_clmm_pool();
+    let token_in = pool.token_0.clone();
+    let token_out = pool.token_1.clone();
+    let candidate = candidate(
+        "orca",
+        "pool-clmm-sell-tax",
+        PoolKindState::Clmm(pool),
+        fresh_freshness(),
+    );
+    let trade = intent_with_chain(
+        ChainId::Solana,
+        TradeSide::Sell,
+        token_in.clone(),
+        token_out.clone(),
+        100_000,
+    );
+    let tax = tax_assessment_on(ChainId::Solana, token_in.clone(), 0, 250);
+    let policy = policy();
+
+    let leg = simulate_leg(
+        &candidate,
+        &trade,
+        trade.amount,
+        Some(&tax),
+        &policy,
+        NOW_MS,
+    )
+    .expect("leg");
+    // Sell tax floor(100_000 * 250 / 10_000) = 2_500; net input 97_500 -> output 97_518.
+    assert_eq!(leg.amount_in.get(), 97_500);
+    assert_eq!(leg.gross_output.get(), 97_518);
+    assert_eq!(leg.net_output.get(), 97_518);
+    assert_eq!(leg.expected_amount_out.get(), 97_518);
+    assert_eq!(
+        leg.dex_fee,
+        Some(AssetAmount {
+            asset: token_in.clone(),
+            amount: AtomicAmount::new(292),
+        })
+    );
+    assert_eq!(
+        leg.tax_cost,
+        Some(AssetAmount {
+            asset: token_in.clone(),
+            amount: AtomicAmount::new(2_500),
+        })
+    );
+    assert_eq!(
+        leg.amount_in.get() + leg.tax_cost.as_ref().expect("tax").amount.get(),
+        trade.amount.get()
+    );
+
+    let config = config(64);
+    let decision = plan_with(
+        &trade,
+        std::slice::from_ref(&candidate),
+        Some(&tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
+    assert_eq!(decision.plan.expected_net_output.amount.get(), 97_518);
+    assert_eq!(decision.plan.legs[0].amount_in.get(), 97_500);
+    assert!(decision.plan.validate().is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // 7. Net-vs-gross: primary ranking key is simulated net output, never gross
 // ---------------------------------------------------------------------------
 
@@ -685,10 +921,17 @@ fn plan_direct_route_selects_max_net_output_end_to_end() {
     );
     let trade = base_intent(TradeSide::Buy, token_in, token_out, 10_000);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
     let config = config(64);
 
-    let decision =
-        plan_with(&trade, &[candidate_a, candidate_b], None, &policy, &config).expect("decision");
+    let decision = plan_with(
+        &trade,
+        &[candidate_a, candidate_b],
+        Some(&zero_tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
     assert_eq!(decision.winner.legs[0].pool_ref, "pool-b");
     assert_eq!(decision.score.simulated_net_output.amount.get(), 20_792);
     assert_eq!(decision.score.gross_output.amount.get(), 20_792);
@@ -739,8 +982,9 @@ fn two_candidates() -> (
 #[test]
 fn repeated_planning_is_identical_and_serializes_identically() {
     let (trade, candidates, policy, config) = two_candidates();
-    let first = plan_with(&trade, &candidates, None, &policy, &config).expect("first");
-    let second = plan_with(&trade, &candidates, None, &policy, &config).expect("second");
+    let zero_tax = zero_tax_for(&trade);
+    let first = plan_with(&trade, &candidates, Some(&zero_tax), &policy, &config).expect("first");
+    let second = plan_with(&trade, &candidates, Some(&zero_tax), &policy, &config).expect("second");
 
     assert_eq!(first, second);
     assert_eq!(
@@ -752,11 +996,14 @@ fn repeated_planning_is_identical_and_serializes_identically() {
 #[test]
 fn candidate_order_permutation_yields_same_winner_and_score() {
     let (trade, candidates, policy, config) = two_candidates();
-    let forward = plan_with(&trade, &candidates, None, &policy, &config).expect("forward");
+    let zero_tax = zero_tax_for(&trade);
+    let forward =
+        plan_with(&trade, &candidates, Some(&zero_tax), &policy, &config).expect("forward");
 
     let mut reversed = candidates.clone();
     reversed.reverse();
-    let backward = plan_with(&trade, &reversed, None, &policy, &config).expect("backward");
+    let backward =
+        plan_with(&trade, &reversed, Some(&zero_tax), &policy, &config).expect("backward");
 
     assert_eq!(forward.winner, backward.winner);
     assert_eq!(forward.score, backward.score);
@@ -800,12 +1047,13 @@ fn stale_and_resync_candidates_are_skipped() {
     );
     let trade = base_intent(TradeSide::Buy, token_in, token_out, 10_000);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
     let config = config(64);
 
     let decision = plan_with(
         &trade,
         &[stale.clone(), good.clone()],
-        None,
+        Some(&zero_tax),
         &policy,
         &config,
     )
@@ -814,7 +1062,13 @@ fn stale_and_resync_candidates_are_skipped() {
 
     // A single stale candidate yields no viable route.
     assert_eq!(
-        plan_with(&trade, std::slice::from_ref(&stale), None, &policy, &config),
+        plan_with(
+            &trade,
+            std::slice::from_ref(&stale),
+            Some(&zero_tax),
+            &policy,
+            &config
+        ),
         Err(RoutingError::NoViableRoute)
     );
 
@@ -866,6 +1120,7 @@ fn zero_output_candidate_is_skipped_without_aborting_search() {
     );
     let trade = base_intent(TradeSide::Buy, token_in, token_out, 10);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
     let config = config(64);
 
     assert_eq!(
@@ -875,15 +1130,21 @@ fn zero_output_candidate_is_skipped_without_aborting_search() {
         ))
     );
 
-    let decision =
-        plan_with(&trade, &[zero_output.clone(), good], None, &policy, &config).expect("decision");
+    let decision = plan_with(
+        &trade,
+        &[zero_output.clone(), good],
+        Some(&zero_tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
     assert_eq!(decision.winner.legs[0].pool_ref, "pool-good");
 
     assert_eq!(
         plan_with(
             &trade,
             std::slice::from_ref(&zero_output),
-            None,
+            Some(&zero_tax),
             &policy,
             &config
         ),
@@ -898,6 +1159,7 @@ fn unusable_candidates_yield_no_viable_route() {
     let policy = policy();
     let config = config(64);
     let trade = base_intent(TradeSide::Buy, token_in.clone(), token_out, 10_000);
+    let zero_tax = zero_tax_for(&trade);
 
     // Candidate pair does not contain the intent output token.
     let wrong_pair = candidate(
@@ -916,7 +1178,7 @@ fn unusable_candidates_yield_no_viable_route() {
         plan_with(
             &trade,
             std::slice::from_ref(&wrong_pair),
-            None,
+            Some(&zero_tax),
             &policy,
             &config
         ),
@@ -940,7 +1202,7 @@ fn unusable_candidates_yield_no_viable_route() {
         plan_with(
             &trade,
             std::slice::from_ref(&wrong_chain),
-            None,
+            Some(&zero_tax),
             &policy,
             &config
         ),
@@ -953,7 +1215,95 @@ fn unusable_candidates_yield_no_viable_route() {
 
     // Empty candidate set.
     assert_eq!(
-        plan_with(&trade, &[], None, &policy, &config),
+        plan_with(&trade, &[], Some(&zero_tax), &policy, &config),
+        Err(RoutingError::NoViableRoute)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9b. Malformed candidate references never abort the search (FIX 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn malformed_best_net_candidate_is_skipped_for_viable_lower_net() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    // This candidate has the best net output but a whitespace venue, so it can
+    // never produce a valid `RoutePlan`.
+    let malformed_best = candidate(
+        "   ",
+        "pool-high-net",
+        PoolKindState::Cpmm(cpmm_pool(
+            token_in.clone(),
+            token_out.clone(),
+            1_000_000,
+            2_100_000,
+            0,
+        )),
+        fresh_freshness(),
+    );
+    let viable_lower = candidate(
+        "venue-good",
+        "pool-good",
+        PoolKindState::Cpmm(cpmm_pool(
+            token_in.clone(),
+            token_out.clone(),
+            1_000_000,
+            2_000_000,
+            0,
+        )),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in.clone(), token_out.clone(), 10_000);
+    let zero_tax = zero_tax_for(&trade);
+    let policy = policy();
+    let config = config(64);
+
+    let decision = plan_with(
+        &trade,
+        &[malformed_best.clone(), viable_lower.clone()],
+        Some(&zero_tax),
+        &policy,
+        &config,
+    )
+    .expect("decision");
+    assert_eq!(decision.winner.legs[0].pool_ref, "pool-good");
+    assert_eq!(decision.plan.legs[0].pool_ref, "pool-good");
+
+    // A whitespace pool_ref is equally malformed, and a candidate set with only
+    // malformed candidates fails closed as `NoViableRoute` (not a domain error).
+    let malformed_ref = candidate(
+        "venue-x",
+        "\t ",
+        PoolKindState::Cpmm(cpmm_pool(
+            token_in.clone(),
+            token_out.clone(),
+            1_000_000,
+            2_100_000,
+            0,
+        )),
+        fresh_freshness(),
+    );
+    for malformed in [&malformed_best, &malformed_ref] {
+        assert_eq!(
+            plan_with(
+                &trade,
+                std::slice::from_ref(malformed),
+                Some(&zero_tax),
+                &policy,
+                &config
+            ),
+            Err(RoutingError::NoViableRoute)
+        );
+    }
+    assert_eq!(
+        plan_with(
+            &trade,
+            &[malformed_best, malformed_ref],
+            Some(&zero_tax),
+            &policy,
+            &config
+        ),
         Err(RoutingError::NoViableRoute)
     );
 }
@@ -1077,6 +1427,274 @@ fn tax_asset_mismatch_fails_closed_as_tax_error() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 9c. Tax assessment binding, freshness, and presence (FIX 2/3/4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_surfaces_unbound_tax_assessment_instead_of_no_viable_route() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    let pool = cpmm_pool(
+        token_in.clone(),
+        token_out.clone(),
+        1_000_000,
+        2_000_000,
+        30,
+    );
+    let candidate = candidate(
+        "venue-a",
+        "pool-a",
+        PoolKindState::Cpmm(pool),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in, token_out.clone(), 10_000);
+    let policy = policy();
+    let config = config(64);
+
+    // Assessed asset is not the intent's `token_out` for a Buy: surfaced as the
+    // typed Tax error, not masked as `NoViableRoute`.
+    let wrong_asset = tax_assessment(other_token(), 500, 0);
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&wrong_asset),
+            &policy,
+            &config
+        ),
+        Err(RoutingError::Tax(TaxSafetyError::AssessedAssetMismatch))
+    );
+
+    // Chain mismatch is surfaced the same way.
+    let wrong_chain = tax_assessment_on(ChainId::Solana, token_out, 500, 0);
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&wrong_chain),
+            &policy,
+            &config
+        ),
+        Err(RoutingError::Tax(TaxSafetyError::ChainMismatch))
+    );
+}
+
+#[test]
+fn plan_fails_closed_on_stale_tax_assessment() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    let pool = cpmm_pool(
+        token_in.clone(),
+        token_out.clone(),
+        1_000_000,
+        2_000_000,
+        30,
+    );
+    let candidate = candidate(
+        "venue-a",
+        "pool-a",
+        PoolKindState::Cpmm(pool),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in, token_out.clone(), 10_000);
+    let policy = policy();
+    let config = config(64);
+
+    // The preserved status itself is unusable.
+    let status_stale = TaxAssessment::new(
+        token_out.clone(),
+        ChainId::Base,
+        Bps::new(500).expect("bps"),
+        Bps::new(0).expect("bps"),
+        SafeFreshnessMeta {
+            status: FreshnessStatus::Stale,
+            observed_at_ms: NOW_MS,
+            evaluated_at_ms: NOW_MS,
+            age_ms: 0,
+            sequence: Sequence(1),
+        },
+        1,
+    );
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&status_stale),
+            &policy,
+            &config
+        ),
+        Err(RoutingError::StaleState)
+    );
+
+    let resync = TaxAssessment::new(
+        token_out.clone(),
+        ChainId::Base,
+        Bps::new(500).expect("bps"),
+        Bps::new(0).expect("bps"),
+        SafeFreshnessMeta {
+            status: FreshnessStatus::ResyncRequired,
+            observed_at_ms: NOW_MS,
+            evaluated_at_ms: NOW_MS,
+            age_ms: 0,
+            sequence: Sequence(1),
+        },
+        1,
+    );
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&resync),
+            &policy,
+            &config
+        ),
+        Err(RoutingError::ResyncRequired)
+    );
+
+    // Status says Fresh, but `observed_at_ms` is older than the caller's policy
+    // window at `now_ms`: the planner re-evaluates and fails closed.
+    let observation_stale = TaxAssessment::new(
+        token_out,
+        ChainId::Base,
+        Bps::new(500).expect("bps"),
+        Bps::new(0).expect("bps"),
+        SafeFreshnessMeta {
+            status: FreshnessStatus::Fresh,
+            observed_at_ms: NOW_MS - 20_000,
+            evaluated_at_ms: NOW_MS - 20_000,
+            age_ms: 20_000,
+            sequence: Sequence(1),
+        },
+        1,
+    );
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&observation_stale),
+            &policy,
+            &config
+        ),
+        Err(RoutingError::StaleState)
+    );
+}
+
+#[test]
+fn missing_tax_assessment_fails_closed() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    let pool = cpmm_pool(
+        token_in.clone(),
+        token_out.clone(),
+        1_000_000,
+        2_000_000,
+        30,
+    );
+    let candidate = candidate(
+        "venue-a",
+        "pool-a",
+        PoolKindState::Cpmm(pool),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in, token_out, 10_000);
+    let policy = policy();
+    let config = config(64);
+
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            None,
+            &policy,
+            &config
+        ),
+        Err(RoutingError::TaxAssessmentRequired)
+    );
+
+    // `simulate_leg` retains its `Option` for internal/test use, and an explicit
+    // zero-tax assessment keeps the untaxed expectations.
+    let zero_tax = zero_tax_for(&trade);
+    assert!(simulate_leg(
+        &candidate,
+        &trade,
+        trade.amount,
+        Some(&zero_tax),
+        &policy,
+        NOW_MS
+    )
+    .is_ok());
+    assert!(simulate_leg(&candidate, &trade, trade.amount, None, &policy, NOW_MS).is_ok());
+}
+
+#[test]
+fn buy_amount_mismatch_is_rejected() {
+    let token_in = base_token_0();
+    let token_out = base_token_1();
+    let pool = cpmm_pool(
+        token_in.clone(),
+        token_out.clone(),
+        1_000_000,
+        2_000_000,
+        30,
+    );
+    let candidate = candidate(
+        "venue-a",
+        "pool-a",
+        PoolKindState::Cpmm(pool),
+        fresh_freshness(),
+    );
+    let trade = base_intent(TradeSide::Buy, token_in, token_out, 10_000);
+    let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
+
+    // A direct caller cannot simulate an arbitrary Buy amount.
+    assert_eq!(
+        simulate_leg(
+            &candidate,
+            &trade,
+            AtomicAmount::new(trade.amount.get() + 1),
+            Some(&zero_tax),
+            &policy,
+            NOW_MS
+        ),
+        Err(RoutingError::InputConservationViolated)
+    );
+    assert_eq!(
+        simulate_leg(
+            &candidate,
+            &trade,
+            AtomicAmount::new(trade.amount.get() - 1),
+            Some(&zero_tax),
+            &policy,
+            NOW_MS
+        ),
+        Err(RoutingError::InputConservationViolated)
+    );
+    // The same binding holds even without an assessment.
+    assert_eq!(
+        simulate_leg(
+            &candidate,
+            &trade,
+            AtomicAmount::new(trade.amount.get() + 1),
+            None,
+            &policy,
+            NOW_MS
+        ),
+        Err(RoutingError::InputConservationViolated)
+    );
+    // The exact intent amount still simulates.
+    assert!(simulate_leg(
+        &candidate,
+        &trade,
+        trade.amount,
+        Some(&zero_tax),
+        &policy,
+        NOW_MS
+    )
+    .is_ok());
+}
+
 #[test]
 fn budget_exceeded_when_candidate_count_over_cap() {
     let token_in = base_token_0();
@@ -1104,13 +1722,14 @@ fn budget_exceeded_when_candidate_count_over_cap() {
     ];
     let trade = base_intent(TradeSide::Buy, token_in, token_out, 10_000);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
 
     assert_eq!(
-        plan_with(&trade, &candidates, None, &policy, &config(1)),
+        plan_with(&trade, &candidates, Some(&zero_tax), &policy, &config(1)),
         Err(RoutingError::BudgetExceeded)
     );
     assert_eq!(
-        plan_with(&trade, &candidates, None, &policy, &config(0)),
+        plan_with(&trade, &candidates, Some(&zero_tax), &policy, &config(0)),
         Err(RoutingError::BudgetExceeded)
     );
 }
@@ -1134,13 +1753,27 @@ fn invalid_intent_fails_closed_before_search() {
     );
     let trade = base_intent(TradeSide::Buy, token_in, token_out, 0);
     let policy = policy();
+    let zero_tax = zero_tax_for(&trade);
     assert_eq!(
         plan_with(
             &trade,
             std::slice::from_ref(&candidate),
-            None,
+            Some(&zero_tax),
             &policy,
             &config(64)
+        ),
+        Err(RoutingError::Domain(DomainError::ZeroTradeAmount))
+    );
+
+    // Intent validity is checked before the candidate budget, so an invalid
+    // intent is never masked by `BudgetExceeded`.
+    assert_eq!(
+        plan_with(
+            &trade,
+            std::slice::from_ref(&candidate),
+            Some(&zero_tax),
+            &policy,
+            &config(0)
         ),
         Err(RoutingError::Domain(DomainError::ZeroTradeAmount))
     );
@@ -1191,6 +1824,7 @@ fn routing_errors_are_redacted_and_payload_free() {
         RoutingError::Bin(BinSimulationError::InvalidBinStep),
         RoutingError::Tax(TaxSafetyError::AssessedAssetMismatch),
         RoutingError::NoViableRoute,
+        RoutingError::TaxAssessmentRequired,
         RoutingError::StaleState,
         RoutingError::ResyncRequired,
         RoutingError::UnsupportedPoolKind,

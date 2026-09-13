@@ -41,6 +41,13 @@ pub enum RoutingError {
     #[error("no viable route")]
     NoViableRoute,
 
+    /// The direct-route planner was called without a tax assessment.
+    ///
+    /// A missing assessment is not evidence of a zero-tax token, so the planner
+    /// fails closed rather than overstating net output.
+    #[error("tax assessment required")]
+    TaxAssessmentRequired,
+
     /// The candidate's pool state is stale under the supplied freshness policy.
     #[error("pool state is stale")]
     StaleState,

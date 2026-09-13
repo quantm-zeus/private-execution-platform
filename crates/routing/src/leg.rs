@@ -60,6 +60,14 @@ pub fn simulate_leg(
     freshness_policy: &FreshnessPolicy,
     now_ms: i64,
 ) -> Result<EvaluatedLeg, RoutingError> {
+    // Bind the simulated input to the intent exactly. Sell-side tax is checked
+    // separately through input conservation, but a Buy leg previously consumed
+    // whatever `amount_in` the caller supplied, so this closes that gap
+    // symmetrically for every side.
+    if amount_in != intent.amount {
+        return Err(RoutingError::InputConservationViolated);
+    }
+
     validate_state(&candidate.state)?;
 
     if candidate.state.token_0().chain != intent.chain
@@ -79,7 +87,13 @@ pub fn simulate_leg(
         return Err(output_asset_mismatch(&candidate.state));
     }
 
-    let bound_tax = validated_tax(intent, tax)?;
+    let bound_tax = match tax {
+        Some(assessment) => {
+            validate_tax_assessment(intent, assessment, freshness_policy, now_ms)?;
+            Some(assessment)
+        }
+        None => None,
+    };
 
     let raw = match &candidate.state {
         PoolKindState::Cpmm(pool) => simulate_cpmm(pool, intent, amount_in, bound_tax)?,
@@ -146,22 +160,50 @@ fn check_freshness(
     }
 }
 
-/// Validates that a supplied assessment is bound to the intent chain and to the
-/// asset actually being assessed (`token_out` for Buy, `token_in` for Sell).
-fn validated_tax<'a>(
+/// Validates a supplied tax assessment against the intent, its binding assets,
+/// and the caller's freshness policy.
+///
+/// Binding: `chain` must equal the intent chain and `assessed_asset` must be
+/// `token_out` for Buy intents / `token_in` for Sell intents.
+///
+/// Freshness: the preserved [`FreshnessStatus`] must be usable. Because
+/// [`SafeFreshnessMeta`] exposes its `observed_at_ms`, the assessment is also
+/// re-evaluated against `now_ms` with the caller's policy, so an assessment that
+/// was fresh when it was computed cannot silently remain usable when the
+/// planner's reference time is later.
+pub(crate) fn validate_tax_assessment(
     intent: &TradeIntent,
-    tax: Option<&'a TaxAssessment>,
-) -> Result<Option<&'a TaxAssessment>, RoutingError> {
-    let Some(assessment) = tax else {
-        return Ok(None);
-    };
+    assessment: &TaxAssessment,
+    freshness_policy: &FreshnessPolicy,
+    now_ms: i64,
+) -> Result<(), RoutingError> {
     if assessment.chain != intent.chain {
         return Err(RoutingError::Tax(TaxSafetyError::ChainMismatch));
     }
     if assessment.assessed_asset != *assessed_asset_for_intent(intent) {
         return Err(RoutingError::Tax(TaxSafetyError::AssessedAssetMismatch));
     }
-    Ok(Some(assessment))
+
+    match assessment.freshness.status {
+        FreshnessStatus::Fresh => {}
+        FreshnessStatus::Stale => return Err(RoutingError::StaleState),
+        FreshnessStatus::ResyncRequired => return Err(RoutingError::ResyncRequired),
+    }
+
+    let meta = evaluate_freshness(
+        freshness_policy,
+        assessment.freshness.observed_at_ms,
+        now_ms,
+        assessment.freshness.sequence,
+        false,
+    )
+    .map_err(|_| RoutingError::Internal("tax freshness evaluation failed"))?;
+
+    match meta.status {
+        FreshnessStatus::Fresh => Ok(()),
+        FreshnessStatus::Stale => Err(RoutingError::StaleState),
+        FreshnessStatus::ResyncRequired => Err(RoutingError::ResyncRequired),
+    }
 }
 
 fn side_tax(assessment: &TaxAssessment, side: TradeSide) -> Bps {

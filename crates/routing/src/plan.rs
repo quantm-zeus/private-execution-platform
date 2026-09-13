@@ -11,7 +11,7 @@ use domain::{RouteLeg, RoutePlan, RouteScore, TradeIntent};
 use market_types::{AssetAmount, PoolKindState};
 
 use crate::error::RoutingError;
-use crate::leg::simulate_leg;
+use crate::leg::{simulate_leg, validate_tax_assessment};
 use crate::types::{EvaluatedLeg, EvaluatedPath, PoolCandidate, RouteDecision, RoutingInput};
 
 /// Plans the best single-hop direct route for the supplied input.
@@ -20,15 +20,30 @@ use crate::types::{EvaluatedLeg, EvaluatedPath, PoolCandidate, RouteDecision, Ro
 /// candidate failure is isolated: a failed candidate is skipped and never aborts
 /// the search. The winner is selected by simulated net output (never gross) with
 /// deterministic `(pool_ref, venue)` tie-breaking.
+///
+/// The intent is validated before the resource budget so an invalid intent is
+/// never masked by `BudgetExceeded`. A tax assessment is mandatory: a missing
+/// assessment fails closed with [`RoutingError::TaxAssessmentRequired`] rather
+/// than assuming a zero-tax token. When one is supplied, its binding and
+/// freshness are validated once up front so a bad assessment is surfaced as the
+/// typed error instead of being erased as `NoViableRoute`. Candidates with an
+/// empty or whitespace `venue`/`pool_ref` cannot form a valid route plan and are
+/// skipped during the candidate loop.
 pub fn plan_direct_route(input: &RoutingInput<'_>) -> Result<RouteDecision, RoutingError> {
+    input.intent.validate(input.now_ms)?;
+
     if input.config.max_candidates == 0 || input.candidates.len() > input.config.max_candidates {
         return Err(RoutingError::BudgetExceeded);
     }
 
-    input.intent.validate(input.now_ms)?;
+    let tax = input.tax.ok_or(RoutingError::TaxAssessmentRequired)?;
+    validate_tax_assessment(input.intent, tax, input.freshness_policy, input.now_ms)?;
 
     let mut ranked: Vec<(EvaluatedPath, &PoolCandidate)> = Vec::new();
     for candidate in input.candidates {
+        if candidate.venue.trim().is_empty() || candidate.pool_ref.trim().is_empty() {
+            continue;
+        }
         if !contains_pair(&candidate.state, input.intent) {
             continue;
         }
@@ -36,7 +51,7 @@ pub fn plan_direct_route(input: &RoutingInput<'_>) -> Result<RouteDecision, Rout
             candidate,
             input.intent,
             input.intent.amount,
-            input.tax,
+            Some(tax),
             input.freshness_policy,
             input.now_ms,
         ) {
