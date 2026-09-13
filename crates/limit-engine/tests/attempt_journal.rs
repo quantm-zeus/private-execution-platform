@@ -14,10 +14,10 @@ use domain::{
     WalletRef,
 };
 use limit_engine::{
-    attempt_intent_id, attempt_key, attempt_stream_blind_index, object_id, order_id_for_creation,
-    stream_blind_index, ApprovalSnapshot, AttemptAppendOutcome, AttemptPhase, BoundAttempt,
-    DurableLimitOrderStore, LimitEngineError, LimitOrderStore, OrderAttemptEvent, OrderKeyMaterial,
-    OrderKeyProvider, StoredLimitOrder,
+    attempt_intent_id, attempt_key, attempt_prepared_reference, attempt_stream_blind_index,
+    object_id, order_id_for_creation, stream_blind_index, ApprovalSnapshot, AttemptAppendOutcome,
+    AttemptPhase, BoundAttempt, DurableLimitOrderStore, LimitEngineError, LimitOrderStore,
+    OrderAttemptEvent, OrderKeyMaterial, OrderKeyProvider, StoredLimitOrder,
 };
 use market_types::{
     AssetAmount, AtomicAmount, Bps, Freshness, FreshnessStatus, PriceRatio, Sequence,
@@ -133,7 +133,13 @@ fn bound_attempt(keys: &TestOrderKeys, order: &OrderId, attempt_seq: u64) -> Bou
             approved_trade_usd: 500_000,
             approved_at_ms: 1,
         },
-        prepared_reference: format!("prepared-{attempt_seq}"),
+        prepared_reference: attempt_prepared_reference(
+            &keys.blind_key(),
+            &ChainId::Base,
+            order,
+            attempt_seq,
+        )
+        .expect("prepared reference"),
         payload_digest: [u8::try_from(attempt_seq).unwrap_or(1); 32],
         attempt_key: intent.idempotency_key.clone(),
         attempt_seq,
@@ -246,12 +252,22 @@ async fn conflicting_payload_for_the_same_phase_is_rejected() {
     let bound = bound_event(&keys, &order.order.id, 0);
     store.append_attempt(&bound).await.expect("first");
 
-    let mut conflicting = bound_attempt(&keys, &order.order.id, 1);
-    conflicting.prepared_reference = "prepared-other".to_string();
-    let conflicting = OrderAttemptEvent::bound(conflicting, order.order.id.clone(), 0);
-
+    // A genuine payload conflict on a non-identity field (the digest) is
+    // rejected as a conflict, not as a malformed identity.
+    let mut digest_conflict = bound_attempt(&keys, &order.order.id, 1);
+    digest_conflict.payload_digest = [0xCD; 32];
+    let digest_conflict = OrderAttemptEvent::bound(digest_conflict, order.order.id.clone(), 0);
     assert_eq!(
-        store.append_attempt(&conflicting).await,
+        store.append_attempt(&digest_conflict).await,
+        Err(LimitEngineError::PersistenceConflict)
+    );
+
+    // The same holds for a conflicting bound route.
+    let mut route_conflict = bound_attempt(&keys, &order.order.id, 1);
+    route_conflict.route.legs[0].pool_ref = "pool-other".to_string();
+    let route_conflict = OrderAttemptEvent::bound(route_conflict, order.order.id.clone(), 0);
+    assert_eq!(
+        store.append_attempt(&route_conflict).await,
         Err(LimitEngineError::PersistenceConflict)
     );
     assert_eq!(
@@ -262,6 +278,30 @@ async fn conflicting_payload_for_the_same_phase_is_rejected() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn bound_with_a_forged_prepared_reference_is_rejected() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = keys();
+    let store = durable_store(&backend, &keys);
+    let order = create_order(&store, &keys, "forged").await;
+
+    // A `BoundAttempt` whose `prepared_reference` is caller-asserted rather than
+    // derived from the blind index must be refused as malformed, even on the
+    // first append (no conflicting prior event).
+    let mut forged = bound_attempt(&keys, &order.order.id, 1);
+    forged.prepared_reference = "prepared-forged".to_string();
+    let forged = OrderAttemptEvent::bound(forged, order.order.id.clone(), 0);
+    assert_eq!(
+        store.append_attempt(&forged).await,
+        Err(LimitEngineError::RecordMalformed)
+    );
+    assert!(store
+        .read_attempts(&order.order.id)
+        .await
+        .expect("read")
+        .is_empty());
 }
 
 #[tokio::test]

@@ -714,7 +714,8 @@ fn open_attempt(
 /// to a different `(order, attempt_seq)`. A mismatch is fail-closed
 /// [`LimitEngineError::RecordMalformed`]. For a `Bound` event the bound intent is
 /// additionally required to be the derived per-attempt intent on the same chain,
-/// so a restarted reconciler can always reconstruct the reservation it names.
+/// and its `prepared_reference` must equal the derived per-attempt reference, so
+/// a restarted reconciler can always reconstruct the reservation it names.
 fn attempt_identity_binds(
     blind_index: &BlindIndexKey,
     chain: &ChainId,
@@ -732,9 +733,16 @@ fn attempt_identity_binds(
             &event.order_id,
             event.attempt_seq,
         )?;
+        let expected_reference = crate::attempt::attempt_prepared_reference(
+            blind_index,
+            chain,
+            &event.order_id,
+            event.attempt_seq,
+        )?;
         if bound.intent.idempotency_key != expected_key
             || bound.intent.id != expected_intent
             || bound.intent.chain != *chain
+            || bound.prepared_reference != expected_reference
         {
             return Err(LimitEngineError::RecordMalformed);
         }

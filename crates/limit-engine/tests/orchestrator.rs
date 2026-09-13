@@ -310,7 +310,7 @@ struct ExecutorHandles {
 /// Scripted fake execution seam. Never signs; records the durable binding it
 /// was handed and verifies the reserve-before-sign WAL is already durable.
 struct FakeExecutor {
-    digest: [u8; 32],
+    digest: Result<[u8; 32], LimitEngineError>,
     calls: Arc<AtomicU64>,
     prepared_calls: Arc<AtomicU64>,
     resolutions: Arc<Mutex<VecDeque<AttemptResolution>>>,
@@ -344,7 +344,7 @@ impl FakeExecutor {
         };
         (
             Self {
-                digest: [0xAB; 32],
+                digest: Ok([0xAB; 32]),
                 calls,
                 prepared_calls,
                 resolutions,
@@ -358,12 +358,18 @@ impl FakeExecutor {
             handles,
         )
     }
+
+    /// Overrides the digest the fake seam reports (success, zero, or error).
+    fn with_digest(mut self, digest: Result<[u8; 32], LimitEngineError>) -> Self {
+        self.digest = digest;
+        self
+    }
 }
 
 #[async_trait]
 impl AttemptExecutor for FakeExecutor {
     async fn payload_digest(&self, _intent: &TradeIntent) -> Result<[u8; 32], LimitEngineError> {
-        Ok(self.digest)
+        self.digest
     }
 
     async fn execute(
@@ -448,6 +454,25 @@ async fn harness(
     enabled: bool,
     max_attempts: u32,
 ) -> Harness {
+    harness_with_digest(
+        spec,
+        resolutions,
+        provider,
+        enabled,
+        max_attempts,
+        Ok([0xAB; 32]),
+    )
+    .await
+}
+
+async fn harness_with_digest(
+    spec: OrderSpec<'_>,
+    resolutions: Vec<AttemptResolution>,
+    provider: ModelProvider,
+    enabled: bool,
+    max_attempts: u32,
+    digest: Result<[u8; 32], LimitEngineError>,
+) -> Harness {
     let backend = Arc::new(InMemoryOpaqueStore::new());
     let keys = Arc::new(TestOrderKeys::deterministic(7));
     let mut order = durable_order(
@@ -469,7 +494,7 @@ async fn harness(
     let orchestrator = Orchestrator::new(
         durable_store(&backend, &keys),
         provider,
-        executor,
+        executor.with_digest(digest),
         policy(enabled),
         AttemptLimits {
             max_attempts_per_order: max_attempts,
@@ -587,6 +612,54 @@ async fn happy_path_fills_and_persists_bound_before_execute() {
     let recorded = lock(&h.handles.recorded);
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].intent.amount.get(), 1000);
+}
+
+#[tokio::test]
+async fn payload_digest_error_reverts_to_active_without_attempt() {
+    // A failing digest must be resolved *before* the `Quoting -> Simulating ->
+    // Executing` chain is durably persisted, so the order cannot wedge in
+    // `Executing` with no `Bound` WAL. The `TriggerCandidate` state the trigger
+    // persisted is reverted to `Active`.
+    let h = harness_with_digest(
+        OrderSpec::new("p51-digest-err", OrderStatus::Active, 1000, 1000, 0),
+        vec![realized(1000, 240)],
+        constant_provider(),
+        true,
+        4,
+        Err(LimitEngineError::KeyUnavailable),
+    )
+    .await;
+
+    let outcome = tick(&h, true).await;
+    assert_eq!(outcome.err(), Some(LimitEngineError::KeyUnavailable));
+
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::Active);
+    assert_eq!(h.handles.calls.load(Ordering::SeqCst), 0);
+    assert!(attempts(&h).await.is_empty());
+}
+
+#[tokio::test]
+async fn zero_payload_digest_reverts_to_active_without_attempt() {
+    // A zero digest is an un-bindable payload: fail `RecordMalformed` before the
+    // execution chain is persisted, reverting to `Active`.
+    let h = harness_with_digest(
+        OrderSpec::new("p51-digest-zero", OrderStatus::Active, 1000, 1000, 0),
+        vec![realized(1000, 240)],
+        constant_provider(),
+        true,
+        4,
+        Ok([0u8; 32]),
+    )
+    .await;
+
+    let outcome = tick(&h, true).await;
+    assert_eq!(outcome.err(), Some(LimitEngineError::RecordMalformed));
+
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::Active);
+    assert_eq!(h.handles.calls.load(Ordering::SeqCst), 0);
+    assert!(attempts(&h).await.is_empty());
 }
 
 #[tokio::test]
@@ -948,6 +1021,35 @@ async fn trading_disabled_is_policy_rejected_without_attempt() {
         assert_eq!(h.handles.calls.load(Ordering::SeqCst), 0);
         assert!(h.backend.event_attempts().is_empty());
     }
+
+    // A disabled gate must NOT mask an already-reserved in-flight attempt: the
+    // `Executing` check runs first, so the tick reports `InFlight` and writes
+    // nothing.
+    let h = harness(
+        OrderSpec::new(
+            "p51-disabled-executing",
+            OrderStatus::Executing,
+            1000,
+            1000,
+            0,
+        ),
+        vec![],
+        constant_provider(),
+        false,
+        4,
+    )
+    .await;
+    let outcome = tick(&h, true).await.expect("tick");
+    assert!(
+        matches!(&outcome, TickOutcome::InFlight { attempt_seq: 0 }),
+        "got {outcome:?}"
+    );
+    let stored = load(&h).await;
+    assert_eq!(stored.order.status, OrderStatus::Executing);
+    assert_eq!(stored.version, 1);
+    assert_eq!(h.handles.calls.load(Ordering::SeqCst), 0);
+    assert!(h.backend.event_attempts().is_empty());
+    assert!(attempts(&h).await.is_empty());
 }
 
 #[tokio::test]

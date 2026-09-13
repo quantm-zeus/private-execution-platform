@@ -4,17 +4,19 @@
 //! pieces. One [`Orchestrator::tick`] call:
 //!
 //! 1. loads the authoritative order from the P46 durable store,
-//! 2. fails closed on a terminal order or a disabled trading gate,
+//! 2. fails closed on a terminal order,
 //! 3. structurally refuses to re-touch an `Executing` order (its `Bound` WAL is
 //!    already durable and re-signing is forbidden),
-//! 4. normalizes a crash-left `Created`/`Quoting`/`Simulating` order to `Active`,
-//! 5. evaluates the P45 trigger against the P44/P45 pure economics,
-//! 6. re-quotes the exact chunk and runs the P50 preparation core,
-//! 7. persists the `TriggerCandidate -> Quoting -> Simulating -> Executing`
-//!    chain *before* any side effect,
-//! 8. appends the durable `Bound` attempt (reserve-before-sign),
-//! 9. delegates signing/submission to an injected [`AttemptExecutor`], and
-//! 10. applies the realized fill / remainder through the P44 FSM + fill ledger.
+//! 4. fails closed on a disabled trading gate,
+//! 5. normalizes a crash-left `Created`/`Quoting`/`Simulating` order to `Active`,
+//! 6. evaluates the P45 trigger against the P44/P45 pure economics,
+//! 7. re-quotes the exact chunk and runs the P50 preparation core,
+//! 8. validates the executor's payload digest, then persists the
+//!    `TriggerCandidate -> Quoting -> Simulating -> Executing` chain *before* any
+//!    side effect,
+//! 9. appends the durable `Bound` attempt (reserve-before-sign),
+//! 10. delegates signing/submission to an injected [`AttemptExecutor`], and
+//! 11. applies the realized fill / remainder through the P44 FSM + fill ledger.
 //!
 //! Nothing here signs, submits, reads a clock, uses an RNG, or performs network
 //! I/O: every instant is the explicit `now_ms`, and the only capability that can
@@ -32,9 +34,11 @@
 //!    `apply_transition` chain the trigger used, one persisted step at a time,
 //!    because the durable store re-derives and compares every transition
 //!    byte-for-byte. `TriggerCandidate`/`Expired` outcomes are single-step.
-//! 2. The kill-switch gate runs immediately after the terminal check and before
-//!    any execution-path write, so a disabled gate leaves a `Created`/`Quoting`
-//!    order untouched (no transition persisted) and never calls the provider.
+//! 2. The kill-switch gate runs after the terminal *and* `Executing` checks but
+//!    before any execution-path write, so a disabled gate still reports
+//!    `InFlight` for an already-reserved attempt while leaving a
+//!    `Created`/`Quoting` order untouched (no transition persisted) and never
+//!    calling the provider.
 //! 3. The locked FSM has no `TriggerCandidate -> FailedFinal` edge, so a final
 //!    preparation abort parks the order back in `Active` with no side effect.
 //! 4. The executor receives the live [`PreparedAttempt`] in addition to the
@@ -278,15 +282,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             });
         }
 
-        // 2b. Kill-switch gate: fail closed before any execution-path write or
-        // provider call. `prepare_attempt` re-checks policy as the second layer.
-        if !self.policy.is_trading_enabled() {
-            return Ok(TickOutcome::PolicyRejected);
-        }
-
         // 3. An `Executing` order already has a durable `Bound` WAL; a tick must
         // never re-sign or re-submit it. Reporting in-flight is the structural
-        // crash-safety answer.
+        // crash-safety answer. This must run before the kill-switch gate so a
+        // disabled gate cannot mask an in-flight attempt that still needs
+        // reconciliation.
         if order.order.status == OrderStatus::Executing {
             let attempt_seq = self
                 .store
@@ -295,6 +295,14 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 .map(|event| event.attempt_seq)
                 .unwrap_or(0);
             return Ok(TickOutcome::InFlight { attempt_seq });
+        }
+
+        // 3b. Kill-switch gate: fail closed before any execution-path write or
+        // provider call, but after the in-flight check so it cannot mask an
+        // `Executing` order. `prepare_attempt` re-checks policy as the second
+        // layer.
+        if !self.policy.is_trading_enabled() {
+            return Ok(TickOutcome::PolicyRejected);
         }
 
         // 4. Normalize a crash-left pre-sign state without any execution side
@@ -400,7 +408,26 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             }
         };
 
-        // 9. Persist the FSM chain before any side effect. Each step is the
+        // 9. Resolve the executor's payload digest *before* persisting any part
+        // of the execution chain. A digest error or a zero digest must not leave
+        // the order durably `Executing` with no `Bound` attempt, which would
+        // wedge it forever. The revert below restores the `Active` state that
+        // `prepare_attempt` saw, so a later tick can retry from scratch.
+        let payload_digest = match self.executor.payload_digest(&prepared.intent).await {
+            Ok(digest) if digest != [0u8; 32] => digest,
+            Ok(_) => {
+                self.advance(&order, OrderStatus::Active, input.now_ms)
+                    .await?;
+                return Err(LimitEngineError::RecordMalformed);
+            }
+            Err(error) => {
+                self.advance(&order, OrderStatus::Active, input.now_ms)
+                    .await?;
+                return Err(error);
+            }
+        };
+
+        // 10. Persist the FSM chain before any side effect. Each step is the
         // exact `apply_transition` output; the store re-derives and compares it.
         order = self
             .advance(&order, OrderStatus::Quoting, input.now_ms)
@@ -412,7 +439,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             .advance(&order, OrderStatus::Executing, input.now_ms)
             .await?;
 
-        // 10. Build the durable binding.
+        // 11. Build the durable binding.
         let approval = &prepared.approval;
         let bound = BoundAttempt {
             intent: prepared.intent.clone(),
@@ -428,16 +455,13 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 approved_at_ms: approval.approved_at_ms(),
             },
             prepared_reference: identity.prepared_reference.clone(),
-            payload_digest: self.executor.payload_digest(&prepared.intent).await?,
+            payload_digest,
             attempt_key: prepared.intent.idempotency_key.clone(),
             attempt_seq: identity.attempt_seq,
             nonce: prepared.intent.nonce,
         };
-        if bound.payload_digest == [0u8; 32] {
-            return Err(LimitEngineError::RecordMalformed);
-        }
 
-        // 11. Reserve before sign: the `Bound` event is durable before the
+        // 12. Reserve before sign: the `Bound` event is durable before the
         // executor is ever contacted. A fresh attempt may only be `Applied`.
         let bound_event =
             OrderAttemptEvent::bound(bound.clone(), input.order_id.clone(), input.now_ms);
@@ -448,10 +472,10 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             }
         }
 
-        // 12. Delegate signing/submission to the injected seam at most once.
+        // 13. Delegate signing/submission to the injected seam at most once.
         let resolution = self.executor.execute(&prepared, &bound, input.now_ms).await;
 
-        // 13. Record the matching attempt phase, then apply the order effect.
+        // 14. Record the matching attempt phase, then apply the order effect.
         let attempt_seq = identity.attempt_seq;
         let attempt_key = bound.attempt_key.clone();
         match resolution {
