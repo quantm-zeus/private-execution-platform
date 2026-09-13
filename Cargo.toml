@@ -21,6 +21,7 @@ members = [
     "crates/provider-broker",
     "crates/simulation",
     "crates/tax-engine",
+    "crates/routing",
     "crates/execution-preview",
     "crates/execution-relay",
     "crates/audit",
@@ -51,6 +52,7 @@ mcp-adapters = { path = "crates/mcp-adapters" }
 provider-broker = { path = "crates/provider-broker" }
 simulation = { path = "crates/simulation" }
 tax-engine = { path = "crates/tax-engine" }
+routing = { path = "crates/routing" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
 audit = { path = "crates/audit" }
