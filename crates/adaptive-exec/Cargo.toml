@@ -10,4 +10,10 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
+chain-types.workspace = true
 market-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
