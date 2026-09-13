@@ -106,14 +106,29 @@ enum Outcome {
 pub struct McpServer<B: AgentBackend> {
     backend: B,
     capabilities: AgentCapabilities,
+    /// Channel reported to `authorize` and the backend.
+    ///
+    /// `authorize` treats every channel identically (AC-4), but a backend or an
+    /// audit sink may label commands by channel, so the value is explicit rather
+    /// than hardcoded to MCP.
+    channel: AgentChannel,
 }
 
 impl<B: AgentBackend> McpServer<B> {
     /// Builds a dispatcher from a trusted backend and capability context.
+    ///
+    /// The channel is [`AgentChannel::Mcp`]; use [`McpServer::for_channel`] for a
+    /// different transport (for example Telegram) that shares this dispatcher.
     pub fn new(backend: B, capabilities: AgentCapabilities) -> Self {
+        Self::for_channel(backend, capabilities, AgentChannel::Mcp)
+    }
+
+    /// Builds a dispatcher that labels commands as `channel`.
+    pub fn for_channel(backend: B, capabilities: AgentCapabilities, channel: AgentChannel) -> Self {
         Self {
             backend,
             capabilities,
+            channel,
         }
     }
 
@@ -239,21 +254,21 @@ impl<B: AgentBackend> McpServer<B> {
         // The valuation is backend-supplied and trusted; the dispatcher never
         // derives value from the request body.
         let valuation = self.backend.valuation_usd_micros(&command).await;
-        match authorize(AgentChannel::Mcp, command, &self.capabilities, valuation) {
+        match authorize(self.channel, command, &self.capabilities, valuation) {
             AuthorizedCommand::Denied(reason) => {
                 Reply::Result(tool_error(deny_reason_name(reason)))
             }
             AuthorizedCommand::Read(command) => {
                 let outcome = self
                     .backend
-                    .execute(AgentChannel::Mcp, AgentCommand::Read(command))
+                    .execute(self.channel, AgentCommand::Read(command))
                     .await;
                 Reply::Result(backend_result(outcome))
             }
             AuthorizedCommand::Trade(command) => {
                 let outcome = self
                     .backend
-                    .execute(AgentChannel::Mcp, AgentCommand::Trade(command))
+                    .execute(self.channel, AgentCommand::Trade(command))
                     .await;
                 Reply::Result(backend_result(outcome))
             }
@@ -293,10 +308,12 @@ fn json_rpc_version_ok(fields: &RawFields) -> bool {
 /// This is the shared entry point for transports that receive a structured
 /// command directly (for example the Telegram bot) and want the exact same
 /// dispatcher path as an MCP client. The command object is parsed losslessly and
-/// duplicate keys are rejected (so a repeated `"tool"` or argument fails closed)
-/// and the argument bytes are spliced through verbatim, so atomic `u128` amounts
-/// stay lossless. Returns `None` when the text is not a JSON object, has no
-/// non-empty string `"tool"`, or repeats a key.
+/// **top-level** duplicate keys are rejected (so a repeated `"tool"` or top-level
+/// argument fails closed; a duplicate nested inside an argument object is left
+/// for the `agent-commands` decoder, which rejects it) and the argument bytes are
+/// spliced through verbatim, so atomic `u128` amounts stay lossless. Returns
+/// `None` when the text is not a JSON object, has no non-empty string `"tool"`,
+/// or repeats a top-level key.
 pub fn tools_call_frame(command_json: &str) -> Option<String> {
     let fields = parse_object(command_json).ok()?;
     let tool = fields

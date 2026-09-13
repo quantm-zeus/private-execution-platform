@@ -10,11 +10,11 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+agent-commands.workspace = true
 async-trait.workspace = true
 mcp-server.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-agent-commands.workspace = true
 tokio.workspace = true

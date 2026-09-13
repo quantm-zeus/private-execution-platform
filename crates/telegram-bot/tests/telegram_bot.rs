@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_commands::{AgentCapabilities, AgentChannel, AgentCommand};
 use async_trait::async_trait;
-use mcp_server::{AgentBackend, BackendOutcome, McpServer};
+use mcp_server::{AgentBackend, BackendOutcome};
 use serde_json::{json, Value};
 use telegram_bot::{Delivery, TelegramBot, TelegramError, TelegramTransport, REPLY_TOO_LARGE};
 
@@ -50,9 +50,42 @@ fn bot(
     transport: RecordingTransport,
 ) -> TelegramBot<FakeBackend, RecordingTransport> {
     TelegramBot::new(
-        McpServer::new(FakeBackend { outcome }, capabilities(trading_enabled)),
+        FakeBackend { outcome },
+        capabilities(trading_enabled),
         transport,
     )
+}
+
+/// Records the channel the dispatcher reports for each command.
+struct ChannelBackend {
+    seen: Arc<Mutex<Vec<AgentChannel>>>,
+}
+
+#[async_trait]
+impl AgentBackend for ChannelBackend {
+    async fn execute(&self, channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
+        self.seen.lock().expect("lock").push(channel);
+        BackendOutcome::Value(json!({}))
+    }
+}
+
+#[tokio::test]
+async fn telegram_commands_are_labeled_with_the_telegram_channel() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = TelegramBot::new(
+        ChannelBackend { seen: seen.clone() },
+        capabilities(false),
+        transport,
+    );
+    bot.handle_text("42", r#"{"tool":"get_orders"}"#)
+        .await
+        .expect("handled");
+    assert_eq!(*seen.lock().expect("lock"), vec![AgentChannel::Telegram]);
 }
 
 #[tokio::test]
@@ -130,6 +163,13 @@ async fn natural_language_and_non_text_updates_fail_closed() {
     let no_chat = json!({ "message": { "text": "{\"tool\":\"get_orders\"}" } });
     assert_eq!(
         bot.handle_update(&no_chat).await,
+        Err(TelegramError::Malformed)
+    );
+    // A non-integer (float) chat id is malformed.
+    let float_chat =
+        json!({ "message": { "chat": { "id": 1.5 }, "text": "{\"tool\":\"get_orders\"}" } });
+    assert_eq!(
+        bot.handle_update(&float_chat).await,
         Err(TelegramError::Malformed)
     );
     assert!(sent.lock().expect("lock").is_empty());

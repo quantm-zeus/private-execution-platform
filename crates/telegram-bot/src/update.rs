@@ -8,6 +8,10 @@ use crate::error::TelegramError;
 /// UTF-16; 16 KiB of UTF-8 is a safe outer bound and keeps parsing bounded).
 pub const MAX_UPDATE_TEXT_BYTES: usize = 16 * 1024;
 
+/// Maximum accepted chat-id length. Telegram ids are small integers; the bound
+/// only stops a malicious update from carrying an unbounded destination string.
+pub const MAX_CHAT_ID_BYTES: usize = 64;
+
 /// A parsed text message: one chat and the structured command text.
 ///
 /// Fields are private and `Debug` is redacted so a chat id or command body can
@@ -20,15 +24,21 @@ pub struct TelegramUpdate {
 impl TelegramUpdate {
     /// Parses a Telegram `Update` JSON object.
     ///
-    /// Only a `message` with a `chat.id` (integer or string) and a non-empty
-    /// `text` within [`MAX_UPDATE_TEXT_BYTES`] is accepted; anything else is
-    /// [`TelegramError::Malformed`] and is never dispatched.
+    /// Only a `message` with a `chat.id` (a JSON integer, or a non-empty string
+    /// within [`MAX_CHAT_ID_BYTES`]) and a non-empty `text` within
+    /// [`MAX_UPDATE_TEXT_BYTES`] is accepted; anything else (including a
+    /// floating-point id) is [`TelegramError::Malformed`] and is never
+    /// dispatched.
     pub fn parse(update: &Value) -> Result<Self, TelegramError> {
         let message = update.get("message").ok_or(TelegramError::Malformed)?;
         let chat = message.get("chat").ok_or(TelegramError::Malformed)?;
         let chat_id = match chat.get("id") {
-            Some(Value::Number(number)) => number.to_string(),
-            Some(Value::String(value)) if !value.is_empty() => value.clone(),
+            // Telegram sends an integer; reject a float (ambiguous and not a
+            // valid chat id) rather than stringifying it.
+            Some(Value::Number(number)) if number.is_i64() || number.is_u64() => number.to_string(),
+            Some(Value::String(value)) if !value.is_empty() && value.len() <= MAX_CHAT_ID_BYTES => {
+                value.clone()
+            }
             _ => return Err(TelegramError::Malformed),
         };
         let text = message

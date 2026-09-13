@@ -1,5 +1,6 @@
 //! The Telegram bot core: same MCP dispatcher and authorization path as MCP.
 
+use agent_commands::{AgentCapabilities, AgentChannel};
 use mcp_server::{tools_call_frame, AgentBackend, McpServer};
 use serde_json::Value;
 
@@ -37,9 +38,17 @@ pub struct TelegramBot<B: AgentBackend, T: TelegramTransport> {
 }
 
 impl<B: AgentBackend, T: TelegramTransport> TelegramBot<B, T> {
-    /// Wires the bot from the shared dispatcher and an outbound transport.
-    pub fn new(server: McpServer<B>, transport: T) -> Self {
-        Self { server, transport }
+    /// Wires the bot from a trusted backend, capability context, and outbound
+    /// transport.
+    ///
+    /// The shared dispatcher is built with [`AgentChannel::Telegram`], so the
+    /// backend and any audit sink observe the true channel rather than MCP. The
+    /// rule set is otherwise identical (`authorize` is channel-agnostic, AC-4).
+    pub fn new(backend: B, capabilities: AgentCapabilities, transport: T) -> Self {
+        Self {
+            server: McpServer::for_channel(backend, capabilities, AgentChannel::Telegram),
+            transport,
+        }
     }
 
     /// Handles one raw Telegram `Update`.
@@ -54,7 +63,10 @@ impl<B: AgentBackend, T: TelegramTransport> TelegramBot<B, T> {
     /// `{"tool": "<name>", ...arguments}`; free-form natural language is rejected
     /// as [`TelegramError::Malformed`] (ambiguity fails closed). The command is
     /// forwarded to the shared dispatcher, so a denied, forbidden, or malformed
-    /// command never reaches the backend.
+    /// command never reaches [`AgentBackend::execute`]. (The dispatcher does ask
+    /// [`AgentBackend::valuation_usd_micros`] for the trusted valuation before
+    /// authorization on every command, exactly as over MCP; the default returns
+    /// `None` and no execution occurs.)
     pub async fn handle_text(&self, chat_id: &str, text: &str) -> Result<Delivery, TelegramError> {
         if chat_id.is_empty() || text.is_empty() || text.len() > MAX_UPDATE_TEXT_BYTES {
             return Err(TelegramError::Malformed);
