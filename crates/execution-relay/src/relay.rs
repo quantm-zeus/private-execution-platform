@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use domain::{IdempotencyKey, RoutePlan, TradeIntent, ValidatedExecutionPreview};
+use domain::{IdempotencyKey, IntentId, RoutePlan, TradeIntent, ValidatedExecutionPreview};
 use policy::{ApprovedExecution, PolicyContext, PolicyEngine};
-use privy::{PreparedExecutionRef, RequestDigest, SigningRequest};
+use privy::{PayloadDigest, PreparedExecutionRef, RequestDigest, SigningRequest};
 
 use crate::adapter::{
     ChainObservation, ChainSubmissionAdapter, PrivySigningBoundaryAdapter, SigningBoundary,
@@ -238,6 +238,25 @@ where
                 Ok(RelayOutcome::Unknown)
             }
         }
+    }
+
+    /// Resolves the payload digest the relay would bind into a signing request
+    /// for `(idempotency_key, intent_id)`.
+    ///
+    /// This is an additive, non-invasive accessor: it performs the *same*
+    /// `payload_to_sign` lookup `execute` performs at step 3 and returns the
+    /// digest without signing, reserving, or submitting anything. A caller (for
+    /// example a limit-order `AttemptExecutor`) can therefore expose the exact
+    /// digest the relay will commit to, deterministically and without a signer.
+    pub async fn payload_digest_for(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        intent_id: &IntentId,
+    ) -> Result<PayloadDigest, RelayError> {
+        self.payload_source
+            .payload_to_sign(idempotency_key, intent_id)
+            .await
+            .map(|payload| *payload.digest())
     }
 
     /// Reconciles a previously executed attempt. NEVER submits.

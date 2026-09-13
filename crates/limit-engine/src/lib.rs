@@ -3,8 +3,11 @@
 //!
 //! This crate is the pure, deterministic L1 core for limit orders. It owns the
 //! order-status transition guard, the fill ledger arithmetic, and a persistence
-//! *contract* (a trait plus an in-memory fake). There is no clock, no RPC, no
-//! network, no encryption, no relay, and no signing anywhere on this path.
+//! *contract* (a trait plus an in-memory fake). The pure core has no clock, RPC,
+//! network, encryption, or signing; the only chain-facing capability is the
+//! injected [`AttemptExecutor`] seam, and its concrete
+//! [`RelayAttemptExecutor`] fails closed until a real transport is installed
+//! under review.
 //!
 //! # Scope
 //! In scope for L1:
@@ -22,11 +25,11 @@
 //! bounded safety-confirmation ladder ([`trigger::MAX_FALLBACK_STEPS`]) so a
 //! non-executable chunk is never returned.
 //!
-//! Explicitly out of scope (later Phase 5 slices): the attempt journal, the
-//! execution relay, event publication, and signing. P46 adds the durable
-//! encrypted order store and recovery in [`journal`]: an
-//! [`journal::OrderKeyProvider`]-keyed, `OpaqueStore`-backed implementation of
-//! [`LimitOrderStore`] plus [`journal::recover_open`].
+//! Earlier slices added the durable encrypted order store and recovery in
+//! [`journal`] (P46), the durable attempt journal (P48), event publication
+//! (P54), and the concrete relay-backed [`RelayAttemptExecutor`] (P57). The
+//! shipped production wiring remains fail-closed: there is no real signer,
+//! chain adapter, network, or key material anywhere on the execution path.
 //!
 //! # Adaptations forced by the real APIs
 //! The P44 spec is a sketch; the landed APIs differ in these ways and the
@@ -72,6 +75,7 @@
 pub mod attempt;
 pub mod error;
 pub mod events;
+pub mod executor;
 pub mod fill;
 pub mod fsm;
 pub mod journal;
@@ -88,6 +92,7 @@ pub use attempt::{
 };
 pub use error::LimitEngineError;
 pub use events::{event_subject, order_event_id, PendingOrderEvent, ORDER_EVENT_DOMAIN};
+pub use executor::RelayAttemptExecutor;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use journal::{
