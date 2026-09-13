@@ -14,11 +14,11 @@ use execution_preview::{
 };
 use market_types::{
     AssetAmount, AtomicAmount, BinPoolState, Bps, ClmmPoolState, ClmmTick, CpmmPoolState,
-    Freshness, FreshnessStatus, LiquidityBin, MarketTypeError, PriceRatio, SafeFreshnessMeta,
-    Sequence,
+    Freshness, FreshnessStatus, LiquidityBin, PriceRatio, SafeFreshnessMeta, Sequence,
 };
 use simulation::{
     simulate_bin_exact_input, simulate_clmm_exact_input, simulate_cpmm_exact_input,
+    simulate_tax_aware_clmm_buy_exact_input, simulate_tax_aware_clmm_sell_exact_input,
     simulate_tax_aware_cpmm_buy_exact_input, simulate_tax_aware_cpmm_sell_exact_input,
     BinExactInputRequest, BinSimulationError, ClmmExactInputRequest, ClmmSimulationError,
     CpmmExactInputRequest, CpmmSimulationErrorClass,
@@ -68,8 +68,18 @@ fn cpmm_pool(fee_bps: u16) -> CpmmPoolState {
 }
 
 fn assessment(chain: ChainId, address: &str, buy_tax: u16, sell_tax: u16) -> TaxAssessment {
+    assessment_with_status(chain, address, buy_tax, sell_tax, FreshnessStatus::Fresh)
+}
+
+fn assessment_with_status(
+    chain: ChainId,
+    address: &str,
+    buy_tax: u16,
+    sell_tax: u16,
+    status: FreshnessStatus,
+) -> TaxAssessment {
     let freshness = SafeFreshnessMeta {
-        status: FreshnessStatus::Fresh,
+        status,
         observed_at_ms: 1_000,
         evaluated_at_ms: 1_000,
         age_ms: 0,
@@ -835,10 +845,14 @@ fn vector_15_assessment_tax_caps_and_asset_binding() {
     // Buy tax 200 within the 500 bps cap succeeds.
     assert!(validate_delta_preview_with_assessment(&intent, &plan, &delta, &in_cap, 1_000).is_ok());
 
-    // Buy tax 600 exceeds the cap.
+    // Buy tax 600 exceeds the cap once the delta realizes that same 600 bps tax.
     let over_cap = assessment(ChainId::Base, TOKEN_ADDR, 600, 0);
+    let over_cap_quote =
+        simulate_tax_aware_cpmm_buy_exact_input(&pool, &request, &over_cap).unwrap();
+    let over_cap_delta = NetDelta::from_tax_aware_cpmm_buy(&over_cap_quote).unwrap();
+    assert_eq!(over_cap_delta.tax_cost, Some(amount(&token(), 1_184)));
     assert_eq!(
-        validate_delta_preview_with_assessment(&intent, &plan, &delta, &over_cap, 1_000),
+        validate_delta_preview_with_assessment(&intent, &plan, &over_cap_delta, &over_cap, 1_000),
         Err(BridgeError::TaxCapExceeded)
     );
 
@@ -873,17 +887,231 @@ fn vector_15_assessment_tax_caps_and_asset_binding() {
     )
     .is_ok());
 
+    // Sell tax 600 exceeds the cap once the delta realizes that same 600 bps tax.
     let sell_over_cap = assessment(ChainId::Base, TOKEN_ADDR, 0, 600);
+    let sell_over_cap_quote =
+        simulate_tax_aware_cpmm_sell_exact_input(&pool, &sell_request, &sell_over_cap).unwrap();
+    let sell_over_cap_delta = NetDelta::from_tax_aware_cpmm_sell(&sell_over_cap_quote).unwrap();
+    assert_eq!(sell_over_cap_delta.tax_cost, Some(amount(&token(), 600)));
     assert_eq!(
         validate_delta_preview_with_assessment(
             &sell_intent,
             &sell_plan,
-            &sell_delta,
+            &sell_over_cap_delta,
             &sell_over_cap,
             1_000
         ),
         Err(BridgeError::TaxCapExceeded)
     );
+}
+
+// ---------------------------------------------------------------------------
+// 15b. Assessment freshness, realized-delta tax binding, and direction binding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn assessment_ok_when_delta_realizes_assessed_buy_tax() {
+    let pool = cpmm_pool(30);
+    let tax = assessment(ChainId::Base, TOKEN_ADDR, 200, 0);
+    let request = CpmmExactInputRequest::new(usdc(), AtomicAmount::new(10_000));
+    let quote = simulate_tax_aware_cpmm_buy_exact_input(&pool, &request, &tax).unwrap();
+    let delta = NetDelta::from_tax_aware_cpmm_buy(&quote).unwrap();
+    assert_eq!(delta.gross_output, amount(&token(), 19_743));
+    assert_eq!(delta.tax_cost, Some(amount(&token(), 394)));
+
+    let intent = base_intent(TradeSide::Buy, &usdc(), &token(), 10_000, None, true);
+    let plan = route(
+        &usdc(),
+        &token(),
+        10_000,
+        19_743,
+        19_349,
+        1_000,
+        Sequence(1),
+    );
+    assert!(validate_delta_preview_with_assessment(&intent, &plan, &delta, &tax, 1_000).is_ok());
+}
+
+#[test]
+fn assessment_rejects_delta_with_mismatched_buy_tax() {
+    let pool = cpmm_pool(30);
+    // A realized delta as if buy_tax were 600: gross 19_743 -> tax_cost 1_184.
+    let six_hundred = assessment(ChainId::Base, TOKEN_ADDR, 600, 0);
+    let request = CpmmExactInputRequest::new(usdc(), AtomicAmount::new(10_000));
+    let quote = simulate_tax_aware_cpmm_buy_exact_input(&pool, &request, &six_hundred).unwrap();
+    let delta = NetDelta::from_tax_aware_cpmm_buy(&quote).unwrap();
+    assert_eq!(delta.gross_output, amount(&token(), 19_743));
+    assert_eq!(delta.tax_cost, Some(amount(&token(), 1_184)));
+
+    // A 200 bps assessment does not explain the realized 1_184 output tax.
+    let two_hundred = assessment(ChainId::Base, TOKEN_ADDR, 200, 0);
+    let intent = base_intent(TradeSide::Buy, &usdc(), &token(), 10_000, None, true);
+    let plan = route(
+        &usdc(),
+        &token(),
+        10_000,
+        19_743,
+        18_559,
+        1_000,
+        Sequence(1),
+    );
+    assert_eq!(
+        validate_delta_preview_with_assessment(&intent, &plan, &delta, &two_hundred, 1_000),
+        Err(BridgeError::AssessmentDeltaMismatch)
+    );
+}
+
+#[test]
+fn assessment_sell_matching_ok_and_mismatched_sell_tax_rejected() {
+    let pool = cpmm_pool(30);
+    let tax = assessment(ChainId::Base, TOKEN_ADDR, 0, 100);
+    let request = CpmmExactInputRequest::new(token(), AtomicAmount::new(10_000));
+    let quote = simulate_tax_aware_cpmm_sell_exact_input(&pool, &request, &tax).unwrap();
+    let delta = NetDelta::from_tax_aware_cpmm_sell(&quote).unwrap();
+    assert_eq!(delta.net_input, amount(&token(), 10_000));
+    assert_eq!(delta.tax_cost, Some(amount(&token(), 100)));
+
+    let intent = base_intent(TradeSide::Sell, &token(), &usdc(), 10_000, None, true);
+    let plan = route(&token(), &usdc(), 10_000, 4_911, 4_911, 1_000, Sequence(1));
+    assert!(validate_delta_preview_with_assessment(&intent, &plan, &delta, &tax, 1_000).is_ok());
+
+    // A 50 bps assessment implies 50, not the realized 100.
+    let fifty = assessment(ChainId::Base, TOKEN_ADDR, 0, 50);
+    assert_eq!(
+        validate_delta_preview_with_assessment(&intent, &plan, &delta, &fifty, 1_000),
+        Err(BridgeError::AssessmentDeltaMismatch)
+    );
+}
+
+#[test]
+fn assessment_requires_fresh_status() {
+    let pool = cpmm_pool(30);
+    let fresh = assessment(ChainId::Base, TOKEN_ADDR, 200, 0);
+    let request = CpmmExactInputRequest::new(usdc(), AtomicAmount::new(10_000));
+    let quote = simulate_tax_aware_cpmm_buy_exact_input(&pool, &request, &fresh).unwrap();
+    let delta = NetDelta::from_tax_aware_cpmm_buy(&quote).unwrap();
+    let intent = base_intent(TradeSide::Buy, &usdc(), &token(), 10_000, None, true);
+    let plan = route(
+        &usdc(),
+        &token(),
+        10_000,
+        19_743,
+        19_349,
+        1_000,
+        Sequence(1),
+    );
+
+    let stale = assessment_with_status(ChainId::Base, TOKEN_ADDR, 200, 0, FreshnessStatus::Stale);
+    assert_eq!(
+        validate_delta_preview_with_assessment(&intent, &plan, &delta, &stale, 1_000),
+        Err(BridgeError::FreshnessUnavailable)
+    );
+}
+
+#[test]
+fn assessment_sell_requires_input_asset_binding() {
+    let pool = cpmm_pool(30);
+    let tax = assessment(ChainId::Base, TOKEN_ADDR, 0, 100);
+    let request = CpmmExactInputRequest::new(token(), AtomicAmount::new(10_000));
+    let quote = simulate_tax_aware_cpmm_sell_exact_input(&pool, &request, &tax).unwrap();
+    let delta = NetDelta::from_tax_aware_cpmm_sell(&quote).unwrap();
+    let intent = base_intent(TradeSide::Sell, &token(), &usdc(), 10_000, None, true);
+    let plan = route(&token(), &usdc(), 10_000, 4_911, 4_911, 1_000, Sequence(1));
+
+    // A Sell intent assesses `token_in`; assessing the other leg must fail.
+    let wrong_asset = assessment(ChainId::Base, USDC_ADDR, 0, 100);
+    assert_eq!(
+        validate_delta_preview_with_assessment(&intent, &plan, &delta, &wrong_asset, 1_000),
+        Err(BridgeError::AssessedAssetMismatch)
+    );
+}
+
+#[test]
+fn direction_binding_rejects_sell_style_tax_on_buy_intent() {
+    // Sell-style delta: input-side tax in `token_in`, but the same USDC/TOKEN
+    // pair as the Buy intent.
+    let sell_style = plain_delta(
+        &usdc(),
+        &token(),
+        10_000,
+        19_743,
+        19_743,
+        Some((usdc(), 30)),
+        Some((usdc(), 100)),
+    );
+    assert!(sell_style.validate().is_ok());
+
+    let intent = base_intent(TradeSide::Buy, &usdc(), &token(), 10_000, None, true);
+    let plan = route(
+        &usdc(),
+        &token(),
+        10_000,
+        19_743,
+        19_743,
+        1_000,
+        Sequence(1),
+    );
+    assert_eq!(
+        validate_delta_preview(&intent, &plan, &sell_style, 1_000),
+        Err(BridgeError::DirectionMismatch)
+    );
+    assert_eq!(
+        build_execution_preview(&intent, &sell_style, FreshnessStatus::Fresh),
+        Err(BridgeError::DirectionMismatch)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15c. Tax-aware CLMM normalization coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tax_aware_clmm_buy_normalizes_exact_conservation() {
+    let pool = clmm_sample_pool();
+    let tax = assessment(ChainId::Solana, SOL_USDC_ADDR, 200, 0);
+    let request = ClmmExactInputRequest {
+        token_in: pool.token_0.clone(),
+        amount_in: AtomicAmount::new(100_000),
+        token_out: None,
+    };
+    let quote = simulate_tax_aware_clmm_buy_exact_input(&pool, &request, &tax).unwrap();
+    let delta = NetDelta::from_tax_aware_clmm_buy(&quote).unwrap();
+
+    // Full wallet debit equals the original input; the DEX fee is input-side.
+    assert_eq!(delta.net_input, quote.clmm_quote.input);
+    assert_eq!(delta.net_input, amount(&pool.token_0, 100_000));
+    assert_eq!(delta.dex_fee, Some(quote.clmm_quote.fee.clone()));
+    assert_eq!(delta.dex_fee.as_ref().unwrap().asset, pool.token_0);
+    // Buy tax is output-side over the gross CLMM output.
+    assert_eq!(delta.tax_cost, Some(quote.tax_output.tax_cost.clone()));
+    assert_eq!(delta.tax_cost.as_ref().unwrap().asset, pool.token_1);
+    assert_eq!(delta.gross_output, quote.tax_output.gross_output);
+    assert_eq!(delta.net_output, quote.tax_output.net_output);
+    assert!(delta.validate().is_ok());
+}
+
+#[test]
+fn tax_aware_clmm_sell_normalizes_exact_conservation() {
+    let pool = clmm_sample_pool();
+    let tax = assessment(ChainId::Solana, SOL_USDC_ADDR, 0, 100);
+    let request = ClmmExactInputRequest {
+        token_in: pool.token_1.clone(),
+        amount_in: AtomicAmount::new(10_000),
+        token_out: None,
+    };
+    let quote = simulate_tax_aware_clmm_sell_exact_input(&pool, &request, &tax).unwrap();
+    let delta = NetDelta::from_tax_aware_clmm_sell(&quote).unwrap();
+
+    // Full wallet debit is the gross input; the DEX fee and sell tax are input-side.
+    assert_eq!(delta.net_input, quote.tax_input.gross_input);
+    assert_eq!(delta.net_input, amount(&pool.token_1, 10_000));
+    assert_eq!(delta.dex_fee, Some(quote.clmm_quote.fee.clone()));
+    assert_eq!(delta.dex_fee.as_ref().unwrap().asset, pool.token_1);
+    assert_eq!(delta.tax_cost, Some(quote.tax_input.tax_cost.clone()));
+    assert_eq!(delta.tax_cost.as_ref().unwrap().asset, pool.token_1);
+    assert_eq!(delta.gross_output, quote.clmm_quote.output);
+    assert_eq!(delta.net_output, quote.clmm_quote.output);
+    assert!(delta.validate().is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -938,12 +1166,12 @@ fn bridge_error_messages_are_redacted() {
         BridgeError::Clmm(ClmmSimulationError::TickCrossingExceeded),
         BridgeError::Bin(BinSimulationError::BinCrossingExceeded),
         BridgeError::Tax(TaxSafetyError::AssessedAssetMismatch),
-        BridgeError::Market(MarketTypeError::ChainMismatch),
         BridgeError::DirectionMismatch,
         BridgeError::ChainMismatch,
         BridgeError::InputAssetMismatch,
         BridgeError::OutputAssetMismatch,
         BridgeError::AssessedAssetMismatch,
+        BridgeError::AssessmentDeltaMismatch,
         BridgeError::TaxCapExceeded,
         BridgeError::FreshnessUnavailable,
     ];

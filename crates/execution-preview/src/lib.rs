@@ -24,7 +24,9 @@ use domain::{
     ExecutionCostComponents, ExecutionPreview, RoutePlan, TradeIntent, TradeSide,
     ValidatedExecutionPreview,
 };
-use market_types::{evaluate_freshness, AssetAmount, FreshnessPolicy, FreshnessStatus};
+use market_types::{
+    evaluate_freshness, AssetAmount, AtomicAmount, FreshnessPolicy, FreshnessStatus,
+};
 use serde::{Deserialize, Serialize};
 use simulation::{
     BinSimulationQuote, ClmmSimulationQuote, CpmmSimulationQuote, TaxAwareClmmBuyQuote,
@@ -47,6 +49,31 @@ fn nonzero(amount: AssetAmount) -> Option<AssetAmount> {
     } else {
         Some(amount)
     }
+}
+
+/// Exact `floor(amount * bps / 10_000)` using the same `q`/`r` decomposition as
+/// the tax engine, so it cannot overflow for any `u128` amount and any `Bps`.
+///
+/// For `amount = q * 10_000 + r`:
+/// `floor(amount * bps / 10_000) = q * bps + floor(r * bps / 10_000)`.
+/// Since `q <= u128::MAX / 10_000` and `bps <= 10_000`, `q * bps <= amount`;
+/// since `r < 10_000`, `r * bps < 100_000_000`. No intermediate overflows.
+fn floor_bps(amount: u128, bps: u16) -> Result<u128, BridgeError> {
+    debug_assert!(bps <= 10_000, "Bps is bounded by construction");
+    let bps = bps as u128;
+    let q = amount / 10_000;
+    let r = amount % 10_000;
+    let q_part = q.checked_mul(bps).ok_or(BridgeError::NetDeltaInconsistent(
+        "tax amount overflowed u128",
+    ))?;
+    let r_part = r.checked_mul(bps).ok_or(BridgeError::NetDeltaInconsistent(
+        "tax amount overflowed u128",
+    ))? / 10_000;
+    q_part
+        .checked_add(r_part)
+        .ok_or(BridgeError::NetDeltaInconsistent(
+            "tax amount overflowed u128",
+        ))
 }
 
 /// Exact normalized net balance delta for a single simulated swap.
@@ -187,8 +214,8 @@ impl NetDelta {
     /// - Output-denominated tax (buy) satisfies
     ///   `net_output + tax_cost == gross_output`; input-denominated tax (sell)
     ///   satisfies `net_output == gross_output`.
-    /// - A present fee/tax is non-zero, shares the pair chain, and is
-    ///   denominated in `token_in` or `token_out`.
+    /// - A present fee/tax is non-zero. `dex_fee` is always denominated in
+    ///   `token_in`; `tax_cost` is denominated in `token_in` or `token_out`.
     /// - Input-side conservation holds: `dex_fee <= net_input`, and for a sell
     ///   `tax_cost <= net_input` with `net_input - tax_cost >= dex_fee`.
     pub fn validate(&self) -> Result<(), BridgeError> {
@@ -244,14 +271,9 @@ impl NetDelta {
                     "dex_fee must be non-zero when present",
                 ));
             }
-            if fee.asset.chain != self.token_in.chain {
+            if fee.asset != self.token_in {
                 return Err(BridgeError::NetDeltaInconsistent(
-                    "dex_fee must share the pair chain",
-                ));
-            }
-            if fee.asset != self.token_in && fee.asset != self.token_out {
-                return Err(BridgeError::NetDeltaInconsistent(
-                    "dex_fee must be denominated in token_in or token_out",
+                    "dex_fee must be denominated in token_in",
                 ));
             }
             if fee.amount > self.net_input.amount {
@@ -268,9 +290,9 @@ impl NetDelta {
                         "tax_cost must be non-zero when present",
                     ));
                 }
-                if tax.asset.chain != self.token_in.chain {
+                if tax.asset != self.token_in && tax.asset != self.token_out {
                     return Err(BridgeError::NetDeltaInconsistent(
-                        "tax_cost must share the pair chain",
+                        "tax_cost must be denominated in token_in or token_out",
                     ));
                 }
                 if tax.asset == self.token_out {
@@ -288,7 +310,7 @@ impl NetDelta {
                             "net_output plus tax_cost must equal gross_output",
                         ));
                     }
-                } else if tax.asset == self.token_in {
+                } else {
                     // Sell side: input tax is deducted before the pool swap.
                     if self.net_output.amount != self.gross_output.amount {
                         return Err(BridgeError::NetDeltaInconsistent(
@@ -314,10 +336,6 @@ impl NetDelta {
                             "net_input after tax must cover dex_fee",
                         ));
                     }
-                } else {
-                    return Err(BridgeError::NetDeltaInconsistent(
-                        "tax_cost must be denominated in token_in or token_out",
-                    ));
                 }
             }
             None => {
@@ -353,6 +371,18 @@ pub fn build_execution_preview(
     }
     if delta.token_out != intent.token_out {
         return Err(BridgeError::OutputAssetMismatch);
+    }
+
+    // The tax denomination must agree with the intent direction: a buy pays
+    // output-side tax in `token_out`, a sell pays input-side tax in `token_in`.
+    if let Some(tax) = &delta.tax_cost {
+        let expected_asset = match intent.side {
+            TradeSide::Buy => &delta.token_out,
+            TradeSide::Sell => &delta.token_in,
+        };
+        if tax.asset != *expected_asset {
+            return Err(BridgeError::DirectionMismatch);
+        }
     }
 
     Ok(ExecutionPreview {
@@ -403,11 +433,16 @@ pub fn validate_delta_preview(
 
 /// Validates a net delta against an intent, route, and tax assessment.
 ///
-/// In addition to [`validate_delta_preview`], this enforces the intent tax caps
-/// that the raw tax arithmetic does not apply: the assessment chain must match
-/// the intent chain, the assessed asset must bind to `token_out` for a buy and
-/// `token_in` for a sell, and the assessed tax must not exceed the intent's
-/// corresponding risk cap.
+/// In addition to [`validate_delta_preview`], this binds the caller-supplied
+/// assessment to the *realized* delta before applying the intent tax caps:
+/// - The assessment must be [`FreshnessStatus::Fresh`].
+/// - The assessment chain must match the intent chain and the assessed asset
+///   must bind to `token_out` for a buy and `token_in` for a sell.
+/// - The tax implied by the assessment over the realized delta must equal
+///   `delta.tax_cost` exactly (buy: output-side tax over `gross_output`; sell:
+///   input-side tax over `net_input`), otherwise the assessment is not a valid
+///   explanation of the delta.
+/// - Finally the assessed tax must not exceed the intent's corresponding risk cap.
 pub fn validate_delta_preview_with_assessment(
     intent: &TradeIntent,
     route: &RoutePlan,
@@ -415,13 +450,30 @@ pub fn validate_delta_preview_with_assessment(
     assessment: &TaxAssessment,
     now_ms: i64,
 ) -> Result<ValidatedExecutionPreview, BridgeError> {
+    if assessment.freshness.status != FreshnessStatus::Fresh {
+        return Err(BridgeError::FreshnessUnavailable);
+    }
     if assessment.chain != intent.chain {
         return Err(BridgeError::ChainMismatch);
     }
+
     match intent.side {
         TradeSide::Buy => {
             if assessment.assessed_asset != intent.token_out {
                 return Err(BridgeError::AssessedAssetMismatch);
+            }
+            // Buy tax is output-side over the realized gross output.
+            let expected = floor_bps(delta.gross_output.amount.get(), assessment.buy_tax.get())?;
+            let expected_cost = if expected == 0 {
+                None
+            } else {
+                Some(AssetAmount {
+                    asset: intent.token_out.clone(),
+                    amount: AtomicAmount::new(expected),
+                })
+            };
+            if delta.tax_cost != expected_cost {
+                return Err(BridgeError::AssessmentDeltaMismatch);
             }
             if assessment.buy_tax > intent.risk.max_buy_tax {
                 return Err(BridgeError::TaxCapExceeded);
@@ -430,6 +482,19 @@ pub fn validate_delta_preview_with_assessment(
         TradeSide::Sell => {
             if assessment.assessed_asset != intent.token_in {
                 return Err(BridgeError::AssessedAssetMismatch);
+            }
+            // Sell tax is input-side over the full realized wallet debit.
+            let expected = floor_bps(delta.net_input.amount.get(), assessment.sell_tax.get())?;
+            let expected_cost = if expected == 0 {
+                None
+            } else {
+                Some(AssetAmount {
+                    asset: intent.token_in.clone(),
+                    amount: AtomicAmount::new(expected),
+                })
+            };
+            if delta.tax_cost != expected_cost {
+                return Err(BridgeError::AssessmentDeltaMismatch);
             }
             if assessment.sell_tax > intent.risk.max_sell_tax {
                 return Err(BridgeError::TaxCapExceeded);

@@ -6,7 +6,6 @@
 //! parameters, endpoints, or secrets.
 
 use domain::DomainError;
-use market_types::MarketTypeError;
 use simulation::{BinSimulationError, ClmmSimulationError, CpmmSimulationErrorClass};
 use tax_engine::TaxSafetyError;
 use thiserror::Error;
@@ -35,10 +34,6 @@ pub enum BridgeError {
     #[error("tax evaluation failed: {0}")]
     Tax(#[from] TaxSafetyError),
 
-    /// Canonical market-type validation failed.
-    #[error("market type validation failed: {0}")]
-    Market(#[from] MarketTypeError),
-
     /// The normalized net delta violates exact conservation or denomination rules.
     #[error("net delta is inconsistent: {0}")]
     NetDeltaInconsistent(&'static str),
@@ -62,6 +57,10 @@ pub enum BridgeError {
     /// The tax assessment is bound to a different asset than the intent assesses.
     #[error("assessed asset mismatch")]
     AssessedAssetMismatch,
+
+    /// The realized delta tax does not equal the tax implied by the assessment.
+    #[error("delta tax does not match assessment")]
+    AssessmentDeltaMismatch,
 
     /// The assessed tax exceeds the intent risk cap for the trade side.
     #[error("assessed tax exceeds the intent cap")]
