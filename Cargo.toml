@@ -28,6 +28,7 @@ members = [
     "crates/limit-engine",
     "crates/agent-commands",
     "crates/mcp-server",
+    "crates/agent-backend",
 ]
 
 [workspace.package]
@@ -62,6 +63,7 @@ audit = { path = "crates/audit" }
 limit-engine = { path = "crates/limit-engine" }
 agent-commands = { path = "crates/agent-commands" }
 mcp-server = { path = "crates/mcp-server" }
+agent-backend = { path = "crates/agent-backend" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

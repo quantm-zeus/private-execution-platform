@@ -121,6 +121,11 @@ pub const RECOVERY_LIST_LIMIT: usize = 1024;
 /// this many objects. A pass that stops here reports truncation rather than
 /// silently omitting older orders.
 pub const RECOVERY_MAX_OBJECTS: usize = 4096;
+/// Hard cap on orders returned by one owner-facing listing.
+///
+/// A read model must never let a caller page an unbounded result set; the cap
+/// bound is enforced inside [`DurableLimitOrderStore::list_orders_for_owner`].
+pub const MAX_OWNER_ORDERS: usize = 256;
 /// Maximum event records fetched per `read_events` round.
 pub const REPLAY_BATCH: usize = 256;
 /// Maximum object compare-and-swap attempts before admitting a conflict.
@@ -956,6 +961,64 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
     /// The chain this store serves.
     pub fn chain(&self) -> &ChainId {
         &self.chain
+    }
+
+    /// Lists up to `limit` of `owner`'s orders in class-listing order (newest
+    /// creation bucket first, then object id ascending).
+    ///
+    /// This is a bounded, read-only projection of the durable encrypted store:
+    /// it enumerates the order class with the same paging as recovery, drops any
+    /// object whose class or owner blind index does not match `owner` **before**
+    /// decrypting, opens the remaining records, and returns their current
+    /// [`StoredLimitOrder`]. When `status` is `Some`, only records holding that
+    /// exact status are returned.
+    ///
+    /// Fail-closed and quarantine-aware: an environmental fault (an unavailable
+    /// store or key provider, or a class-index derivation failure) fails the
+    /// whole pass, while a per-record fault (a corrupt, foreign, or inconsistent
+    /// object) skips that one record rather than hiding every healthy order.
+    /// `limit` is clamped to [`MAX_OWNER_ORDERS`]; `limit == 0` performs no I/O.
+    /// The list may omit older orders beyond [`RECOVERY_MAX_OBJECTS`]; this read
+    /// path reports no truncation because the caller cannot act on it (use
+    /// [`DurableLimitOrderStore::recover`] for the recovery pass).
+    pub async fn list_orders_for_owner(
+        &self,
+        owner: &UserId,
+        status: Option<OrderStatus>,
+        limit: usize,
+    ) -> Result<Vec<StoredLimitOrder>, LimitEngineError> {
+        let limit = limit.min(MAX_OWNER_ORDERS);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let material = self.keys.current()?;
+        let class = class_blind_index(&material.blind_index)?;
+        let owner_index = owner_blind_index(&material.blind_index, owner)?;
+        let (objects, _truncated) = enumerate_class(self.store.as_ref(), &class).await?;
+        let mut orders = Vec::new();
+        for object in objects {
+            if orders.len() >= limit {
+                break;
+            }
+            // Blind-index filter before any decryption: a foreign-class or
+            // foreign-owner object is not ours to open.
+            if object.class_blind_index.as_slice() != class.as_slice()
+                || object.owner_blind_index.as_slice() != owner_index.as_slice()
+            {
+                continue;
+            }
+            match open_record(self.keys.as_ref(), &object) {
+                Ok(record) => {
+                    if status.is_none_or(|wanted| record.current.order.status == wanted) {
+                        orders.push(record.current);
+                    }
+                }
+                // A single unreadable order must not hide the rest.
+                Err(error) if is_per_order_fault(error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(orders)
     }
 
     /// Enumerates open orders and classifies each one's latest attempt.

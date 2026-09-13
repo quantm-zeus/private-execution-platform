@@ -100,7 +100,7 @@ pub use journal::{
     recover_open, stream_blind_index, AttemptAppendOutcome, AttemptIdentity,
     AttemptRecoveryOutcome, BlindIndexKey, DurableLimitOrderStore, DurableOrderRecord,
     InFlightAttempt, OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder,
-    RecoveryOutcome, UnavailableOrderKeyProvider,
+    RecoveryOutcome, UnavailableOrderKeyProvider, MAX_OWNER_ORDERS,
 };
 pub use orchestrator::{
     AttemptExecutor, AttemptLimits, AttemptResolution, Orchestrator, RecoveryReport, TickInput,
