@@ -1930,6 +1930,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "privacy"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "private-api"
 version = "0.1.0"
 dependencies = [

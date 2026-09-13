@@ -32,6 +32,7 @@ members = [
     "crates/telegram-bot",
     "crates/social-intel",
     "crates/adaptive-exec",
+    "crates/privacy",
 ]
 
 [workspace.package]
@@ -70,6 +71,7 @@ agent-backend = { path = "crates/agent-backend" }
 telegram-bot = { path = "crates/telegram-bot" }
 social-intel = { path = "crates/social-intel" }
 adaptive-exec = { path = "crates/adaptive-exec" }
+privacy = { path = "crates/privacy" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
