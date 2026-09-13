@@ -21,6 +21,30 @@ pub enum SubmissionState {
     Pending,
 }
 
+/// Realized amounts a chain adapter observed for a confirmed attempt.
+///
+/// This is the *observational* companion to a [`RelayOutcome::Confirmed`]:
+/// amounts reported by authoritative chain state (for example a mined
+/// transaction receipt). It is deliberately bare-atomic: the relay carries no
+/// asset binding, and the consumer (the limit engine) binds the amounts to the
+/// attempt's `token_in`/`token_out` and validates them against the sealed bound
+/// context before any ledger mutation. An adapter that cannot observe exact
+/// amounts must report `None` rather than guess.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ObservedFill {
+    /// Net input actually consumed on chain, in `token_in` atomic units.
+    pub net_input: u128,
+    /// Net output actually received on chain, in `token_out` atomic units.
+    pub net_output: u128,
+}
+
+impl fmt::Debug for ObservedFill {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted: realized amounts are private execution economics.
+        formatter.write_str("ObservedFill { .. }")
+    }
+}
+
 /// Terminal or in-flight outcome of an execution attempt.
 ///
 /// `Display`/`Debug` never reveal the opaque reference or adapter reason.
@@ -43,7 +67,14 @@ pub enum RelayOutcome {
     /// The chain state of the attempt is unknown and requires reconciliation.
     Unknown,
     /// The chain confirmed the submission.
-    Confirmed { reference: String },
+    ///
+    /// `fill` is the exact realized amounts when the adapter observed them;
+    /// `None` means the confirmation is real but the amounts are not yet known,
+    /// which a consumer must treat as unresolved (`Unknown`) rather than infer.
+    Confirmed {
+        reference: String,
+        fill: Option<ObservedFill>,
+    },
     /// The chain definitively rejected the submission.
     Rejected { final_reason: String },
     /// The attempt failed before any chain submission occurred.

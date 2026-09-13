@@ -277,7 +277,9 @@ where
         };
 
         let outcome = match observation {
-            ChainObservation::Confirmed { reference } => RelayOutcome::Confirmed { reference },
+            ChainObservation::Confirmed { reference, fill } => {
+                RelayOutcome::Confirmed { reference, fill }
+            }
             ChainObservation::Rejected { final_reason } => RelayOutcome::Rejected { final_reason },
             ChainObservation::Pending | ChainObservation::Unknown => RelayOutcome::Unknown,
         };

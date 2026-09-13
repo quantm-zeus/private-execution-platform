@@ -13,6 +13,7 @@ use privy::{PrivySigningBoundary, SigningRequest};
 use crate::error::RelayError;
 use crate::health::ChainHealth;
 use crate::plan::{SignedExecutionRef, SubmitRequest};
+use crate::state::ObservedFill;
 
 /// Observation of an attempt's actual chain state.
 ///
@@ -23,7 +24,15 @@ use crate::plan::{SignedExecutionRef, SubmitRequest};
 #[derive(Clone, PartialEq, Eq)]
 pub enum ChainObservation {
     /// The chain confirmed the attempt.
-    Confirmed { reference: String },
+    ///
+    /// `fill` is the exact realized amounts when the adapter can observe them
+    /// (for example from a mined receipt); `None` means the confirmation is real
+    /// but the amounts are unknown, and the consumer must resolve it rather than
+    /// infer a fill.
+    Confirmed {
+        reference: String,
+        fill: Option<ObservedFill>,
+    },
     /// The attempt is still pending on-chain.
     Pending,
     /// The chain definitively rejected the attempt.

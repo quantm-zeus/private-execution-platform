@@ -316,6 +316,7 @@ impl MockAdapter {
             MockBehavior::Accept,
             ChainObservation::Confirmed {
                 reference: "confirmed-ref".to_string(),
+                fill: None,
             },
         )
     }

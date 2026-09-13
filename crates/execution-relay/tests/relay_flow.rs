@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chain_types::ChainId;
 use domain::{IdempotencyKey, OrderStatus};
 use execution_relay::{
-    ChainHealth, RelayError, RelayExecutionInput, RelayOutcome, SubmissionState,
+    ChainHealth, ObservedFill, RelayError, RelayExecutionInput, RelayOutcome, SubmissionState,
 };
 use support::{
     other_payload, payload, MockAdapter, MockBehavior, MockSigning, MockSource, MockStore,
@@ -45,7 +45,8 @@ async fn happy_path_submits_once_then_reconciles_to_confirmed() {
     assert_eq!(
         confirmed,
         RelayOutcome::Confirmed {
-            reference: "confirmed-ref".to_string()
+            reference: "confirmed-ref".to_string(),
+            fill: None,
         }
     );
     assert_eq!(confirmed.order_status(), OrderStatus::Filled);
@@ -58,6 +59,46 @@ async fn happy_path_submits_once_then_reconciles_to_confirmed() {
         .expect("reconcile");
     assert_eq!(again, confirmed);
     assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reconcile_carries_an_observed_fill_through_to_the_outcome() {
+    let harness = RelayHarness::standard();
+    harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("execute");
+
+    harness
+        .adapter
+        .set_query_observation(execution_relay::ChainObservation::Confirmed {
+            reference: "confirmed-ref".to_string(),
+            fill: Some(ObservedFill {
+                net_input: 7,
+                net_output: 11,
+            }),
+        });
+    let confirmed = harness
+        .relay
+        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        confirmed,
+        RelayOutcome::Confirmed {
+            reference: "confirmed-ref".to_string(),
+            fill: Some(ObservedFill {
+                net_input: 7,
+                net_output: 11,
+            }),
+        }
+    );
+    assert_eq!(confirmed.order_status(), OrderStatus::Filled);
+    // The realized amounts never appear in the redacted outcome Debug.
+    let rendered = format!("{confirmed:?}");
+    assert!(!rendered.contains('7'));
+    assert!(!rendered.contains("11"));
 }
 
 #[tokio::test]
@@ -123,6 +164,7 @@ async fn timeout_yields_unknown_and_repeated_reconcile_never_submits() {
         MockBehavior::Timeout,
         execution_relay::ChainObservation::Confirmed {
             reference: "confirmed-ref".to_string(),
+            fill: None,
         },
     );
     let harness = RelayHarness::build(
@@ -151,7 +193,8 @@ async fn timeout_yields_unknown_and_repeated_reconcile_never_submits() {
     assert_eq!(
         confirmed,
         RelayOutcome::Confirmed {
-            reference: "confirmed-ref".to_string()
+            reference: "confirmed-ref".to_string(),
+            fill: None,
         }
     );
     let again = harness
@@ -559,7 +602,8 @@ async fn reconcile_falls_through_when_query_returns_unknown() {
     assert_eq!(
         confirmed,
         RelayOutcome::Confirmed {
-            reference: "confirmed-ref".to_string()
+            reference: "confirmed-ref".to_string(),
+            fill: None,
         }
     );
     assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);
@@ -595,7 +639,8 @@ async fn reconcile_falls_through_when_query_errors() {
     assert_eq!(
         confirmed,
         RelayOutcome::Confirmed {
-            reference: "confirmed-ref".to_string()
+            reference: "confirmed-ref".to_string(),
+            fill: None,
         }
     );
     assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);
@@ -713,6 +758,7 @@ async fn definitive_query_observation_wins_and_reconcile_is_not_called() {
     let adapter = MockAdapter::accepting();
     adapter.set_query_observation(execution_relay::ChainObservation::Confirmed {
         reference: "query-confirmed-ref".to_string(),
+        fill: None,
     });
     adapter.set_reconcile_observation(execution_relay::ChainObservation::Unknown);
     let harness = RelayHarness::build(
@@ -741,7 +787,8 @@ async fn definitive_query_observation_wins_and_reconcile_is_not_called() {
     assert_eq!(
         confirmed,
         RelayOutcome::Confirmed {
-            reference: "query-confirmed-ref".to_string()
+            reference: "query-confirmed-ref".to_string(),
+            fill: None,
         }
     );
     assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);

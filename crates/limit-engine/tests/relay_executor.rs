@@ -23,8 +23,8 @@ use domain::{
 use execution_preview::{AllowanceObservation, NetDelta, WalletBalance};
 use execution_relay::{
     ChainHealth, ChainHealthBreaker, ChainObservation, ChainSubmissionAdapter, ExecutionRelay,
-    InMemoryReservationStore, RelayError, SignedExecutionRef, SignedPayload, SignedPayloadSource,
-    SigningBoundary, SubmissionReceipt,
+    InMemoryReservationStore, ObservedFill, RelayError, SignedExecutionRef, SignedPayload,
+    SignedPayloadSource, SigningBoundary, SubmissionReceipt,
 };
 use limit_engine::{
     attempt_intent_id, attempt_key, attempt_prepared_reference, AttemptExecutor, AttemptLimits,
@@ -310,6 +310,7 @@ impl ScriptedAdapter {
             Behavior::Accept,
             ChainObservation::Confirmed {
                 reference: "confirmed-ref".to_string(),
+                fill: None,
             },
         )
     }
@@ -655,10 +656,11 @@ async fn reconcile_never_signs_and_maps_confirmed_to_unknown_then_rejected() {
     assert_eq!(submitted, AttemptResolution::Unknown);
     let signs_after_execute = signer.calls.load(Ordering::SeqCst);
 
-    // A `Confirmed` observation carries no realized amounts: it must not become
-    // a fabricated `Filled`.
+    // A `Confirmed` observation with no realized amounts must not become a
+    // fabricated `Filled`.
     adapter.set_observation(ChainObservation::Confirmed {
         reference: "confirmed-ref".to_string(),
+        fill: None,
     });
     let confirmed = executor.reconcile(&bound, NOW_MS).await;
     assert_eq!(confirmed, AttemptResolution::Unknown);
@@ -684,6 +686,49 @@ async fn reconcile_never_signs_and_maps_confirmed_to_unknown_then_rejected() {
         "reconcile must never sign"
     );
     assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn reconcile_maps_an_observed_fill_to_filled_without_side_effects() {
+    let (executor, adapter, _source, signer) =
+        executor(true, Behavior::Accept, unknown_observation());
+    let prepared = prepared_attempt();
+    let bound = bound_attempt(&prepared);
+
+    let submitted = executor.execute(&prepared, &bound, NOW_MS).await;
+    assert_eq!(submitted, AttemptResolution::Unknown);
+    let signs_after_execute = signer.calls.load(Ordering::SeqCst);
+    let submits_after_execute = adapter.submits.load(Ordering::SeqCst);
+
+    // A chain adapter that observed the realized amounts now yields a fill. The
+    // executor maps the observation verbatim; the orchestrator re-validates it
+    // against the sealed bound context (`net_input == chunk`, `net_output >=
+    // min_out`) before any ledger mutation.
+    adapter.set_observation(ChainObservation::Confirmed {
+        reference: "confirmed-ref".to_string(),
+        fill: Some(ObservedFill {
+            net_input: 1_000,
+            net_output: 240,
+        }),
+    });
+    let confirmed = executor.reconcile(&bound, NOW_MS).await;
+    match confirmed {
+        AttemptResolution::Filled(fill) => {
+            assert_eq!(fill.net_input.get(), 1_000);
+            assert_eq!(fill.net_output.get(), 240);
+        }
+        other => panic!("expected Filled, got {other:?}"),
+    }
+    assert_eq!(
+        signer.calls.load(Ordering::SeqCst),
+        signs_after_execute,
+        "reconcile must never sign"
+    );
+    assert_eq!(
+        adapter.submits.load(Ordering::SeqCst),
+        submits_after_execute,
+        "reconcile must not submit"
+    );
 }
 
 #[tokio::test]
@@ -1065,4 +1110,102 @@ async fn orchestrator_tick_maps_relay_submission_to_in_flight_without_unearned_f
         attempt_prepared_reference(&blind, &ChainId::Base, &order_id, 1).expect("reference")
     );
     assert_eq!(bound.payload_digest, *payload().digest().as_bytes());
+}
+
+#[tokio::test]
+async fn orchestrator_recover_applies_an_observed_relay_fill_exactly_once() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = Arc::new(TestOrderKeys::deterministic(7));
+    let mut order = durable_order(
+        &keys,
+        "p69-observed-fill",
+        domain::OrderStatus::Active,
+        1_000,
+        1_000,
+        0,
+    );
+    order.order.limit_price.ratio = PriceRatio::new(100, 24).expect("ratio");
+    let order_id = order.order.id.clone();
+    let reader: DurableLimitOrderStore<InMemoryOpaqueStore> = durable_store(&backend, &keys);
+    reader.create(order).await.expect("create order");
+
+    let adapter = Arc::new(ScriptedAdapter::accepting());
+    let source = Arc::new(CountingSource::new());
+    let signer = Arc::new(CountingSigner::new(false));
+    let relay = ExecutionRelay::new_with_seams(
+        orchestrator_policy(true),
+        InMemoryReservationStore::new(),
+        Arc::clone(&adapter),
+        Arc::clone(&source),
+        Arc::clone(&signer),
+        ChainHealthBreaker::new(2, 5_000),
+    );
+    let executor = RelayAttemptExecutor::new(relay, context());
+    let orchestrator: FrozenOrchestrator = Orchestrator::new(
+        durable_store(&backend, &keys),
+        ModelProvider::new(),
+        executor,
+        orchestrator_policy(true),
+        AttemptLimits {
+            max_attempts_per_order: 4,
+        },
+    );
+
+    let trust = orchestrator_trust(ORCH_NOW);
+    let outcome = orchestrator
+        .tick(TickInput {
+            order_id: &order_id,
+            signal: true,
+            source: TradeSource::Web,
+            trust: &trust,
+            now_ms: ORCH_NOW,
+        })
+        .await
+        .expect("tick");
+    assert!(matches!(outcome, TickOutcome::InFlight { .. }));
+
+    // The sealed bound context supplies the exact chunk and the exact simulated
+    // output, so the adapter observes a fill that satisfies OR-4/OR-5 instead of
+    // a guessed amount.
+    let events: Vec<OrderAttemptEvent> = reader
+        .read_attempts(&order_id)
+        .await
+        .expect("read attempts");
+    let bound = events[0].bound.clone().expect("bound context");
+    let expected_input = bound.intent.amount.get();
+    let expected_output = bound.preview.simulated_net_output.amount.get();
+    assert!(expected_input > 0 && expected_output > 0);
+
+    adapter.set_observation(ChainObservation::Confirmed {
+        reference: "confirmed-ref".to_string(),
+        fill: Some(ObservedFill {
+            net_input: expected_input,
+            net_output: expected_output,
+        }),
+    });
+
+    let report = orchestrator.recover(ORCH_NOW + 1).await.expect("recover");
+    assert_eq!(report.fills_applied, 1);
+
+    let stored = reader
+        .load(&order_id)
+        .await
+        .expect("load")
+        .expect("order present");
+    assert_eq!(stored.order.status, domain::OrderStatus::Filled);
+    assert_eq!(stored.filled_input.get(), expected_input);
+    assert!(stored.order.remaining_input.is_zero());
+
+    // Re-running recovery cannot apply the same observed fill twice.
+    let report = orchestrator
+        .recover(ORCH_NOW + 2)
+        .await
+        .expect("recover again");
+    assert_eq!(report.fills_applied, 0);
+    let stored = reader
+        .load(&order_id)
+        .await
+        .expect("load")
+        .expect("order present");
+    assert_eq!(stored.filled_input.get(), expected_input);
 }

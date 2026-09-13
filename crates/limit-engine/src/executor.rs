@@ -10,17 +10,21 @@
 //!
 //! # Outcome mapping (invariant RE-2)
 //!
-//! The relay's [`RelayOutcome`] is *observational*, not a realized fill. Its
-//! `Confirmed` variant carries only an opaque chain reference; it does **not**
-//! carry the amounts actually swapped. Because
-//! [`AttemptResolution::Filled`](crate::AttemptResolution::Filled) requires a
-//! [`RealizedFill`](crate::RealizedFill), a `Confirmed` observation **must not**
-//! be turned into a fill by guessing the bound chunk. This executor therefore
-//! fails closed:
+//! The relay's [`RelayOutcome`] is *observational*. Its `Confirmed` variant
+//! carries the amounts actually swapped only when the chain adapter observed
+//! them. Because [`AttemptResolution::Filled`](crate::AttemptResolution::Filled)
+//! requires a [`RealizedFill`](crate::RealizedFill), this executor maps:
+//!
+//! - a `Confirmed` **with** observed amounts to `Filled`, which the orchestrator
+//!   then re-validates against the sealed bound context before any ledger
+//!   mutation; and
+//! - a `Confirmed` **without** observed amounts to `Unknown` (never a fabricated
+//!   fill), so the orchestrator reconciles for evidence it lacks.
 //!
 //! | Relay observation / error | `AttemptResolution` | Why |
 //! |---|---|---|
-//! | `Confirmed` | `Unknown` | No observed amounts; reconcile for evidence. |
+//! | `Confirmed { fill: Some(_) }` | `Filled` | Chain-observed amounts; orchestrator re-validates. |
+//! | `Confirmed { fill: None }` | `Unknown` | No observed amounts; reconcile for evidence. |
 //! | `Submitted` / `Unknown` / `Reserved` / `Signed` / `Prepared` | `Unknown` | Possibly in flight; never re-execute. |
 //! | `Rejected` | `Rejected` | Definitive chain rejection. |
 //! | `FailedBeforeSubmit` | `FailedBeforeSubmit` | Definitive pre-send failure. |
@@ -68,7 +72,9 @@ use execution_relay::{
 use policy::{PolicyContext, PolicyEngine};
 use privy::PreparedExecutionRef;
 
-use crate::attempt::BoundAttempt;
+use market_types::AtomicAmount;
+
+use crate::attempt::{BoundAttempt, RealizedFill};
 use crate::error::LimitEngineError;
 use crate::orchestrator::{AttemptExecutor, AttemptResolution};
 use crate::prepare::PreparedAttempt;
@@ -223,15 +229,22 @@ where
 /// and `reconcile` use this one function so their behavior cannot drift.
 fn map_outcome(result: Result<RelayOutcome, RelayError>) -> AttemptResolution {
     match result {
-        // A `Confirmed` relay observation carries only an opaque chain reference,
-        // never realized amounts. Turning it into `Filled` would fabricate the
-        // bound chunk as an actual fill (RE-2), so it fails closed to `Unknown`
-        // and the orchestrator reconciles for evidence it does not yet have.
+        // A `Confirmed` observation becomes a realized fill ONLY when the chain
+        // adapter observed exact amounts. Without them (`fill: None`) a fill
+        // would be fabricated from the bound chunk (RE-2), so it fails closed to
+        // `Unknown` and the orchestrator reconciles for evidence it lacks.
         //
-        // TODO(P57-followup): map a future chain adapter that observes realized
-        // net input/output amounts into `AttemptResolution::Filled`; the relay
-        // observation type itself does not carry them today.
-        Ok(RelayOutcome::Confirmed { .. }) => AttemptResolution::Unknown,
+        // The orchestrator re-validates the observed fill against the sealed
+        // bound context (`net_input == chunk`, `net_output >= min_out`, OR-4/OR-5)
+        // before any ledger mutation, so a malformed or adverse observation can
+        // never move the ledger.
+        Ok(RelayOutcome::Confirmed {
+            fill: Some(fill), ..
+        }) => AttemptResolution::Filled(RealizedFill {
+            net_input: AtomicAmount::new(fill.net_input),
+            net_output: AtomicAmount::new(fill.net_output),
+        }),
+        Ok(RelayOutcome::Confirmed { fill: None, .. }) => AttemptResolution::Unknown,
         // Possibly in flight: reconcile, never re-execute.
         Ok(RelayOutcome::Submitted { .. })
         | Ok(RelayOutcome::Unknown)

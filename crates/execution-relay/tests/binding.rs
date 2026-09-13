@@ -193,6 +193,7 @@ fn payload_reference_and_request_debug_are_redacted() {
 
     let confirmation = execution_relay::RelayOutcome::Confirmed {
         reference: "confirmed-ref".to_string(),
+        fill: None,
     };
     assert_redacted("RelayOutcome Debug", &format!("{confirmation:?}"));
     let rejected = execution_relay::RelayOutcome::Rejected {
@@ -208,8 +209,18 @@ fn receipt_and_observation_debug_are_redacted() {
 
     let confirmed = ChainObservation::Confirmed {
         reference: "confirmed-ref".to_string(),
+        fill: None,
     };
     assert_redacted("ChainObservation Debug", &format!("{confirmed:?}"));
+
+    let observed = execution_relay::ObservedFill {
+        net_input: 1_234,
+        net_output: 5_678,
+    };
+    let rendered = format!("{observed:?}");
+    assert_redacted("ObservedFill Debug", &rendered);
+    assert!(!rendered.contains("1234"));
+    assert!(!rendered.contains("5678"));
 
     let rejected = ChainObservation::Rejected {
         final_reason: "rejected-final-reason".to_string(),

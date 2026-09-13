@@ -60,7 +60,9 @@ pub use plan::{
 };
 pub use relay::{ExecutionRelay, RelayExecutionInput};
 pub use reservation::InMemoryReservationStore;
-pub use state::{AttemptReservationStore, RelayOutcome, Reservation, SubmissionState};
+pub use state::{
+    AttemptReservationStore, ObservedFill, RelayOutcome, Reservation, SubmissionState,
+};
 
 /// Acquires a mutex, recovering from poisoning.
 ///
