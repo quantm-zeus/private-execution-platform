@@ -2244,6 +2244,7 @@ version = "0.1.0"
 dependencies = [
  "chain-types",
  "domain",
+ "execution-preview",
  "market-types",
  "serde",
  "serde_json",

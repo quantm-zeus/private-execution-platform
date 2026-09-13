@@ -15,6 +15,7 @@ domain.workspace = true
 market-types.workspace = true
 simulation.workspace = true
 tax-engine.workspace = true
+execution-preview.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
