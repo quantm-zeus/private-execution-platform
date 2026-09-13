@@ -260,6 +260,18 @@ pub trait OpaqueStore: Send + Sync {
     async fn put_object(&self, object: OpaqueObject) -> Result<(), StorageError>;
     async fn get_object(&self, id: &str) -> Result<Option<OpaqueObject>, StorageError>;
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError>;
+    /// Reads records from `stream_blind_index` with `sequence >= from_sequence`,
+    /// in ascending sequence order, at most `limit` records.
+    ///
+    /// `from_sequence` is inclusive; `limit == 0` yields an empty result without
+    /// touching the backend. Implementations must fail closed rather than
+    /// returning partially-decoded or foreign rows.
+    async fn read_events(
+        &self,
+        stream_blind_index: &[u8],
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<OpaqueEventRecord>, StorageError>;
     async fn latest_snapshot(
         &self,
         stream_blind_index: &[u8],

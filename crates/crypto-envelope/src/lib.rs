@@ -13,9 +13,15 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod artifact;
+pub mod at_rest;
 pub mod frame;
 #[path = "hpke.rs"]
 pub mod hpke;
+
+pub use at_rest::{
+    open_at_rest, seal_at_rest, wire_kid, SealKey, AT_REST_DOMAIN, AT_REST_HEADER_LEN,
+    AT_REST_KID_LEN, AT_REST_MIN_LEN, AT_REST_NONCE_LEN, AT_REST_TAG_LEN, AT_REST_VERSION,
+};
 
 pub use artifact::{
     canonical_artifact_info, canonical_unlock_info, decrypt_artifact, decrypt_artifact_with_secret,

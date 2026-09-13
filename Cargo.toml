@@ -23,6 +23,7 @@ members = [
     "crates/tax-engine",
     "crates/execution-preview",
     "crates/execution-relay",
+    "crates/audit",
 ]
 
 [workspace.package]
@@ -52,6 +53,7 @@ simulation = { path = "crates/simulation" }
 tax-engine = { path = "crates/tax-engine" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
+audit = { path = "crates/audit" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

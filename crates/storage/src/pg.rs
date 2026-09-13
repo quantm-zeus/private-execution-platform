@@ -262,6 +262,55 @@ impl crate::OpaqueStore for PostgresStore {
         Ok(())
     }
 
+    async fn read_events(
+        &self,
+        stream_blind_index: &[u8],
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<OpaqueEventRecord>, StorageError> {
+        validate_stream_index(stream_blind_index)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let from_sequence = i64::try_from(from_sequence)
+            .map_err(|_| StorageError::Invalid(StorageValidationError::ZeroSequence))?;
+        // A `usize` limit above `i64::MAX` can only mean "unbounded"; clamp to
+        // the largest representable row count instead of failing.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .next_client()
+            .query(
+                "SELECT stream_blind_index, sequence, schema_version, ciphertext, created_bucket
+                 FROM events
+                 WHERE stream_blind_index = $1 AND sequence >= $2
+                 ORDER BY sequence ASC
+                 LIMIT $3",
+                &[&stream_blind_index, &from_sequence, &limit],
+            )
+            .await
+            .map_err(map_error)?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let stored_index: Vec<u8> = row.try_get(0).map_err(|_| StorageError::Backend)?;
+            let sequence: i64 = row.try_get(1).map_err(|_| StorageError::Backend)?;
+            let schema_version: i16 = row.try_get(2).map_err(|_| StorageError::Backend)?;
+            let ciphertext: Vec<u8> = row.try_get(3).map_err(|_| StorageError::Backend)?;
+            let bucket: i64 = row.try_get(4).map_err(|_| StorageError::Backend)?;
+            let record = OpaqueEventRecord {
+                stream_blind_index: stored_index,
+                sequence: db_u64(sequence)?,
+                schema_version: u16::try_from(schema_version).map_err(|_| StorageError::Backend)?,
+                ciphertext,
+                created_bucket: CreatedBucket::new(bucket).ok_or(StorageError::Backend)?,
+            };
+            // Corrupt/foreign rows are Backend, not caller-validation errors.
+            record.validate().map_err(|_| StorageError::Backend)?;
+            validate_stream_index(&record.stream_blind_index).map_err(|_| StorageError::Backend)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     async fn latest_snapshot(
         &self,
         stream_blind_index: &[u8],
