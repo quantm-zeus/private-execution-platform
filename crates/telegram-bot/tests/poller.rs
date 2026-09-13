@@ -490,3 +490,35 @@ fn the_sender_allowlist_is_redacted_and_counted() {
     assert!(!rendered.contains("secret-chat"));
     assert!(!rendered.contains("secret-sender"));
 }
+
+#[tokio::test]
+async fn a_numeric_sender_id_is_normalized_and_matched() {
+    let source = ScriptedSource::with_batches(vec![vec![json!({
+        "update_id": 1,
+        "message": { "chat": { "id": "42" }, "from": { "id": 7 }, "text": READ },
+    })]]);
+    let (mut poller, calls, _sent) = poller(
+        source,
+        sender_allowlist(&["42"], &["7"]),
+        RecordingTransport::default(),
+    );
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.denied, 0);
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(*calls.lock().expect("lock"), 1);
+}
+
+#[tokio::test]
+async fn an_oversized_sender_id_cannot_satisfy_the_allowlist() {
+    let oversized = "7".repeat(65);
+    let source = ScriptedSource::with_batches(vec![vec![update_from(1, "42", &oversized, READ)]]);
+    let (mut poller, calls, _sent) = poller(
+        source,
+        sender_allowlist(&["42"], &[oversized.as_str()]),
+        RecordingTransport::default(),
+    );
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.denied, 1);
+    assert_eq!(report.dispatched, 0);
+    assert_eq!(*calls.lock().expect("lock"), 0);
+}

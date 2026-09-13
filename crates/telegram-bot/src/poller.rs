@@ -28,9 +28,10 @@
 //!   backend-side idempotency (for example the durable limit-order store's
 //!   deterministic creation identity); the poller alone is at-most-once only
 //!   within one process lifetime.
-//! - **Allowlist first.** No chat outside [`ChatAllowlist`] is dispatched; an
-//!   empty allowlist denies every chat (fail closed). Denied updates are still
-//!   acknowledged so they do not repeat.
+//! - **Allowlist first.** No chat outside [`ChatAllowlist`] is dispatched, and
+//!   when a non-empty sender allowlist is configured a listed chat is dispatched
+//!   only for a listed sender. An empty chat allowlist denies every chat (fail
+//!   closed). Denied updates are still acknowledged so they do not repeat.
 //! - **No I/O and no timers.** The source and transport are injected; the poller
 //!   exposes one deterministic [`TelegramPoller::poll_once`] pass and never
 //!   sleeps or retries. A source failure is returned unchanged (redacted) without
@@ -196,7 +197,7 @@ pub struct PollReport {
     pub sent: usize,
     /// Dispatched updates the dispatcher answered with nothing.
     pub skipped: usize,
-    /// Updates dropped because the chat is not allowlisted.
+    /// Updates dropped because the chat or the sender is not allowlisted.
     pub denied: usize,
     /// Updates that could not be acknowledged or parsed (no usable `update_id`,
     /// or a malformed message shape).
