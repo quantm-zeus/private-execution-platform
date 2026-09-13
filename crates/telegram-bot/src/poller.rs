@@ -9,18 +9,31 @@
 //! `agent-commands` authorization path as MCP).
 //!
 //! ## Boundaries
-//! - **Offset ownership and dedup.** `next_offset` advances to
-//!   `max(update_id) + 1` over every fetched update, including denied and
-//!   malformed ones, so an update is acknowledged at most once. A redelivered
-//!   `update_id` at or below the last processed id is counted as a duplicate and
-//!   never dispatched, so a retrying source cannot double-execute a mutation.
+//! - **Offset ownership and dedup.** `next_offset` is the acknowledgement
+//!   high-water mark: every update with `update_id < next_offset` is already
+//!   acknowledged and is never dispatched again. A batch is processed in
+//!   ascending `update_id` order, so a source that returns updates out of order
+//!   cannot make the high-water mark skip a lower, never-acknowledged update.
+//! - **Resumable.** [`TelegramPoller::resume_from`] seeds the offset from a
+//!   caller-persisted value, and [`TelegramPoller::next_offset`] exposes it after
+//!   each pass. A production binary MUST persist `next_offset` and restore it on
+//!   restart; otherwise a crash after a dispatch but before the next `getUpdates`
+//!   re-confirms the offset causes that update to be redelivered and dispatched
+//!   again. The poller itself performs no I/O, so persistence is the caller's
+//!   responsibility.
 //! - **Allowlist first.** No chat outside [`ChatAllowlist`] is dispatched; an
 //!   empty allowlist denies every chat (fail closed). Denied updates are still
 //!   acknowledged so they do not repeat.
 //! - **No I/O and no timers.** The source and transport are injected; the poller
 //!   exposes one deterministic [`TelegramPoller::poll_once`] pass and never
-//!   sleeps or retries. A source failure is surfaced as
-//!   [`TelegramError::Transport`] without advancing the offset.
+//!   sleeps or retries. A source failure is returned unchanged (redacted) without
+//!   advancing the offset.
+//! - **Source contract.** Every returned update MUST carry a non-negative integer
+//!   `update_id` (Telegram always does). An update without one cannot be
+//!   acknowledged, so it is counted as malformed and the offset is not advanced
+//!   for it; a source that repeatedly returns only such updates will fetch them
+//!   again, and the caller must treat that as a source fault. A malformed update
+//!   *body* with a usable id is acknowledged and skipped.
 //! - **Redaction.** Failures are payload-free, and `Debug` never renders a chat
 //!   id, an update body, or the allowlist contents.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
@@ -43,13 +56,14 @@ pub const MAX_POLL_BATCH: usize = 100;
 
 /// One raw batch source for Telegram `getUpdates`.
 ///
-/// Implementations own the transport call and must not retry internally: the
-/// poller advances the offset only after a batch is accepted, and a retry of a
-/// half-consumed batch is exactly what the dedup window is for.
+/// Implementations own the transport call and must not retry internally. They
+/// MUST return updates in ascending `update_id` order (the poller re-sorts
+/// defensively, but the offset semantics assume ascending delivery) and every
+/// update MUST carry a non-negative integer `update_id`.
 #[async_trait]
 pub trait TelegramUpdateSource: Send + Sync {
-    /// Returns updates with `update_id >= offset`, at most `limit`, in ascending
-    /// `update_id` order.
+    /// Returns updates with `update_id >= offset`, at most `limit`, each with an
+    /// integer `update_id`.
     async fn get_updates(&self, offset: i64, limit: usize) -> Result<Vec<Value>, TelegramError>;
 }
 
@@ -136,12 +150,14 @@ impl Default for PollLimits {
 
 /// Counts from one [`TelegramPoller::poll_once`] pass.
 ///
-/// All fields are non-semantic counts, safe for telemetry.
+/// All fields are non-semantic counts, safe for telemetry. `dispatched` equals
+/// `sent + skipped + invalid_commands + reply_failures` (every update that passed
+/// dedup and the allowlist and was handed to the bot).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollReport {
     /// Updates returned by the source.
     pub fetched: usize,
-    /// Updates that passed dedup and the allowlist and were handed to the bot.
+    /// Updates handed to the bot (passed dedup and the allowlist).
     pub dispatched: usize,
     /// Dispatched updates that produced a reply.
     pub sent: usize,
@@ -149,11 +165,14 @@ pub struct PollReport {
     pub skipped: usize,
     /// Updates dropped because the chat is not allowlisted.
     pub denied: usize,
-    /// Updates dropped because they were malformed or had no usable id.
+    /// Updates that could not be acknowledged or parsed (no usable `update_id`,
+    /// or a malformed message shape).
     pub malformed: usize,
-    /// Redelivered updates dropped by the dedup window.
+    /// Dispatched updates whose command text the bot rejected as malformed.
+    pub invalid_commands: usize,
+    /// Redelivered updates at or below the acknowledgement high-water mark.
     pub duplicates: usize,
-    /// Dispatch attempts whose reply could not be delivered.
+    /// Dispatched updates whose reply could not be delivered.
     pub reply_failures: usize,
 }
 
@@ -164,14 +183,14 @@ pub struct TelegramPoller<B: AgentBackend, T: TelegramTransport, S: TelegramUpda
     allowlist: ChatAllowlist,
     limits: PollLimits,
     next_offset: i64,
-    last_processed: i64,
 }
 
 impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPoller<B, T, S> {
     /// Wires the poller from a bot, an update source, and a chat allowlist.
     ///
     /// `next_offset` starts at `0`; Telegram update ids start at `1`, so the
-    /// first request returns everything pending.
+    /// first request returns everything pending. Use
+    /// [`resume_from`](Self::resume_from) to restore a persisted offset.
     pub fn new(bot: TelegramBot<B, T>, source: S, allowlist: ChatAllowlist) -> Self {
         Self {
             bot,
@@ -179,8 +198,19 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
             allowlist,
             limits: PollLimits::default(),
             next_offset: 0,
-            last_processed: -1,
         }
+    }
+
+    /// Resumes from a caller-persisted acknowledgement offset.
+    ///
+    /// Every update with `update_id < next_offset` is treated as already
+    /// acknowledged. A negative value is clamped to `0`. A production binary must
+    /// persist [`next_offset`](Self::next_offset) after a pass and restore it here
+    /// on restart, otherwise the Telegram protocol has not been told the update
+    /// was consumed and it may be redelivered.
+    pub fn resume_from(mut self, next_offset: i64) -> Self {
+        self.next_offset = next_offset.max(0);
+        self
     }
 
     /// Overrides the `getUpdates` batch size.
@@ -189,7 +219,7 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
         self
     }
 
-    /// The offset that will be sent on the next fetch.
+    /// The acknowledgement offset that will be sent on the next fetch.
     pub fn next_offset(&self) -> i64 {
         self.next_offset
     }
@@ -197,41 +227,38 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
     /// Performs one fetch-and-dispatch pass.
     ///
     /// A source failure is returned unchanged (redacted) and leaves the offset
-    /// unchanged, so the next pass retries the same batch. Every fetched update
-    /// then advances the offset at most once; dedup, allowlist, and malformed
-    /// drops are counted rather than fatal, so one bad update cannot wedge the
-    /// loop.
+    /// unchanged, so the next pass retries the same batch. The batch is processed
+    /// in ascending `update_id` order and the offset advances monotonically, so
+    /// each update is acknowledged and dispatched at most once. Dedup, allowlist,
+    /// and malformed drops are counted rather than fatal, so one bad update cannot
+    /// block the well-formed updates around it.
     pub async fn poll_once(&mut self) -> Result<PollReport, TelegramError> {
         let batch = self.limits.batch.clamp(1, MAX_POLL_BATCH);
-        let updates = self.source.get_updates(self.next_offset, batch).await?;
+        let mut updates = self.source.get_updates(self.next_offset, batch).await?;
         let mut report = PollReport {
             fetched: updates.len(),
             ..PollReport::default()
         };
 
+        // Ascending order makes the high-water mark sound even if a non-conforming
+        // source returns a batch out of order: a lower, never-acknowledged update
+        // is processed before a higher one. Updates without a usable id sort to
+        // the front and are counted as malformed.
+        updates.sort_by_key(|update| parse_update_id(update).unwrap_or(-1));
+
         for update in &updates {
-            // Telegram always carries a non-negative integer `update_id`; an
-            // update without one cannot be acknowledged, so it is counted and
-            // never dispatched.
             let Some(update_id) = parse_update_id(update) else {
                 report.malformed = report.malformed.saturating_add(1);
                 continue;
             };
 
-            // Acknowledge the id before any content check so a denied or
-            // malformed update does not repeat forever.
-            let duplicate = update_id <= self.last_processed;
-            if update_id > self.last_processed {
-                self.last_processed = update_id;
-            }
-            let next = update_id.saturating_add(1);
-            if next > self.next_offset {
-                self.next_offset = next;
-            }
-            if duplicate {
+            // `next_offset` is the acknowledgement high-water mark: an id below it
+            // was consumed in an earlier pass.
+            if update_id < self.next_offset {
                 report.duplicates = report.duplicates.saturating_add(1);
                 continue;
             }
+            self.next_offset = update_id.saturating_add(1);
 
             let parsed = match TelegramUpdate::parse(update) {
                 Ok(parsed) => parsed,
@@ -258,7 +285,7 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
                 // already acknowledged, so it is not retried.
                 Err(TelegramError::Malformed) => {
                     report.dispatched = report.dispatched.saturating_add(1);
-                    report.malformed = report.malformed.saturating_add(1);
+                    report.invalid_commands = report.invalid_commands.saturating_add(1);
                 }
                 // Any other dispatch failure (for example a reply the transport
                 // could not deliver) is counted and never re-dispatched, because

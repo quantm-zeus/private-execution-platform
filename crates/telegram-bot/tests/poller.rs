@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use mcp_server::{AgentBackend, BackendOutcome};
 use serde_json::{json, Value};
 use telegram_bot::{
-    ChatAllowlist, PollLimits, TelegramBot, TelegramError, TelegramPoller, TelegramTransport,
-    TelegramUpdateSource,
+    ChatAllowlist, PollLimits, PollReport, TelegramBot, TelegramError, TelegramPoller,
+    TelegramTransport, TelegramUpdateSource,
 };
 
 struct FakeBackend {
@@ -298,6 +298,89 @@ fn debug_output_is_redacted() {
     let allowlist = allowlist(&["secret-chat"]);
     let rendered = format!("{allowlist:?}");
     assert!(!rendered.contains("secret-chat"));
+
+    let report = PollReport {
+        fetched: 1,
+        dispatched: 1,
+        ..PollReport::default()
+    };
+    let rendered = format!("{report:?}");
+    assert!(!rendered.contains("secret-chat"));
+    assert_eq!(format!("{:?}", TelegramError::Malformed), "Malformed");
+    assert_eq!(
+        format!("{:?}", PollLimits { batch: 7 }),
+        "PollLimits { batch: 7 }"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_order_batch_still_processes_every_never_acknowledged_update() {
+    let source =
+        ScriptedSource::with_batches(vec![vec![update(7, "42", READ), update(5, "42", READ)]]);
+    let (mut poller, calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.fetched, 2);
+    assert_eq!(report.duplicates, 0);
+    assert_eq!(report.dispatched, 2);
+    assert_eq!(*calls.lock().expect("lock"), 2);
+    assert_eq!(poller.next_offset(), 8);
+}
+
+#[tokio::test]
+async fn resume_from_seeds_the_acknowledgement_offset() {
+    let source =
+        ScriptedSource::with_batches(vec![vec![update(5, "42", READ), update(6, "42", READ)]]);
+    let calls = source.calls_handle();
+    let (fresh, backend_calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let mut resumed = fresh.resume_from(5);
+    let report = resumed.poll_once().await.expect("poll");
+    assert_eq!(report.duplicates, 0);
+    assert_eq!(report.dispatched, 2);
+    assert_eq!(*backend_calls.lock().expect("lock"), 2);
+    assert_eq!(resumed.next_offset(), 7);
+    assert_eq!(calls.lock().expect("lock").as_slice(), &[(5, 100)]);
+
+    // An update below the resumed offset is already acknowledged.
+    let source =
+        ScriptedSource::with_batches(vec![vec![update(3, "42", READ), update(4, "42", READ)]]);
+    let (fresh, backend_calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let mut resumed = fresh.resume_from(5);
+    let report = resumed.poll_once().await.expect("poll");
+    assert_eq!(report.duplicates, 2);
+    assert_eq!(report.dispatched, 0);
+    assert_eq!(resumed.next_offset(), 5);
+    assert_eq!(*backend_calls.lock().expect("lock"), 0);
+}
+
+#[tokio::test]
+async fn an_id_less_only_batch_cannot_advance_the_offset() {
+    let source = ScriptedSource::with_batches(vec![vec![json!({
+        "message": { "chat": { "id": "42" }, "text": READ }
+    })]]);
+    let (mut poller, calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.malformed, 1);
+    assert_eq!(report.dispatched, 0);
+    assert_eq!(poller.next_offset(), 0);
+    assert_eq!(*calls.lock().expect("lock"), 0);
+}
+
+#[tokio::test]
+async fn an_invalid_command_is_counted_separately_from_a_malformed_update() {
+    let source = ScriptedSource::with_batches(vec![vec![update(1, "42", "not json")]]);
+    let (mut poller, calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(report.invalid_commands, 1);
+    assert_eq!(report.malformed, 0);
+    assert_eq!(report.sent, 0);
+    assert_eq!(poller.next_offset(), 2);
+    assert_eq!(*calls.lock().expect("lock"), 0);
 }
 
 #[tokio::test]
