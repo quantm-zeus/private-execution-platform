@@ -1,11 +1,12 @@
-//! # Agent backend (Phase 6 S4/S6/S7)
+//! # Agent backend (Phase 6 S4/S6/S7/S8)
 //!
 //! A real [`mcp_server::AgentBackend`] composition over the canonical Trading
 //! Core. It serves owner-scoped read projections through injected ports,
 //! delegates authorized limit-order placement/cancellation to the durable
-//! [`limit_engine`] order store, and quotes exact `preview_market_order`
-//! economics through the injected market/route ports. The dispatcher never
-//! touches the store or the router, and neither knows about MCP.
+//! [`limit_engine`] order store, quotes exact `preview_market_order` economics
+//! through the injected market/route ports, and delegates authorized
+//! `execute_market_order` to an injected [`MarketExecutionPort`]. The dispatcher
+//! never touches the store or the router, and neither knows about MCP.
 //!
 //! ## Boundaries
 //! - **Reads** ([`AgentReadBackend`]) serve the owner-scoped `get_orders` and
@@ -19,8 +20,12 @@
 //! - **Market preview** ([`TradingAgentBackend`] + [`MarketSnapshotSource`])
 //!   returns the exact full-net-economics [`MarketPreview`] from the same
 //!   bounded single-path router the execution path uses. It moves no funds and
-//!   fails closed when no trusted market view exists. `execute_market_order`
-//!   still has no landed pipeline and fails closed, never guessed at.
+//!   fails closed when no trusted market view exists.
+//! - **Market execution** ([`TradingAgentBackend`] + [`MarketExecutionPort`])
+//!   delegates `execute_market_order` the exact trusted intent and quote; the
+//!   injected port owns pre-sign revalidation/policy/sign/submit. The default
+//!   port fails closed, so nothing executes without an explicitly installed
+//!   pipeline.
 //! - **No signing/transfer/relay capability.** This crate names no signing,
 //!   transfer, or relay type and exposes no path that can reach one. (The
 //!   `limit-engine` dependency it uses for the durable order store is itself
@@ -31,15 +36,16 @@
 //!   (one session), so a command carries no user identity and cannot be pointed
 //!   at another owner's data.
 //! - **Redaction.** Internal failures collapse to the redacted
-//!   [`BackendError`]; nothing here logs. User-facing order/portfolio/preview
-//!   payloads are returned only through the authenticated channel, never as
-//!   telemetry.
+//!   [`BackendError`]; nothing here logs. User-facing order/portfolio/preview/
+//!   execution payloads are returned only through the authenticated channel,
+//!   never as telemetry.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
 
 #![forbid(unsafe_code)]
 
 mod backend;
 mod error;
+mod execute;
 mod market;
 mod order;
 mod portfolio;
@@ -47,6 +53,10 @@ mod trade;
 
 pub use backend::{parse_status_filter, AgentReadBackend};
 pub use error::BackendError;
+pub use execute::{
+    MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
+    UnavailableMarketExecution,
+};
 pub use market::{
     plan_market_preview, MarketPreview, MarketPreviewError, MarketSnapshot, MarketSnapshotSource,
     UnavailableMarketSnapshot,

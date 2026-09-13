@@ -10,9 +10,9 @@
 //!   creates a durable `Created` record (no signing, no submission, no funds
 //!   movement); `cancel_order` appends a validated `Cancelled` transition.
 //!   `preview_market_order` is served read-only through an injected exact
-//!   [`MarketSnapshotSource`] (see [`crate::market`]); `execute_market_order`
-//!   still has no landed market execution pipeline and fails closed
-//!   [`BackendOutcome::Unavailable`].
+//!   [`MarketSnapshotSource`] (see [`crate::market`]); `execute_market_order` is
+//!   delegated to an injected [`MarketExecutionPort`] (fail-closed by default)
+//!   that owns the pre-sign revalidation/policy/sign/submit composition.
 //! - **Trusted identity and policy.** The owner, wallet, chain, risk caps, and
 //!   minimum partial-fill floor come from the injected [`TradingBackendConfig`];
 //!   nothing is taken from the command. The command's chain must equal the
@@ -49,8 +49,13 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::AgentReadBackend;
 use crate::error::BackendError;
+use crate::execute::{
+    MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
+    UnavailableMarketExecution,
+};
 use crate::market::{
-    plan_market_preview, MarketPreviewError, MarketSnapshotSource, UnavailableMarketSnapshot,
+    plan_market_preview, MarketPreview, MarketPreviewError, MarketSnapshotSource,
+    UnavailableMarketSnapshot,
 };
 use crate::order::{OrderReadModel, OrderSummary};
 use crate::portfolio::PortfolioReadModel;
@@ -160,8 +165,8 @@ impl std::fmt::Debug for TradingBackendConfig {
 /// Reads are delegated to the same [`AgentReadBackend`] used by the read-only
 /// composition; limit-order placement and cancellation are served by the
 /// injected durable store; `preview_market_order` is quoted exactly through the
-/// injected [`MarketSnapshotSource`] and gas model. `execute_market_order` fails
-/// closed until a market execution pipeline lands.
+/// injected [`MarketSnapshotSource`] and gas model; `execute_market_order` is
+/// delegated to the injected [`MarketExecutionPort`] (fail-closed by default).
 pub struct TradingAgentBackend<O: OrderReadModel, P: PortfolioReadModel, S> {
     reads: AgentReadBackend<O, P>,
     store: Arc<S>,
@@ -170,14 +175,17 @@ pub struct TradingAgentBackend<O: OrderReadModel, P: PortfolioReadModel, S> {
     valuation: Arc<dyn OrderValuation>,
     market: Arc<dyn MarketSnapshotSource>,
     gas: Option<Arc<dyn GasEstimator>>,
+    execution: Arc<dyn MarketExecutionPort>,
 }
 
 impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     /// Wires the write backend from its trusted ports.
     ///
     /// The market preview port defaults to fail-closed
-    /// ([`UnavailableMarketSnapshot`]) and the gas model to absent; use
-    /// [`Self::with_market_snapshot`] and [`Self::with_gas_estimator`] to opt in.
+    /// ([`UnavailableMarketSnapshot`]), the execution port to fail-closed
+    /// ([`UnavailableMarketExecution`]), and the gas model to absent; use
+    /// [`Self::with_market_snapshot`], [`Self::with_market_execution`], and
+    /// [`Self::with_gas_estimator`] to opt in.
     pub fn new(
         reads: AgentReadBackend<O, P>,
         store: Arc<S>,
@@ -193,6 +201,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             valuation,
             market: Arc::new(UnavailableMarketSnapshot),
             gas: None,
+            execution: Arc::new(UnavailableMarketExecution),
         }
     }
 
@@ -202,9 +211,15 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         self
     }
 
-    /// Installs the deterministic gas model used by preview scoring.
+    /// Installs the deterministic gas model used by preview/execution scoring.
     pub fn with_gas_estimator(mut self, gas: Arc<dyn GasEstimator>) -> Self {
         self.gas = Some(gas);
+        self
+    }
+
+    /// Installs the market-execution port used by `execute_market_order`.
+    pub fn with_market_execution(mut self, execution: Arc<dyn MarketExecutionPort>) -> Self {
+        self.execution = execution;
         self
     }
 
@@ -375,7 +390,10 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         Ok((intent, amount_in))
     }
 
-    /// Quotes an exact market preview, returning the fully composed result.
+    /// Quotes an exact market preview, returning the trusted intent and result.
+    ///
+    /// The intent is returned so `execute_market_order` can hand the exact same
+    /// trusted intent (and route) to the execution port that produced the quote.
     #[allow(clippy::too_many_arguments)]
     fn quote_market_preview(
         &self,
@@ -386,7 +404,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount: AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
-    ) -> Result<crate::market::MarketPreview, BackendError> {
+    ) -> Result<(TradeIntent, MarketPreview), BackendError> {
         let (intent, amount_in) = self.preview_intent(
             channel,
             token_in,
@@ -397,7 +415,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             max_price_impact_bps,
         )?;
         let now_ms = self.clock.now_ms();
-        plan_market_preview(
+        let preview = plan_market_preview(
             self.market.as_ref(),
             self.gas.as_deref(),
             &intent,
@@ -407,7 +425,47 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         .map_err(|error| match error {
             MarketPreviewError::Unavailable => BackendError::Unavailable,
             MarketPreviewError::NoViableRoute => BackendError::Denied,
-        })
+        })?;
+        Ok((intent, preview))
+    }
+
+    /// Executes a market order by delegating the exact quote to the injected port.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_market_order(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+    ) -> BackendOutcome {
+        let (intent, preview) = match self.quote_market_preview(
+            channel,
+            token_in,
+            token_out,
+            side,
+            amount,
+            max_slippage_bps,
+            max_price_impact_bps,
+        ) {
+            Ok(quoted) => quoted,
+            Err(BackendError::Denied) => return BackendOutcome::Denied,
+            Err(BackendError::Unavailable) => return BackendOutcome::Unavailable,
+        };
+        let now_ms = self.clock.now_ms();
+        let request = MarketExecutionRequest {
+            intent,
+            quote: preview.quote,
+            score: preview.score,
+            now_ms,
+        };
+        match self.execution.execute(request).await {
+            Ok(outcome) => BackendOutcome::Value(json!({ "execution": execution_json(outcome) })),
+            Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
+            Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
+        }
     }
 }
 
@@ -448,6 +506,9 @@ where
         match trade {
             TradeCommand::PlaceLimitOrder {
                 token_in, amount, ..
+            }
+            | TradeCommand::ExecuteMarketOrder {
+                token_in, amount, ..
             } => match amount {
                 // A USD-micros amount is a request-body value, not a trusted
                 // valuation, so the port must value it (and today cannot):
@@ -460,10 +521,8 @@ where
             },
             // Cancellation moves no funds; authorize still requires a valuation.
             TradeCommand::CancelOrder { .. } => Some(0),
-            // No market pipeline exists; these are never authorized as mutating.
-            TradeCommand::PreviewMarketOrder { .. } | TradeCommand::ExecuteMarketOrder { .. } => {
-                None
-            }
+            // Preview is read-only, so it needs no trusted valuation.
+            TradeCommand::PreviewMarketOrder { .. } => None,
         }
     }
 }
@@ -492,10 +551,29 @@ where
                 max_slippage_bps,
                 max_price_impact_bps,
             ) {
-                Ok(preview) => BackendOutcome::Value(json!({ "preview": preview })),
+                Ok((_intent, preview)) => BackendOutcome::Value(json!({ "preview": preview })),
                 Err(BackendError::Denied) => BackendOutcome::Denied,
                 Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
             },
+            TradeCommand::ExecuteMarketOrder {
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+            } => {
+                self.execute_market_order(
+                    channel,
+                    token_in,
+                    token_out,
+                    side,
+                    amount,
+                    max_slippage_bps,
+                    max_price_impact_bps,
+                )
+                .await
+            }
             TradeCommand::PlaceLimitOrder {
                 token_in,
                 token_out,
@@ -532,9 +610,6 @@ where
             TradeCommand::CancelOrder { order_id } => {
                 outcome_for(self.cancel_order(&order_id).await)
             }
-            // Market execution has no landed pipeline: fail closed rather than
-            // guess. (Preview is served above through the exact router.)
-            TradeCommand::ExecuteMarketOrder { .. } => BackendOutcome::Unavailable,
         }
     }
 
@@ -808,5 +883,25 @@ fn outcome_for(result: Result<StoredLimitOrder, BackendError>) -> BackendOutcome
         Ok(record) => BackendOutcome::Value(json!({ "order": OrderSummary::from_stored(&record) })),
         Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
         Err(BackendError::Denied) => BackendOutcome::Denied,
+    }
+}
+
+/// Shapes a port execution outcome into the authenticated response payload.
+///
+/// The payload is intentionally coarse: the state is explicit and realized
+/// amounts are included only when the chain observed them.
+fn execution_json(outcome: MarketExecutionOutcome) -> serde_json::Value {
+    match outcome {
+        MarketExecutionOutcome::Submitted => json!({ "state": "submitted" }),
+        MarketExecutionOutcome::Filled {
+            net_input,
+            net_output,
+        } => json!({
+            "state": "filled",
+            "net_input": net_input,
+            "net_output": net_output,
+        }),
+        MarketExecutionOutcome::Unknown => json!({ "state": "unknown" }),
+        MarketExecutionOutcome::Failed => json!({ "state": "failed" }),
     }
 }
