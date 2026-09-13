@@ -231,6 +231,81 @@ fn an_inverted_plan_does_not_panic() {
 }
 
 #[test]
+fn a_zero_slice_plan_does_not_panic() {
+    // `slices` is a public field; a directly-mutated zero must not divide by zero.
+    let mut plan = plan(1_000, 4, 100);
+    plan.slices = 0;
+    let state = TwapState::new(amount(1_000));
+    match engine().next(&plan, &state, &fresh(0), 0) {
+        TwapDecision::Execute { chunk, reason, .. } => {
+            assert!(chunk.get() >= 1);
+            // The nominal schedule is exhausted, so the remainder is a final slice.
+            assert_eq!(chunk.get(), 1_000);
+            assert_eq!(reason, ChunkReason::Final);
+        }
+        other => panic!("expected execute, got {other:?}"),
+    }
+}
+
+#[test]
+fn exactly_at_the_slippage_cap_does_not_halt() {
+    let plan = plan(1_000, 4, 100);
+    let state = TwapState::new(amount(1_000));
+    let observation = MarketObservation {
+        observed_at_ms: 0,
+        last_slippage_bps: Some(100),
+        liquidity_recovery_bps: Some(0),
+        volatility_bps: Some(0),
+    };
+    assert!(matches!(
+        engine().next(&plan, &state, &observation, 0),
+        TwapDecision::Execute { .. }
+    ));
+}
+
+#[test]
+fn an_explicit_min_max_clamp_is_honored() {
+    // base = 1000/4 = 250; the max of 200 must win.
+    let plan = TwapPlan::new(
+        amount(1_000),
+        4,
+        amount(100),
+        amount(200),
+        4_000,
+        1_000,
+        100,
+    );
+    let state = TwapState::new(amount(1_000));
+    match engine().next(&plan, &state, &fresh(0), 0) {
+        TwapDecision::Execute { chunk, reason, .. } => {
+            assert_eq!(chunk.get(), 200);
+            assert_eq!(reason, ChunkReason::Schedule);
+        }
+        other => panic!("expected execute, got {other:?}"),
+    }
+}
+
+#[test]
+fn zero_or_negative_durations_do_not_panic() {
+    for duration in [0i64, -5] {
+        let plan = TwapPlan::new(
+            amount(1_000),
+            4,
+            amount(1),
+            amount(1_000),
+            duration,
+            1_000,
+            100,
+        );
+        let state = TwapState::new(amount(1_000));
+        match engine().next(&plan, &state, &fresh(0), 0) {
+            TwapDecision::Execute { next_at_ms, .. } => assert!(next_at_ms >= 0),
+            other => panic!("expected execute, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn varying_observations_still_conserve_the_total() {
     let plan = plan(10_000, 8, 200);
     let mut state = TwapState::new(amount(10_000));

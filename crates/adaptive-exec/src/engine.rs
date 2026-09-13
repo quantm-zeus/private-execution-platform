@@ -105,7 +105,10 @@ impl AdaptiveTwap {
                 plan.fallback_interval_ms.max(0),
             )
         } else {
-            let base_interval = plan.duration_ms / plan.slices as i64;
+            // `slices` is a public field and a caller may mutate it to 0 after
+            // construction; floor the divisor as the schedule arithmetic above
+            // already does.
+            let base_interval = plan.duration_ms / plan.slices.max(1) as i64;
             let volatility_high = observation
                 .volatility_bps
                 .is_some_and(|value| value >= self.policy.high_volatility_bps);
