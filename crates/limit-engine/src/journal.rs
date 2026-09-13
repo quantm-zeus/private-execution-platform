@@ -966,8 +966,9 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
     /// Lists up to `limit` of `owner`'s orders in class-listing order (the
     /// record's coarse created bucket descending, then object id ascending).
     ///
-    /// The created bucket is derived from the order's `expires_at_ms` (see
-    /// [`bucket_for_ms`]), so the order is effectively newest-deadline first.
+    /// The created bucket is derived from the order's `expires_at_ms` (see the
+    /// private `bucket_for_ms`), so the order is effectively newest-deadline
+    /// first.
     ///
     /// This is a bounded, read-only projection of the durable encrypted store:
     /// it enumerates the order class with the same paging as recovery, drops any
@@ -997,10 +998,17 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
     /// key; rotation requires a migration/replay pass. This matches the existing
     /// recovery enumeration and does not affect owner isolation.
     ///
+    /// A record whose seal key id the provider cannot resolve is treated as a
+    /// per-record fault by `is_per_order_fault` and skipped, so a **seal-key-only
+    /// rotation** (the blind index is unchanged but the old key id is no longer
+    /// resolvable) yields `Ok`, possibly empty, rather than failing closed. A
+    /// provider must therefore retain historical key ids for as long as their
+    /// records are readable; this is the same classification recovery uses.
+    ///
     /// The store's `chain` binding is not applied to this read: enumeration is
-    /// chain-independent and every returned [`OrderSummary`]-style projection
-    /// carries its own `chain`, so a caller must still check it. Filtering here is
-    /// a follow-up if a single store must serve multiple chains.
+    /// chain-independent and every returned [`StoredLimitOrder`] carries its own
+    /// `chain`, so a caller must still check it. Filtering here is a follow-up if
+    /// a single store must serve multiple chains.
     pub async fn list_orders_for_owner(
         &self,
         owner: &UserId,

@@ -106,9 +106,12 @@ pub trait OrderReadModel: Send + Sync {
 /// Real [`OrderReadModel`] over the durable encrypted [`limit_engine`] store.
 ///
 /// The listing is owner-scoped at construction and bounded by `page` (clamped by
-/// the store to [`limit_engine::MAX_OWNER_ORDERS`]). Any store/key fault collapses
-/// to the redacted [`BackendError::Unavailable`]; no partial or cross-owner
-/// result is ever returned.
+/// the store to [`limit_engine::MAX_OWNER_ORDERS`]). A cross-owner record is
+/// never returned, and an environmental store/key fault collapses to the
+/// redacted [`BackendError::Unavailable`]. Like every read of the class
+/// enumeration, a single unreadable own-owner record (corrupt or under an
+/// unresolvable historical key id) is skipped rather than hiding the healthy
+/// orders; see `DurableLimitOrderStore::list_orders_for_owner`.
 pub struct DurableOrderReadModel<S: OpaqueStore> {
     store: Arc<DurableLimitOrderStore<S>>,
     owner: UserId,

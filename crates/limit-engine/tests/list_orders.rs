@@ -156,6 +156,15 @@ async fn a_corrupt_object_is_skipped_not_fatal() {
     .await
     .expect("put corrupt object");
 
+    // Confirm the corrupt object really passes both blind-index filters, so the
+    // skip below can only come from `open_record` failing (not a filter drop).
+    let stored = fake.objects();
+    assert!(stored.iter().any(|object| {
+        object.id == "corrupt-object"
+            && object.class_blind_index == class.to_vec()
+            && object.owner_blind_index == owner_index.to_vec()
+    }));
+
     let listed = store
         .list_orders_for_owner(&owner(), None, 10)
         .await
