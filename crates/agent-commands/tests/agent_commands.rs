@@ -273,6 +273,50 @@ fn inconsistent_outer_command_tag_fails_closed() {
     assert_eq!(AgentCommand::parse(json), Err(AgentCommandError::Malformed));
 }
 
+#[test]
+fn duplicate_keys_fail_closed() {
+    let base = concat!(
+        r#"{"tool":"get_quote","token_in":"#,
+        r#"{"chain":{"kind":"solana"},"address":"So11111111111111111111111111111111111111112"},"#,
+        r#""token_out":{"chain":{"kind":"solana"},"address":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"},"#,
+    );
+
+    // A repeated `unit` must not let the last value silently win.
+    let duplicate_unit = format!(
+        "{base}\"amount\":{{\"unit\":\"token_atomic\",\"value\":1,\"unit\":\"usd_micros\"}}}}"
+    );
+    assert_eq!(
+        AgentCommand::parse(&duplicate_unit),
+        Err(AgentCommandError::Malformed)
+    );
+
+    // A repeated `value` is equally ambiguous.
+    let duplicate_value =
+        format!("{base}\"amount\":{{\"unit\":\"token_atomic\",\"value\":1,\"value\":2}}}}");
+    assert_eq!(
+        AgentCommand::parse(&duplicate_value),
+        Err(AgentCommandError::Malformed)
+    );
+
+    // A repeated top-level `tool` must not let `get_portfolio` win.
+    let json = r#"{"tool":"withdraw","tool":"get_portfolio"}"#;
+    assert_eq!(AgentCommand::parse(json), Err(AgentCommandError::Malformed));
+
+    // The direct typed decoders reject the same ambiguity.
+    assert!(serde_json::from_str::<AmountSpec>(
+        r#"{"unit":"token_atomic","value":1,"unit":"usd_micros"}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<AssetRef>(
+        r#"{"chain":{"kind":"solana"},"address":"0xabc","address":"0xdef"}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<LimitPriceSpec>(
+        r#"{"numerator_atomic":1,"numerator_atomic":2,"denominator_atomic":1}"#
+    )
+    .is_err());
+}
+
 // --- AC-3 forbidden surface ---------------------------------------------------
 
 #[test]
@@ -641,6 +685,120 @@ fn authorized_command_debug_redacts_payload() {
     assert!(!debug.contains("1000000"));
     assert!(!debug.contains("So11111111111111111111111111111111111111112"));
     assert!(!debug.contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));
+}
+
+#[test]
+fn command_debug_is_payload_free() {
+    let query = "SECRETQUERY123";
+    let order_id = "SECRETORDERID456";
+    let amount_atomic = 9876543210123456789u128;
+
+    let read_query = parse(&format!(r#"{{"tool":"search_token","query":"{query}"}}"#));
+    let read_quote = parse(&format!(
+        r#"{{"tool":"get_quote","token_in":{SOL},"token_out":{USDC},"amount":{{"unit":"token_atomic","value":{amount_atomic}}}}}"#
+    ));
+    let trade_cancel = parse(&format!(
+        r#"{{"tool":"cancel_order","order_id":"{order_id}"}}"#
+    ));
+    let trade_place = parse(PLACE_JSON);
+
+    let asset = sol();
+    let amount = AmountSpec::TokenAtomic(amount_atomic);
+    let limit_price = LimitPriceSpec::new(123456789012345678901u128, 2).expect("valid price");
+
+    let rendered = [
+        format!("{read_query:?}"),
+        format!("{read_quote:?}"),
+        format!("{trade_cancel:?}"),
+        format!("{trade_place:?}"),
+        format!("{asset:?}"),
+        format!("{amount:?}"),
+        format!("{limit_price:?}"),
+    ];
+
+    let secrets = [
+        query,
+        order_id,
+        "9876543210123456789",
+        "123456789012345678901",
+        "So11111111111111111111111111111111111111112",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    ];
+    for text in &rendered {
+        for secret in secrets {
+            assert!(!text.contains(secret), "Debug leaked {secret}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_ascii_digit()),
+            "Debug leaked an ASCII digit: {text}"
+        );
+    }
+}
+
+fn assert_failure_is_payload_free<T>(input: &str, secrets: &[&str])
+where
+    T: serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    let error = serde_json::from_str::<T>(input)
+        .map(|value| format!("{value:?}"))
+        .expect_err("input must fail to deserialize");
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for secret in secrets {
+        assert!(
+            !display.contains(secret),
+            "Display leaked {secret}: {display}"
+        );
+        assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+    }
+}
+
+#[test]
+fn direct_deserialize_failures_are_payload_free() {
+    let bare_amount = concat!(
+        r#"{"tool":"get_quote","token_in":"#,
+        r#"{"chain":{"kind":"solana"},"address":"So11111111111111111111111111111111111111112"},"#,
+        r#""token_out":{"chain":{"kind":"solana"},"address":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"},"#,
+        r#""amount":9876543210123456789}"#
+    );
+    let wrong_case_unit = concat!(
+        r#"{"tool":"get_quote","token_in":"#,
+        r#"{"chain":{"kind":"solana"},"address":"So11111111111111111111111111111111111111112"},"#,
+        r#""token_out":{"chain":{"kind":"solana"},"address":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"},"#,
+        r#""amount":{"unit":"TOKEN_ATOMIC","value":12345}}"#
+    );
+    let forbidden_tool = r#"{"tool":"withdraw","order_id":"SECRETORDER789"}"#;
+    let bad_asset = concat!(
+        r#"{"tool":"get_token","token":"#,
+        r#"{"chain":{"kind":"solana"},"address":"SECRET ADDRESS 42"}}"#
+    );
+    let bad_asset_direct = r#"{"chain":{"kind":"solana"},"address":"SECRET ADDRESS 42"}"#;
+
+    let secrets = [
+        "SECRET",
+        "SECRETQUERY123",
+        "9876543210123456789",
+        "SECRETORDER789",
+    ];
+    let inputs = [
+        r#""SECRETQUERY123""#,
+        "9876543210123456789",
+        "[1,2,3]",
+        bare_amount,
+        wrong_case_unit,
+        forbidden_tool,
+        bad_asset,
+        bad_asset_direct,
+    ];
+
+    for input in inputs {
+        assert_failure_is_payload_free::<AgentCommand>(input, &secrets);
+        assert_failure_is_payload_free::<ReadCommand>(input, &secrets);
+        assert_failure_is_payload_free::<TradeCommand>(input, &secrets);
+        assert_failure_is_payload_free::<AmountSpec>(input, &secrets);
+        assert_failure_is_payload_free::<AssetRef>(input, &secrets);
+        assert_failure_is_payload_free::<LimitPriceSpec>(input, &secrets);
+    }
 }
 
 // --- serialization round trips ------------------------------------------------

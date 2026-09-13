@@ -12,15 +12,25 @@
 //! enums implement [`Deserialize`] manually over
 //! [`serde_json::value::RawValue`] field captures, then decode each field from
 //! its exact raw JSON. This keeps atomic amounts lossless.
+//!
+//! ## Redaction note
+//!
+//! Every type carrying a semantic payload implements a hand-written,
+//! payload-free [`Debug`](fmt::Debug). Public [`Deserialize`] impls first capture
+//! the whole input as a [`RawValue`] and then run the strict parser, so a direct
+//! `serde_json::from_str` failure cannot echo raw request values. The object
+//! decoders also reject duplicate keys, so an ambiguous command fails closed
+//! instead of silently keeping the last value.
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
+use std::fmt;
 
 use chain_types::ChainId;
 use domain::TradeSide;
 use market_types::PriceRatio;
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
-use serde_json::Value;
 
 use crate::AgentCommandError;
 
@@ -33,6 +43,57 @@ pub const MAX_ASSET_ADDRESS_LEN: usize = 128;
 /// Raw, lossless capture of a JSON object's fields.
 type RawFields = BTreeMap<String, Box<RawValue>>;
 
+/// Lossless JSON object capture that fails closed on duplicate keys.
+///
+/// Serde's ordinary map decoders silently keep the last value for a repeated
+/// key. Ambiguity must fail closed here, so the visitor rejects a repeated key
+/// instead of letting the later value win.
+struct RawObject(RawFields);
+
+impl RawObject {
+    fn into_map(self) -> RawFields {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RawObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawObjectVisitor;
+
+        impl<'de> Visitor<'de> for RawObjectVisitor {
+            type Value = RawObject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut fields = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    match fields.entry(key) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(map.next_value::<Box<RawValue>>()?);
+                        }
+                        Entry::Occupied(_) => {
+                            // The repeated key is never echoed.
+                            return Err(serde::de::Error::custom("duplicate key"));
+                        }
+                    }
+                }
+                Ok(RawObject(fields))
+            }
+        }
+
+        deserializer.deserialize_map(RawObjectVisitor)
+    }
+}
+
 /// Channel that submitted a command. Both channels share the same restrictions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,7 +103,7 @@ pub enum AgentChannel {
 }
 
 /// Explicit amount unit. A bare number is NOT accepted anywhere.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "unit", content = "value")]
 pub enum AmountSpec {
     /// Token base units (atomic).
@@ -53,16 +114,24 @@ pub enum AmountSpec {
     UsdMicros(u64),
 }
 
+impl fmt::Debug for AmountSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: the atomic/micro value is never rendered.
+        match self {
+            Self::TokenAtomic(_) => f.write_str("AmountSpec::TokenAtomic(..)"),
+            Self::StablecoinAtomic(_) => f.write_str("AmountSpec::StablecoinAtomic(..)"),
+            Self::UsdMicros(_) => f.write_str("AmountSpec::UsdMicros(..)"),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for AmountSpec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Capture both members losslessly and decode order-independently: the
-        // derived adjacently-tagged decoder routes `value`-before-`unit` through
-        // serde's `Content` buffer, which cannot represent `u128`.
-        let fields = BTreeMap::<String, Box<RawValue>>::deserialize(deserializer)?;
-        amount_from_raw_fields(&fields).map_err(serde::de::Error::custom)
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        amount_from_raw_str(raw.get()).map_err(|_| serde::de::Error::custom("invalid amount"))
     }
 }
 
@@ -88,18 +157,28 @@ pub enum ChartWindow {
 }
 
 /// Chain-qualified token reference handed in by a transport.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawAssetRef")]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AssetRef {
     pub chain: ChainId,
     pub address: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawAssetRef {
-    chain: ChainId,
-    address: String,
+impl fmt::Debug for AssetRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: chain and address are never rendered.
+        f.write_str("AssetRef { .. }")
+    }
+}
+
+impl<'de> Deserialize<'de> for AssetRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        asset_from_raw_str(raw.get())
+            .map_err(|_| serde::de::Error::custom("invalid asset reference"))
+    }
 }
 
 impl AssetRef {
@@ -134,32 +213,29 @@ impl AssetRef {
     }
 }
 
-impl TryFrom<RawAssetRef> for AssetRef {
-    type Error = AgentCommandError;
-
-    fn try_from(raw: RawAssetRef) -> Result<Self, Self::Error> {
-        let asset = Self {
-            chain: raw.chain,
-            address: raw.address,
-        };
-        asset.validate()?;
-        Ok(asset)
-    }
-}
-
 /// Explicit atomic limit price for a limit order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawLimitPriceSpec")]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LimitPriceSpec {
     pub numerator_atomic: u128,
     pub denominator_atomic: u128,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawLimitPriceSpec {
-    numerator_atomic: u128,
-    denominator_atomic: u128,
+impl fmt::Debug for LimitPriceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: the atomic price sides are never rendered.
+        f.write_str("LimitPriceSpec { .. }")
+    }
+}
+
+impl<'de> Deserialize<'de> for LimitPriceSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        limit_price_from_raw_str(raw.get())
+            .map_err(|_| serde::de::Error::custom("invalid limit price"))
+    }
 }
 
 impl LimitPriceSpec {
@@ -188,16 +264,8 @@ impl LimitPriceSpec {
     }
 }
 
-impl TryFrom<RawLimitPriceSpec> for LimitPriceSpec {
-    type Error = AgentCommandError;
-
-    fn try_from(raw: RawLimitPriceSpec) -> Result<Self, Self::Error> {
-        Self::new(raw.numerator_atomic, raw.denominator_atomic)
-    }
-}
-
 /// Read-only commands (allowed while trading is disabled).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "tool")]
 pub enum ReadCommand {
     SearchToken {
@@ -224,8 +292,24 @@ pub enum ReadCommand {
     GetPortfolio,
 }
 
+impl fmt::Debug for ReadCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: only the variant name and non-semantic shape are shown.
+        let name = match self {
+            Self::SearchToken { .. } => "ReadCommand::SearchToken { .. }",
+            Self::GetToken { .. } => "ReadCommand::GetToken { .. }",
+            Self::GetChart { .. } => "ReadCommand::GetChart { .. }",
+            Self::GetIntelligence { .. } => "ReadCommand::GetIntelligence { .. }",
+            Self::GetQuote { .. } => "ReadCommand::GetQuote { .. }",
+            Self::GetOrders { .. } => "ReadCommand::GetOrders { .. }",
+            Self::GetPortfolio => "ReadCommand::GetPortfolio",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Mutating commands. All require an enabled trading gate and an explicit amount unit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "tool")]
 pub enum TradeCommand {
     PreviewMarketOrder {
@@ -256,6 +340,19 @@ pub enum TradeCommand {
     CancelOrder {
         order_id: String,
     },
+}
+
+impl fmt::Debug for TradeCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: only the variant name and non-semantic shape are shown.
+        let name = match self {
+            Self::PreviewMarketOrder { .. } => "TradeCommand::PreviewMarketOrder { .. }",
+            Self::ExecuteMarketOrder { .. } => "TradeCommand::ExecuteMarketOrder { .. }",
+            Self::PlaceLimitOrder { .. } => "TradeCommand::PlaceLimitOrder { .. }",
+            Self::CancelOrder { .. } => "TradeCommand::CancelOrder { .. }",
+        };
+        f.write_str(name)
+    }
 }
 
 impl TradeCommand {
@@ -290,11 +387,21 @@ impl TradeCommand {
 }
 
 /// A structured command from either channel.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "command")]
 pub enum AgentCommand {
     Read(ReadCommand),
     Trade(TradeCommand),
+}
+
+impl fmt::Debug for AgentCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Payload-free: the nested command is never rendered.
+        match self {
+            Self::Read(_) => f.write_str("AgentCommand::Read(..)"),
+            Self::Trade(_) => f.write_str("AgentCommand::Trade(..)"),
+        }
+    }
 }
 
 const READ_TOOL_NAMES: &[&str] = &[
@@ -366,14 +473,14 @@ impl AgentCommand {
     ///
     /// The optional outer `command` tag emitted by serialization (`"read"` /
     /// `"trade"`) is accepted only when consistent with the tool name. Unknown
-    /// fields, a missing amount unit, a bare amount, and malformed assets,
-    /// windows, or limit prices all fail closed. Any tool name outside the
-    /// closed read/trade vocabulary returns
+    /// fields, a missing amount unit, a bare amount, duplicate keys, and
+    /// malformed assets, windows, or limit prices all fail closed. Any tool name
+    /// outside the closed read/trade vocabulary returns
     /// [`AgentCommandError::ForbiddenOperation`], never a generic parse error,
     /// so a withdraw/transfer/ownership/limit-raising/signing attempt cannot be
     /// smuggled through.
     pub fn parse(json: &str) -> Result<Self, AgentCommandError> {
-        let fields = parse_fields(json)?;
+        let fields = parse_raw_object(json)?;
         Self::from_fields(fields)
     }
 
@@ -401,13 +508,35 @@ impl AgentCommand {
     }
 }
 
+/// Strictly decodes a read command from raw JSON.
+fn read_from_raw(json: &str) -> Result<ReadCommand, AgentCommandError> {
+    let fields = parse_raw_object(json)?;
+    let tool = tool_name(&fields)?;
+    if !READ_TOOL_NAMES.contains(&tool.as_str()) {
+        return Err(AgentCommandError::ForbiddenOperation);
+    }
+    build_read(&tool, &fields)
+}
+
+/// Strictly decodes a trade command from raw JSON.
+fn trade_from_raw(json: &str) -> Result<TradeCommand, AgentCommandError> {
+    let fields = parse_raw_object(json)?;
+    let tool = tool_name(&fields)?;
+    if !TRADE_TOOL_NAMES.contains(&tool.as_str()) {
+        return Err(AgentCommandError::ForbiddenOperation);
+    }
+    build_trade(&tool, &fields)
+}
+
 impl<'de> Deserialize<'de> for AgentCommand {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let fields = RawFields::deserialize(deserializer)?;
-        Self::from_fields(fields).map_err(serde::de::Error::custom)
+        // Capture the whole input first: `RawValue` accepts any JSON value, so
+        // its own errors can never echo a value-bearing type mismatch.
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        Self::parse(raw.get()).map_err(|_| serde::de::Error::custom("invalid agent command"))
     }
 }
 
@@ -416,14 +545,8 @@ impl<'de> Deserialize<'de> for ReadCommand {
     where
         D: Deserializer<'de>,
     {
-        let fields = RawFields::deserialize(deserializer)?;
-        let tool = tool_name(&fields).map_err(serde::de::Error::custom)?;
-        if !READ_TOOL_NAMES.contains(&tool.as_str()) {
-            return Err(serde::de::Error::custom(
-                AgentCommandError::ForbiddenOperation,
-            ));
-        }
-        build_read(&tool, &fields).map_err(serde::de::Error::custom)
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        read_from_raw(raw.get()).map_err(|_| serde::de::Error::custom("invalid read command"))
     }
 }
 
@@ -432,19 +555,15 @@ impl<'de> Deserialize<'de> for TradeCommand {
     where
         D: Deserializer<'de>,
     {
-        let fields = RawFields::deserialize(deserializer)?;
-        let tool = tool_name(&fields).map_err(serde::de::Error::custom)?;
-        if !TRADE_TOOL_NAMES.contains(&tool.as_str()) {
-            return Err(serde::de::Error::custom(
-                AgentCommandError::ForbiddenOperation,
-            ));
-        }
-        build_trade(&tool, &fields).map_err(serde::de::Error::custom)
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        trade_from_raw(raw.get()).map_err(|_| serde::de::Error::custom("invalid trade command"))
     }
 }
 
-fn parse_fields(json: &str) -> Result<RawFields, AgentCommandError> {
-    serde_json::from_str::<RawFields>(json).map_err(|_| AgentCommandError::Malformed)
+fn parse_raw_object(json: &str) -> Result<RawFields, AgentCommandError> {
+    serde_json::from_str::<RawObject>(json)
+        .map(RawObject::into_map)
+        .map_err(|_| AgentCommandError::Malformed)
 }
 
 fn tool_name(fields: &RawFields) -> Result<String, AgentCommandError> {
@@ -663,7 +782,7 @@ fn field_i64(fields: &RawFields, name: &str) -> Result<i64, AgentCommandError> {
 
 fn field_asset(fields: &RawFields, name: &str) -> Result<AssetRef, AgentCommandError> {
     let raw = fields.get(name).ok_or(AgentCommandError::InvalidAsset)?;
-    serde_json::from_str::<AssetRef>(raw.get()).map_err(|_| AgentCommandError::InvalidAsset)
+    asset_from_raw_str(raw.get())
 }
 
 fn field_window(fields: &RawFields) -> Result<ChartWindow, AgentCommandError> {
@@ -681,15 +800,19 @@ fn field_side(fields: &RawFields) -> Result<TradeSide, AgentCommandError> {
 fn field_amount(fields: &RawFields) -> Result<AmountSpec, AgentCommandError> {
     let raw = fields.get("amount").ok_or(AgentCommandError::Malformed)?;
     // A bare number or non-object amount fails to decode as a field map here.
-    let inner: BTreeMap<String, Box<RawValue>> =
-        serde_json::from_str(raw.get()).map_err(|_| AgentCommandError::Malformed)?;
-    amount_from_raw_fields(&inner)
+    amount_from_raw_str(raw.get())
 }
 
 /// Decodes an amount from losslessly-captured `unit`/`value` members.
 ///
+/// The capture rejects duplicate keys and any member other than `unit`/`value`.
 /// Member order is irrelevant: the `value` is decoded directly from its exact
 /// raw JSON using the unit's width, so `u128` atomics stay lossless.
+fn amount_from_raw_str(json: &str) -> Result<AmountSpec, AgentCommandError> {
+    let fields = parse_raw_object(json)?;
+    amount_from_raw_fields(&fields)
+}
+
 fn amount_from_raw_fields(
     fields: &BTreeMap<String, Box<RawValue>>,
 ) -> Result<AmountSpec, AgentCommandError> {
@@ -734,39 +857,56 @@ fn field_limit_price(fields: &RawFields) -> Result<LimitPriceSpec, AgentCommandE
     let raw = fields
         .get("limit_price")
         .ok_or(AgentCommandError::InvalidLimitPrice)?;
-    let value: Value =
-        serde_json::from_str(raw.get()).map_err(|_| AgentCommandError::InvalidLimitPrice)?;
-    let map = value
-        .as_object()
-        .ok_or(AgentCommandError::InvalidLimitPrice)?;
+    limit_price_from_raw_str(raw.get())
+}
 
-    for key in map.keys() {
+/// Decodes a limit price from a losslessly-captured object.
+///
+/// Only `numerator_atomic`/`denominator_atomic` are accepted, duplicate keys
+/// fail closed, and both sides must be non-zero [`u128`] atomics.
+fn limit_price_from_raw_str(json: &str) -> Result<LimitPriceSpec, AgentCommandError> {
+    let fields = parse_raw_object(json).map_err(|_| AgentCommandError::InvalidLimitPrice)?;
+    for key in fields.keys() {
         if key != "numerator_atomic" && key != "denominator_atomic" {
             return Err(AgentCommandError::InvalidLimitPrice);
         }
     }
 
-    let numerator = map
+    let numerator_raw = fields
         .get("numerator_atomic")
         .ok_or(AgentCommandError::InvalidLimitPrice)?;
-    let denominator = map
+    let denominator_raw = fields
         .get("denominator_atomic")
         .ok_or(AgentCommandError::InvalidLimitPrice)?;
-    if !numerator.is_number() || !denominator.is_number() {
-        return Err(AgentCommandError::InvalidLimitPrice);
-    }
-    if is_json_zero(numerator) || is_json_zero(denominator) {
-        return Err(AgentCommandError::InvalidLimitPrice);
-    }
+    let numerator: u128 = serde_json::from_str(numerator_raw.get())
+        .map_err(|_| AgentCommandError::InvalidLimitPrice)?;
+    let denominator: u128 = serde_json::from_str(denominator_raw.get())
+        .map_err(|_| AgentCommandError::InvalidLimitPrice)?;
 
-    serde_json::from_str::<LimitPriceSpec>(raw.get())
-        .map_err(|_| AgentCommandError::InvalidLimitPrice)
+    LimitPriceSpec::new(numerator, denominator)
 }
 
-/// True when a JSON numeric value is exactly zero.
+/// Decodes a validated asset reference from a losslessly-captured object.
 ///
-/// The intermediate [`Value`] is only used for shape and zero checks; actual
-/// 128-bit decoding happens from the lossless raw JSON.
-fn is_json_zero(value: &Value) -> bool {
-    value.as_f64() == Some(0.0)
+/// Only `chain`/`address` are accepted and duplicate keys fail closed.
+fn asset_from_raw_str(json: &str) -> Result<AssetRef, AgentCommandError> {
+    let fields = parse_raw_object(json).map_err(|_| AgentCommandError::InvalidAsset)?;
+    for key in fields.keys() {
+        if key != "chain" && key != "address" {
+            return Err(AgentCommandError::InvalidAsset);
+        }
+    }
+
+    let chain_raw = fields.get("chain").ok_or(AgentCommandError::InvalidAsset)?;
+    let chain: ChainId =
+        serde_json::from_str(chain_raw.get()).map_err(|_| AgentCommandError::InvalidAsset)?;
+    let address_raw = fields
+        .get("address")
+        .ok_or(AgentCommandError::InvalidAsset)?;
+    let address: String =
+        serde_json::from_str(address_raw.get()).map_err(|_| AgentCommandError::InvalidAsset)?;
+
+    let asset = AssetRef { chain, address };
+    asset.validate()?;
+    Ok(asset)
 }
