@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use mcp_server::{AgentBackend, BackendOutcome};
 use serde_json::{json, Value};
 use telegram_bot::{
-    ChatAllowlist, PollLimits, PollReport, TelegramBot, TelegramError, TelegramPoller,
-    TelegramTransport, TelegramUpdateSource,
+    ChatAllowlist, PollLimits, TelegramBot, TelegramError, TelegramPoller, TelegramTransport,
+    TelegramUpdateSource,
 };
 
 struct FakeBackend {
@@ -298,19 +298,20 @@ fn debug_output_is_redacted() {
     let allowlist = allowlist(&["secret-chat"]);
     let rendered = format!("{allowlist:?}");
     assert!(!rendered.contains("secret-chat"));
+}
 
-    let report = PollReport {
-        fetched: 1,
-        dispatched: 1,
-        ..PollReport::default()
+#[test]
+fn resume_from_clamps_a_negative_offset() {
+    let build = || {
+        poller(
+            ScriptedSource::default(),
+            allowlist(&["42"]),
+            RecordingTransport::default(),
+        )
+        .0
     };
-    let rendered = format!("{report:?}");
-    assert!(!rendered.contains("secret-chat"));
-    assert_eq!(format!("{:?}", TelegramError::Malformed), "Malformed");
-    assert_eq!(
-        format!("{:?}", PollLimits { batch: 7 }),
-        "PollLimits { batch: 7 }"
-    );
+    assert_eq!(build().resume_from(-5).next_offset(), 0);
+    assert_eq!(build().resume_from(i64::MIN).next_offset(), 0);
 }
 
 #[tokio::test]

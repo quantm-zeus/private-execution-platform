@@ -20,7 +20,14 @@
 //!   restart; otherwise a crash after a dispatch but before the next `getUpdates`
 //!   re-confirms the offset causes that update to be redelivered and dispatched
 //!   again. The poller itself performs no I/O, so persistence is the caller's
-//!   responsibility.
+//!   responsibility. Persisting after a pass narrows this window but does not
+//!   eliminate it: dispatch happens inside [`TelegramPoller::poll_once`], so a
+//!   crash mid-pass (or after the pass returns, before the caller persists) still
+//!   leaves the older offset and re-delivers those updates. A caller that must
+//!   guarantee no duplicated execution across crashes therefore needs
+//!   backend-side idempotency (for example the durable limit-order store's
+//!   deterministic creation identity); the poller alone is at-most-once only
+//!   within one process lifetime.
 //! - **Allowlist first.** No chat outside [`ChatAllowlist`] is dispatched; an
 //!   empty allowlist denies every chat (fail closed). Denied updates are still
 //!   acknowledged so they do not repeat.
@@ -168,7 +175,8 @@ pub struct PollReport {
     /// Updates that could not be acknowledged or parsed (no usable `update_id`,
     /// or a malformed message shape).
     pub malformed: usize,
-    /// Dispatched updates whose command text the bot rejected as malformed.
+    /// Dispatched updates the bot rejected as malformed (the command text was
+    /// not a structured command, or a dispatcher reply could not be rendered).
     pub invalid_commands: usize,
     /// Redelivered updates at or below the acknowledgement high-water mark.
     pub duplicates: usize,
@@ -253,7 +261,10 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
             };
 
             // `next_offset` is the acknowledgement high-water mark: an id below it
-            // was consumed in an earlier pass.
+            // was consumed in an earlier pass. An id at `i64::MAX` cannot be
+            // advanced past (the `saturating_add` keeps `next_offset` at the
+            // maximum), so such an id would redeliver; real Telegram ids never
+            // approach the bound.
             if update_id < self.next_offset {
                 report.duplicates = report.duplicates.saturating_add(1);
                 continue;
