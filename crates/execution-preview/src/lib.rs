@@ -35,8 +35,13 @@ use simulation::{
 use tax_engine::TaxAssessment;
 
 pub mod error;
+pub mod revalidation;
 
 pub use error::BridgeError;
+pub use revalidation::{
+    revalidate_pre_sign, AllowanceObservation, AllowanceState, RevalidationInput,
+    RevalidationOutcome, RevalidationReason, RouteBinding, RouteLegRef, WalletBalance,
+};
 
 /// Returns `Some(amount)` when non-zero, `None` otherwise.
 ///

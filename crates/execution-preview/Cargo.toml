@@ -13,6 +13,7 @@ path = "src/lib.rs"
 chain-types.workspace = true
 domain.workspace = true
 market-types.workspace = true
+policy.workspace = true
 simulation.workspace = true
 tax-engine.workspace = true
 serde.workspace = true
