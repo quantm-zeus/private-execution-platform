@@ -1340,9 +1340,11 @@ dependencies = [
  "async-trait",
  "chain-types",
  "domain",
+ "execution-preview",
  "market-types",
  "serde",
  "serde_json",
+ "tax-engine",
  "thiserror 2.0.20",
  "tokio",
 ]

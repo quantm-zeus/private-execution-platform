@@ -14,9 +14,15 @@
 //!   semantics and an in-memory implementation.
 //! - A redacted, payload-free [`LimitEngineError`].
 //!
-//! Explicitly out of scope (later Phase 5 slices L2–L6): the trigger loop, the
-//! quote provider, the max-safe-fill search, durable encrypted persistence, the
-//! execution relay, and signing.
+//! The P45 L2 slice adds the pure trigger and maximum-safe-fill search in
+//! [`trigger`]: an injected [`trigger::QuoteProvider`], an explicit `now_ms`,
+//! and the exact simulated **net** limit check (never chart/gross price).
+//! Bisection is bounded ([`trigger::MAX_SEARCH_STEPS`]) and is followed by a
+//! bounded safety-confirmation ladder ([`trigger::MAX_FALLBACK_STEPS`]) so a
+//! non-executable chunk is never returned.
+//!
+//! Explicitly out of scope (later Phase 5 slices L3–L6): durable encrypted
+//! persistence, the attempt journal, the execution relay, and signing.
 //!
 //! # Adaptations forced by the real APIs
 //! The P44 spec is a sketch; the landed APIs differ in these ways and the
@@ -64,9 +70,14 @@ pub mod fill;
 pub mod fsm;
 pub mod order;
 pub mod store;
+pub mod trigger;
 
 pub use error::LimitEngineError;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 pub use store::{AppendOutcome, CreateOutcome, InMemoryLimitOrderStore, LimitOrderStore};
+pub use trigger::{
+    attempt_is_executable, evaluate_trigger, max_safe_fill, QuoteOutcome, QuoteProvider,
+    QuotedAttempt, TriggerDecision, TriggerOutcome, MAX_FALLBACK_STEPS, MAX_SEARCH_STEPS,
+};
