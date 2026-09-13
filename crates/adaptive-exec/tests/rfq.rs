@@ -316,6 +316,18 @@ async fn the_validity_and_deadline_boundaries_are_inclusive() {
     .await;
     assert!(matches!(outcome, CompetitionOutcome::Winner { .. }));
 
+    // At exactly the request deadline the request is still open, and a quote
+    // expiring exactly then is still valid.
+    let at_deadline_solvers = vec![ok("a", "TOKEN", 250, 10_000)];
+    let at_deadline = run(
+        &at_deadline_solvers,
+        &request(RfqSide::Buy, 0),
+        &baseline("TOKEN", 200),
+        10_000,
+    )
+    .await;
+    assert!(matches!(at_deadline, CompetitionOutcome::Winner { .. }));
+
     // One millisecond later the request has closed.
     let expired = run(
         &solvers,
