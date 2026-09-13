@@ -293,7 +293,8 @@ impl std::fmt::Debug for InFlightAttempt {
 pub struct AttemptRecoveryOutcome {
     /// Non-terminal orders whose attempt stream also authenticated.
     pub open: Vec<StoredLimitOrder>,
-    /// Open orders whose latest attempt is non-terminal and possibly sent.
+    /// Open orders whose latest attempt is non-terminal (reserved before
+    /// signing, or possibly already sent).
     pub in_flight: Vec<InFlightAttempt>,
     /// Quarantined orders, including attempt-stream faults.
     pub quarantined: Vec<QuarantinedOrder>,
@@ -1064,14 +1065,6 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         let Some(record) = self.read_record(&object_id).await? else {
             return Err(LimitEngineError::StoreInvalid);
         };
-        // A `Bound` event starts a new signable attempt, so it must never be
-        // attached to a terminal order. Later-phase events are permitted so a
-        // late reconciliation can still record an already-observed outcome.
-        if event.phase == crate::attempt::AttemptPhase::Bound
-            && is_terminal(record.current.order.status)
-        {
-            return Err(LimitEngineError::InvalidTransition);
-        }
 
         let events = read_attempt_records(
             self.store.as_ref(),
@@ -1080,7 +1073,9 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
             &stream,
         )
         .await?;
-        // Idempotency first: an existing `(attempt_seq, phase)` event wins.
+        // Idempotency first: an existing `(attempt_seq, phase)` event wins, even
+        // if the order has since become terminal. A crash-retry of the exact same
+        // event must always be a no-op, never an error.
         if let Some(present) = events.iter().find(|present| {
             present.attempt_seq == event.attempt_seq && present.phase == event.phase
         }) {
@@ -1092,6 +1087,31 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
                 return Err(LimitEngineError::PersistenceConflict);
             }
             return Ok(AttemptAppendOutcome::AlreadyApplied(present.clone()));
+        }
+
+        // The materialized object can lag the authoritative transition stream
+        // (see the module docs); its status must therefore not gate a new
+        // signable attempt until it is known to be in sync. A lagging object is
+        // repaired by recovery, never by deriving a forward attempt from stale
+        // state.
+        let transition_stream =
+            stream_blind_index(&material.blind_index, &self.chain, &event.order_id)?;
+        let transition_events = self.read_stream(&transition_stream).await?;
+        let transition_head = transition_events
+            .last()
+            .map(|present| present.transition_seq)
+            .unwrap_or(0);
+        if record.current.last_transition_seq != transition_head {
+            return Err(LimitEngineError::RecoveryInconsistent);
+        }
+
+        // A `Bound` event starts a new signable attempt, so it must never be
+        // attached to a terminal order. Later-phase events are permitted so a
+        // late reconciliation can still record an already-observed outcome.
+        if event.phase == crate::attempt::AttemptPhase::Bound
+            && is_terminal(record.current.order.status)
+        {
+            return Err(LimitEngineError::InvalidTransition);
         }
 
         let head = events.last().map(|present| present.sequence).unwrap_or(0);

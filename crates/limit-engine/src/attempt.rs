@@ -82,7 +82,7 @@ impl AttemptPhase {
 /// constructor), so the durable record carries only its read-only projection.
 /// Recovery never needs to rebuild an `ApprovedExecution`: it reconciles, it
 /// does not sign.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSnapshot {
     /// Intent the approval was issued for.
     pub intent_id: IntentId,
@@ -98,6 +98,18 @@ pub struct ApprovalSnapshot {
     pub approved_trade_usd: u64,
     /// Time the approval was issued at, in milliseconds.
     pub approved_at_ms: i64,
+}
+
+impl std::fmt::Debug for ApprovalSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The snapshot carries wallet/idempotency/amount semantics; render only
+        // the chain and expiry shape.
+        formatter
+            .debug_struct("ApprovalSnapshot")
+            .field("chain", &self.chain)
+            .field("has_expiry", &self.expires_at_ms.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The fully bound context of one attempt, persisted before signing.

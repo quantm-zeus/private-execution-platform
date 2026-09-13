@@ -25,7 +25,7 @@ use market_types::{
 
 use crypto_envelope::at_rest::SealKey;
 use support::opaque::{durable_order, durable_store, InMemoryOpaqueStore, TestOrderKeys};
-use support::{asset, idempotency_key, EXPIRY_MS};
+use support::{apply_and_append_for, asset, idempotency_key, EXPIRY_MS};
 
 fn keys() -> Arc<TestOrderKeys> {
     Arc::new(TestOrderKeys::deterministic(7))
@@ -865,6 +865,115 @@ async fn recovery_debug_output_is_redacted() {
         format!("{:?}", outcome.in_flight[0]),
         "InFlightAttempt { phase: Bound, .. }"
     );
+
+    // The inherited P46 recovery outcome must be redacted too.
+    let plain = limit_engine::recover_open(backend.as_ref(), keys.as_ref())
+        .await
+        .expect("recover_open");
+    let rendered = format!("{plain:?}");
+    for needle in ["user", "wallet", "TOKEN", "USDC", "10000", "order.v"] {
+        assert!(
+            !rendered.contains(needle),
+            "RecoveryOutcome Debug leaked `{needle}`: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bound_with_a_foreign_intent_chain_is_rejected() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = keys();
+    let store = durable_store(&backend, &keys);
+    let order = create_order(&store, &keys, "w").await;
+
+    let mut context = bound_attempt(&keys, &order.order.id, 1);
+    context.intent.chain = ChainId::Ethereum;
+    let event = OrderAttemptEvent::bound(context, order.order.id.clone(), 0);
+    assert_eq!(
+        store.append_attempt(&event).await,
+        Err(LimitEngineError::RecordMalformed)
+    );
+}
+
+#[tokio::test]
+async fn a_lagging_object_cannot_gate_terminal_rejection() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = keys();
+    let store = durable_store(&backend, &keys);
+    let order = create_order(&store, &keys, "x").await;
+
+    // The authoritative transition stream reaches a terminal state ...
+    apply_and_append_for(
+        &store,
+        order.order.id.as_str(),
+        OrderStatus::FailedFinal,
+        None,
+        EXPIRY_MS - 1_000,
+    )
+    .await;
+    // ... while the materialized object is rolled back to its pre-transition
+    // version (a documented lag seam). The attempt journal must refuse to bind a
+    // new signable attempt off that stale status.
+    let object_key = object_id(&keys.blind_key(), &ChainId::Base, &order.order.id).expect("object");
+    backend.truncate_object_versions(&object_key, 1);
+
+    assert_eq!(
+        store
+            .append_attempt(&bound_event(&keys, &order.order.id, 0))
+            .await,
+        Err(LimitEngineError::RecoveryInconsistent)
+    );
+}
+
+#[tokio::test]
+async fn idempotent_bound_retry_after_terminal_order_is_a_noop() {
+    let backend = Arc::new(InMemoryOpaqueStore::new());
+    let keys = keys();
+    let store = durable_store(&backend, &keys);
+    let order = create_order(&store, &keys, "y").await;
+    let bound = bound_event(&keys, &order.order.id, 0);
+    store.append_attempt(&bound).await.expect("bound");
+
+    apply_and_append_for(
+        &store,
+        order.order.id.as_str(),
+        OrderStatus::FailedFinal,
+        None,
+        EXPIRY_MS - 1_000,
+    )
+    .await;
+
+    // The order is now terminal, but retrying the exact same event must be a
+    // no-op, not an error.
+    assert!(matches!(
+        store
+            .append_attempt(&bound)
+            .await
+            .expect("idempotent retry"),
+        AttemptAppendOutcome::AlreadyApplied(_)
+    ));
+    assert_eq!(
+        store
+            .read_attempts(&order.order.id)
+            .await
+            .expect("read")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn approval_snapshot_debug_is_redacted() {
+    let keys = keys();
+    let order = OrderId::new("order-approval").expect("order");
+    let context = bound_attempt(&keys, &order, 1);
+    let rendered = format!("{:?}", context.approval);
+    for needle in ["wallet-secret", "500000", "user-secret", "idempotency"] {
+        assert!(
+            !rendered.contains(needle),
+            "ApprovalSnapshot Debug leaked `{needle}`: {rendered}"
+        );
+    }
 }
 
 #[tokio::test]
