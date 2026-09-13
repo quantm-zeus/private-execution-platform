@@ -97,7 +97,6 @@ impl std::fmt::Debug for PreparedAttempt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedAttempt")
-            .field("attempt_seq", &self.intent.nonce)
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +171,15 @@ pub fn prepare_attempt(
 
     if input.quoted.net_delta.token_in != intent.token_in
         || input.quoted.net_delta.token_out != intent.token_out
+    {
+        return Err(LimitEngineError::IntegrityViolation);
+    }
+    // The P45 contract is that the quote prices exactly `chunk`: the provider's
+    // intent amount and the simulated wallet debit both equal it. The bridge only
+    // bounds `net_input <= intent.amount`, so the exact equality is re-asserted
+    // here (mirroring the trigger) rather than trusted.
+    if input.quoted.intent.amount != input.chunk
+        || input.quoted.net_delta.net_input.amount != input.chunk
     {
         return Err(LimitEngineError::IntegrityViolation);
     }

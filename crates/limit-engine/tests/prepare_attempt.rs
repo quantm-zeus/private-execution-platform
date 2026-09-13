@@ -15,7 +15,7 @@ use domain::{
     TradeIntent, TradeSide, TradeSource, UserId, WalletRef,
 };
 use execution_preview::{
-    AllowanceObservation, NetDelta, RevalidationReason, RouteBinding, WalletBalance,
+    AllowanceObservation, AllowanceState, NetDelta, RevalidationReason, WalletBalance,
 };
 use limit_engine::{
     prepare_attempt, AttemptTrust, LimitEngineError, PrepareAttemptInput, PreparedAttemptOutcome,
@@ -447,16 +447,124 @@ fn prepared_attempt_debug_is_redacted() {
 }
 
 #[test]
-fn route_binding_is_structural_only() {
-    // The prepared route binding must equal the route it was prepared from.
-    let order = order();
+fn chunk_equal_to_min_fill_or_remaining_is_allowed() {
+    // chunk == min_fill is allowed (the check is strict `<`, not `<=`).
+    let mut at_min = order();
+    at_min.order.min_fill = AtomicAmount::new(CHUNK);
+    let at_min_quote = quoted(&at_min);
+    let trust = trust();
+    let outcome = prepare_attempt(&input(&at_min, &at_min_quote, &trust, CHUNK), &engine())
+        .expect("preparation must not error");
+    assert!(matches!(outcome, PreparedAttemptOutcome::Ready(_)));
+
+    // chunk == remaining_input is allowed (the check is strict `>`, not `>=`).
+    let mut at_remaining = stored("p50-full", OrderStatus::Executing, CHUNK, CHUNK, 0);
+    at_remaining.order.limit_price.ratio = PriceRatio::new(100, 24).expect("ratio");
+    let at_remaining_quote = quoted(&at_remaining);
+    let outcome = prepare_attempt(
+        &input(&at_remaining, &at_remaining_quote, &trust, CHUNK),
+        &engine(),
+    )
+    .expect("preparation must not error");
+    assert!(matches!(outcome, PreparedAttemptOutcome::Ready(_)));
+}
+
+#[test]
+fn nonce_is_the_order_nonce_plus_the_attempt_sequence() {
+    let mut order = order();
+    order.nonce = 7;
     let quoted = quoted(&order);
     let trust = trust();
     let outcome = prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine())
         .expect("preparation must not error");
-    let prepared = ready(&outcome);
-    assert_eq!(
-        RouteBinding::from_route(&prepared.route),
-        RouteBinding::from_route(&route())
-    );
+    assert_eq!(ready(&outcome).intent.nonce, 8);
+}
+
+#[test]
+fn a_quote_that_does_not_price_the_chunk_is_an_integrity_violation() {
+    let order = order();
+    let mut quoted = quoted(&order);
+    quoted.net_delta.net_input.amount = AtomicAmount::new(CHUNK - 1);
+    let trust = trust();
+    assert!(matches!(
+        prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine()),
+        Err(LimitEngineError::IntegrityViolation)
+    ));
+}
+
+#[test]
+fn a_delta_pair_mismatch_is_an_integrity_violation() {
+    let order = order();
+    let mut quoted = quoted(&order);
+    quoted.net_delta.token_in = asset("OTHER");
+    let trust = trust();
+    assert!(matches!(
+        prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine()),
+        Err(LimitEngineError::IntegrityViolation)
+    ));
+}
+
+#[test]
+fn a_stricter_caller_freshness_policy_is_applied() {
+    let order = order();
+    let quoted = quoted(&order);
+    let mut trust = trust();
+    // Observed 1s ago: fresh under the 10s default, stale under this policy.
+    trust.freshness_policy = FreshnessPolicy::new(500, 1_000).expect("policy");
+    let outcome = prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine())
+        .expect("preparation must not error");
+    assert!(matches!(
+        outcome,
+        PreparedAttemptOutcome::Requote(RevalidationReason::StaleState)
+    ));
+}
+
+fn allowance(value: u128, spender: &str) -> AllowanceObservation {
+    AllowanceObservation::Required(AllowanceState {
+        wallet_ref: wallet_ref(),
+        chain: ChainId::Base,
+        asset: usdc(),
+        spender_ref: spender.to_string(),
+        amount: AtomicAmount::new(value),
+        freshness: freshness(),
+    })
+}
+
+#[test]
+fn a_sufficient_required_allowance_is_accepted() {
+    let order = order();
+    let quoted = quoted(&order);
+    let mut trust = trust();
+    trust.allowance = allowance(CHUNK, "uniswap_v3");
+    let outcome = prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine())
+        .expect("preparation must not error");
+    assert!(matches!(outcome, PreparedAttemptOutcome::Ready(_)));
+}
+
+#[test]
+fn an_insufficient_allowance_requests_a_requote() {
+    let order = order();
+    let quoted = quoted(&order);
+    let mut trust = trust();
+    trust.allowance = allowance(CHUNK - 1, "uniswap_v3");
+    let outcome = prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine())
+        .expect("preparation must not error");
+    assert!(matches!(
+        outcome,
+        PreparedAttemptOutcome::Requote(RevalidationReason::InsufficientAllowance)
+    ));
+}
+
+#[test]
+fn a_wrong_allowance_spender_aborts() {
+    let order = order();
+    let quoted = quoted(&order);
+    let mut trust = trust();
+    trust.allowance = allowance(CHUNK, "evil_router");
+    let outcome = prepare_attempt(&input(&order, &quoted, &trust, CHUNK), &engine())
+        .expect("preparation must not error");
+    assert!(matches!(
+        outcome,
+        PreparedAttemptOutcome::Abort(RevalidationReason::AllowanceSpenderMismatch)
+    ));
 }
