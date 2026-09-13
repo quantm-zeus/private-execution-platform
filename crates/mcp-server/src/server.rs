@@ -287,6 +287,42 @@ fn json_rpc_version_ok(fields: &RawFields) -> bool {
         .is_some_and(|version| version == "2.0")
 }
 
+/// Builds a canonical JSON-RPC `tools/call` frame from a structured command
+/// object of the shape `{"tool": "<name>", ...arguments}`.
+///
+/// This is the shared entry point for transports that receive a structured
+/// command directly (for example the Telegram bot) and want the exact same
+/// dispatcher path as an MCP client. The command object is parsed losslessly and
+/// duplicate keys are rejected (so a repeated `"tool"` or argument fails closed)
+/// and the argument bytes are spliced through verbatim, so atomic `u128` amounts
+/// stay lossless. Returns `None` when the text is not a JSON object, has no
+/// non-empty string `"tool"`, or repeats a key.
+pub fn tools_call_frame(command_json: &str) -> Option<String> {
+    let fields = parse_object(command_json).ok()?;
+    let tool = fields
+        .get("tool")
+        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())?;
+    if tool.is_empty() {
+        return None;
+    }
+    let mut inner = String::new();
+    for (key, raw) in &fields {
+        if key == "tool" {
+            continue;
+        }
+        if !inner.is_empty() {
+            inner.push(',');
+        }
+        inner.push_str(&serde_json::to_string(key).ok()?);
+        inner.push(':');
+        inner.push_str(raw.get());
+    }
+    let name = serde_json::to_string(&tool).ok()?;
+    Some(format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":{name},"arguments":{{{inner}}}}}}}"#
+    ))
+}
+
 fn request_id(fields: &RawFields) -> Option<Value> {
     fields
         .get("id")

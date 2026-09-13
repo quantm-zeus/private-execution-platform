@@ -1,0 +1,225 @@
+//! P59 Telegram bot: same dispatcher path, structured-only input, fail-closed.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use agent_commands::{AgentCapabilities, AgentChannel, AgentCommand};
+use async_trait::async_trait;
+use mcp_server::{AgentBackend, BackendOutcome, McpServer};
+use serde_json::{json, Value};
+use telegram_bot::{Delivery, TelegramBot, TelegramError, TelegramTransport, REPLY_TOO_LARGE};
+
+struct FakeBackend {
+    outcome: BackendOutcome,
+}
+
+#[async_trait]
+impl AgentBackend for FakeBackend {
+    async fn execute(&self, _channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
+        self.outcome.clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingTransport {
+    sent: Arc<Mutex<Vec<(String, String)>>>,
+    fail: bool,
+}
+
+#[async_trait]
+impl TelegramTransport for RecordingTransport {
+    async fn send_message(&self, chat_id: &str, text: &str) -> Result<(), TelegramError> {
+        if self.fail {
+            return Err(TelegramError::Transport);
+        }
+        self.sent
+            .lock()
+            .expect("lock")
+            .push((chat_id.to_string(), text.to_string()));
+        Ok(())
+    }
+}
+
+fn capabilities(trading_enabled: bool) -> AgentCapabilities {
+    AgentCapabilities::new(trading_enabled, HashSet::new(), 0)
+}
+
+fn bot(
+    outcome: BackendOutcome,
+    trading_enabled: bool,
+    transport: RecordingTransport,
+) -> TelegramBot<FakeBackend, RecordingTransport> {
+    TelegramBot::new(
+        McpServer::new(FakeBackend { outcome }, capabilities(trading_enabled)),
+        transport,
+    )
+}
+
+#[tokio::test]
+async fn a_structured_read_command_is_dispatched_and_replied() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = bot(
+        BackendOutcome::Value(json!({ "orders": [] })),
+        false,
+        transport,
+    );
+
+    let delivery = bot
+        .handle_text("42", r#"{"tool":"get_orders","status":"active"}"#)
+        .await
+        .expect("handled");
+    assert_eq!(delivery, Delivery::Sent);
+
+    let sent = sent.lock().expect("lock");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, "42");
+    assert_eq!(sent[0].1, r#"{"orders":[]}"#);
+}
+
+#[tokio::test]
+async fn an_update_is_parsed_and_handled() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = bot(BackendOutcome::Value(json!({"ok": true})), false, transport);
+
+    let update: Value = json!({
+        "update_id": 1,
+        "message": {
+            "message_id": 7,
+            "chat": { "id": 99, "type": "private" },
+            "text": "{\"tool\":\"get_portfolio\"}"
+        }
+    });
+    assert_eq!(
+        bot.handle_update(&update).await.expect("handled"),
+        Delivery::Sent
+    );
+    let sent = sent.lock().expect("lock");
+    assert_eq!(sent[0].0, "99");
+    assert_eq!(sent[0].1, r#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn natural_language_and_non_text_updates_fail_closed() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = bot(BackendOutcome::Value(json!({})), false, transport);
+
+    // Free-form text is not a structured command.
+    assert_eq!(
+        bot.handle_text("42", "please buy some token").await,
+        Err(TelegramError::Malformed)
+    );
+    // A non-text update (e.g. a sticker) is malformed, not a command.
+    let sticker = json!({ "message": { "chat": { "id": 1 }, "sticker": {} } });
+    assert_eq!(
+        bot.handle_update(&sticker).await,
+        Err(TelegramError::Malformed)
+    );
+    // A missing chat id is malformed.
+    let no_chat = json!({ "message": { "text": "{\"tool\":\"get_orders\"}" } });
+    assert_eq!(
+        bot.handle_update(&no_chat).await,
+        Err(TelegramError::Malformed)
+    );
+    assert!(sent.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_keys_fail_closed() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = bot(BackendOutcome::Value(json!({})), false, transport);
+
+    assert_eq!(
+        bot.handle_text(
+            "42",
+            r#"{"tool":"get_orders","status":"active","status":"filled"}"#
+        )
+        .await,
+        Err(TelegramError::Malformed)
+    );
+    assert!(sent.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn forbidden_and_disabled_mutations_never_reach_the_backend() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    // The backend would happily return a value, so any reply other than the
+    // denial proves the dispatcher short-circuited.
+    let bot = bot(
+        BackendOutcome::Value(json!({"hacked": true})),
+        false,
+        transport,
+    );
+
+    let delivery = bot
+        .handle_text("42", r#"{"tool":"withdraw","amount":"1"}"#)
+        .await
+        .expect("handled");
+    assert_eq!(delivery, Delivery::Sent);
+    let sent_text = sent.lock().expect("lock")[0].1.clone();
+    assert_eq!(sent_text, "tool not found");
+
+    let delivery = bot
+        .handle_text("42", r#"{"tool":"cancel_order","order_id":"o1"}"#)
+        .await
+        .expect("handled");
+    assert_eq!(delivery, Delivery::Sent);
+    let sent_text = sent.lock().expect("lock")[1].1.clone();
+    assert_eq!(sent_text, "TradingDisabled");
+}
+
+#[tokio::test]
+async fn a_large_reply_is_replaced_by_a_static_marker() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let huge = "x".repeat(5000);
+    let bot = bot(
+        BackendOutcome::Value(json!({ "blob": huge })),
+        false,
+        transport,
+    );
+
+    assert_eq!(
+        bot.handle_text("42", r#"{"tool":"get_portfolio"}"#)
+            .await
+            .expect("handled"),
+        Delivery::Sent
+    );
+    let sent = sent.lock().expect("lock");
+    assert_eq!(sent[0].1, REPLY_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_transport_failure_is_reported_without_leaking() {
+    let transport = RecordingTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        fail: true,
+    };
+    let bot = bot(BackendOutcome::Value(json!({})), false, transport);
+    assert_eq!(
+        bot.handle_text("42", r#"{"tool":"get_orders"}"#).await,
+        Err(TelegramError::Transport)
+    );
+}

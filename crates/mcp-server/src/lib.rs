@@ -30,5 +30,5 @@ mod stdio;
 
 pub use backend::{AgentBackend, BackendOutcome, UnavailableBackend};
 pub use error::McpError;
-pub use server::McpServer;
+pub use server::{tools_call_frame, McpServer};
 pub use stdio::{StdioLimits, StdioServer};

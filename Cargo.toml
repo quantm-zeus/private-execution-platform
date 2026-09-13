@@ -29,6 +29,7 @@ members = [
     "crates/agent-commands",
     "crates/mcp-server",
     "crates/agent-backend",
+    "crates/telegram-bot",
 ]
 
 [workspace.package]
@@ -64,6 +65,7 @@ limit-engine = { path = "crates/limit-engine" }
 agent-commands = { path = "crates/agent-commands" }
 mcp-server = { path = "crates/mcp-server" }
 agent-backend = { path = "crates/agent-backend" }
+telegram-bot = { path = "crates/telegram-bot" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

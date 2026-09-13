@@ -2821,6 +2821,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "telegram-bot"
+version = "0.1.0"
+dependencies = [
+ "agent-commands",
+ "async-trait",
+ "mcp-server",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "telemetry"
 version = "0.1.0"
 dependencies = [
