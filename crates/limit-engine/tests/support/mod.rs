@@ -1,6 +1,8 @@
 //! Shared fixtures for the limit-engine integration tests.
 #![allow(dead_code)]
 
+pub mod opaque;
+
 use chain_types::{AssetId, ChainId};
 use domain::{
     IdempotencyKey, IntentId, LimitOrder, LimitPrice, OrderId, OrderStatus, RiskConstraints,

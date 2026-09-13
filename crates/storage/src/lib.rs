@@ -150,6 +150,8 @@ pub enum EventSubject {
     OrderPartiallyFilled,
     OrderFilled,
     OrderCancelled,
+    OrderExpired,
+    OrderFailed,
     ExecutionStarted,
     ExecutionSigned,
     ExecutionSubmitted,
@@ -170,6 +172,8 @@ impl EventSubject {
             Self::OrderPartiallyFilled => "order.partially_filled",
             Self::OrderFilled => "order.filled",
             Self::OrderCancelled => "order.cancelled",
+            Self::OrderExpired => "order.expired",
+            Self::OrderFailed => "order.failed",
             Self::ExecutionStarted => "execution.started",
             Self::ExecutionSigned => "execution.signed",
             Self::ExecutionSubmitted => "execution.submitted",
@@ -263,6 +267,26 @@ pub enum StorageError {
 pub trait OpaqueStore: Send + Sync {
     async fn put_object(&self, object: OpaqueObject) -> Result<(), StorageError>;
     async fn get_object(&self, id: &str) -> Result<Option<OpaqueObject>, StorageError>;
+    /// Lists the newest version of each object whose `class_blind_index` equals
+    /// `class_blind_index`, ordered by `created_bucket` descending and then by
+    /// `id` ascending, at most `limit` objects.
+    ///
+    /// `limit == 0` yields an empty result without touching the backend.
+    /// Implementations must fail closed rather than returning foreign rows or a
+    /// silently wrong subset.
+    ///
+    /// The default body fails closed. It exists so that stores which do not
+    /// support class listing (for example, the encryption-agnostic in-memory
+    /// fakes used by other crates) keep compiling without pretending to serve a
+    /// listing they cannot produce.
+    async fn list_objects_by_class(
+        &self,
+        class_blind_index: &[u8],
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
+        let _ = (class_blind_index, limit);
+        Err(StorageError::Unavailable)
+    }
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError>;
     /// Reads records from `stream_blind_index` with `sequence >= from_sequence`,
     /// in ascending sequence order, at most `limit` records.
@@ -525,5 +549,60 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         let decoded: OpaqueObject = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.created_bucket.get(), 86_400_000);
+    }
+
+    #[test]
+    fn order_lifecycle_subjects_are_stable() {
+        assert_eq!(EventSubject::OrderExpired.as_str(), "order.expired");
+        assert_eq!(EventSubject::OrderFailed.as_str(), "order.failed");
+    }
+
+    struct DefaultListStore;
+
+    #[async_trait]
+    impl OpaqueStore for DefaultListStore {
+        async fn put_object(&self, _object: OpaqueObject) -> Result<(), StorageError> {
+            Err(StorageError::Unavailable)
+        }
+
+        async fn get_object(&self, _id: &str) -> Result<Option<OpaqueObject>, StorageError> {
+            Ok(None)
+        }
+
+        async fn append_event(&self, _event: OpaqueEventRecord) -> Result<(), StorageError> {
+            Err(StorageError::Unavailable)
+        }
+
+        async fn read_events(
+            &self,
+            _stream_blind_index: &[u8],
+            _from_sequence: u64,
+            _limit: usize,
+        ) -> Result<Vec<OpaqueEventRecord>, StorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn latest_snapshot(
+            &self,
+            _stream_blind_index: &[u8],
+        ) -> Result<Option<OpaqueSnapshot>, StorageError> {
+            Ok(None)
+        }
+
+        async fn health(&self) -> HealthProbe {
+            HealthProbe {
+                component: "test.default-list",
+                status: ComponentHealth::Healthy,
+                observed_at_ms: 0,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_class_listing_fails_closed() {
+        assert_eq!(
+            DefaultListStore.list_objects_by_class(&[1, 2, 3], 10).await,
+            Err(StorageError::Unavailable)
+        );
     }
 }

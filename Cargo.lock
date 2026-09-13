@@ -1339,14 +1339,19 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chain-types",
+ "crypto-envelope",
  "domain",
  "execution-preview",
+ "hmac",
  "market-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "storage",
  "tax-engine",
  "thiserror 2.0.20",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -21,8 +21,11 @@
 //! bounded safety-confirmation ladder ([`trigger::MAX_FALLBACK_STEPS`]) so a
 //! non-executable chunk is never returned.
 //!
-//! Explicitly out of scope (later Phase 5 slices L3–L6): durable encrypted
-//! persistence, the attempt journal, the execution relay, and signing.
+//! Explicitly out of scope (later Phase 5 slices): the attempt journal, the
+//! execution relay, event publication, and signing. P46 adds the durable
+//! encrypted order store and recovery in [`journal`]: an
+//! [`journal::OrderKeyProvider`]-keyed, `OpaqueStore`-backed implementation of
+//! [`LimitOrderStore`] plus [`journal::recover_open`].
 //!
 //! # Adaptations forced by the real APIs
 //! The P44 spec is a sketch; the landed APIs differ in these ways and the
@@ -68,6 +71,7 @@
 pub mod error;
 pub mod fill;
 pub mod fsm;
+pub mod journal;
 pub mod order;
 pub mod store;
 pub mod trigger;
@@ -75,6 +79,11 @@ pub mod trigger;
 pub use error::LimitEngineError;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
+pub use journal::{
+    class_blind_index, object_id, order_id_for_creation, owner_blind_index, recover_open,
+    stream_blind_index, BlindIndexKey, DurableLimitOrderStore, DurableOrderRecord,
+    OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, UnavailableOrderKeyProvider,
+};
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 pub use store::{AppendOutcome, CreateOutcome, InMemoryLimitOrderStore, LimitOrderStore};
 pub use trigger::{

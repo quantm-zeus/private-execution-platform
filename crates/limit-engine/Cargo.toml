@@ -12,12 +12,18 @@ path = "src/lib.rs"
 [dependencies]
 async-trait.workspace = true
 chain-types.workspace = true
+crypto-envelope.workspace = true
 domain.workspace = true
 execution-preview.workspace = true
+hmac = "0.13"
 market-types.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+storage.workspace = true
 tax-engine.workspace = true
 thiserror.workspace = true
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 serde_json.workspace = true

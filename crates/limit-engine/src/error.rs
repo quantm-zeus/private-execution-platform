@@ -52,6 +52,24 @@ pub enum LimitEngineError {
     /// The store is unavailable.
     #[error("persistence is unavailable")]
     PersistenceUnavailable,
+    /// No order key material is configured or reachable.
+    #[error("order key material is unavailable")]
+    KeyUnavailable,
+    /// The record's key id is not known to the provider.
+    #[error("unknown order key identifier")]
+    UnknownKeyId,
+    /// The provider returned key material whose id does not match the request.
+    #[error("order key identifier mismatch")]
+    KeyIdMismatch,
+    /// Sealing failed; nothing may be persisted.
+    #[error("order record sealing failed")]
+    SealFailed,
+    /// Authentication or decryption failed; no plaintext is produced.
+    #[error("order record could not be opened")]
+    OpenFailed,
+    /// The stored record is structurally invalid.
+    #[error("order record is malformed")]
+    RecordMalformed,
     /// The idempotency key is already bound to a different order.
     #[error("idempotency key conflict")]
     IdempotencyConflict,
@@ -77,7 +95,7 @@ pub enum LimitEngineError {
 
 impl LimitEngineError {
     /// Every error variant, for the redaction roster test.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 26] = [
         Self::InvalidTransition,
         Self::InvalidOrder,
         Self::Expired,
@@ -92,6 +110,12 @@ impl LimitEngineError {
         Self::QuoteUnavailable,
         Self::PersistenceConflict,
         Self::PersistenceUnavailable,
+        Self::KeyUnavailable,
+        Self::UnknownKeyId,
+        Self::KeyIdMismatch,
+        Self::SealFailed,
+        Self::OpenFailed,
+        Self::RecordMalformed,
         Self::IdempotencyConflict,
         Self::RecoveryFailed,
         Self::RecoveryInconsistent,
@@ -123,6 +147,12 @@ mod tests {
             LimitEngineError::QuoteUnavailable => "QuoteUnavailable",
             LimitEngineError::PersistenceConflict => "PersistenceConflict",
             LimitEngineError::PersistenceUnavailable => "PersistenceUnavailable",
+            LimitEngineError::KeyUnavailable => "KeyUnavailable",
+            LimitEngineError::UnknownKeyId => "UnknownKeyId",
+            LimitEngineError::KeyIdMismatch => "KeyIdMismatch",
+            LimitEngineError::SealFailed => "SealFailed",
+            LimitEngineError::OpenFailed => "OpenFailed",
+            LimitEngineError::RecordMalformed => "RecordMalformed",
             LimitEngineError::IdempotencyConflict => "IdempotencyConflict",
             LimitEngineError::RecoveryFailed => "RecoveryFailed",
             LimitEngineError::RecoveryInconsistent => "RecoveryInconsistent",
@@ -135,9 +165,9 @@ mod tests {
     #[test]
     fn roster_names_every_variant_once() {
         let mut names: Vec<&'static str> = LimitEngineError::ALL.iter().map(variant_name).collect();
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 26);
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 20, "ALL duplicates a variant");
+        assert_eq!(names.len(), 26, "ALL duplicates a variant");
     }
 }

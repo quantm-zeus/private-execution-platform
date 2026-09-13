@@ -221,6 +221,65 @@ impl crate::OpaqueStore for PostgresStore {
         Ok(Some(object))
     }
 
+    async fn list_objects_by_class(
+        &self,
+        class_blind_index: &[u8],
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
+        validate_index(class_blind_index, StorageValidationError::EmptyClassIndex)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // A `usize` limit above `i64::MAX` can only mean "unbounded"; clamp to
+        // the largest representable row count instead of failing.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Newest version per id, class-scoped, ordered for a deterministic,
+        // bounded listing. The join back onto (id, version) is the primary key,
+        // and the class predicate is served by idx_objects_class.
+        let rows = self
+            .next_client()
+            .query(
+                "SELECT o.id, o.owner_blind_index, o.class_blind_index, o.version, o.ciphertext, o.created_bucket
+                 FROM objects o
+                 JOIN (
+                     SELECT id, max(version) AS version
+                     FROM objects
+                     WHERE class_blind_index = $1
+                     GROUP BY id
+                 ) newest ON o.id = newest.id AND o.version = newest.version
+                 WHERE o.class_blind_index = $1
+                 ORDER BY o.created_bucket DESC, o.id ASC
+                 LIMIT $2",
+                &[&class_blind_index, &limit],
+            )
+            .await
+            .map_err(map_error)?;
+        let mut objects = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get(0).map_err(|_| StorageError::Backend)?;
+            let owner_blind_index: Vec<u8> = row.try_get(1).map_err(|_| StorageError::Backend)?;
+            let stored_class: Vec<u8> = row.try_get(2).map_err(|_| StorageError::Backend)?;
+            let version: i64 = row.try_get(3).map_err(|_| StorageError::Backend)?;
+            let ciphertext: Vec<u8> = row.try_get(4).map_err(|_| StorageError::Backend)?;
+            let bucket: i64 = row.try_get(5).map_err(|_| StorageError::Backend)?;
+            let object = OpaqueObject {
+                id,
+                owner_blind_index,
+                class_blind_index: stored_class,
+                version: db_u64(version)?,
+                ciphertext,
+                created_bucket: CreatedBucket::new(bucket).ok_or(StorageError::Backend)?,
+            };
+            // Corrupt/foreign rows are Backend, not caller-validation errors.
+            validate_object(&object).map_err(|_| StorageError::Backend)?;
+            if object.class_blind_index.as_slice() != class_blind_index {
+                return Err(StorageError::Backend);
+            }
+            objects.push(object);
+        }
+        Ok(objects)
+    }
+
     async fn append_event(&self, event: OpaqueEventRecord) -> Result<(), StorageError> {
         event.validate()?;
         validate_stream_index(&event.stream_blind_index)?;
