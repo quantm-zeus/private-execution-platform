@@ -49,4 +49,4 @@ pub use poller::{
     UnavailableUpdateSource, DEFAULT_POLL_BATCH, MAX_POLL_BATCH,
 };
 pub use transport::{TelegramTransport, UnavailableTelegramTransport};
-pub use update::{TelegramUpdate, MAX_CHAT_ID_BYTES, MAX_UPDATE_TEXT_BYTES};
+pub use update::{TelegramUpdate, MAX_CHAT_ID_BYTES, MAX_SENDER_ID_BYTES, MAX_UPDATE_TEXT_BYTES};

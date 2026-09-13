@@ -92,21 +92,35 @@ impl TelegramUpdateSource for UnavailableUpdateSource {
     }
 }
 
-/// Explicit chat allowlist.
+/// Explicit chat and sender allowlist.
 ///
-/// An empty allowlist denies every chat, so a deployment that forgets to
-/// configure one cannot accidentally authorize a random chat.
+/// An empty chat allowlist denies every chat, so a deployment that forgets to
+/// configure one cannot accidentally authorize a random chat. When a sender
+/// allowlist is configured, a command is accepted only from a listed sender in a
+/// listed chat; a missing or malformed sender id then fails closed. An empty
+/// sender allowlist leaves access at the chat level (the default).
 #[derive(Clone, Default)]
 pub struct ChatAllowlist {
     allowed: HashSet<String>,
+    allowed_senders: HashSet<String>,
 }
 
 impl ChatAllowlist {
-    /// Builds an allowlist from the permitted chat ids.
+    /// Builds a chat-only allowlist (any sender within a listed chat).
     pub fn new(ids: impl IntoIterator<Item = String>) -> Self {
         Self {
             allowed: ids.into_iter().collect(),
+            allowed_senders: HashSet::new(),
         }
+    }
+
+    /// Restricts the listed chats to the listed sender user ids.
+    ///
+    /// A command is then accepted only when its chat *and* its `from.id` are
+    /// listed; a missing or malformed sender id is denied.
+    pub fn with_senders(mut self, senders: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_senders = senders.into_iter().collect();
+        self
     }
 
     /// An allowlist that denies every chat.
@@ -114,9 +128,15 @@ impl ChatAllowlist {
         Self::default()
     }
 
-    /// Whether `chat_id` may be dispatched.
-    pub fn allows(&self, chat_id: &str) -> bool {
-        self.allowed.contains(chat_id)
+    /// Whether a command from `chat_id` by `sender_id` may be dispatched.
+    pub fn allows(&self, chat_id: &str, sender_id: Option<&str>) -> bool {
+        if !self.allowed.contains(chat_id) {
+            return false;
+        }
+        if self.allowed_senders.is_empty() {
+            return true;
+        }
+        sender_id.is_some_and(|sender| self.allowed_senders.contains(sender))
     }
 
     /// Number of allowed chats.
@@ -124,18 +144,24 @@ impl ChatAllowlist {
         self.allowed.len()
     }
 
-    /// Whether the allowlist is empty (denies everything).
+    /// Whether the chat allowlist is empty (denies everything).
     pub fn is_empty(&self) -> bool {
         self.allowed.is_empty()
+    }
+
+    /// Number of allowed senders (`0` means chat-level access).
+    pub fn sender_count(&self) -> usize {
+        self.allowed_senders.len()
     }
 }
 
 impl std::fmt::Debug for ChatAllowlist {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never render the permitted chat ids.
+        // Never render the permitted chat or sender ids.
         formatter
             .debug_struct("ChatAllowlist")
             .field("allowed", &self.allowed.len())
+            .field("allowed_senders", &self.allowed_senders.len())
             .finish()
     }
 }
@@ -278,7 +304,7 @@ impl<B: AgentBackend, T: TelegramTransport, S: TelegramUpdateSource> TelegramPol
                     continue;
                 }
             };
-            if !self.allowlist.allows(parsed.chat_id()) {
+            if !self.allowlist.allows(parsed.chat_id(), parsed.sender_id()) {
                 report.denied = report.denied.saturating_add(1);
                 continue;
             }

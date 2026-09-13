@@ -116,8 +116,24 @@ fn update(id: i64, chat: &str, text: &str) -> Value {
     })
 }
 
+fn update_from(id: i64, chat: &str, sender: &str, text: &str) -> Value {
+    json!({
+        "update_id": id,
+        "message": {
+            "chat": { "id": chat },
+            "from": { "id": sender },
+            "text": text,
+        },
+    })
+}
+
 fn allowlist(ids: &[&str]) -> ChatAllowlist {
     ChatAllowlist::new(ids.iter().map(|id| id.to_string()))
+}
+
+fn sender_allowlist(chats: &[&str], senders: &[&str]) -> ChatAllowlist {
+    ChatAllowlist::new(chats.iter().map(|id| id.to_string()))
+        .with_senders(senders.iter().map(|id| id.to_string()))
 }
 
 const READ: &str = r#"{"tool":"get_orders"}"#;
@@ -400,4 +416,77 @@ async fn the_running_offset_is_sent_on_each_fetch() {
         &[(0, 100), (2, 100)]
     );
     assert_eq!(poller.next_offset(), 3);
+}
+
+#[tokio::test]
+async fn a_sender_restricted_allowlist_denies_unlisted_or_missing_senders() {
+    let source = ScriptedSource::with_batches(vec![vec![
+        update_from(1, "42", "7", READ),
+        update_from(2, "42", "8", READ),
+        update(3, "42", READ), // no `from` at all
+    ]]);
+    let (mut poller, calls, sent) = poller(
+        source,
+        sender_allowlist(&["42"], &["7"]),
+        RecordingTransport::default(),
+    );
+
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.fetched, 3);
+    assert_eq!(report.denied, 2);
+    assert_eq!(report.dispatched, 1);
+    assert_eq!(*calls.lock().expect("lock"), 1);
+    assert_eq!(sent.lock().expect("lock").len(), 1);
+    // Denied updates are still acknowledged.
+    assert_eq!(poller.next_offset(), 4);
+}
+
+#[tokio::test]
+async fn a_chat_level_allowlist_accepts_any_well_formed_sender() {
+    let source = ScriptedSource::with_batches(vec![vec![
+        update_from(1, "42", "999", READ),
+        update(2, "42", READ),
+    ]]);
+    let (mut poller, calls, _sent) =
+        poller(source, allowlist(&["42"]), RecordingTransport::default());
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.denied, 0);
+    assert_eq!(report.dispatched, 2);
+    assert_eq!(*calls.lock().expect("lock"), 2);
+}
+
+#[tokio::test]
+async fn a_malformed_sender_id_cannot_satisfy_a_sender_allowlist() {
+    // A float `from.id` is not a usable sender id, so the update fails closed.
+    let source = ScriptedSource::with_batches(vec![vec![json!({
+        "update_id": 1,
+        "message": {
+            "chat": { "id": "42" },
+            "from": { "id": 7.5 },
+            "text": READ,
+        },
+    })]]);
+    let (mut poller, calls, _sent) = poller(
+        source,
+        sender_allowlist(&["42"], &["7"]),
+        RecordingTransport::default(),
+    );
+    let report = poller.poll_once().await.expect("poll");
+    assert_eq!(report.denied, 1);
+    assert_eq!(report.dispatched, 0);
+    assert_eq!(*calls.lock().expect("lock"), 0);
+}
+
+#[test]
+fn the_sender_allowlist_is_redacted_and_counted() {
+    let allowlist = sender_allowlist(&["secret-chat"], &["secret-sender"]);
+    assert_eq!(allowlist.len(), 1);
+    assert_eq!(allowlist.sender_count(), 1);
+    assert!(allowlist.allows("secret-chat", Some("secret-sender")));
+    assert!(!allowlist.allows("secret-chat", Some("other")));
+    assert!(!allowlist.allows("secret-chat", None));
+    assert!(!allowlist.allows("other", Some("secret-sender")));
+    let rendered = format!("{allowlist:?}");
+    assert!(!rendered.contains("secret-chat"));
+    assert!(!rendered.contains("secret-sender"));
 }
