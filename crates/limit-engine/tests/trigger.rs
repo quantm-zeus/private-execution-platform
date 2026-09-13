@@ -9,15 +9,16 @@ mod support;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use chain_types::ChainId;
 use domain::{
     AmountType, IdempotencyKey, IntentId, OrderStatus, OrderType, RouteLeg, RoutePlan, TradeIntent,
-    TradeSource,
+    TradeSide, TradeSource, UserId, WalletRef,
 };
 use execution_preview::NetDelta;
 use limit_engine::{
     apply_transition, attempt_is_executable, conservation_holds, evaluate_trigger, max_safe_fill,
-    FillDelta, QuoteOutcome, QuoteProvider, QuotedAttempt, StoredLimitOrder, TriggerDecision,
-    MAX_FALLBACK_STEPS, MAX_SEARCH_STEPS,
+    FillDelta, LimitEngineError, QuoteOutcome, QuoteProvider, QuotedAttempt, StoredLimitOrder,
+    TriggerDecision, MAX_FALLBACK_STEPS, MAX_SEARCH_STEPS,
 };
 use market_types::{
     AssetAmount, AtomicAmount, Bps, Freshness, FreshnessPolicy, FreshnessStatus, PriceRatio,
@@ -41,6 +42,24 @@ fn order_with(
     stored.order.min_fill = AtomicAmount::new(min_fill);
     stored.order.allow_partial_fill = allow_partial;
     stored.order.limit_price.ratio = PriceRatio::new(ratio.0, ratio.1).expect("valid ratio");
+    stored
+}
+
+/// A valid sell-side order: the limit numerator binds `token_out` and the
+/// denominator binds `token_in`, per `satisfies_limit_price` sell semantics.
+fn sell_order_with(
+    id: &str,
+    status: OrderStatus,
+    max: u128,
+    remaining: u128,
+    min_fill: u128,
+    allow_partial: bool,
+    ratio: (u128, u128),
+) -> StoredLimitOrder {
+    let mut stored = order_with(id, status, max, remaining, min_fill, allow_partial, ratio);
+    stored.order.side = TradeSide::Sell;
+    stored.order.limit_price.numerator_asset = stored.order.token_out.clone();
+    stored.order.limit_price.denominator_asset = stored.order.token_in.clone();
     stored
 }
 
@@ -145,6 +164,48 @@ fn fallback_provider(threshold: u128) -> ModelProvider {
     })
 }
 
+/// A provider that returns a well-formed attempt and then mutates it, so tests
+/// can model a quote that is not bound to the order it was asked to price.
+struct MutationProvider {
+    net_output: u128,
+    mutation: Box<dyn Fn(&mut QuotedAttempt) + Send + Sync>,
+}
+
+impl MutationProvider {
+    fn new(
+        net_output: u128,
+        mutation: impl Fn(&mut QuotedAttempt) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            net_output,
+            mutation: Box::new(mutation),
+        }
+    }
+}
+
+impl QuoteProvider for MutationProvider {
+    fn quote(
+        &self,
+        order: &StoredLimitOrder,
+        amount_in: AtomicAmount,
+        now_ms: i64,
+    ) -> QuoteOutcome {
+        let mut attempt = build_attempt(
+            order,
+            amount_in.get(),
+            QuotePlan {
+                net_output: self.net_output,
+                gross_output: self.net_output,
+                tax: None,
+                buy_tax_bps: 0,
+            },
+            now_ms,
+        );
+        (self.mutation)(&mut attempt);
+        QuoteOutcome::Quoted(Box::new(attempt))
+    }
+}
+
 /// Builds the full quoted attempt the bridge expects.
 fn build_attempt(
     order: &StoredLimitOrder,
@@ -215,7 +276,10 @@ fn build_attempt(
         },
     };
     let assessment = TaxAssessment::new(
-        token_out,
+        match order.order.side {
+            TradeSide::Buy => token_out,
+            TradeSide::Sell => token_in,
+        },
         order.order.chain.clone(),
         Bps::new(plan.buy_tax_bps).expect("buy tax"),
         Bps::new(0).expect("sell tax"),
@@ -600,4 +664,260 @@ fn property_threshold_chunk_is_maximal_viable_and_conserves() {
             remaining
         );
     }
+}
+
+#[test]
+fn provider_intent_must_bind_to_order_every_field() {
+    let policy = FreshnessPolicy::default();
+    let cases: Vec<(&str, MutationProvider)> = vec![
+        (
+            "chain",
+            MutationProvider::new(500, |a| a.intent.chain = ChainId::Ethereum),
+        ),
+        (
+            "token_in",
+            MutationProvider::new(500, |a| a.intent.token_in = support::asset("DAI")),
+        ),
+        (
+            "token_out",
+            MutationProvider::new(500, |a| a.intent.token_out = support::asset("WETH")),
+        ),
+        (
+            "side",
+            MutationProvider::new(500, |a| a.intent.side = TradeSide::Sell),
+        ),
+        (
+            "limit_price",
+            MutationProvider::new(500, |a| {
+                if let Some(limit) = a.intent.limit_price.as_mut() {
+                    limit.ratio = PriceRatio::new(1, 1).expect("valid ratio");
+                }
+            }),
+        ),
+        (
+            "amount",
+            MutationProvider::new(500, |a| {
+                a.intent.amount = AtomicAmount::new(a.intent.amount.get() + 1);
+            }),
+        ),
+        (
+            "amount_type",
+            MutationProvider::new(500, |a| {
+                a.intent.amount_type = AmountType::OutputAssetAtomic
+            }),
+        ),
+        (
+            "order_type",
+            MutationProvider::new(500, |a| a.intent.order_type = OrderType::Market),
+        ),
+        (
+            "expiry_ms",
+            MutationProvider::new(500, |a| {
+                a.intent.expiry_ms = a.intent.expiry_ms.map(|e| e + 1);
+            }),
+        ),
+        ("nonce", MutationProvider::new(500, |a| a.intent.nonce += 1)),
+        (
+            "owner",
+            MutationProvider::new(500, |a| {
+                a.intent.user_id = UserId::new("other").expect("valid user");
+            }),
+        ),
+        (
+            "wallet_ref",
+            MutationProvider::new(500, |a| {
+                a.intent.wallet_ref = WalletRef::new("other").expect("valid wallet");
+            }),
+        ),
+    ];
+
+    for (label, provider) in &cases {
+        let order = order_with(
+            "bind",
+            OrderStatus::Active,
+            1_000,
+            1_000,
+            1,
+            true,
+            (100, 25),
+        );
+        assert_eq!(
+            attempt_is_executable(&order, AtomicAmount::new(1_000), provider, NOW_MS, &policy),
+            Err(LimitEngineError::IntegrityViolation),
+            "intent binding mismatch on {label} must be a hard integrity error"
+        );
+        assert_eq!(
+            max_safe_fill(&order, provider, NOW_MS, &policy),
+            Err(LimitEngineError::IntegrityViolation),
+            "max_safe_fill must propagate the {label} integrity error"
+        );
+        assert_eq!(
+            evaluate_trigger(&order, true, provider, NOW_MS, &policy),
+            Err(LimitEngineError::IntegrityViolation),
+            "evaluate_trigger must propagate the {label} integrity error, never fill"
+        );
+    }
+}
+
+#[test]
+fn stale_route_under_stricter_policy_is_soft() {
+    let order = order_with("stale", OrderStatus::Active, 1_000, 1_000, 1, true, (1, 1));
+    // The quote itself is executable, but the frozen snapshot ages 50ms; the
+    // caller's stricter policy rejects it while the default policy accepts it.
+    let provider = MutationProvider::new(500, |a| a.route.state.observed_at_ms = NOW_MS - 50);
+    let strict = FreshnessPolicy::new(1, 2_000).expect("valid policy");
+    let default = FreshnessPolicy::default();
+
+    assert!(
+        attempt_is_executable(&order, AtomicAmount::new(500), &provider, NOW_MS, &default).unwrap(),
+        "the snapshot must be fresh under the default policy"
+    );
+    assert!(
+        !attempt_is_executable(&order, AtomicAmount::new(500), &provider, NOW_MS, &strict).unwrap(),
+        "a stale snapshot under the caller policy is soft, not a fill"
+    );
+
+    let outcome = evaluate_trigger(&order, true, &provider, NOW_MS, &strict).unwrap();
+    assert_eq!(outcome.decision, TriggerDecision::NotExecutable);
+    assert_eq!(outcome.order.order.status, OrderStatus::Active);
+}
+
+#[test]
+fn net_delta_debit_must_equal_probed_chunk() {
+    let order = order_with("debit", OrderStatus::Active, 1_000, 1_000, 1, true, (1, 1));
+    let policy = FreshnessPolicy::default();
+
+    // Provider-honesty boundary: the chunk contract requires the wallet debit to
+    // equal the probed amount. A route that debits more could over-charge the
+    // order and is a hard integrity failure.
+    let over = MutationProvider::new(500, |a| {
+        let debit = a.net_delta.net_input.amount.get();
+        a.net_delta.net_input.amount = AtomicAmount::new(debit + 1);
+    });
+    assert_eq!(
+        attempt_is_executable(&order, AtomicAmount::new(1_000), &over, NOW_MS, &policy),
+        Err(LimitEngineError::IntegrityViolation)
+    );
+
+    // A route that debits less cannot be counted as a full fill for the probed
+    // chunk, so it is hard-rejected rather than treated as executable.
+    let under = MutationProvider::new(500, |a| {
+        let debit = a.net_delta.net_input.amount.get();
+        a.net_delta.net_input.amount = AtomicAmount::new(debit - 1);
+    });
+    assert_eq!(
+        attempt_is_executable(&order, AtomicAmount::new(1_000), &under, NOW_MS, &policy),
+        Err(LimitEngineError::IntegrityViolation)
+    );
+    assert_eq!(
+        max_safe_fill(&order, &under, NOW_MS, &policy),
+        Err(LimitEngineError::IntegrityViolation)
+    );
+}
+
+#[test]
+fn trigger_candidate_reevaluation_proceeds() {
+    let order = order_with(
+        "retrig",
+        OrderStatus::TriggerCandidate,
+        1_000,
+        1_000,
+        10,
+        true,
+        (1, 1),
+    );
+    let policy = FreshnessPolicy::default();
+    let provider = threshold_provider(200);
+
+    let outcome = evaluate_trigger(&order, true, &provider, NOW_MS, &policy).unwrap();
+    assert_eq!(outcome.order.order.status, OrderStatus::TriggerCandidate);
+    assert_eq!(
+        outcome.decision,
+        TriggerDecision::Fill(AtomicAmount::new(200))
+    );
+}
+
+#[test]
+fn trigger_candidate_reevaluation_without_fill_reverts_to_active() {
+    let order = order_with(
+        "retrig-none",
+        OrderStatus::TriggerCandidate,
+        1_000,
+        1_000,
+        50,
+        true,
+        (1, 1),
+    );
+    let policy = FreshnessPolicy::default();
+    let provider = threshold_provider(10);
+
+    let outcome = evaluate_trigger(&order, true, &provider, NOW_MS, &policy).unwrap();
+    assert_eq!(outcome.order.order.status, OrderStatus::Active);
+    assert_eq!(outcome.decision, TriggerDecision::NotExecutable);
+}
+
+#[test]
+fn sell_side_signal_uses_exact_net_limit() {
+    let order = sell_order_with(
+        "sell-sig",
+        OrderStatus::Active,
+        1_000,
+        1_000,
+        1,
+        true,
+        (1, 1),
+    );
+    let policy = FreshnessPolicy::default();
+    // Sell satisfies while net_out >= net_in, so the max safe chunk is 500.
+    let provider = zero_tax(500);
+
+    assert!(
+        attempt_is_executable(&order, AtomicAmount::new(500), &provider, NOW_MS, &policy).unwrap()
+    );
+    assert!(
+        !attempt_is_executable(&order, AtomicAmount::new(501), &provider, NOW_MS, &policy).unwrap()
+    );
+
+    let outcome = evaluate_trigger(&order, true, &provider, NOW_MS, &policy).unwrap();
+    assert_eq!(outcome.order.order.status, OrderStatus::TriggerCandidate);
+    assert_eq!(
+        outcome.decision,
+        TriggerDecision::Fill(AtomicAmount::new(500))
+    );
+}
+
+#[test]
+fn all_or_nothing_trigger_requires_full_remaining() {
+    let policy = FreshnessPolicy::default();
+
+    let full_ok = order_with(
+        "aon-sig-ok",
+        OrderStatus::Active,
+        100,
+        100,
+        100,
+        false,
+        (1, 1),
+    );
+    let outcome = evaluate_trigger(&full_ok, true, &threshold_provider(100), NOW_MS, &policy)
+        .expect("no error");
+    assert_eq!(
+        outcome.decision,
+        TriggerDecision::Fill(AtomicAmount::new(100))
+    );
+    assert_eq!(outcome.order.order.status, OrderStatus::TriggerCandidate);
+
+    let full_bad = order_with(
+        "aon-sig-bad",
+        OrderStatus::Active,
+        100,
+        100,
+        100,
+        false,
+        (1, 1),
+    );
+    let outcome = evaluate_trigger(&full_bad, true, &threshold_provider(99), NOW_MS, &policy)
+        .expect("no error");
+    assert_eq!(outcome.decision, TriggerDecision::NotExecutable);
+    assert_eq!(outcome.order.order.status, OrderStatus::Active);
 }

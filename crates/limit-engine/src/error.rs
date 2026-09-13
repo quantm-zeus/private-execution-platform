@@ -67,11 +67,17 @@ pub enum LimitEngineError {
     /// The store holds an internally inconsistent order record.
     #[error("order store state is invalid")]
     StoreInvalid,
+    /// A trigger input failed a hard integrity binding: the provider's quote (or
+    /// the order's own limit) does not describe the order it was asked to price.
+    /// This is distinct from a soft "not executable now" market condition and
+    /// must never be swallowed as an idle order.
+    #[error("trigger input failed an integrity binding check")]
+    IntegrityViolation,
 }
 
 impl LimitEngineError {
     /// Every error variant, for the redaction roster test.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::InvalidTransition,
         Self::InvalidOrder,
         Self::Expired,
@@ -91,6 +97,7 @@ impl LimitEngineError {
         Self::RecoveryInconsistent,
         Self::ArithmeticOverflow,
         Self::StoreInvalid,
+        Self::IntegrityViolation,
     ];
 }
 
@@ -121,15 +128,16 @@ mod tests {
             LimitEngineError::RecoveryInconsistent => "RecoveryInconsistent",
             LimitEngineError::ArithmeticOverflow => "ArithmeticOverflow",
             LimitEngineError::StoreInvalid => "StoreInvalid",
+            LimitEngineError::IntegrityViolation => "IntegrityViolation",
         }
     }
 
     #[test]
     fn roster_names_every_variant_once() {
         let mut names: Vec<&'static str> = LimitEngineError::ALL.iter().map(variant_name).collect();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 19, "ALL duplicates a variant");
+        assert_eq!(names.len(), 20, "ALL duplicates a variant");
     }
 }
