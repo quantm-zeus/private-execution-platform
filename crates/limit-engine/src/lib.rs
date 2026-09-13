@@ -71,6 +71,7 @@
 
 pub mod attempt;
 pub mod error;
+pub mod events;
 pub mod fill;
 pub mod fsm;
 pub mod journal;
@@ -86,6 +87,7 @@ pub use attempt::{
     ATTEMPT_PREPARED_DOMAIN, ATTEMPT_SCHEMA_VERSION,
 };
 pub use error::LimitEngineError;
+pub use events::{event_subject, order_event_id, PendingOrderEvent, ORDER_EVENT_DOMAIN};
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use journal::{
@@ -97,7 +99,7 @@ pub use journal::{
 };
 pub use orchestrator::{
     AttemptExecutor, AttemptLimits, AttemptResolution, Orchestrator, RecoveryReport, TickInput,
-    TickOutcome,
+    TickOutcome, DEFAULT_PUBLISH_BATCH,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
 pub use prepare::{

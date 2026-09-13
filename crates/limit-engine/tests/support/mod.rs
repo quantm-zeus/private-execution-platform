@@ -86,6 +86,7 @@ pub fn stored(
         attempt_seq: 0,
         filled_input: AtomicAmount::new(filled),
         last_transition_seq: 0,
+        published_seq: 0,
         next_eligible_at_ms: None,
     }
 }

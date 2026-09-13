@@ -34,6 +34,16 @@ pub struct StoredLimitOrder {
     pub filled_input: AtomicAmount,
     /// Sequence of the last applied transition; `0` before any transition.
     pub last_transition_seq: u64,
+    /// Highest transition sequence whose sealed event has been durably published
+    /// to the event bus; `0` before any publication.
+    ///
+    /// This is the outbox watermark (P54). It is advanced by an object-only
+    /// compare-and-swap that never appends a transition event, and it is
+    /// preserved across every `apply_transition`. `#[serde(default)]` keeps a
+    /// record sealed before this field existed decodable as "nothing
+    /// published".
+    #[serde(default)]
+    pub published_seq: u64,
     /// Earliest eligible time for the next attempt, when set by later slices.
     pub next_eligible_at_ms: Option<i64>,
 }

@@ -86,13 +86,15 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{
-    ClassListCursor, CreatedBucket, OpaqueEventRecord, OpaqueObject, OpaqueStore, StorageError,
+    ClassListCursor, CreatedBucket, EventBus, InternalEventEnvelope, OpaqueEventRecord,
+    OpaqueObject, OpaqueStore, StorageError,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::attempt::{attempt_stream_blind_index, OrderAttemptEvent, ATTEMPT_SCHEMA_VERSION};
 use crate::error::LimitEngineError;
+use crate::events::{event_subject, order_event_id, PendingOrderEvent};
 use crate::fill::conservation_holds;
 use crate::fsm::{apply_transition, is_terminal};
 use crate::order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
@@ -529,6 +531,13 @@ fn validate_record(record: &DurableOrderRecord) -> Result<(), LimitEngineError> 
     if record.baseline.version != 1 || record.baseline.last_transition_seq != 0 {
         return Err(LimitEngineError::RecordMalformed);
     }
+    // The creation baseline has published nothing, and the watermark can never
+    // name a transition that does not exist (OE-5).
+    if record.baseline.published_seq != 0
+        || record.current.published_seq > record.current.last_transition_seq
+    {
+        return Err(LimitEngineError::RecordMalformed);
+    }
     if record.baseline.order.id != record.current.order.id
         || record.baseline.order.chain != record.current.order.chain
     {
@@ -540,6 +549,25 @@ fn validate_record(record: &DurableOrderRecord) -> Result<(), LimitEngineError> 
     validate_static_order(&record.baseline)?;
     validate_static_order(&record.current)?;
     Ok(())
+}
+
+/// Compares two records on every field except the store CAS `version` and the
+/// out-of-band outbox `published_seq` watermark.
+///
+/// Publication advances both without applying a transition, so a sealed event
+/// captures the version and watermark that existed when it was appended; a later
+/// publication can move the object past that point. Replay and idempotency
+/// checks must therefore compare the state machine and ledger (the fields a
+/// transition actually changes) plus `last_transition_seq`, not the out-of-band
+/// bookkeeping that publication owns.
+fn fsm_state_eq(left: &StoredLimitOrder, right: &StoredLimitOrder) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.version = 0;
+    right.version = 0;
+    left.published_seq = 0;
+    right.published_seq = 0;
+    left == right
 }
 
 /// Seals an object payload under `(object_id, version)`.
@@ -887,6 +915,20 @@ fn is_per_order_fault(error: LimitEngineError) -> bool {
     )
 }
 
+/// One read of the not-yet-published tail of an order's transition stream.
+///
+/// Carries the watermark and object version observed by the read so
+/// [`DurableLimitOrderStore::publish_pending`] can advance the watermark with a
+/// compare-and-swap anchored at the exact state the envelopes were built from.
+struct PendingBatch {
+    /// Ready-to-publish envelopes, strictly after `published_seq`, in order.
+    events: Vec<PendingOrderEvent>,
+    /// Watermark observed when the batch was read.
+    published_seq: u64,
+    /// Object version observed when the batch was read.
+    version: u64,
+}
+
 /// Durable, encrypted [`LimitOrderStore`] over an [`OpaqueStore`].
 ///
 /// The store is bound to one [`ChainId`] because the P44 `load(order_id)` API
@@ -975,6 +1017,218 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         Ok(events)
     }
 
+    /// Reads the sealed, not-yet-published transition events after the outbox
+    /// watermark, building ready-to-publish envelopes.
+    ///
+    /// The `payload` of every envelope is the raw sealed
+    /// [`OpaqueEventRecord::ciphertext`] (byte-equal to `read_events`); the
+    /// sealed event is opened in-crate only to derive the post-state subject,
+    /// and `occurred_at_ms` is the record's coarse `created_bucket`. `max_events`
+    /// bounds the batch; `max_events == 0` is a no-op with no I/O.
+    pub async fn pending_events(
+        &self,
+        order_id: &OrderId,
+        max_events: usize,
+    ) -> Result<Vec<PendingOrderEvent>, LimitEngineError> {
+        Ok(self.pending_batch(order_id, max_events).await?.events)
+    }
+
+    /// Publishes up to `max_events` pending events on `bus`, advancing the
+    /// object watermark only past events the bus accepted.
+    ///
+    /// Returns the number of events the bus accepted. A bus failure stops the
+    /// pump without failing the caller and without rolling back any order state;
+    /// the next call retries from the watermark (at-least-once, deduped by the
+    /// deterministic `event_id`). A failed or conflicted watermark write is also
+    /// swallowed for the same reason. `max_events == 0` is a no-op.
+    pub async fn publish_pending(
+        &self,
+        order_id: &OrderId,
+        bus: &dyn EventBus,
+        max_events: usize,
+    ) -> Result<u32, LimitEngineError> {
+        if max_events == 0 {
+            return Ok(0);
+        }
+        let batch = self.pending_batch(order_id, max_events).await?;
+        let mut published: u32 = 0;
+        let mut highest = batch.published_seq;
+        for event in batch.events {
+            let seq = event.transition_seq;
+            match bus.publish(event.envelope).await {
+                Ok(()) => {
+                    published = published.saturating_add(1);
+                    highest = seq;
+                }
+                // Stop on the first bus error: never skip an event and never
+                // advance the watermark past a failure (OE-2, OE-5).
+                Err(_) => break,
+            }
+        }
+        if published > 0 {
+            // Best-effort: if the watermark write conflicts or fails, the next
+            // pump republishes from the old watermark. Consumers dedupe by the
+            // deterministic `event_id`.
+            let _ = self.mark_published(order_id, batch.version, highest).await;
+        }
+        Ok(published)
+    }
+
+    /// Advances the outbox watermark with an object-only compare-and-swap.
+    ///
+    /// Re-seals the [`DurableOrderRecord`] at the next object version with
+    /// `current.published_seq` advanced to `published_seq`, preserving the
+    /// baseline, the current order state, and every other field. It **never**
+    /// appends a transition event. The write is serialized with every other
+    /// sealing path by the process seal lock and retried a bounded number of
+    /// times on CAS conflict. A watermark already at or past the request is an
+    /// idempotent no-op.
+    pub async fn mark_published(
+        &self,
+        order_id: &OrderId,
+        expected_version: u64,
+        published_seq: u64,
+    ) -> Result<StoredLimitOrder, LimitEngineError> {
+        let material = self.keys.current()?;
+        let object_id = object_id(&material.blind_index, &self.chain, order_id)?;
+        let _guard = seal_guard().lock().await;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let Some(record) = self.read_record(&object_id).await? else {
+                return Err(LimitEngineError::StoreInvalid);
+            };
+            // A concurrent publisher already advanced the watermark: idempotent.
+            if record.current.published_seq >= published_seq {
+                return Ok(record.current);
+            }
+            // The watermark may never name a transition the object has not
+            // applied; writing one would make the sealed record invalid on the
+            // next read. `publish_pending` already caps its batch, so this only
+            // rejects a direct-method caller.
+            if published_seq > record.current.last_transition_seq {
+                return Err(LimitEngineError::StoreInvalid);
+            }
+            // The caller's optimistic version is stale; report the conflict so
+            // the next pump retries from the current watermark rather than
+            // advancing from a state the caller did not observe.
+            if record.current.version != expected_version {
+                return Err(LimitEngineError::PersistenceConflict);
+            }
+            let version = record
+                .current
+                .version
+                .checked_add(1)
+                .ok_or(LimitEngineError::ArithmeticOverflow)?;
+            let mut current = record.current.clone();
+            current.version = version;
+            current.published_seq = published_seq;
+            let write = DurableOrderRecord {
+                schema_version: DEFAULT_SCHEMA_VERSION,
+                created_bucket: record.created_bucket,
+                baseline: record.baseline.clone(),
+                current: current.clone(),
+            };
+            let ciphertext = seal_record(&material, &object_id, version, &write)?;
+            let object = OpaqueObject {
+                id: object_id.clone(),
+                owner_blind_index: owner_blind_index(&material.blind_index, &current.order.owner)?
+                    .to_vec(),
+                class_blind_index: class_blind_index(&material.blind_index)?.to_vec(),
+                version,
+                ciphertext,
+                created_bucket: record.created_bucket,
+            };
+            match self.store.put_object(object).await {
+                Ok(()) => return Ok(current),
+                Err(StorageError::Conflict) if attempt < MAX_OBJECT_CAS_ATTEMPTS => continue,
+                Err(StorageError::Conflict) => return Err(LimitEngineError::PersistenceConflict),
+                Err(error) => return Err(map_storage(error)),
+            }
+        }
+    }
+
+    /// Reads and authenticates the sealed transition records after the outbox
+    /// watermark, mapping each to an envelope.
+    ///
+    /// The batch is capped at the object's *materialized* head
+    /// (`last_transition_seq`): the watermark lives on the object, so advancing
+    /// it past an event the object has not yet applied would make the record's
+    /// own `published_seq <= last_transition_seq` invariant false. An event that
+    /// is durable in the stream but not yet materialized is published once
+    /// recovery/replay repairs the object. Enforces stream contiguity from
+    /// `published_seq + 1`, so a gap is a fail-closed
+    /// [`LimitEngineError::RecoveryInconsistent`] rather than a silent skip.
+    async fn pending_batch(
+        &self,
+        order_id: &OrderId,
+        max_events: usize,
+    ) -> Result<PendingBatch, LimitEngineError> {
+        if max_events == 0 {
+            return Ok(PendingBatch {
+                events: Vec::new(),
+                published_seq: 0,
+                version: 0,
+            });
+        }
+        let material = self.keys.current()?;
+        let object_id = object_id(&material.blind_index, &self.chain, order_id)?;
+        let Some(record) = self.read_record(&object_id).await? else {
+            return Err(LimitEngineError::StoreInvalid);
+        };
+        let published_seq = record.current.published_seq;
+        let version = record.current.version;
+        let available = record
+            .current
+            .last_transition_seq
+            .saturating_sub(published_seq);
+        let limit = usize::try_from(available)
+            .unwrap_or(usize::MAX)
+            .min(max_events);
+        if limit == 0 {
+            return Ok(PendingBatch {
+                events: Vec::new(),
+                published_seq,
+                version,
+            });
+        }
+        let stream = stream_blind_index(&material.blind_index, &self.chain, order_id)?;
+        let from = published_seq
+            .checked_add(1)
+            .ok_or(LimitEngineError::ArithmeticOverflow)?;
+        let records = self
+            .store
+            .read_events(&stream, from, limit)
+            .await
+            .map_err(map_storage)?;
+        let mut events = Vec::with_capacity(records.len());
+        let mut expected = from;
+        for record in records {
+            if record.sequence != expected {
+                return Err(LimitEngineError::RecoveryInconsistent);
+            }
+            let opened = open_event(self.keys.as_ref(), &stream, &record)?;
+            events.push(PendingOrderEvent {
+                transition_seq: record.sequence,
+                envelope: InternalEventEnvelope {
+                    event_id: order_event_id(&material.blind_index, &stream, record.sequence)?,
+                    subject: event_subject(opened.order.order.status),
+                    schema_version: DEFAULT_SCHEMA_VERSION,
+                    occurred_at_ms: record.created_bucket.get(),
+                    payload: record.ciphertext,
+                },
+            });
+            expected = expected
+                .checked_add(1)
+                .ok_or(LimitEngineError::ArithmeticOverflow)?;
+        }
+        Ok(PendingBatch {
+            events,
+            published_seq,
+            version,
+        })
+    }
+
     /// Writes the next object state, retrying a bounded number of CAS
     /// conflicts by re-reading and re-applying the transition.
     async fn write_object_cas(
@@ -1038,7 +1292,7 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
                         transition.at_ms,
                     )
                     .map_err(|_| LimitEngineError::StoreInvalid)?;
-                    if rederived != *next {
+                    if !fsm_state_eq(&rederived, next) {
                         return Err(LimitEngineError::PersistenceConflict);
                     }
                     current = reloaded;
@@ -1320,7 +1574,7 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
             return Err(LimitEngineError::StoreInvalid);
         }
         validate_static_order(&order)?;
-        if order.version != 1 || order.last_transition_seq != 0 {
+        if order.version != 1 || order.last_transition_seq != 0 || order.published_seq != 0 {
             return Err(LimitEngineError::InvalidOrder);
         }
         let material = self.keys.current()?;
@@ -1414,7 +1668,7 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
                 .iter()
                 .find(|event| event.transition_seq == transition.transition_seq)
                 .ok_or(LimitEngineError::StoreInvalid)?;
-            if present.transition != *transition || present.order != *next {
+            if present.transition != *transition || !fsm_state_eq(&present.order, next) {
                 return Err(LimitEngineError::PersistenceConflict);
             }
             // Replayed authoritative head. Repair a lagging materialized object
@@ -1496,7 +1750,8 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
                 match existing.first() {
                     Some(record) if record.sequence == transition.transition_seq => {
                         let present = open_event(self.keys.as_ref(), &stream, record)?;
-                        if present.transition != *transition || present.order != *next {
+                        if present.transition != *transition || !fsm_state_eq(&present.order, next)
+                        {
                             return Err(LimitEngineError::PersistenceConflict);
                         }
                         let authoritative = self
@@ -1558,10 +1813,15 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
                 event.transition.fill.as_ref(),
                 event.transition.at_ms,
             )?;
-            if state != event.order {
+            if !fsm_state_eq(&state, &event.order) {
                 return Err(LimitEngineError::RecoveryInconsistent);
             }
         }
+        // Replay reaches the head, so the reconstructed record must carry the
+        // object's current CAS version and watermark: a publication that landed
+        // after an event was sealed is not visible in that event's payload.
+        state.version = record.current.version;
+        state.published_seq = record.current.published_seq;
         Ok(state)
     }
 
@@ -1653,7 +1913,7 @@ async fn reconcile_lagging<S: OpaqueStore>(
                 event.transition.fill.as_ref(),
                 event.transition.at_ms,
             )?;
-            if next != event.order {
+            if !fsm_state_eq(&next, &event.order) {
                 return Err(LimitEngineError::RecoveryInconsistent);
             }
             state = next;

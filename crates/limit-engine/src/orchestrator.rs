@@ -20,8 +20,21 @@
 //!
 //! Nothing here signs, submits, reads a clock, uses an RNG, or performs network
 //! I/O: every instant is the explicit `now_ms`, and the only capability that can
-//! reach a chain is the injected seam. Event/outbox publication (P51b) and the
-//! concrete relay adapter are out of scope.
+//! reach a chain is the injected seam. P54 adds best-effort order-event outbox
+//! publication: when an optional [`storage::EventBus`] is injected, `tick` and
+//! `recover` publish the sealed transition events durably produced by that call
+//! after the call's durable writes complete. Publication never fails or rolls
+//! back the state machine; the concrete relay adapter is still out of scope.
+//!
+//! # P54 publication shape
+//! The orchestrator stays transport-free: [`Orchestrator::new`] takes no bus and
+//! publication is opt-in through [`Orchestrator::with_event_bus`], or callers may
+//! publish explicitly with [`Orchestrator::publish_events`]. When a bus is
+//! injected, `tick`/`recover` publish once after their durable writes rather than
+//! after each individual `apply_transition` step: the watermark write advances
+//! the object version, so publishing mid-call would invalidate the in-memory
+//! record the remaining steps derive from. The whole call's transitions are
+//! already durable before publication runs, so OE-1 still holds.
 //!
 //! # Adaptations forced by the real APIs
 //! The spec sketch is authoritative for the semantics; the landed APIs force
@@ -46,12 +59,14 @@
 //!    be reconstructed from the durable [`ApprovalSnapshot`], so a concrete
 //!    adapter needs the same-process value.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use domain::{IdempotencyKey, OrderId, OrderStatus, TradeIntent, TradeSource};
 use execution_preview::RevalidationReason;
 use market_types::AtomicAmount;
 use policy::PolicyEngine;
-use storage::OpaqueStore;
+use storage::{EventBus, OpaqueStore};
 
 use crate::attempt::{
     ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, RealizedFill,
@@ -67,6 +82,9 @@ use crate::prepare::{
 };
 use crate::store::{AppendOutcome, LimitOrderStore};
 use crate::trigger::{evaluate_trigger, QuoteOutcome, QuoteProvider, TriggerDecision};
+
+/// Transition events published per best-effort outbox pump.
+pub const DEFAULT_PUBLISH_BATCH: usize = 32;
 
 /// Resolution of one attempt by the execution seam.
 ///
@@ -317,11 +335,16 @@ pub struct Orchestrator<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> {
     executor: E,
     policy: PolicyEngine,
     limits: AttemptLimits,
+    bus: Option<Arc<dyn EventBus>>,
 }
 
 impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E> {
     /// Builds an orchestrator from its durable store, pure quote provider,
     /// injected execution seam, policy engine, and attempt limits.
+    ///
+    /// No event bus is attached, so `tick`/`recover` publish nothing. Opt in with
+    /// [`Orchestrator::with_event_bus`], or publish explicitly with
+    /// [`Orchestrator::publish_events`].
     pub fn new(
         store: DurableLimitOrderStore<S>,
         provider: Q,
@@ -335,14 +358,65 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             executor,
             policy,
             limits,
+            bus: None,
         }
+    }
+
+    /// Attaches (or clears) the outbox event bus used by `tick`/`recover`.
+    ///
+    /// Publication is always best-effort: a bus or watermark failure is left for
+    /// the next `tick`/`recover` to retry and never fails or rolls back the order
+    /// state machine (OE-2).
+    pub fn with_event_bus(mut self, bus: Option<Arc<dyn EventBus>>) -> Self {
+        self.bus = bus;
+        self
+    }
+
+    /// Publishes up to `max_events` durable pending events for `order_id` on an
+    /// explicit `bus`.
+    ///
+    /// This is the transport-free publication seam: the orchestrator stores no
+    /// transport, and callers that do not inject a bus can drive the outbox
+    /// directly. It never fails the caller for a bus or watermark error; the
+    /// returned count is the number of envelopes the bus accepted.
+    pub async fn publish_events(
+        &self,
+        order_id: &OrderId,
+        bus: &dyn EventBus,
+        max_events: usize,
+    ) -> Result<u32, LimitEngineError> {
+        self.store.publish_pending(order_id, bus, max_events).await
+    }
+
+    /// Best-effort publication of this order's durable pending events on the
+    /// injected bus. Swallows every failure (OE-2); a no-op when no bus is
+    /// attached.
+    async fn publish_best_effort(&self, order_id: &OrderId) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = self
+            .store
+            .publish_pending(order_id, bus.as_ref(), DEFAULT_PUBLISH_BATCH)
+            .await;
     }
 
     /// Runs exactly one deterministic orchestrator tick.
     ///
     /// The returned [`TickOutcome`] is the only channel for the result; the
-    /// durable store and attempt journal are the only side effects.
+    /// durable store and attempt journal are the only side effects. When an
+    /// event bus is injected, every transition this tick made durable is
+    /// published best-effort before the outcome returns.
     pub async fn tick(&self, input: TickInput<'_>) -> Result<TickOutcome, LimitEngineError> {
+        let order_id = input.order_id;
+        let result = self.tick_inner(input).await;
+        self.publish_best_effort(order_id).await;
+        result
+    }
+
+    /// The body of [`Orchestrator::tick`], split out so publication runs after
+    /// both the success and the failure paths.
+    async fn tick_inner(&self, input: TickInput<'_>) -> Result<TickOutcome, LimitEngineError> {
         // 1. Load the authoritative order.
         let Some(mut order) = self.store.load(input.order_id).await? else {
             return Err(LimitEngineError::StoreInvalid);
@@ -603,6 +677,10 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     /// window. The resolution mapping is the same
     /// [`Orchestrator::apply_resolution`] that [`Orchestrator::tick`] uses, so a
     /// live tick and a restart cannot drift.
+    ///
+    /// When an event bus is injected, every open order's durable pending events
+    /// are published best-effort after all recovery writes complete. A
+    /// publication failure never fails or rolls back recovery.
     pub async fn recover(&self, now_ms: i64) -> Result<RecoveryReport, LimitEngineError> {
         let outcome = self.store.recover().await?;
         let mut report = RecoveryReport {
@@ -631,6 +709,13 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             let events = self.store.read_attempts(&order.order.id).await?;
             self.recover_executing(order, &events, now_ms, &mut report)
                 .await?;
+        }
+
+        // Best-effort outbox pump for every open order, after all recovery
+        // writes complete so a watermark bump cannot perturb an in-flight
+        // reconciliation. A failure is retried by the next recover/tick.
+        for order in &outcome.open {
+            self.publish_best_effort(&order.order.id).await;
         }
         Ok(report)
     }
