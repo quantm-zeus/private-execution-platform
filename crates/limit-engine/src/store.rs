@@ -50,10 +50,11 @@ pub trait LimitOrderStore: Send + Sync {
     /// Derives the exact [`OrderId`] that a creation under `idempotency_key`
     /// must carry.
     ///
-    /// [`create`](Self::create) validates that the record's id equals this
-    /// value. The durable store derives it with a keyed MAC over the creation
-    /// key, so an order id cannot be forged or correlated from caller input; the
-    /// in-memory reference store returns a deterministic local id. A caller that
+    /// The [`DurableLimitOrderStore`](crate::DurableLimitOrderStore) rejects a
+    /// creation whose id does not equal this value; the in-memory reference store
+    /// accepts any id and returns a deterministic local id from this method. The
+    /// durable store derives it with a keyed MAC over the creation key, so an
+    /// order id cannot be forged or correlated from caller input. A caller that
     /// builds a [`StoredLimitOrder`] for creation must obtain the id from this
     /// method rather than inventing one, so the same creation request always
     /// maps to the same stream/object by construction.

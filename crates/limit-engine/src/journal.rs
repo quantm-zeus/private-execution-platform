@@ -1744,14 +1744,15 @@ impl<S: OpaqueStore> LimitOrderStore for DurableLimitOrderStore<S> {
         if order.version != 1 || order.last_transition_seq != 0 || order.published_seq != 0 {
             return Err(LimitEngineError::InvalidOrder);
         }
-        // The id is derived from the creation key by the store itself, so every
-        // caller (including the agent backend) can obtain the exact id the store
-        // will accept instead of re-implementing the keyed derivation.
-        let derived_id = self.creation_order_id(&order.order_idempotency_key)?;
+        // The id is derived from the creation key with the active key material,
+        // so every caller (including the agent backend) can obtain the exact id
+        // the store will accept instead of re-implementing the keyed derivation.
+        let material = self.keys.current()?;
+        let derived_id =
+            order_id_for_creation(&material.blind_index, &order.order_idempotency_key)?;
         if order.order.id != derived_id {
             return Err(LimitEngineError::IdempotencyConflict);
         }
-        let material = self.keys.current()?;
         let object_id = object_id(&material.blind_index, &self.chain, &order.order.id)?;
 
         // Serialize read-check-seal-CAS: two creates with the same creation key

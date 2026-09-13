@@ -15,11 +15,11 @@
 //!   minimum partial-fill floor come from the injected [`TradingBackendConfig`];
 //!   nothing is taken from the command. The command's chain must equal the
 //!   configured chain.
-//! - **Deterministic idempotency.** The order id and idempotency key are derived
-//!   from a domain-separated SHA-256 over the canonical creation fields, so a
-//!   retried identical placement returns the existing record rather than
-//!   creating a second order, and the derived id never carries token/amount
-//!   semantics.
+//! - **Deterministic idempotency.** The idempotency key (and the internal intent
+//!   id) is derived from a domain-separated SHA-256 over the canonical creation
+//!   fields, and the order id is derived by the injected store from that key, so
+//!   a retried identical placement returns the existing record rather than
+//!   creating a second order, and no derived id carries token/amount semantics.
 //! - **Fail closed.** Invalid, foreign-owner, terminal, or cross-chain requests
 //!   return the redacted [`BackendError::Denied`]; a store fault collapses to
 //!   [`BackendError::Unavailable`]. No logging, no signing, no network.
