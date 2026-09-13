@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use agent_commands::{AgentChannel, AmountSpec, LimitPriceSpec, TradeCommand};
+use agent_commands::{AgentChannel, AmountSpec, LimitPriceSpec, ReadCommand, TradeCommand};
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use domain::{
@@ -163,10 +163,12 @@ impl std::fmt::Debug for TradingBackendConfig {
 /// Owner-scoped agent backend with a durable limit-order write path.
 ///
 /// Reads are delegated to the same [`AgentReadBackend`] used by the read-only
-/// composition; limit-order placement and cancellation are served by the
-/// injected durable store; `preview_market_order` is quoted exactly through the
-/// injected [`MarketSnapshotSource`] and gas model; `execute_market_order` is
-/// delegated to the injected [`MarketExecutionPort`] (fail-closed by default).
+/// composition, except `get_quote`, which is served here from the exact local
+/// router (the read-only composition has no market port); limit-order placement
+/// and cancellation are served by the injected durable store;
+/// `preview_market_order` is quoted exactly through the injected
+/// [`MarketSnapshotSource`] and gas model; `execute_market_order` is delegated to
+/// the injected [`MarketExecutionPort`] (fail-closed by default).
 pub struct TradingAgentBackend<O: OrderReadModel, P: PortfolioReadModel, S> {
     reads: AgentReadBackend<O, P>,
     store: Arc<S>,
@@ -472,6 +474,37 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
         }
     }
+
+    /// Serves the read-only `get_quote` command from the exact local router.
+    ///
+    /// `get_quote` carries no side, so it quotes the exact-input direction:
+    /// spending `token_in` to receive `token_out` (a Buy of `token_out`). The
+    /// result is the same locked route and full-net-economics preview that
+    /// `preview_market_order` returns, so a displayed quote is never mistaken
+    /// for an approximate price. No funds move and no execution port is touched.
+    fn quote_read(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        amount: AmountSpec,
+    ) -> BackendOutcome {
+        let now_ms = self.clock.now_ms();
+        match self.quote_market_preview(
+            channel,
+            token_in,
+            token_out,
+            TradeSide::Buy,
+            amount,
+            None,
+            None,
+            now_ms,
+        ) {
+            Ok((_intent, preview)) => BackendOutcome::Value(json!({ "quote": preview })),
+            Err(BackendError::Denied) => BackendOutcome::Denied,
+            Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
+        }
+    }
 }
 
 impl<O: OrderReadModel, P: PortfolioReadModel, S> std::fmt::Debug for TradingAgentBackend<O, P, S> {
@@ -495,6 +528,14 @@ where
         command: agent_commands::AgentCommand,
     ) -> BackendOutcome {
         match command {
+            // `get_quote` needs exact local market state, so the trading backend
+            // serves it (the read-only composition has no market port and keeps
+            // returning Unavailable for it).
+            agent_commands::AgentCommand::Read(ReadCommand::GetQuote {
+                token_in,
+                token_out,
+                amount,
+            }) => self.quote_read(channel, token_in, token_out, amount),
             agent_commands::AgentCommand::Read(read) => {
                 self.reads
                     .execute(channel, agent_commands::AgentCommand::Read(read))

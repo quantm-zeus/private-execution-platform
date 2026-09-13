@@ -4,15 +4,19 @@
 //! Core. It serves owner-scoped read projections through injected ports,
 //! delegates authorized limit-order placement/cancellation to the durable
 //! [`limit_engine`] order store, quotes exact `preview_market_order` economics
-//! through the injected market/route ports, and delegates authorized
-//! `execute_market_order` to an injected [`MarketExecutionPort`]. The dispatcher
-//! never touches the store or the router, and neither knows about MCP.
+//! through the injected market/route ports, serves the read-only `get_quote` from
+//! the same exact router, and delegates authorized `execute_market_order` to an
+//! injected [`MarketExecutionPort`]. The dispatcher never touches the store or
+//! the router, and neither knows about MCP.
 //!
 //! ## Boundaries
 //! - **Reads** ([`AgentReadBackend`]) serve the owner-scoped `get_orders` and
 //!   `get_portfolio` projections through injected [`OrderReadModel`]/
-//!   [`PortfolioReadModel`] ports. Every other read fails closed
-//!   [`mcp_server::BackendOutcome::Unavailable`].
+//!   [`PortfolioReadModel`] ports; every other read fails closed
+//!   [`mcp_server::BackendOutcome::Unavailable`]. [`TradingAgentBackend`]
+//!   additionally serves `get_quote` from the exact local router (the read-only
+//!   composition has no market port) and delegates all other reads to its
+//!   [`AgentReadBackend`].
 //! - **Writes** ([`TradingAgentBackend`]) create a durable `Created` limit order
 //!   and append a validated `Cancelled` transition over the injected
 //!   [`limit_engine::LimitOrderStore`]. No funds move here: there is no signing,
