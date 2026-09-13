@@ -11,11 +11,15 @@ use chain_types::{AssetId, ChainId};
 use market_types::{AssetAmount, AtomicAmount};
 
 /// Direction of an RFQ request.
+///
+/// `token_in` is always the asset spent and `token_out` the asset received, so
+/// the settled output is `token_out` for both directions; the side documents the
+/// economic direction for callers and analytics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RfqSide {
-    /// Spend `token_in` to receive `token_out`.
+    /// Spend a quote/base asset (`token_in`) to receive the other (`token_out`).
     Buy,
-    /// Spend `token_in` (the held token) to receive `token_out` (the quote asset).
+    /// Spend a held asset (`token_in`) to receive a quote asset (`token_out`).
     Sell,
 }
 
@@ -40,12 +44,10 @@ pub struct RfqRequest {
 }
 
 impl RfqRequest {
-    /// The asset the user receives.
+    /// The asset the user receives: always `token_out` (the spent asset is
+    /// `token_in` for both directions).
     pub fn output_asset(&self) -> AssetId {
-        match self.side {
-            RfqSide::Buy => self.token_out.clone(),
-            RfqSide::Sell => self.token_in.clone(),
-        }
+        self.token_out.clone()
     }
 
     /// Whether the request is still open at `now_ms` (inclusive).

@@ -284,26 +284,106 @@ async fn an_expired_request_and_a_mismatched_baseline_are_rejected() {
 }
 
 #[tokio::test]
-async fn a_sell_request_settles_in_the_input_asset() {
-    // For a Sell, the user receives token_in (USDC); a TOKEN quote is invalid.
-    let solvers = vec![
-        ok("wrong", "TOKEN", 900, 10_000),
-        ok("right", "USDC", 120, 10_000),
-    ];
+async fn the_settled_output_is_token_out_for_both_sides() {
+    // `token_in` is always the spent asset, so a quote in token_in (USDC) is
+    // invalid for both a Buy and a Sell.
+    for side in [RfqSide::Buy, RfqSide::Sell] {
+        let solvers = vec![
+            ok("wrong", "USDC", 900, 10_000),
+            ok("right", "TOKEN", 120, 10_000),
+        ];
+        let outcome = run(&solvers, &request(side, 0), &baseline("TOKEN", 100), 1_000).await;
+        match outcome {
+            CompetitionOutcome::Winner { winner, .. } => {
+                assert_eq!(winner.solver_id, "right");
+                assert_eq!(winner.settled_output.asset, asset("TOKEN"));
+            }
+            other => panic!("expected a winner for {side:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_validity_and_deadline_boundaries_are_inclusive() {
+    // valid_until_ms == now_ms is accepted; deadline == now_ms is open.
+    let solvers = vec![ok("a", "TOKEN", 250, 1_000)];
     let outcome = run(
         &solvers,
-        &request(RfqSide::Sell, 0),
-        &baseline("USDC", 100),
+        &request(RfqSide::Buy, 0),
+        &baseline("TOKEN", 200),
+        1_000,
+    )
+    .await;
+    assert!(matches!(outcome, CompetitionOutcome::Winner { .. }));
+
+    // One millisecond later the request has closed.
+    let expired = run(
+        &solvers,
+        &request(RfqSide::Buy, 0),
+        &baseline("TOKEN", 200),
+        10_001,
+    )
+    .await;
+    assert_eq!(
+        expired,
+        CompetitionOutcome::NoWinner {
+            reason: NoWinnerReason::RequestExpired,
+            best_quote: None,
+            improvement_bps: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn improvement_saturates_and_a_margin_above_10000_is_honored() {
+    // A nonzero baseline with an enormous winner saturates the reported
+    // improvement without panicking; the exact cross-multiply overflows, so the
+    // result is fail-closed `Arithmetic` (the improvement is still reported).
+    let solvers = vec![ok("a", "TOKEN", u128::MAX, 10_000)];
+    let outcome = run(
+        &solvers,
+        &request(RfqSide::Buy, 0),
+        &baseline("TOKEN", 1),
         1_000,
     )
     .await;
     match outcome {
-        CompetitionOutcome::Winner { winner, .. } => {
-            assert_eq!(winner.solver_id, "right");
-            assert_eq!(winner.settled_output.asset, asset("USDC"));
+        CompetitionOutcome::NoWinner {
+            reason,
+            improvement_bps,
+            ..
+        } => {
+            assert_eq!(reason, NoWinnerReason::Arithmetic);
+            assert_eq!(improvement_bps, Some(u16::MAX));
         }
-        other => panic!("expected a winner, got {other:?}"),
+        other => panic!("expected arithmetic no-winner, got {other:?}"),
     }
+
+    // A margin above 100% requires a quote that more than doubles the baseline.
+    let below_solvers = vec![ok("a", "TOKEN", 250, 10_000)];
+    let below = run(
+        &below_solvers,
+        &request(RfqSide::Buy, 20_000),
+        &baseline("TOKEN", 200),
+        1_000,
+    )
+    .await;
+    assert!(matches!(
+        below,
+        CompetitionOutcome::NoWinner {
+            reason: NoWinnerReason::BelowBaseline,
+            ..
+        }
+    ));
+    let above_solvers = vec![ok("a", "TOKEN", 700, 10_000)];
+    let above = run(
+        &above_solvers,
+        &request(RfqSide::Buy, 20_000),
+        &baseline("TOKEN", 200),
+        1_000,
+    )
+    .await;
+    assert!(matches!(above, CompetitionOutcome::Winner { .. }));
 }
 
 #[tokio::test]
