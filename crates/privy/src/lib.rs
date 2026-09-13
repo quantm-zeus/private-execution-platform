@@ -1,9 +1,21 @@
 //! Narrow Privy signing boundary. No generic signing/transfer/withdraw surface exists.
+//!
+//! Callers can only submit a fully bound [`SigningRequest`]. There is no method
+//! that signs arbitrary bytes or calldata, and this crate never receives raw
+//! transaction bytes. Production construction always installs an unavailable
+//! transport, so the boundary fails closed until a real signer is wired in
+//! under review.
+
+pub mod signing;
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use domain::{IdempotencyKey, IntentId};
-use policy::ApprovedExecution;
 use thiserror::Error;
+
+pub use signing::{PayloadDigest, RequestDigest, SignedExecutionRef, SigningRequest};
 
 /// Opaque reference to a prepared execution. This is not a signing capability;
 /// it only carries the policy intent/idempotency binding for later validation.
@@ -44,84 +56,104 @@ impl PreparedExecutionRef {
     }
 }
 
-/// Read-only reference to an execution submitted by the private signing backend.
-/// External crates cannot construct this type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubmittedExecutionRef {
-    reference: String,
-    intent_id: IntentId,
-    idempotency_key: IdempotencyKey,
-}
-
-impl SubmittedExecutionRef {
-    pub fn reference(&self) -> &str {
-        &self.reference
-    }
-
-    pub fn intent_id(&self) -> &IntentId {
-        &self.intent_id
-    }
-
-    pub fn idempotency_key(&self) -> &IdempotencyKey {
-        &self.idempotency_key
-    }
-}
-
+/// Crate-private signing transport. Test doubles live in [`signing::test_support`].
 #[async_trait]
-trait PrivySigningBackend: Send + Sync {
-    async fn submit(
-        &self,
-        approved: &ApprovedExecution,
-        prepared: &PreparedExecutionRef,
-    ) -> Result<SubmittedExecutionRef, PrivyError>;
+pub(crate) trait SigningTransport: Send + Sync {
+    async fn submit_signing_request(&self, request: &SigningRequest) -> Result<String, PrivyError>;
 }
 
+/// Production transport: no live signer is wired in, so every request fails closed.
 #[derive(Debug, Default)]
-struct UnavailablePrivyBackend;
+struct UnavailableTransport;
 
 #[async_trait]
-impl PrivySigningBackend for UnavailablePrivyBackend {
-    async fn submit(
+impl SigningTransport for UnavailableTransport {
+    async fn submit_signing_request(
         &self,
-        _approved: &ApprovedExecution,
-        _prepared: &PreparedExecutionRef,
-    ) -> Result<SubmittedExecutionRef, PrivyError> {
+        _request: &SigningRequest,
+    ) -> Result<String, PrivyError> {
         Err(PrivyError::SigningUnavailable)
     }
 }
 
-/// Concrete, non-heritable signing boundary. Production defaults to an
-/// unavailable backend and exposes no way for callers to install one.
-#[derive(Debug, Default)]
+/// Concrete, non-heritable signing boundary.
+///
+/// It enforces exactly-once submission per idempotency key and holds the only
+/// transport handle. Production code can only build the unavailable transport;
+/// there is no public constructor that installs a real one.
 pub struct PrivySigningBoundary {
-    backend: UnavailablePrivyBackend,
+    transport: Box<dyn SigningTransport>,
+    seen: Mutex<HashMap<IdempotencyKey, RequestDigest>>,
+}
+
+impl std::fmt::Debug for PrivySigningBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never reveal the transport or endpoints.
+        f.debug_struct("PrivySigningBoundary")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PrivySigningBoundary {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PrivySigningBoundary {
+    /// Builds the production boundary, which is always fail-closed.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn validate_binding(
-        &self,
-        approved: &ApprovedExecution,
-        prepared: &PreparedExecutionRef,
-    ) -> Result<(), PrivyError> {
-        if prepared.intent_id != *approved.intent_id()
-            || prepared.idempotency_key != *approved.idempotency_key()
-        {
-            return Err(PrivyError::ApprovalBindingMismatch);
+        Self {
+            transport: Box::new(UnavailableTransport),
+            seen: Mutex::new(HashMap::new()),
         }
-        Ok(())
     }
 
-    pub async fn submit_approved_execution(
+    /// Test-only seam for installing an in-crate transport double.
+    #[cfg(test)]
+    fn with_transport(transport: Box<dyn SigningTransport>) -> Self {
+        Self {
+            transport,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Submits a bound signing request at most once per idempotency key.
+    ///
+    /// - same key + same request digest -> [`PrivyError::DuplicateSigningRequest`]
+    ///   (the transport is not called);
+    /// - same key + different digest -> [`PrivyError::IdempotencyConflict`];
+    /// - otherwise the key is recorded *before* the transport runs and kept
+    ///   regardless of the outcome, so a timeout can never cause a double-sign.
+    ///
+    /// There is no automatic retry anywhere on this path.
+    pub async fn submit_signing_request(
         &self,
-        approved: &ApprovedExecution,
-        prepared: &PreparedExecutionRef,
-    ) -> Result<SubmittedExecutionRef, PrivyError> {
-        self.validate_binding(approved, prepared)?;
-        self.backend.submit(approved, prepared).await
+        request: &SigningRequest,
+    ) -> Result<SignedExecutionRef, PrivyError> {
+        {
+            let mut seen = self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match seen.get(request.idempotency_key()) {
+                Some(existing) if existing == request.request_digest() => {
+                    return Err(PrivyError::DuplicateSigningRequest);
+                }
+                Some(_) => return Err(PrivyError::IdempotencyConflict),
+                None => {
+                    seen.insert(request.idempotency_key().clone(), *request.request_digest());
+                }
+            }
+        }
+
+        let reference = self.transport.submit_signing_request(request).await?;
+        SignedExecutionRef::new(
+            reference,
+            *request.request_digest(),
+            request.intent_id().clone(),
+            request.idempotency_key().clone(),
+        )
     }
 }
 
@@ -129,124 +161,129 @@ impl PrivySigningBoundary {
 pub enum PrivyError {
     #[error("Privy signing boundary unavailable")]
     SigningUnavailable,
-    #[error("invalid prepared execution reference")]
+    #[error("invalid execution reference")]
     InvalidExecutionReference,
-    #[error("prepared execution does not match policy approval")]
+    #[error("execution does not match policy approval")]
     ApprovalBindingMismatch,
+    #[error("policy approval expired")]
+    ApprovalExpired,
+    #[error("trading disabled")]
+    TradingDisabled,
+    #[error("execution preview revalidation failed")]
+    PreviewRevalidationFailed,
+    #[error("payload digest missing")]
+    MissingPayloadDigest,
+    #[error("duplicate signing request")]
+    DuplicateSigningRequest,
+    #[error("idempotency key conflict")]
+    IdempotencyConflict,
+    #[error("signer rejected request")]
+    SignerRejected,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
-    use chain_types::{AssetId, ChainId};
-    use domain::{
-        AmountType, IdempotencyKey, IntentId, OrderType, RiskConstraints, TradeIntent, TradeSide,
-        TradeSource, UserId, WalletRef,
-    };
-    use market_types::{AtomicAmount, Bps};
-    use policy::{
-        PolicyContext, PolicyEngine, PolicyLimits, TradingGate, TurnoverSnapshot, UsdMicros,
-    };
-    use std::collections::HashSet;
+    use crate::signing::fixtures;
+    use crate::signing::test_support::{CountingTransport, EmptyRefTransport, RejectingTransport};
 
-    fn approved() -> ApprovedExecution {
-        let intent = TradeIntent {
-            id: IntentId::new("intent").unwrap(),
-            source: TradeSource::Web,
-            user_id: UserId::new("user").unwrap(),
-            wallet_ref: WalletRef::new("wallet").unwrap(),
-            chain: ChainId::Base,
-            token_in: AssetId::new(ChainId::Base, "USDC").unwrap(),
-            token_out: AssetId::new(ChainId::Base, "TOKEN").unwrap(),
-            side: TradeSide::Buy,
-            amount_type: AmountType::UsdMicros,
-            amount: AtomicAmount::new(500_000),
-            order_type: OrderType::Market,
-            limit_price: None,
-            risk: RiskConstraints {
-                max_buy_tax: Bps::new(100).unwrap(),
-                max_sell_tax: Bps::new(100).unwrap(),
-                max_price_impact: Bps::new(100).unwrap(),
-                max_slippage: Bps::new(100).unwrap(),
-                max_total_cost: None,
-            },
-            allow_partial_fill: true,
-            expiry_ms: Some(10_000),
-            nonce: 1,
-            idempotency_key: IdempotencyKey::new("idem").unwrap(),
-        };
-        let limits = PolicyLimits {
-            max_trade_usd: UsdMicros::new(1_000_000),
-            max_hourly_turnover_usd: UsdMicros::new(10_000_000),
-            max_daily_turnover_usd: UsdMicros::new(50_000_000),
-            max_buy_tax: Bps::new(500).unwrap(),
-            max_sell_tax: Bps::new(500).unwrap(),
-            max_price_impact: Bps::new(300).unwrap(),
-            max_slippage: Bps::new(200).unwrap(),
-            allowed_chains: HashSet::from([ChainId::Base]),
-            allowed_venues: HashSet::from(["uniswap".to_string()]),
-        };
-        let ctx = PolicyContext::from_trusted_backend_state(
-            1_000,
-            UsdMicros::new(500_000),
-            TurnoverSnapshot::from_trusted_backend_state(UsdMicros::new(0), UsdMicros::new(0)),
-            Some("uniswap".to_string()),
-        )
-        .unwrap();
-        PolicyEngine::new(
-            TradingGate::from_trusted_startup(Some("true")).unwrap(),
-            limits,
-        )
-        .unwrap()
-        .authorize_trade(&intent, &ctx)
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn mismatch_is_rejected_before_backend() {
-        let boundary = PrivySigningBoundary::default();
-        let approved = approved();
-        let prepared = PreparedExecutionRef::new(
-            "prepared",
-            IntentId::new("other").unwrap(),
-            approved.idempotency_key().clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            boundary
-                .submit_approved_execution(&approved, &prepared)
-                .await,
-            Err(PrivyError::ApprovalBindingMismatch)
-        );
+    fn counting_boundary() -> (PrivySigningBoundary, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let boundary = PrivySigningBoundary::with_transport(Box::new(CountingTransport::new(
+            Arc::clone(&calls),
+        )));
+        (boundary, calls)
     }
 
     #[tokio::test]
     async fn production_boundary_fails_closed() {
         let boundary = PrivySigningBoundary::default();
-        let approved = approved();
-        let prepared = PreparedExecutionRef::new(
-            "prepared",
-            approved.intent_id().clone(),
-            approved.idempotency_key().clone(),
-        )
-        .unwrap();
+        let request = fixtures::signing_request();
         assert_eq!(
-            boundary
-                .submit_approved_execution(&approved, &prepared)
-                .await,
+            boundary.submit_signing_request(&request).await,
             Err(PrivyError::SigningUnavailable)
         );
     }
 
     #[test]
     fn empty_reference_is_rejected() {
-        let approved = approved();
+        let intent = fixtures::intent();
         assert_eq!(
-            PreparedExecutionRef::new(
-                " ",
-                approved.intent_id().clone(),
-                approved.idempotency_key().clone(),
-            ),
+            PreparedExecutionRef::new(" ", intent.id.clone(), intent.idempotency_key.clone(),),
+            Err(PrivyError::InvalidExecutionReference)
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_is_rejected_without_second_transport_call() {
+        let (boundary, calls) = counting_boundary();
+        let request = fixtures::signing_request();
+        let signed = boundary
+            .submit_signing_request(&request)
+            .await
+            .expect("first submit succeeds");
+        assert_eq!(signed.request_digest(), request.request_digest());
+        assert_eq!(signed.intent_id(), request.intent_id());
+        assert_eq!(signed.idempotency_key(), request.idempotency_key());
+        assert!(!signed.reference().is_empty());
+        assert_eq!(
+            boundary.submit_signing_request(&request).await,
+            Err(PrivyError::DuplicateSigningRequest)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn same_key_different_digest_conflicts_without_second_transport_call() {
+        let (boundary, calls) = counting_boundary();
+        let request = fixtures::signing_request();
+
+        let mut other_intent = fixtures::intent();
+        other_intent.nonce = 8;
+        let engine = fixtures::engine();
+        let approved = fixtures::approved(&engine, &other_intent);
+        let prepared = fixtures::prepared(&other_intent);
+        let route = fixtures::route();
+        let preview = fixtures::execution_preview(&other_intent, &route);
+        let conflict_request = SigningRequest::bind(
+            &engine,
+            &approved,
+            &prepared,
+            &other_intent,
+            &route,
+            &preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("conflicting request binds");
+        assert_ne!(
+            request.request_digest(),
+            conflict_request.request_digest(),
+            "nonce change must change the request digest"
+        );
+
+        assert!(boundary.submit_signing_request(&request).await.is_ok());
+        assert_eq!(
+            boundary.submit_signing_request(&conflict_request).await,
+            Err(PrivyError::IdempotencyConflict)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejection_and_empty_reference_fail_closed() {
+        let request = fixtures::signing_request();
+        let rejecting = PrivySigningBoundary::with_transport(Box::new(RejectingTransport));
+        assert_eq!(
+            rejecting.submit_signing_request(&request).await,
+            Err(PrivyError::SignerRejected)
+        );
+        let empty = PrivySigningBoundary::with_transport(Box::new(EmptyRefTransport));
+        assert_eq!(
+            empty.submit_signing_request(&request).await,
             Err(PrivyError::InvalidExecutionReference)
         );
     }
