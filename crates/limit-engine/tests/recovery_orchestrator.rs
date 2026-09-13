@@ -649,8 +649,11 @@ async fn stale_confirmed_from_prior_attempt_is_never_replayed() {
 
 #[tokio::test]
 async fn stale_confirmed_beyond_remaining_does_not_abort_the_pass() {
-    // Blast-radius variant: a stale fill larger than the new window's remaining
-    // input must not underflow and abort recovery for every other order.
+    // Blast-radius variant: a stale fill whose amount still matches the bound
+    // chunk but exceeds the new window's remaining input. Before the fix this
+    // reached `RemainingUnderflow` and aborted the whole recovery pass; now the
+    // ledger proves the fill was already applied, so recovery closes pre-send
+    // with no mutation.
     let h = build(
         spec(
             "p52-stale-confirmed-overflow",
@@ -663,7 +666,9 @@ async fn stale_confirmed_beyond_remaining_does_not_abort_the_pass() {
     )
     .await;
     append_bound(&h, &h.order_id, 1).await;
-    append_confirmed(&h, &h.order_id, 1, realized(1_500, 240)).await;
+    // `net_input` equals the bound chunk (1000) so the pre-fix path passes the
+    // fill validation and reaches the ledger subtraction with remaining 500.
+    append_confirmed(&h, &h.order_id, 1, realized(1_000, 240)).await;
 
     let report = recover(&h).await;
 
