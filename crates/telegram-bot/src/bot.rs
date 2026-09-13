@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::error::TelegramError;
 use crate::transport::TelegramTransport;
-use crate::update::{TelegramUpdate, MAX_UPDATE_TEXT_BYTES};
+use crate::update::{TelegramUpdate, MAX_CHAT_ID_BYTES, MAX_UPDATE_TEXT_BYTES};
 
 /// Maximum reply length sent back to a chat. A longer user-facing payload is
 /// replaced by a static marker rather than truncated (a truncated JSON document
@@ -63,12 +63,16 @@ impl<B: AgentBackend, T: TelegramTransport> TelegramBot<B, T> {
     /// `{"tool": "<name>", ...arguments}`; free-form natural language is rejected
     /// as [`TelegramError::Malformed`] (ambiguity fails closed). The command is
     /// forwarded to the shared dispatcher, so a denied, forbidden, or malformed
-    /// command never reaches [`AgentBackend::execute`]. (The dispatcher does ask
-    /// [`AgentBackend::valuation_usd_micros`] for the trusted valuation before
-    /// authorization on every command, exactly as over MCP; the default returns
-    /// `None` and no execution occurs.)
+    /// command never reaches [`AgentBackend::execute`]. (For every command that
+    /// reaches authorization the dispatcher first asks
+    /// [`AgentBackend::valuation_usd_micros`] for the trusted valuation, exactly
+    /// as over MCP; the default returns `None` and no execution occurs.)
     pub async fn handle_text(&self, chat_id: &str, text: &str) -> Result<Delivery, TelegramError> {
-        if chat_id.is_empty() || text.is_empty() || text.len() > MAX_UPDATE_TEXT_BYTES {
+        if chat_id.is_empty()
+            || chat_id.len() > MAX_CHAT_ID_BYTES
+            || text.is_empty()
+            || text.len() > MAX_UPDATE_TEXT_BYTES
+        {
             return Err(TelegramError::Malformed);
         }
         let frame = tools_call_frame(text).ok_or(TelegramError::Malformed)?;

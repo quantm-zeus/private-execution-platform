@@ -263,3 +263,43 @@ async fn a_transport_failure_is_reported_without_leaking() {
         Err(TelegramError::Transport)
     );
 }
+
+#[tokio::test]
+async fn malformed_chat_ids_are_rejected_on_both_entry_points() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTransport {
+        sent: sent.clone(),
+        fail: false,
+    };
+    let bot = bot(BackendOutcome::Value(json!({})), false, transport);
+    let command = r#"{"tool":"get_orders"}"#;
+
+    // Direct text entry: empty or oversized chat ids fail closed.
+    assert_eq!(
+        bot.handle_text("", command).await,
+        Err(TelegramError::Malformed)
+    );
+    let oversized = "c".repeat(65);
+    assert_eq!(
+        bot.handle_text(&oversized, command).await,
+        Err(TelegramError::Malformed)
+    );
+
+    // Update entry: non-integer / collection / empty chat ids fail closed.
+    for id in [
+        json!(true),
+        json!(null),
+        json!({}),
+        json!([]),
+        json!(""),
+        json!("x".repeat(65)),
+    ] {
+        let update = json!({ "message": { "chat": { "id": id }, "text": command } });
+        assert_eq!(
+            bot.handle_update(&update).await,
+            Err(TelegramError::Malformed)
+        );
+    }
+
+    assert!(sent.lock().expect("lock").is_empty());
+}
