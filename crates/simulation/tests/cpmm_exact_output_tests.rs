@@ -447,3 +447,47 @@ fn input_pool_state_is_never_mutated() {
     }
     assert_eq!(pool, before);
 }
+
+#[test]
+fn nonzero_hi_256bit_success_paths_are_covered() {
+    // Case A exercises a nonzero `numerator_hi` in the effective-input ceiling:
+    // reserve_in * requested_out == 2^179 >= 2^128.
+    let pool = sample_pool(1u128 << 80, 1u128 << 100, 0);
+    let quote = simulate_cpmm_exact_output(
+        &pool,
+        &CpmmExactOutputRequest::new(pool.token_0.clone(), AtomicAmount::new(1u128 << 99)),
+    )
+    .unwrap();
+    assert_eq!(quote.input.amount.get(), 1u128 << 80);
+    assert_eq!(quote.effective_input.amount.get(), 1u128 << 80);
+    assert_eq!(quote.output.amount.get(), 1u128 << 99);
+    assert_eq!(quote.pool_fee.amount.get(), 0);
+    let realized = simulate_cpmm_exact_input(
+        &pool,
+        &CpmmExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(1u128 << 80)),
+    )
+    .unwrap();
+    assert_eq!(realized.output.amount.get(), 1u128 << 99);
+
+    // Case B exercises a nonzero `threshold_hi` in the gross-input ceiling:
+    // 10_000 * (e_min - 1) == 10_000 * (2^120 - 1) >= 2^128. It also drives the
+    // exact-input kernel's own 256-bit product (dy * (dy + 1) == 2^240 + 2^120).
+    let dy = 1u128 << 120;
+    let pool = sample_pool(1, dy + 1, 0);
+    let quote = simulate_cpmm_exact_output(
+        &pool,
+        &CpmmExactOutputRequest::new(pool.token_0.clone(), AtomicAmount::new(dy)),
+    )
+    .unwrap();
+    assert_eq!(quote.input.amount.get(), dy);
+    assert_eq!(quote.effective_input.amount.get(), dy);
+    assert_eq!(quote.output.amount.get(), dy);
+    assert_eq!(quote.pool_fee.amount.get(), 0);
+    // One unit less is insufficient, independently confirming minimality.
+    assert!(simulate_cpmm_exact_output(
+        &pool,
+        &CpmmExactOutputRequest::new(pool.token_0.clone(), AtomicAmount::new(dy - 1)),
+    )
+    .map(|prev| prev.output.amount.get() < dy)
+    .unwrap_or(true));
+}

@@ -591,6 +591,9 @@ pub fn simulate_cpmm_exact_output(
     //     <=> a * (10_000 - fee) >= 10_000 * (effective_min - 1) + 1.
     let fee_denominator = 10_000u128 - fee_bps_val as u128; // in 1..=10_000
     let (scaled_hi, scaled_lo) = mul_u128_wide(10_000, effective_min - 1);
+    // Exact 256-bit `+ 1`. With the fixed multiplier `10_000` the low word is
+    // always `0 (mod 16)`, so the carry branch is currently unreachable, but it
+    // is kept so the wide increment stays correct if the constant ever changes.
     let (threshold_lo, carry) = scaled_lo.overflowing_add(1);
     let threshold_hi = if carry {
         scaled_hi
