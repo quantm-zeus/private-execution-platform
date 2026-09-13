@@ -47,6 +47,21 @@ pub trait LimitOrderStore: Send + Sync {
     /// idempotency key.
     async fn create(&self, order: StoredLimitOrder) -> Result<CreateOutcome, LimitEngineError>;
 
+    /// Derives the exact [`OrderId`] that a creation under `idempotency_key`
+    /// must carry.
+    ///
+    /// [`create`](Self::create) validates that the record's id equals this
+    /// value. The durable store derives it with a keyed MAC over the creation
+    /// key, so an order id cannot be forged or correlated from caller input; the
+    /// in-memory reference store returns a deterministic local id. A caller that
+    /// builds a [`StoredLimitOrder`] for creation must obtain the id from this
+    /// method rather than inventing one, so the same creation request always
+    /// maps to the same stream/object by construction.
+    fn creation_order_id(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<OrderId, LimitEngineError>;
+
     /// Loads the current record, if present.
     async fn load(&self, order_id: &OrderId) -> Result<Option<StoredLimitOrder>, LimitEngineError>;
 
@@ -108,6 +123,17 @@ impl InMemoryLimitOrderStore {
 
 #[async_trait]
 impl LimitOrderStore for InMemoryLimitOrderStore {
+    fn creation_order_id(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<OrderId, LimitEngineError> {
+        // The reference store carries no key material and accepts any id, so a
+        // deterministic local id is sufficient; the durable store derives a
+        // keyed id instead.
+        OrderId::new(format!("mem-{}", idempotency_key.as_str()))
+            .map_err(|_| LimitEngineError::StoreInvalid)
+    }
+
     async fn create(&self, order: StoredLimitOrder) -> Result<CreateOutcome, LimitEngineError> {
         if !conservation_holds(&order) {
             return Err(LimitEngineError::InvalidOrder);

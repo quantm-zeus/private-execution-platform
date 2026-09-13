@@ -1,7 +1,7 @@
 //! P65 durable limit-order write delegation: placement, idempotency,
 //! cancellation, owner isolation, fail-closed paths, and trusted valuation.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_backend::{
     AgentReadBackend, BackendError, FixedClock, OrderReadModel, OrderSummary, OrderValuation,
@@ -13,15 +13,22 @@ use agent_commands::{
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
+use crypto_envelope::at_rest::SealKey;
 use domain::{
     IdempotencyKey, IntentId, LimitOrder, LimitPrice, OrderId, OrderStatus, RiskConstraints,
     TradeSide, UserId, WalletRef,
 };
 use limit_engine::{
-    InMemoryLimitOrderStore, LimitOrderStore, StoredLimitOrder, DEFAULT_SCHEMA_VERSION,
+    AppendOutcome, BlindIndexKey, CreateOutcome, DurableLimitOrderStore, InMemoryLimitOrderStore,
+    LimitEngineError, LimitOrderStore, OrderKeyMaterial, OrderKeyProvider, OrderTransition,
+    StoredLimitOrder, DEFAULT_SCHEMA_VERSION,
 };
 use market_types::{AssetAmount, AtomicAmount, Bps, PriceRatio};
 use mcp_server::{AgentBackend, BackendOutcome};
+use storage::{
+    ClassListCursor, ComponentHealth, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot,
+    OpaqueStore, StorageError,
+};
 
 const NOW: i64 = 1_000_000;
 
@@ -76,16 +83,22 @@ fn config() -> TradingBackendConfig {
 type Backend =
     TradingAgentBackend<FakeOrders, UnavailablePortfolioReadModel, InMemoryLimitOrderStore>;
 
-fn backend() -> (Backend, Arc<InMemoryLimitOrderStore>) {
-    let store = Arc::new(InMemoryLimitOrderStore::new());
+fn backend_with<S: LimitOrderStore + 'static>(
+    store: Arc<S>,
+) -> TradingAgentBackend<FakeOrders, UnavailablePortfolioReadModel, S> {
     let reads = AgentReadBackend::new(FakeOrders, UnavailablePortfolioReadModel::new());
-    let backend = TradingAgentBackend::new(
+    TradingAgentBackend::new(
         reads,
-        store.clone(),
+        store,
         config(),
         Arc::new(FixedClock(NOW)),
         Arc::new(OneAssetValuation { asset: usdc() }),
-    );
+    )
+}
+
+fn backend() -> (Backend, Arc<InMemoryLimitOrderStore>) {
+    let store = Arc::new(InMemoryLimitOrderStore::new());
+    let backend = backend_with(store.clone());
     (backend, store)
 }
 
@@ -124,7 +137,10 @@ fn buy(amount: u128) -> TradeCommand {
     )
 }
 
-async fn execute(backend: &Backend, command: TradeCommand) -> BackendOutcome {
+async fn execute<S: LimitOrderStore + 'static>(
+    backend: &TradingAgentBackend<FakeOrders, UnavailablePortfolioReadModel, S>,
+    command: TradeCommand,
+) -> BackendOutcome {
     backend
         .execute(AgentChannel::Mcp, AgentCommand::Trade(command))
         .await
@@ -202,7 +218,7 @@ async fn place_creates_a_durable_owner_scoped_created_order() {
     let (backend, store) = backend();
     let response = order_value(execute(&backend, buy(1_000)).await);
     let order_id = order_id_of(&response);
-    assert!(order_id.starts_with("ord-"), "derived id: {order_id}");
+    assert!(order_id.starts_with("mem-"), "derived id: {order_id}");
     assert_eq!(response["status"], "created");
     assert_eq!(response["max_input"], 1_000);
     assert_eq!(response["remaining_input"], 1_000);
@@ -229,6 +245,14 @@ async fn place_creates_a_durable_owner_scoped_created_order() {
     assert_eq!(record.filled_input, AtomicAmount::ZERO);
     assert!(record.order_idempotency_key.as_str().starts_with("idem-"));
     assert!(record.order_intent_id.as_str().starts_with("intent-"));
+    // The id is exactly what the store derives from the creation key; this is
+    // the invariant `DurableLimitOrderStore::create` enforces.
+    assert_eq!(
+        store
+            .creation_order_id(&record.order_idempotency_key)
+            .expect("derived id"),
+        record.order.id
+    );
 }
 
 #[tokio::test]
@@ -534,7 +558,8 @@ async fn valuation_is_trusted_and_fail_closed() {
     let known = AgentCommand::Trade(buy(1_000));
     assert_eq!(backend.valuation_usd_micros(&known).await, Some(7_000_000));
 
-    // USD amounts are already valued.
+    // A USD amount is a request-body value, not a trusted valuation, so it
+    // fails closed rather than being echoed back as "trusted".
     let usd = AgentCommand::Trade(place(
         "USDC",
         "TOKEN",
@@ -545,7 +570,7 @@ async fn valuation_is_trusted_and_fail_closed() {
         true,
         NOW + 60_000,
     ));
-    assert_eq!(backend.valuation_usd_micros(&usd).await, Some(123));
+    assert_eq!(backend.valuation_usd_micros(&usd).await, None);
 
     // Cancellation moves no funds.
     let cancel = AgentCommand::Trade(TradeCommand::CancelOrder {
@@ -610,4 +635,251 @@ async fn reads_still_delegate_through_the_write_backend() {
         )
         .await;
     assert_eq!(outcome, BackendOutcome::Unavailable);
+}
+
+#[tokio::test]
+async fn cancel_of_an_executing_order_is_denied() {
+    let (backend, store) = backend();
+    store
+        .create(stored_order(
+            "u1",
+            "own-executing",
+            OrderStatus::Executing,
+            100,
+            100,
+            0,
+        ))
+        .await
+        .expect("seed executing order");
+    assert_eq!(
+        execute(
+            &backend,
+            TradeCommand::CancelOrder {
+                order_id: "own-executing".to_string(),
+            },
+        )
+        .await,
+        BackendOutcome::Denied
+    );
+}
+
+/// A store whose `append_transition` always reports an already-applied head,
+/// letting a test prove the backend does not trust `AlreadyApplied` blindly.
+struct RacyStore {
+    inner: InMemoryLimitOrderStore,
+    forged: Mutex<Option<StoredLimitOrder>>,
+}
+
+impl RacyStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryLimitOrderStore::new(),
+            forged: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl LimitOrderStore for RacyStore {
+    fn creation_order_id(
+        &self,
+        idempotency_key: &IdempotencyKey,
+    ) -> Result<OrderId, LimitEngineError> {
+        self.inner.creation_order_id(idempotency_key)
+    }
+
+    async fn create(&self, order: StoredLimitOrder) -> Result<CreateOutcome, LimitEngineError> {
+        self.inner.create(order).await
+    }
+
+    async fn load(&self, order_id: &OrderId) -> Result<Option<StoredLimitOrder>, LimitEngineError> {
+        self.inner.load(order_id).await
+    }
+
+    async fn append_transition(
+        &self,
+        _expected_version: u64,
+        _transition: &OrderTransition,
+        _next: &StoredLimitOrder,
+    ) -> Result<AppendOutcome, LimitEngineError> {
+        let forged = self
+            .forged
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("forged record");
+        Ok(AppendOutcome::AlreadyApplied(forged))
+    }
+
+    async fn replay_from(
+        &self,
+        order_id: &OrderId,
+        from_seq: u64,
+    ) -> Result<StoredLimitOrder, LimitEngineError> {
+        self.inner.replay_from(order_id, from_seq).await
+    }
+
+    async fn list_open(&self) -> Result<Vec<StoredLimitOrder>, LimitEngineError> {
+        self.inner.list_open().await
+    }
+}
+
+#[tokio::test]
+async fn cancel_is_denied_when_already_applied_reports_a_non_cancelled_head() {
+    let store = Arc::new(RacyStore::new());
+    let backend = backend_with(store.clone());
+    let order_id = order_id_of(&order_value(execute(&backend, buy(1_000)).await));
+
+    // Simulate a racing `Created -> Active` transition at the same sequence: the
+    // store reports the active head as `AlreadyApplied` for our cancel.
+    let current = store
+        .load(&OrderId::new(order_id.clone()).expect("order id"))
+        .await
+        .expect("load")
+        .expect("record");
+    let mut active = current.clone();
+    active.order.status = OrderStatus::Active;
+    active.last_transition_seq = 1;
+    *store.forged.lock().expect("lock") = Some(active);
+
+    assert_eq!(
+        execute(&backend, TradeCommand::CancelOrder { order_id }).await,
+        BackendOutcome::Denied
+    );
+}
+
+const KID: [u8; 16] = [3; 16];
+const SEAL: [u8; 32] = [4; 32];
+const BLIND: [u8; 32] = [5; 32];
+
+fn material() -> OrderKeyMaterial {
+    OrderKeyMaterial {
+        kid: KID,
+        seal: SealKey::from_bytes(SEAL),
+        blind_index: BlindIndexKey::from_bytes(BLIND),
+    }
+}
+
+struct TestKeys;
+
+impl OrderKeyProvider for TestKeys {
+    fn current(&self) -> Result<OrderKeyMaterial, LimitEngineError> {
+        Ok(material())
+    }
+
+    fn by_id(&self, kid: &[u8; 16]) -> Result<OrderKeyMaterial, LimitEngineError> {
+        if kid == &KID {
+            Ok(material())
+        } else {
+            Err(LimitEngineError::UnknownKeyId)
+        }
+    }
+}
+
+#[derive(Default)]
+struct MemStore {
+    objects: Mutex<Vec<OpaqueObject>>,
+}
+
+#[async_trait]
+impl OpaqueStore for MemStore {
+    async fn put_object(&self, object: OpaqueObject) -> Result<(), StorageError> {
+        object.validate().map_err(StorageError::Invalid)?;
+        self.objects
+            .lock()
+            .map_err(|_| StorageError::Unavailable)?
+            .push(object);
+        Ok(())
+    }
+
+    async fn get_object(&self, id: &str) -> Result<Option<OpaqueObject>, StorageError> {
+        let objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
+        Ok(objects
+            .iter()
+            .filter(|object| object.id == id)
+            .max_by_key(|object| object.version)
+            .cloned())
+    }
+
+    async fn list_objects_by_class_page(
+        &self,
+        class_blind_index: &[u8],
+        _cursor: Option<&ClassListCursor>,
+        limit: usize,
+    ) -> Result<Vec<OpaqueObject>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let objects = self.objects.lock().map_err(|_| StorageError::Unavailable)?;
+        let mut matching: Vec<OpaqueObject> = objects
+            .iter()
+            .filter(|object| object.class_blind_index == class_blind_index)
+            .cloned()
+            .collect();
+        matching.sort_by(|left, right| left.id.cmp(&right.id));
+        matching.truncate(limit);
+        Ok(matching)
+    }
+
+    async fn append_event(&self, _event: OpaqueEventRecord) -> Result<(), StorageError> {
+        Err(StorageError::Unavailable)
+    }
+
+    async fn read_events(
+        &self,
+        _stream_blind_index: &[u8],
+        _from_sequence: u64,
+        _limit: usize,
+    ) -> Result<Vec<OpaqueEventRecord>, StorageError> {
+        Err(StorageError::Unavailable)
+    }
+
+    async fn latest_snapshot(
+        &self,
+        _stream_blind_index: &[u8],
+    ) -> Result<Option<OpaqueSnapshot>, StorageError> {
+        Ok(None)
+    }
+
+    async fn health(&self) -> HealthProbe {
+        HealthProbe {
+            component: "test.mem",
+            status: ComponentHealth::Healthy,
+            observed_at_ms: 0,
+        }
+    }
+}
+
+/// The regression test for the production write path: the durable store
+/// validates `order.id == order_id_for_creation(blind_index, idempotency_key)`,
+/// a keyed derivation the backend must obtain from the store itself.
+#[tokio::test]
+async fn durable_store_place_uses_the_store_derived_id() {
+    let durable = Arc::new(DurableLimitOrderStore::new(
+        Arc::new(MemStore::default()),
+        Arc::new(TestKeys),
+        ChainId::Base,
+    ));
+    let backend = backend_with(durable.clone());
+
+    let placed = order_value(execute(&backend, buy(1_000)).await);
+    assert_eq!(placed["status"], "created");
+    let order_id = order_id_of(&placed);
+
+    let record = durable
+        .load(&OrderId::new(order_id.clone()).expect("order id"))
+        .await
+        .expect("load")
+        .expect("durable record exists");
+    assert_eq!(record.order.owner.as_str(), "u1");
+    assert_eq!(
+        durable
+            .creation_order_id(&record.order_idempotency_key)
+            .expect("derived id"),
+        record.order.id
+    );
+
+    // A repeated identical placement is idempotent under the durable store too.
+    let again = order_id_of(&order_value(execute(&backend, buy(1_000)).await));
+    assert_eq!(again, order_id);
 }

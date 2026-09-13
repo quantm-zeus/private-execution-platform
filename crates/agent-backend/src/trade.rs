@@ -48,8 +48,6 @@ use crate::error::BackendError;
 use crate::order::{OrderReadModel, OrderSummary};
 use crate::portfolio::PortfolioReadModel;
 
-/// Domain separation for the derived order identity.
-const ORDER_ID_DOMAIN: &[u8] = b"agent.limit.order.id.v1";
 /// Domain separation for the derived idempotency key.
 const IDEMPOTENCY_DOMAIN: &[u8] = b"agent.limit.order.idem.v1";
 /// Domain separation for the derived internal intent id.
@@ -204,6 +202,19 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             limit_price.denominator_atomic.to_be_bytes().to_vec(),
             vec![u8::from(allow_partial_fill)],
             expires_at_ms.to_be_bytes().to_vec(),
+            // The trusted config is part of the creation baseline the store
+            // compares on an idempotent re-create, so it is part of the
+            // identity too.
+            self.config.min_fill.get().to_be_bytes().to_vec(),
+            self.config.risk.max_buy_tax.get().to_be_bytes().to_vec(),
+            self.config.risk.max_sell_tax.get().to_be_bytes().to_vec(),
+            self.config
+                .risk
+                .max_price_impact
+                .get()
+                .to_be_bytes()
+                .to_vec(),
+            self.config.risk.max_slippage.get().to_be_bytes().to_vec(),
         ]
     }
 }
@@ -246,8 +257,10 @@ where
             TradeCommand::PlaceLimitOrder {
                 token_in, amount, ..
             } => match amount {
-                // A USD-micros amount is already the trusted value.
-                AmountSpec::UsdMicros(value) => Some(*value),
+                // A USD-micros amount is a request-body value, not a trusted
+                // valuation, so the port must value it (and today cannot):
+                // fail closed rather than echo the body back as "trusted".
+                AmountSpec::UsdMicros(_) => None,
                 AmountSpec::TokenAtomic(value) | AmountSpec::StablecoinAtomic(value) => {
                     let asset = token_in.to_asset_id().ok()?;
                     self.valuation.usd_micros(&asset, AtomicAmount::new(*value))
@@ -358,8 +371,18 @@ where
         };
         let min_fill = partial_fill_floor(allow_partial_fill, self.config.min_fill, max_input);
 
+        // The store owns the id derivation: the durable store requires a keyed
+        // MAC over the creation key that this layer must not (and cannot)
+        // reproduce, so ask the store for the exact id it will accept.
+        let idempotency_key = IdempotencyKey::new(derived.idempotency_key.as_str())
+            .map_err(|_| BackendError::Denied)?;
+        let order_id = self
+            .store
+            .creation_order_id(&idempotency_key)
+            .map_err(|_| BackendError::Unavailable)?;
+
         let order = LimitOrder {
-            id: OrderId::new(derived.order_id.as_str()).map_err(|_| BackendError::Denied)?,
+            id: order_id,
             owner: self.config.owner.clone(),
             wallet_ref: self.config.wallet_ref.clone(),
             chain: self.config.chain.clone(),
@@ -393,8 +416,7 @@ where
             order,
             order_intent_id: IntentId::new(derived.intent_id.as_str())
                 .map_err(|_| BackendError::Denied)?,
-            order_idempotency_key: IdempotencyKey::new(derived.idempotency_key.as_str())
-                .map_err(|_| BackendError::Denied)?,
+            order_idempotency_key: idempotency_key,
             nonce: 0,
             attempt_seq: 0,
             filled_input: AtomicAmount::ZERO,
@@ -447,19 +469,29 @@ where
             .append_transition(current.version, &transition, &next)
             .await
         {
-            Ok(AppendOutcome::Applied(record)) | Ok(AppendOutcome::AlreadyApplied(record)) => {
+            // `AlreadyApplied` is only a success when the stored record really is
+            // cancelled. The reference in-memory store returns the current head
+            // for any already-seen sequence without comparing content, so a
+            // racing transition to a different status must not be reported as a
+            // successful cancel.
+            Ok(AppendOutcome::Applied(record)) | Ok(AppendOutcome::AlreadyApplied(record))
+                if record.order.status == OrderStatus::Cancelled =>
+            {
                 Ok(record)
             }
-            // A store fault or a CAS conflict is a redacted denial: the caller
-            // may retry the cancel, which is idempotent.
-            Err(_) => Err(BackendError::Denied),
+            // A store fault, a CAS conflict, or an already-applied different
+            // transition is a redacted denial: retrying the cancel is safe.
+            Ok(_) | Err(_) => Err(BackendError::Denied),
         }
     }
 }
 
-/// The three domain-separated identities derived from one creation payload.
+/// The domain-separated identities derived from one creation payload.
+///
+/// The order id is intentionally absent: it is derived by the injected store via
+/// `LimitOrderStore::creation_order_id`, because the durable store requires a
+/// keyed derivation this layer must not reproduce.
 struct DerivedIdentity {
-    order_id: String,
     idempotency_key: String,
     intent_id: String,
 }
@@ -467,7 +499,6 @@ struct DerivedIdentity {
 impl DerivedIdentity {
     fn from_parts(parts: &[Vec<u8>]) -> Self {
         Self {
-            order_id: prefixed_hex(ORDER_ID_DOMAIN, "ord", parts),
             idempotency_key: prefixed_hex(IDEMPOTENCY_DOMAIN, "idem", parts),
             intent_id: prefixed_hex(INTENT_ID_DOMAIN, "intent", parts),
         }
