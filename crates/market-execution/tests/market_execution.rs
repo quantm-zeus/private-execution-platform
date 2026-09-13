@@ -837,7 +837,12 @@ fn has_hex_run(value: &str, min_len: usize) -> bool {
 }
 
 #[tokio::test]
-async fn min_out_is_the_exact_slippage_floor() {
+async fn market_min_out_denies_a_delta_below_the_slippage_floor() {
+    // The exact floor arithmetic is pinned by the `market_min_out` unit tests in
+    // `src/lib.rs`; this integration case proves the end-to-end gate denies (and
+    // performs no sign/submit) when the delta net output sits below the floor
+    // implied by the route expectation and the slippage cap.
+    //
     // With a zero slippage cap the floor is exactly `route.expected_net_output`,
     // and a quote whose net output equals it passes revalidation and, when the
     // relay observes a fill of exactly that amount, maps to `Filled`.
@@ -882,9 +887,10 @@ async fn trust_is_fetched_once_per_execute() {
 
 #[tokio::test]
 async fn trading_disabled_after_preview_denies() {
-    // Everything else (trust, balance, tax, route) is valid; only the relay's
-    // kill switch is off, and it still denies without reaching the prepared
-    // reference or the signer.
+    // Defense in depth: with a disabled engine the authority check denies at
+    // `authorize_trade` before any trust-derived basis, prepared reference, or
+    // signer/adapter call. (The relay's own kill-switch gate is a redundant
+    // second check on the same engine.)
     let h = harness(false, Behavior::Accept, trust(), false);
 
     let outcome = h.port.execute(request()).await;

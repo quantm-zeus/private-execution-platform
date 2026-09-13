@@ -293,13 +293,18 @@ where
         &self.breaker
     }
 
-    /// Borrows the policy engine that gates this relay (read-only; diagnostics/composition only).
+    /// Borrows the policy engine that gates this relay (diagnostics/composition only).
     ///
     /// This is the same engine `execute` consults for the live kill switch and
     /// that `SigningRequest::bind` re-verifies. A composition layer (for example
     /// the market-execution port) uses it to run the authority check on the
     /// *same* engine that will gate the relay, rather than on a second engine
     /// that could drift.
+    ///
+    /// The borrow is read-only as an API matter (callers cannot replace the
+    /// engine), but [`PolicyEngine`] deliberately exposes the one-way
+    /// `disable_trading` kill switch through interior mutability; the engine
+    /// owner already controls that gate.
     #[doc(hidden)]
     pub fn policy(&self) -> &PolicyEngine {
         &self.policy

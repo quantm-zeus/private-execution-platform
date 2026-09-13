@@ -12,17 +12,16 @@ path = "src/lib.rs"
 [dependencies]
 agent-backend.workspace = true
 async-trait.workspace = true
-chain-types.workspace = true
 domain.workspace = true
 execution-preview.workspace = true
 execution-relay.workspace = true
 market-types.workspace = true
 policy.workspace = true
 privy.workspace = true
-routing.workspace = true
 simulation.workspace = true
 tax-engine.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
+chain-types.workspace = true
+routing.workspace = true
 tokio.workspace = true

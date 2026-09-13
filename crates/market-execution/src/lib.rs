@@ -34,6 +34,11 @@
 //!   revalidation aborts deny, so no sign/submit occurs.
 //! - **Redaction.** [`MarketExecutionTrust`] and [`RelayMarketExecutionPort`]
 //!   render nothing user-facing; errors carry no assets, amounts, routes, or ids.
+//! - **Composition core, not a service.** This crate is a library seam: a binary
+//!   or composition root must install the port through
+//!   `agent_backend::TradingAgentBackend::with_market_execution`. Until it does,
+//!   `agent_backend`'s fail-closed default remains in force, so this crate adds
+//!   the concrete pipeline without by itself wiring a running service.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
 
 #![forbid(unsafe_code)]
@@ -278,6 +283,19 @@ where
 /// `min_out = max(1, ceil(route.expected_net_output.amount * (10_000 - max_slippage) / 10_000))`,
 /// denominated in `intent.token_out`. The multiplication uses the exact 256-bit
 /// helpers; any overflow fails closed as [`MarketExecutionError::Denied`].
+///
+/// # Binding scope
+///
+/// The locked bridge requires `route.expected_net_output == net_delta.net_output`
+/// (`ExecutionPreview::validate`), so for any candidate that can pass the gate
+/// this floor is `<= net_delta.net_output` and the gate's `net_out >= min_out`
+/// check can never be the deciding rejection. It is still derived exactly and
+/// passed into [`execution_preview::RevalidationInput`] so the revalidation
+/// surface is complete and so a future payload builder can reuse the same
+/// number. The **authoritative** on-chain slippage protection is the minimum
+/// output committed inside the opaque prepared payload
+/// ([`PreparedExecutionRefSource`]); this floor is a local consistency guard,
+/// not a substitute for it.
 fn market_min_out(
     intent: &TradeIntent,
     route: &RoutePlan,
@@ -355,5 +373,149 @@ fn map_outcome(
         | Err(RelayError::AdapterRejected)
         | Err(RelayError::UnknownSubmissionState)
         | Err(RelayError::InvalidTransition) => Ok(MarketExecutionOutcome::Unknown),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the exact slippage floor and its asset binding.
+    //!
+    //! These pin `market_min_out` directly (it is private) so the arithmetic is
+    //! non-vacuously asserted, independent of whether the locked revalidation
+    //! gate can use the value to reject a bridge-valid candidate.
+
+    use super::*;
+    use chain_types::{AssetId, ChainId};
+    use domain::{
+        AmountType, IdempotencyKey, IntentId, OrderType, RiskConstraints, TradeSide, TradeSource,
+        UserId, WalletRef,
+    };
+    use market_types::{Bps, Freshness, Sequence};
+
+    fn intent(max_slippage_bps: u16) -> TradeIntent {
+        TradeIntent {
+            id: IntentId::new("intent-1").expect("intent id"),
+            source: TradeSource::Web,
+            user_id: UserId::new("user-1").expect("user"),
+            wallet_ref: WalletRef::new("wallet-1").expect("wallet"),
+            chain: ChainId::Base,
+            token_in: AssetId::new(ChainId::Base, "USDC").expect("asset"),
+            token_out: AssetId::new(ChainId::Base, "TOKEN").expect("asset"),
+            side: TradeSide::Buy,
+            amount_type: AmountType::InputAssetAtomic,
+            amount: AtomicAmount::new(1_000),
+            order_type: OrderType::Market,
+            limit_price: None,
+            risk: RiskConstraints {
+                max_buy_tax: Bps::new(100).expect("bps"),
+                max_sell_tax: Bps::new(100).expect("bps"),
+                max_price_impact: Bps::new(100).expect("bps"),
+                max_slippage: Bps::new(max_slippage_bps).expect("bps"),
+                max_total_cost: None,
+            },
+            allow_partial_fill: false,
+            expiry_ms: None,
+            nonce: 0,
+            idempotency_key: IdempotencyKey::new("idem-1").expect("idem"),
+        }
+    }
+
+    fn route(expected_net_output: u128) -> RoutePlan {
+        RoutePlan {
+            legs: Vec::new(),
+            expected_net_output: AssetAmount {
+                asset: AssetId::new(ChainId::Base, "TOKEN").expect("asset"),
+                amount: AtomicAmount::new(expected_net_output),
+            },
+            state: Freshness {
+                observed_at_ms: 0,
+                chain_height: 1,
+                sequence: Sequence(1),
+            },
+        }
+    }
+
+    /// Independent `ceil(a * b / 10_000)` using the `q`/`r` decomposition, which
+    /// never overflows and shares no code with `checked_ceil_mul_div`.
+    fn oracle_ceil_bps(a: u128, b: u128) -> u128 {
+        let q = a / 10_000;
+        let r = a % 10_000;
+        let floor = q * b + (r * b) / 10_000;
+        if (r * b) % 10_000 == 0 {
+            floor
+        } else {
+            floor + 1
+        }
+    }
+
+    #[test]
+    fn min_out_is_the_exact_ceil_slippage_floor() {
+        // ceil(240 * 9900 / 10000) = ceil(237.6) = 238.
+        assert_eq!(
+            market_min_out(&intent(100), &route(240))
+                .expect("floor")
+                .amount
+                .get(),
+            238
+        );
+        // Zero slippage is the raw expected output.
+        assert_eq!(
+            market_min_out(&intent(0), &route(240))
+                .expect("floor")
+                .amount
+                .get(),
+            240
+        );
+        // A 100% slippage cap floors to zero, clamped up to one.
+        assert_eq!(
+            market_min_out(&intent(10_000), &route(240))
+                .expect("floor")
+                .amount
+                .get(),
+            1
+        );
+        // ceil(3 * 9999 / 10000) = ceil(2.9997) = 3.
+        assert_eq!(
+            market_min_out(&intent(1), &route(3))
+                .expect("floor")
+                .amount
+                .get(),
+            3
+        );
+    }
+
+    #[test]
+    fn min_out_matches_an_independent_oracle_over_a_seeded_sweep() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u128;
+        let next = |seed: &mut u128| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        for _ in 0..100_000 {
+            let expected = next(&mut seed);
+            let slip = (next(&mut seed) % 10_001) as u16;
+            let got = market_min_out(&intent(slip), &route(expected))
+                .expect("floor")
+                .amount
+                .get();
+            let want = oracle_ceil_bps(expected, 10_000 - u128::from(slip)).max(1);
+            assert_eq!(got, want, "expected={expected} slip={slip}");
+            assert!(got >= 1, "floor is clamped to at least one");
+            assert!(
+                got <= expected.max(1),
+                "floor never exceeds the expectation"
+            );
+        }
+    }
+
+    #[test]
+    fn min_out_is_denominated_in_the_output_token() {
+        let floor = market_min_out(&intent(100), &route(240)).expect("floor");
+        assert_eq!(
+            floor.asset,
+            AssetId::new(ChainId::Base, "TOKEN").expect("asset")
+        );
     }
 }
