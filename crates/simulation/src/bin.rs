@@ -17,9 +17,11 @@ use crate::error::BinSimulationError;
 
 /// Hard cap on the number of bin-to-bin transitions performed in a single simulation.
 ///
-/// The exact rational bin price grows as `((10000 + bin_step) / 10000)^b`, so the
-/// cap is kept conservative: it binds before the checked `u128` price arithmetic
-/// can overflow for representable bin steps.
+/// This is a secondary traversal bound, not the primary overflow guard. The exact
+/// rational bin price grows as `((10000 + bin_step) / 10000)^b`, so a sufficiently
+/// deep traversal can fail closed with [`BinSimulationError::ArithmeticOverflow`]
+/// before this cap is reached; the cap still bounds worst-case work for the steps
+/// that remain representable.
 pub const MAX_BIN_CROSSES: usize = 32;
 
 /// Request parameters for an exact-input direct Bin/DLMM swap simulation.
@@ -117,7 +119,7 @@ fn atomic_bin_price(
     let (base_num, base_den) = reduce_fraction(base_num, 10_000);
 
     let exponent = bin_id.unsigned_abs();
-    let (mut num, mut den) = if bin_id >= 0 {
+    let (num_raw, den_raw) = if bin_id >= 0 {
         (
             base_num
                 .checked_pow(exponent)
@@ -141,15 +143,23 @@ fn atomic_bin_price(
     let decimal_factor = 10u128
         .checked_pow(decimal_delta)
         .ok_or(BinSimulationError::ArithmeticOverflow)?;
-    if decimals_1 >= decimals_0 {
-        num = num
-            .checked_mul(decimal_factor)
+
+    // Cancel common factors between the raw fraction and `10^delta` before scaling so
+    // that representable atomic prices do not spuriously overflow the `u128`
+    // intermediates.
+    let (num, den) = if decimals_1 >= decimals_0 {
+        let cancel = gcd_u128(den_raw, decimal_factor);
+        let num = num_raw
+            .checked_mul(decimal_factor / cancel)
             .ok_or(BinSimulationError::ArithmeticOverflow)?;
+        (num, den_raw / cancel)
     } else {
-        den = den
-            .checked_mul(decimal_factor)
+        let cancel = gcd_u128(num_raw, decimal_factor);
+        let den = den_raw
+            .checked_mul(decimal_factor / cancel)
             .ok_or(BinSimulationError::ArithmeticOverflow)?;
-    }
+        (num_raw / cancel, den)
+    };
 
     let (num, den) = reduce_fraction(num, den);
     if num == 0 || den == 0 {
@@ -282,6 +292,9 @@ pub fn simulate_bin_exact_input(
     let mut remaining_input = effective_input_val;
     let mut total_output: u128 = 0;
     let mut bins_crossed: usize = 0;
+    // Ids are recorded as production happens; the active index is only a fallback that
+    // is always overwritten because a successful quote requires non-zero total output.
+    let mut last_output_idx = active_idx;
 
     // Bounded bin traversal loop.
     while remaining_input > 0 {
@@ -315,6 +328,7 @@ pub fn simulate_bin_exact_input(
             total_output = total_output
                 .checked_add(available)
                 .ok_or(BinSimulationError::ArithmeticOverflow)?;
+            last_output_idx = current_idx;
             remaining_input = remaining_input
                 .checked_sub(need)
                 .ok_or(BinSimulationError::ArithmeticOverflow)?;
@@ -324,6 +338,9 @@ pub fn simulate_bin_exact_input(
         } else {
             let partial_output =
                 mul_div_floor(remaining_input, output_numerator, output_denominator)?;
+            if partial_output > 0 {
+                last_output_idx = current_idx;
+            }
             total_output = total_output
                 .checked_add(partial_output)
                 .ok_or(BinSimulationError::ArithmeticOverflow)?;
@@ -335,7 +352,7 @@ pub fn simulate_bin_exact_input(
         return Err(BinSimulationError::ZeroOutputAmount);
     }
 
-    let resulting_active_bin_id = pool.bins[current_idx].id;
+    let resulting_active_bin_id = pool.bins[last_output_idx].id;
 
     Ok(BinSimulationQuote {
         input: AssetAmount {

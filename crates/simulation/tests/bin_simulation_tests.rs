@@ -546,3 +546,94 @@ fn test_error_redaction_debug_and_display() {
     assert!(!debug_str.contains("1010"));
     assert!(debug_str.chars().all(|ch| !ch.is_ascii_digit()));
 }
+
+// ---------------------------------------------------------------------------
+// 7. Resulting-active semantics, zero-available skip, decimal cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_resulting_active_bin_id_is_last_output_bin_token_0_in() {
+    // Crossing past the active bin consumes the residual input with zero output in the
+    // next bin, so the resulting active bin must remain the last bin that produced
+    // output (id 0), not the bin the loop exhausted on (id -1).
+    let pool = make_pool(100, 0, 0, 0, 0, vec![bin(-1, 0, 1000), bin(0, 1000, 1000)]);
+    let initial_pool = pool.clone();
+    let request = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(1001));
+
+    let quote = simulate_bin_exact_input(&pool, &request).expect("traversal must succeed");
+
+    assert_eq!(quote.output.amount.get(), 1000);
+    assert_eq!(quote.bins_crossed, 1);
+    assert_eq!(quote.resulting_active_bin_id, 0);
+    assert_eq!(pool, initial_pool);
+}
+
+#[test]
+fn test_resulting_active_bin_id_is_last_output_bin_token_1_in() {
+    // Mirror of the token_0 case: the residual input floors to zero output in bin 1,
+    // so the reported bin stays at the producing bin 0, not bin 1.
+    let pool = make_pool(100, 0, 0, 0, 0, vec![bin(0, 1000, 1000), bin(1, 1000, 0)]);
+    let initial_pool = pool.clone();
+    let request = BinExactInputRequest::new(pool.token_1.clone(), AtomicAmount::new(1001));
+
+    let quote = simulate_bin_exact_input(&pool, &request).expect("traversal must succeed");
+
+    assert_eq!(quote.output.amount.get(), 1000);
+    assert_eq!(quote.bins_crossed, 1);
+    assert_eq!(quote.resulting_active_bin_id, 0);
+    assert_eq!(pool, initial_pool);
+}
+
+#[test]
+fn test_zero_available_bin_is_skipped_without_recording_output() {
+    // The active bin has no reserve on the output side, so the kernel crosses it
+    // without recording output and produces entirely in the next represented bin.
+    let pool = make_pool(100, 0, 0, 1, 0, vec![bin(0, 0, 1000), bin(1, 500, 0)]);
+    let initial_pool = pool.clone();
+    let request = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(600));
+
+    let quote = simulate_bin_exact_input(&pool, &request).expect("traversal must succeed");
+
+    assert_eq!(quote.output.amount.get(), 600);
+    assert_eq!(quote.bins_crossed, 1);
+    assert_eq!(quote.resulting_active_bin_id, 0);
+    assert_eq!(pool, initial_pool);
+}
+
+#[test]
+fn test_decimal_factor_cancellation_extends_representable_range() {
+    // bin_step 1, decimals 0/18, bin id 6: the raw numerator is 10001^6 and the raw
+    // denominator 10000^6. Scaling by 10^18 without cancellation overflows u128, so
+    // the kernel must cancel the common 10^18 before multiplying.
+    let pool = make_pool(
+        1,
+        0,
+        18,
+        6,
+        0,
+        vec![bin(6, 1, 1_000_000_000_000_000_000_000_000)],
+    );
+    let initial_pool = pool.clone();
+
+    let partial = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(500_000));
+    let quote_partial =
+        simulate_bin_exact_input(&pool, &partial).expect("partial fill must succeed");
+    assert_eq!(
+        quote_partial.output.amount.get(),
+        500_300_075_010_000_750_030_000
+    );
+    assert_eq!(quote_partial.bins_crossed, 0);
+    assert_eq!(quote_partial.resulting_active_bin_id, 6);
+
+    let exhaust = BinExactInputRequest::new(pool.token_0.clone(), AtomicAmount::new(999_401));
+    let quote_exhaust =
+        simulate_bin_exact_input(&pool, &exhaust).expect("reserve-exhausting fill must succeed");
+    assert_eq!(
+        quote_exhaust.output.amount.get(),
+        1_000_000_000_000_000_000_000_000
+    );
+    assert_eq!(quote_exhaust.bins_crossed, 0);
+    assert_eq!(quote_exhaust.resulting_active_bin_id, 6);
+
+    assert_eq!(pool, initial_pool);
+}
