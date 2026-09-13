@@ -91,9 +91,22 @@ async fn limit_zero_is_a_noop_and_the_cap_is_enforced() {
     let fake = Arc::new(InMemoryOpaqueStore::new());
     let keys = Arc::new(TestOrderKeys::deterministic(9));
     let store = durable_store(&fake, &keys);
-    let first = durable_order(&keys, "x", OrderStatus::Active, 100, 100, 0);
-    let second = durable_order(&keys, "y", OrderStatus::Active, 100, 100, 0);
-    seed(&store, [first, second]).await;
+
+    // Strictly more orders than the hard cap, so the clamp is exercised rather
+    // than merely satisfied.
+    let records: Vec<_> = (0..MAX_OWNER_ORDERS + 16)
+        .map(|index| {
+            durable_order(
+                &keys,
+                &format!("k{index}"),
+                OrderStatus::Active,
+                100,
+                100,
+                0,
+            )
+        })
+        .collect();
+    seed(&store, records).await;
 
     assert!(store
         .list_orders_for_owner(&owner(), None, 0)
@@ -105,8 +118,50 @@ async fn limit_zero_is_a_noop_and_the_cap_is_enforced() {
         .list_orders_for_owner(&owner(), None, usize::MAX)
         .await
         .expect("list");
-    assert!(capped.len() <= MAX_OWNER_ORDERS);
-    assert_eq!(capped.len(), 2);
+    assert_eq!(capped.len(), MAX_OWNER_ORDERS);
+
+    let explicit = store
+        .list_orders_for_owner(&owner(), None, 5)
+        .await
+        .expect("list");
+    assert_eq!(explicit.len(), 5);
+}
+
+/// A single corrupt object in the owner's class/owner index is skipped, and the
+/// healthy orders are still listed.
+#[tokio::test]
+async fn a_corrupt_object_is_skipped_not_fatal() {
+    use limit_engine::{class_blind_index, owner_blind_index};
+    use storage::{CreatedBucket, OpaqueObject, OpaqueStore};
+
+    let fake = Arc::new(InMemoryOpaqueStore::new());
+    let keys = Arc::new(TestOrderKeys::deterministic(11));
+    let store = durable_store(&fake, &keys);
+    let healthy = durable_order(&keys, "healthy", OrderStatus::Active, 100, 100, 0);
+    seed(&store, [healthy.clone()]).await;
+
+    // An object that matches the class and owner blind indexes but cannot be
+    // opened (garbage ciphertext) must not hide the healthy order.
+    let material = keys.material();
+    let class = class_blind_index(&material.blind_index).expect("class index");
+    let owner_index = owner_blind_index(&material.blind_index, &owner()).expect("owner index");
+    fake.put_object(OpaqueObject {
+        id: "corrupt-object".to_string(),
+        owner_blind_index: owner_index.to_vec(),
+        class_blind_index: class.to_vec(),
+        version: 1,
+        ciphertext: vec![0u8; 96],
+        created_bucket: CreatedBucket::new(0).expect("bucket"),
+    })
+    .await
+    .expect("put corrupt object");
+
+    let listed = store
+        .list_orders_for_owner(&owner(), None, 10)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].order.id, healthy.order.id);
 }
 
 /// A key provider that has no material cannot list (fail closed).

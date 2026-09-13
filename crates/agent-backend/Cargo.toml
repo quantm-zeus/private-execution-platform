@@ -23,4 +23,5 @@ storage.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+crypto-envelope.workspace = true
 tokio.workspace = true

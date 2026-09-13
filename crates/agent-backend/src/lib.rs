@@ -13,9 +13,13 @@
 //!   including every mutating command — returns
 //!   [`mcp_server::BackendOutcome::Unavailable`], so an unimplemented surface
 //!   fails closed rather than guessing.
-//! - **No signing/transfer/relay dependency.** The backend cannot sign, submit,
-//!   or move funds; mutating commands are handled by later slices over an
-//!   explicit Trading Core seam.
+//! - **No signing/transfer/relay capability.** This crate names no signing,
+//!   transfer, or relay type and exposes no path that can reach one; every
+//!   mutating command fails closed here and is handled by a later slice over an
+//!   explicit Trading Core seam. (The `limit-engine` dependency it uses for the
+//!   durable order read model is itself transitively linked to `privy` and
+//!   `execution-relay`, but those capabilities are not reachable through
+//!   `limit-engine`'s public read surface, and this crate has no direct edge.)
 //! - **Owner-scoped.** A backend instance is bound to one authenticated owner
 //!   (one session), so a command carries no user identity and cannot be pointed
 //!   at another owner's data.

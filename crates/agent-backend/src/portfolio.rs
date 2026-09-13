@@ -10,12 +10,19 @@ use crate::error::BackendError;
 use crate::order::OrderReadModel;
 
 /// One token balance.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct BalanceEntry {
     /// Asset the balance is denominated in.
     pub asset: AssetId,
     /// Atomic balance amount.
     pub amount: AtomicAmount,
+}
+
+impl std::fmt::Debug for BalanceEntry {
+    /// Redacted: asset/amount semantics must not reach logs or telemetry.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BalanceEntry { .. }")
+    }
 }
 
 /// Injected source of authoritative wallet balances.
@@ -30,7 +37,7 @@ pub trait BalanceProvider: Send + Sync {
 }
 
 /// A user-facing portfolio projection.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PortfolioSummary {
     /// Nonzero token balances.
     pub balances: Vec<BalanceEntry>,
@@ -40,6 +47,18 @@ pub struct PortfolioSummary {
     pub filled_orders: u32,
     /// Orders examined, across every status.
     pub total_orders: u32,
+}
+
+impl std::fmt::Debug for PortfolioSummary {
+    /// Redacted: renders only the non-semantic order counts, never balances.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PortfolioSummary")
+            .field("open_orders", &self.open_orders)
+            .field("filled_orders", &self.filled_orders)
+            .field("total_orders", &self.total_orders)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Read-only port over one owner's portfolio.

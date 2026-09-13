@@ -963,8 +963,11 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         &self.chain
     }
 
-    /// Lists up to `limit` of `owner`'s orders in class-listing order (newest
-    /// creation bucket first, then object id ascending).
+    /// Lists up to `limit` of `owner`'s orders in class-listing order (the
+    /// record's coarse created bucket descending, then object id ascending).
+    ///
+    /// The created bucket is derived from the order's `expires_at_ms` (see
+    /// [`bucket_for_ms`]), so the order is effectively newest-deadline first.
     ///
     /// This is a bounded, read-only projection of the durable encrypted store:
     /// it enumerates the order class with the same paging as recovery, drops any
@@ -978,9 +981,26 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
     /// whole pass, while a per-record fault (a corrupt, foreign, or inconsistent
     /// object) skips that one record rather than hiding every healthy order.
     /// `limit` is clamped to [`MAX_OWNER_ORDERS`]; `limit == 0` performs no I/O.
-    /// The list may omit older orders beyond [`RECOVERY_MAX_OBJECTS`]; this read
-    /// path reports no truncation because the caller cannot act on it (use
-    /// [`DurableLimitOrderStore::recover`] for the recovery pass).
+    ///
+    /// # Known bounded-enumeration limits
+    ///
+    /// The order class is a single chain-independent token, so this listing (like
+    /// [`DurableLimitOrderStore::recover`] and `recover_open`) can only enumerate
+    /// the newest [`RECOVERY_MAX_OBJECTS`] objects. Beyond that cap, older orders
+    /// are silently omitted; a caller cannot distinguish "no more orders" from
+    /// "truncated", and another tenant can occupy the newest window. Surfacing a
+    /// truncation signal or an owner-scoped storage index is a follow-up.
+    ///
+    /// The class/owner indexes are derived from
+    /// [`OrderKeyProvider::current`] only, so a blind-index key rotation (a new
+    /// key id with a different blind index) hides records sealed under the older
+    /// key; rotation requires a migration/replay pass. This matches the existing
+    /// recovery enumeration and does not affect owner isolation.
+    ///
+    /// The store's `chain` binding is not applied to this read: enumeration is
+    /// chain-independent and every returned [`OrderSummary`]-style projection
+    /// carries its own `chain`, so a caller must still check it. Filtering here is
+    /// a follow-up if a single store must serve multiple chains.
     pub async fn list_orders_for_owner(
         &self,
         owner: &UserId,

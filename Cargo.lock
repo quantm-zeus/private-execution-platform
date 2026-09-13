@@ -19,6 +19,7 @@ dependencies = [
  "agent-commands",
  "async-trait",
  "chain-types",
+ "crypto-envelope",
  "domain",
  "limit-engine",
  "market-types",

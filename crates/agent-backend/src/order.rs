@@ -24,7 +24,7 @@ pub const DEFAULT_ORDER_PAGE: usize = 64;
 /// creation-baseline version, the outbox watermark, the internal intent id).
 /// Serializing it is safe only on the authenticated response path; it must never
 /// become a telemetry label (PRD line 83).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct OrderSummary {
     /// Order identifier.
     pub order_id: String,
@@ -56,6 +56,15 @@ pub struct OrderSummary {
     pub expires_at_ms: i64,
     /// Sequence of the last applied transition.
     pub last_transition_seq: u64,
+}
+
+impl std::fmt::Debug for OrderSummary {
+    /// Redacted: an order summary carries order/token/wallet/amount semantics, so
+    /// it must never be rendered into a log or telemetry label (PRD line 83). The
+    /// JSON projection is gated behind the authenticated response path instead.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OrderSummary { .. }")
+    }
 }
 
 impl OrderSummary {
