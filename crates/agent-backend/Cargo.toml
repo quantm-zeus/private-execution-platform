@@ -19,6 +19,7 @@ market-types.workspace = true
 mcp-server.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
 storage.workspace = true
 thiserror.workspace = true
 
