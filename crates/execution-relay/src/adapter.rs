@@ -9,15 +9,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use privy::{PrivySigningBoundary, SigningRequest};
-use serde::{Deserialize, Serialize};
 
 use crate::error::RelayError;
 use crate::health::ChainHealth;
 use crate::plan::{SignedExecutionRef, SubmitRequest};
 
 /// Observation of an attempt's actual chain state.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Deliberately not serializable: serializing it would write the opaque chain
+/// `reference` (on `Confirmed`) or the adapter `final_reason` (on `Rejected`)
+/// into logs or wire payloads. The manual `Debug` below is redacted, so these
+/// fields never leave the process through either channel.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ChainObservation {
     /// The chain confirmed the attempt.
     Confirmed { reference: String },

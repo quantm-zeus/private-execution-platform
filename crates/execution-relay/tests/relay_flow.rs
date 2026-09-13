@@ -428,7 +428,7 @@ async fn duplicate_reservation_does_not_burn_half_open_probe() {
     assert_eq!(duplicate, first);
     assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
     assert!(
-        harness.relay.breaker().admit_probe(&chain, 5_300),
+        harness.relay.breaker().admit_probe(&chain, 5_300).is_some(),
         "a duplicate reservation must not consume the half-open probe"
     );
 }
@@ -636,4 +636,119 @@ async fn production_composition_fails_closed_without_submit() {
     let result = relay.execute(input).await;
     assert_eq!(result, Err(RelayError::ChainHealthUnavailable));
     assert_eq!(store.reserve_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_submit_releases_half_open_probe_and_allows_reprobe() {
+    use std::time::Duration;
+
+    let breaker = execution_relay::ChainHealthBreaker::new(2, 1_000);
+    breaker.record_failure(&ChainId::Base, 100);
+    breaker.record_failure(&ChainId::Base, 200);
+    let adapter = MockAdapter::new(
+        MockBehavior::Hang,
+        execution_relay::ChainObservation::Unknown,
+    );
+    let harness = RelayHarness::build(
+        support::engine(true),
+        breaker,
+        MockStore::new(),
+        Arc::clone(&adapter),
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    // An outer timeout cancels `execute` while it awaits a submit that never
+    // completes. The admitted half-open probe must not be stranded by that.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(10),
+        harness.relay.execute(harness.input(1_300)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the hung submit must be cancelled");
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 1);
+
+    // The guard resolved the probe as a failure, so the breaker re-opened with
+    // a fresh cooldown instead of blocking the chain forever.
+    assert_eq!(
+        harness.relay.breaker().health(&ChainId::Base, 1_300),
+        ChainHealth::Unavailable
+    );
+    assert!(!harness.relay.breaker().check_allowed(&ChainId::Base, 2_299));
+    assert!(harness.relay.breaker().check_allowed(&ChainId::Base, 2_300));
+
+    // A fresh, independent attempt can probe again once the cooldown elapses.
+    adapter.set_behavior(MockBehavior::Accept);
+    let intent = support::intent_with_idempotency("idem-2", 8);
+    let context = support::policy_context();
+    let engine = support::engine(true);
+    let approved = support::approved(&engine, &intent);
+    let prepared = support::prepared(&intent);
+    let route = support::route();
+    let preview = support::preview(&intent, &route);
+    let input = RelayExecutionInput {
+        intent: &intent,
+        policy_context: &context,
+        prepared: &prepared,
+        approved: &approved,
+        route: &route,
+        preview: &preview,
+        now_ms: 2_300,
+    };
+    let recovered = harness
+        .relay
+        .execute(input)
+        .await
+        .expect("recovered execute");
+    assert!(matches!(recovered, RelayOutcome::Submitted { .. }));
+    assert_eq!(adapter.submits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        harness.relay.breaker().health(&ChainId::Base, 2_301),
+        ChainHealth::Healthy
+    );
+}
+
+#[tokio::test]
+async fn definitive_query_observation_wins_and_reconcile_is_not_called() {
+    let adapter = MockAdapter::accepting();
+    adapter.set_query_observation(execution_relay::ChainObservation::Confirmed {
+        reference: "query-confirmed-ref".to_string(),
+    });
+    adapter.set_reconcile_observation(execution_relay::ChainObservation::Unknown);
+    let harness = RelayHarness::build(
+        support::engine(true),
+        execution_relay::ChainHealthBreaker::new(2, 5_000),
+        MockStore::new(),
+        adapter,
+        MockSource::standard(),
+        MockSigning::ok(),
+    );
+
+    let submitted = harness
+        .relay
+        .execute(harness.input(NOW_MS))
+        .await
+        .expect("execute");
+    assert!(matches!(submitted, RelayOutcome::Submitted { .. }));
+
+    // `query` is definitive, so its result must win and `reconcile` (which
+    // would have returned `Unknown`) must not even be called.
+    let confirmed = harness
+        .relay
+        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        confirmed,
+        RelayOutcome::Confirmed {
+            reference: "query-confirmed-ref".to_string()
+        }
+    );
+    assert_eq!(harness.adapter.queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        harness.adapter.reconcilers.load(Ordering::SeqCst),
+        0,
+        "a definitive query observation must skip reconcile"
+    );
+    assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 1);
 }

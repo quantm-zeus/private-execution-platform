@@ -189,19 +189,26 @@ where
 
         // 10. Admit the submit exactly once. `check_allowed` above is a
         //     read-only gate, so any failure before this point leaves the
-        //     half-open probe untouched; only this admission consumes it.
-        if !self.breaker.admit_probe(chain, input.now_ms) {
-            // A concurrent attempt consumed the probe between the gate and the
-            // submit: fail closed without sending. No chain call occurred, so
-            // this is a definitive pre-send failure.
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
-            return Err(RelayError::ChainHealthUnavailable);
-        }
+        //     half-open probe untouched; only this admission consumes it. The
+        //     returned guard releases the probe as a failure if this future is
+        //     dropped before the submission resolves (cancellation safety).
+        let probe = match self.breaker.admit_probe(chain, input.now_ms) {
+            Some(probe) => probe,
+            None => {
+                // A concurrent attempt consumed the probe between the gate and
+                // the submit: fail closed without sending. No chain call
+                // occurred, so this is a definitive pre-send failure.
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                return Err(RelayError::ChainHealthUnavailable);
+            }
+        };
 
-        // 11. Submit at most once. There is no retry loop anywhere.
+        // 11. Submit at most once. There is no retry loop anywhere. The probe is
+        //     resolved explicitly once `submit` returns; if the await is
+        //     cancelled the guard's `Drop` resolves it as a failure.
         match self.adapter.submit(&request).await {
             Ok(receipt) => {
-                self.breaker.record_success(chain);
+                probe.success();
                 if receipt.reference.trim().is_empty() {
                     self.record_outcome(key, &request_digest, RelayOutcome::Unknown);
                     return Ok(RelayOutcome::Unknown);
@@ -214,7 +221,7 @@ where
                 Ok(outcome)
             }
             Err(RelayError::AdapterRejected) => {
-                self.breaker.record_success(chain);
+                probe.success();
                 let outcome = RelayOutcome::Rejected {
                     final_reason: "adapter rejected submission".to_string(),
                 };
@@ -226,7 +233,7 @@ where
                 // `AdapterTimeout`, or an undocumented error) may have sent
                 // before failing, so the relay cannot assume "no send". Store
                 // and return Unknown: reconciliation is required, never a retry.
-                self.breaker.record_failure(chain, input.now_ms);
+                probe.failure(input.now_ms);
                 self.record_outcome(key, &request_digest, RelayOutcome::Unknown);
                 Ok(RelayOutcome::Unknown)
             }
@@ -265,6 +272,16 @@ where
         &self.breaker
     }
 
+    /// Persists the terminal/in-flight outcome, best-effort.
+    ///
+    /// A store write failure is deliberately swallowed: `record_outcome` runs
+    /// after the submission (or after a definitive pre-send failure) and a
+    /// transient journal error must not turn a completed attempt into an error a
+    /// caller might retry. The at-most-once submit invariant is unaffected — the
+    /// reservation claimed *before* signing still blocks any resubmission for the
+    /// same `(key, digest)`. A duplicate may therefore observe a stale in-memory
+    /// outcome, but it can never reach the signing boundary or the chain adapter
+    /// again.
     fn record_outcome(&self, key: &IdempotencyKey, digest: &RequestDigest, outcome: RelayOutcome) {
         let _ = self.store.record_outcome(key, digest, outcome);
     }

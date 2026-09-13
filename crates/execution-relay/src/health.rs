@@ -94,30 +94,43 @@ impl ChainHealthBreaker {
     /// consumed. A healthy chain is admitted without consuming a probe; an
     /// unavailable chain whose cooldown has elapsed transitions to a single
     /// half-open probe; a degraded chain admits while no probe is in flight.
-    /// Returns `false` when no admission is currently available.
-    pub fn admit_probe(&self, chain: &ChainId, now_ms: i64) -> bool {
-        let mut states = crate::lock(&self.states);
-        let entry = states.entry(chain.clone()).or_default();
-        match entry.state {
-            ChainHealth::Healthy => true,
-            ChainHealth::Degraded => {
-                if entry.probe_in_flight {
-                    false
-                } else {
+    /// Returns `None` when no admission is currently available.
+    ///
+    /// The returned [`ProbeGuard`] must be explicitly resolved with
+    /// [`ProbeGuard::success`] or [`ProbeGuard::failure`] once the submission
+    /// returns. Dropping it unresolved (for example because the awaiting
+    /// `execute` future was cancelled) releases the half-open probe as a
+    /// failure, so `probe_in_flight` can never be stranded.
+    pub fn admit_probe(&self, chain: &ChainId, now_ms: i64) -> Option<ProbeGuard<'_>> {
+        let consumed_probe = {
+            let mut states = crate::lock(&self.states);
+            let entry = states.entry(chain.clone()).or_default();
+            match entry.state {
+                ChainHealth::Healthy => false,
+                ChainHealth::Degraded => {
+                    if entry.probe_in_flight {
+                        return None;
+                    }
                     entry.probe_in_flight = true;
                     true
                 }
-            }
-            ChainHealth::Unavailable => {
-                if now_ms < entry.cooldown_until_ms || entry.probe_in_flight {
-                    false
-                } else {
+                ChainHealth::Unavailable => {
+                    if now_ms < entry.cooldown_until_ms || entry.probe_in_flight {
+                        return None;
+                    }
                     entry.state = ChainHealth::Degraded;
                     entry.probe_in_flight = true;
                     true
                 }
             }
-        }
+        };
+        Some(ProbeGuard {
+            breaker: self,
+            chain: chain.clone(),
+            admitted_at_ms: now_ms,
+            consumed_probe,
+            resolved: false,
+        })
     }
 
     /// Records a successful chain interaction and closes the breaker.
@@ -167,6 +180,51 @@ impl ChainHealthBreaker {
             }
             Some(entry) => entry.state,
             None => ChainHealth::Healthy,
+        }
+    }
+}
+
+/// RAII admission guard returned by [`ChainHealthBreaker::admit_probe`].
+///
+/// While alive it owns the chain's half-open probe (when one was consumed). The
+/// caller must resolve it explicitly with [`ProbeGuard::success`] (closes the
+/// breaker) or [`ProbeGuard::failure`] (re-opens it with a fresh cooldown).
+///
+/// If the guard is dropped before either method runs it is resolved as a
+/// failure at the admission time. This makes the half-open probe
+/// cancellation-safe: dropping an in-flight `execute` future releases the probe
+/// instead of stranding `probe_in_flight` forever and permanently blocking a
+/// chain whose adapter reports [`ChainHealth::Healthy`].
+pub struct ProbeGuard<'a> {
+    breaker: &'a ChainHealthBreaker,
+    chain: ChainId,
+    admitted_at_ms: i64,
+    consumed_probe: bool,
+    resolved: bool,
+}
+
+impl ProbeGuard<'_> {
+    /// Resolves the admission as a success, closing the breaker.
+    pub fn success(mut self) {
+        self.resolved = true;
+        self.breaker.record_success(&self.chain);
+    }
+
+    /// Resolves the admission as a failure at `now_ms`.
+    pub fn failure(mut self, now_ms: i64) {
+        self.resolved = true;
+        self.breaker.record_failure(&self.chain, now_ms);
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.consumed_probe && !self.resolved {
+            // The admission was never resolved (cancellation or a dropped
+            // caller): release the probe as a failure so the breaker re-opens
+            // with a fresh cooldown rather than blocking forever.
+            self.breaker
+                .record_failure(&self.chain, self.admitted_at_ms);
         }
     }
 }

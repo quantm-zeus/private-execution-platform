@@ -56,6 +56,17 @@ pub fn intent() -> TradeIntent {
     }
 }
 
+/// Builds the standard intent with a different idempotency key and nonce.
+///
+/// Used to drive a second, independent attempt through the same relay so a
+/// fresh reservation never collides with an earlier attempt's key.
+pub fn intent_with_idempotency(key: &str, nonce: u64) -> TradeIntent {
+    let mut value = intent();
+    value.idempotency_key = IdempotencyKey::new(key).expect("idempotency key");
+    value.nonce = nonce;
+    value
+}
+
 pub fn route() -> RoutePlan {
     let token_in = AssetId::new(ChainId::Base, "USDC").unwrap();
     let token_out = AssetId::new(ChainId::Base, "TOKEN").unwrap();
@@ -267,6 +278,9 @@ pub enum MockBehavior {
     Reject,
     Timeout,
     Unavailable,
+    /// `submit` never completes, so an outer `tokio::time::timeout` can cancel
+    /// the relay future mid-submit.
+    Hang,
 }
 
 pub struct MockAdapter {
@@ -344,11 +358,17 @@ impl ChainSubmissionAdapter for MockAdapter {
         _request: &execution_relay::SubmitRequest,
     ) -> Result<SubmissionReceipt, RelayError> {
         self.submits.fetch_add(1, Ordering::SeqCst);
-        match *self.behavior.lock().expect("behavior lock") {
+        // Copy the behavior out so no mutex guard is held across the `Hang`
+        // await.
+        let behavior = *self.behavior.lock().expect("behavior lock");
+        match behavior {
             MockBehavior::Accept => SubmissionReceipt::new("receipt-ref"),
             MockBehavior::Reject => Err(RelayError::AdapterRejected),
             MockBehavior::Timeout => Err(RelayError::AdapterTimeout),
             MockBehavior::Unavailable => Err(RelayError::AdapterUnavailable),
+            MockBehavior::Hang => {
+                std::future::pending::<Result<SubmissionReceipt, RelayError>>().await
+            }
         }
     }
 

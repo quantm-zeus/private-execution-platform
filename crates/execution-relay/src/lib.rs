@@ -54,7 +54,7 @@ pub use adapter::{
     SubmissionReceipt, UnavailableChainAdapter,
 };
 pub use error::RelayError;
-pub use health::{ChainHealth, ChainHealthBreaker};
+pub use health::{ChainHealth, ChainHealthBreaker, ProbeGuard};
 pub use plan::{
     SignedExecutionRef, SignedPayload, SignedPayloadSource, SubmitRequest, MAX_SIGNED_PAYLOAD_BYTES,
 };
