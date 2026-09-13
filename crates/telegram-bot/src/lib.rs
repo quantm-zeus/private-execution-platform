@@ -25,22 +25,28 @@
 //!   redacted, so a chat id, command body, or amount cannot reach a log.
 //! - `#![forbid(unsafe_code)]`; no `unwrap`/`expect`/`panic` in production code.
 //!
-//! ## Residuals (transport wiring, before a live inbound poller)
-//! - There is no chat/sender allowlist hook: any chat whose update reaches
-//!   [`TelegramBot::handle_update`] is authorized with the wallet's
-//!   capabilities. Harmless while the transport is unavailable or trading is
-//!   disabled, but an allowlist must be installed before enabling trading.
-//! - There is no `update_id` deduplication here: a redelivered update is
-//!   re-dispatched. The offset-owning poller must own dedup/at-most-once.
+//! ## Residuals
+//! - The allowlist and `update_id` dedup live in [`TelegramPoller`], not in the
+//!   one-update [`TelegramBot`] primitives: a deployment must drive updates
+//!   through the poller (or enforce the same allowlist itself) instead of
+//!   calling [`TelegramBot::handle_text`]/[`TelegramBot::handle_update`]
+//!   directly.
+//! - Reply chunking remains a follow-up (an oversized reply is replaced by a
+//!   static marker).
 
 #![forbid(unsafe_code)]
 
 mod bot;
 mod error;
+mod poller;
 mod transport;
 mod update;
 
 pub use bot::{Delivery, TelegramBot, MAX_REPLY_BYTES, REPLY_TOO_LARGE};
 pub use error::TelegramError;
+pub use poller::{
+    ChatAllowlist, PollLimits, PollReport, TelegramPoller, TelegramUpdateSource,
+    UnavailableUpdateSource, DEFAULT_POLL_BATCH, MAX_POLL_BATCH,
+};
 pub use transport::{TelegramTransport, UnavailableTelegramTransport};
 pub use update::{TelegramUpdate, MAX_CHAT_ID_BYTES, MAX_UPDATE_TEXT_BYTES};
