@@ -15,13 +15,24 @@ use social_intel::{
 struct FakeProvider {
     calls: Arc<AtomicU32>,
     result: Arc<Mutex<Result<SocialSnapshot, SocialProviderError>>>,
+    /// When `Some`, the fetch replies with this token instead of the requested
+    /// one (used to exercise the contract-violation path).
+    forced_token: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
 impl SocialProvider for FakeProvider {
-    async fn fetch(&self, _request: &SocialRequest) -> Result<SocialSnapshot, SocialProviderError> {
+    async fn fetch(&self, request: &SocialRequest) -> Result<SocialSnapshot, SocialProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.result.lock().expect("lock").clone()
+        let mut snapshot = self.result.lock().expect("lock").clone()?;
+        // By default the provider honors the contract and answers for the
+        // requested asset.
+        snapshot.chain = request.chain.clone();
+        snapshot.token = match self.forced_token.lock().expect("lock").clone() {
+            Some(token) => asset(&token),
+            None => request.token.clone(),
+        };
+        Ok(snapshot)
     }
 }
 
@@ -36,6 +47,7 @@ fn fake(
         FakeProvider {
             calls: calls.clone(),
             result: shared.clone(),
+            forced_token: Arc::new(Mutex::new(None)),
         },
         calls,
         shared,
@@ -240,7 +252,7 @@ async fn stale_fallback_is_served_when_the_provider_fails() {
     assert_eq!(first.meta.cache_state, CacheState::Miss);
 
     *shared.lock().expect("lock") = Err(SocialProviderError::Unavailable);
-    let stale = service.get_intelligence(request, 200).await;
+    let stale = service.get_intelligence(request.clone(), 200).await;
     assert_eq!(stale.meta.cache_state, CacheState::StaleServed);
     assert_eq!(
         stale.meta.degraded_reason,
@@ -248,6 +260,146 @@ async fn stale_fallback_is_served_when_the_provider_fails() {
     );
     assert_eq!(stale.value.signals.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // The negative entry from the failed fetch must not hide the still-usable
+    // stale data: the next call serves it again without re-calling the provider.
+    let stale_again = service.get_intelligence(request, 210).await;
+    assert_eq!(stale_again.meta.cache_state, CacheState::StaleServed);
+    assert_eq!(
+        stale_again.meta.degraded_reason,
+        Some(DegradedReason::NegativeCached)
+    );
+    assert_eq!(stale_again.value.signals.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_stale_entry_is_revalidated_and_the_new_value_is_cached() {
+    let (provider, calls, _) = fake(Ok(snapshot("TOKEN")));
+    let mut service = SocialIntelService::new(provider, policy(), 0);
+    let request = candidate_request("TOKEN", SocialPriority::PromisingCandidate, 80, 75);
+
+    assert_eq!(
+        service
+            .get_intelligence(request.clone(), 0)
+            .await
+            .meta
+            .cache_state,
+        CacheState::Miss
+    );
+    // Within the stale grace: the service revalidates synchronously.
+    let revalidated = service.get_intelligence(request.clone(), 200).await;
+    assert_eq!(revalidated.meta.cache_state, CacheState::Miss);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // The refreshed value is now fresh.
+    assert_eq!(
+        service
+            .get_intelligence(request, 201)
+            .await
+            .meta
+            .cache_state,
+        CacheState::FreshHit
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn distinct_assets_do_not_share_a_cache_entry() {
+    let (provider, calls, _) = fake(Ok(snapshot("TOKEN")));
+    let mut service = SocialIntelService::new(provider, policy(), 0);
+
+    let first = service
+        .get_intelligence(
+            candidate_request("TOKEN", SocialPriority::PromisingCandidate, 80, 75),
+            0,
+        )
+        .await;
+    assert_eq!(first.meta.cache_state, CacheState::Miss);
+
+    let second = service
+        .get_intelligence(
+            candidate_request("OTHER", SocialPriority::PromisingCandidate, 80, 75),
+            0,
+        )
+        .await;
+    assert_eq!(second.meta.cache_state, CacheState::Miss);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn budget_exhaustion_still_serves_a_stale_fallback() {
+    let (provider, calls, _) = fake(Ok(snapshot("TOKEN")));
+    let tight = SocialPolicy {
+        budget_capacity: 1,
+        ..policy()
+    };
+    let mut service = SocialIntelService::new(provider, tight, 0);
+    let request = candidate_request("TOKEN", SocialPriority::PromisingCandidate, 80, 75);
+
+    assert_eq!(
+        service
+            .get_intelligence(request.clone(), 0)
+            .await
+            .meta
+            .cache_state,
+        CacheState::Miss
+    );
+    // Stale, and no budget left: serve the stale value rather than nothing.
+    let stale = service.get_intelligence(request, 200).await;
+    assert_eq!(stale.meta.cache_state, CacheState::StaleServed);
+    assert_eq!(
+        stale.meta.degraded_reason,
+        Some(DegradedReason::BudgetExhausted)
+    );
+    assert_eq!(stale.value.signals.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn snapshots_are_bounded_and_mismatched_snapshots_fail_closed() {
+    let too_many: Vec<SocialSignal> = (0..100)
+        .map(|_| SocialSignal {
+            kind: SocialSignalKind::AttentionSurge,
+            weight_bps: 60_000,
+            observed_at_ms: 0,
+        })
+        .collect();
+    let oversized = SocialSnapshot {
+        chain: ChainId::Base,
+        token: asset("TOKEN"),
+        signals: too_many,
+        observed_at_ms: 0,
+    };
+    let (provider, _, shared) = fake(Ok(oversized));
+    let handle = provider.clone();
+    let mut service = SocialIntelService::new(provider, policy(), 0);
+    let request = candidate_request("TOKEN", SocialPriority::PromisingCandidate, 80, 75);
+
+    let bounded = service.get_intelligence(request.clone(), 0).await;
+    assert_eq!(bounded.value.signals.len(), social_intel::MAX_SIGNALS);
+    assert!(bounded
+        .value
+        .signals
+        .iter()
+        .all(|signal| signal.weight_bps <= social_intel::MAX_WEIGHT_BPS));
+
+    // A provider that returns a different asset is a contract violation and is
+    // treated as an outage, never cached under the request key.
+    *shared.lock().expect("lock") = Ok(snapshot("ATTACKER"));
+    *handle.forced_token.lock().expect("lock") = Some("ATTACKER".to_string());
+    let mismatched = service
+        .get_intelligence(
+            candidate_request("VICTIM", SocialPriority::PromisingCandidate, 80, 75),
+            10,
+        )
+        .await;
+    assert_eq!(
+        mismatched.meta.degraded_reason,
+        Some(DegradedReason::ProviderUnavailable)
+    );
+    assert!(mismatched.value.signals.is_empty());
+    assert_eq!(mismatched.value.token, asset("VICTIM"));
 }
 
 #[tokio::test]

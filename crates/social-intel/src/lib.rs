@@ -33,6 +33,6 @@ pub use error::SocialProviderError;
 pub use policy::{SocialPolicy, SocialPriority};
 pub use provider::{
     SocialProvider, SocialRequest, SocialSignal, SocialSignalKind, SocialSnapshot,
-    UnavailableSocialProvider,
+    UnavailableSocialProvider, MAX_SIGNALS, MAX_WEIGHT_BPS,
 };
 pub use service::{SocialIntelService, SocialMeta, SocialResponse};

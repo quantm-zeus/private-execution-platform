@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::SocialProviderError;
 use crate::policy::SocialPriority;
 
+/// Maximum number of signals the service serves or caches from one snapshot.
+///
+/// The service truncates a provider snapshot to this bound before caching or
+/// returning it, so a hostile/buggy provider cannot force unbounded output.
+pub const MAX_SIGNALS: usize = 64;
+/// Maximum allowed [`SocialSignal::weight_bps`]; the service clamps to it.
+pub const MAX_WEIGHT_BPS: u16 = 10_000;
+
 /// Bounded semantic class of one social observation.
 ///
 /// Raw upstream text/influencer identities are never carried: the provider maps

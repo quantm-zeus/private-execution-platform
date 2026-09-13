@@ -36,7 +36,9 @@ pub struct SocialPolicy {
     pub budget_refill_per_sec: u32,
     /// Fresh cache TTL.
     pub fresh_ttl_ms: u64,
-    /// Stale-while-revalidate grace after the fresh TTL.
+    /// Grace period after the fresh TTL in which a stale value may be served
+    /// (the service revalidates it synchronously and falls back to it on
+    /// failure).
     pub stale_grace_ms: u64,
     /// How long a provider failure is negatively cached.
     pub negative_ttl_ms: u64,

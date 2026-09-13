@@ -75,7 +75,7 @@ impl LogicalCache {
                         value: downcasted,
                         age_ms,
                     };
-                } else if age_ms <= fresh_ttl_ms + stale_grace_ms {
+                } else if age_ms <= fresh_ttl_ms.saturating_add(stale_grace_ms) {
                     return CacheLookup::Stale {
                         value: downcasted,
                         age_ms,
@@ -135,7 +135,7 @@ impl LogicalCache {
 
     /// Clears expired entries.
     pub fn prune_expired(&mut self, now_ms: u64, fresh_ttl_ms: u64, stale_grace_ms: u64) {
-        let max_age = fresh_ttl_ms + stale_grace_ms;
+        let max_age = fresh_ttl_ms.saturating_add(stale_grace_ms);
         self.entries
             .retain(|_, entry| now_ms.saturating_sub(entry.created_at_ms) <= max_age);
         self.negative_entries
@@ -214,5 +214,24 @@ mod tests {
             CacheLookup::Miss => {}
             _ => panic!("expected Miss after negative TTL"),
         }
+    }
+
+    #[test]
+    fn test_max_stale_grace_saturates_without_panicking() {
+        let mut cache = LogicalCache::new();
+        let ctx = RequestContext::default();
+        let key = LogicalRequestKey::new(ProviderId::Gmgn, "trending", "sol:1h".into(), &ctx);
+        cache.insert_success(
+            key.clone(),
+            Arc::new("payload".to_string()) as Arc<dyn Any + Send + Sync>,
+            0,
+        );
+
+        // `fresh_ttl + stale_grace` must not overflow.
+        match cache.lookup::<String>(&key, u64::MAX, 1, u64::MAX) {
+            CacheLookup::Stale { value, .. } => assert_eq!(*value, "payload"),
+            _ => panic!("expected Stale"),
+        }
+        cache.prune_expired(u64::MAX, 1, u64::MAX);
     }
 }

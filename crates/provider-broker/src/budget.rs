@@ -35,10 +35,19 @@ impl ProviderBudget {
         }
 
         let elapsed_ms = now_ms - self.last_replenished_ms;
-        let replenish = (elapsed_ms * (self.refill_per_sec as u64) * SCALE) / 1_000;
+        // Saturating: a caller-supplied clock that jumps far past the last
+        // replenishment must not overflow the fixed-width scaled arithmetic (it
+        // is then capped at `max_capacity` below regardless).
+        let replenish = elapsed_ms
+            .saturating_mul(self.refill_per_sec as u64)
+            .saturating_mul(SCALE)
+            / 1_000;
         let max_scaled = (self.max_capacity as u64) * SCALE;
 
-        self.available_scaled = (self.available_scaled + replenish).min(max_scaled);
+        self.available_scaled = self
+            .available_scaled
+            .saturating_add(replenish)
+            .min(max_scaled);
         self.last_replenished_ms = now_ms;
     }
 
@@ -114,5 +123,18 @@ mod tests {
 
         // Advance 1 second -> refills 10 units -> remaining 30 units (>= 25%)
         assert!(!budget.is_under_pressure(1_000));
+    }
+
+    #[test]
+    fn test_huge_clock_jump_saturates_and_caps_without_panicking() {
+        // A caller-supplied clock far past the last replenishment must not
+        // overflow the scaled replenishment arithmetic; it caps at capacity.
+        let mut budget = ProviderBudget::new(10, 100, 0);
+        assert!(budget.try_consume(u64::MAX, 5).is_ok());
+        assert_eq!(budget.available_units(u64::MAX), 5);
+
+        let mut budget = ProviderBudget::new(u32::MAX, u32::MAX, 0);
+        assert!(budget.try_consume(u64::MAX, 1).is_ok());
+        assert_eq!(budget.available_units(u64::MAX), u32::MAX - 1);
     }
 }
