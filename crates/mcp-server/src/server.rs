@@ -399,6 +399,7 @@ fn backend_result(outcome: BackendOutcome) -> Value {
         BackendOutcome::Value(value) => tool_value(&value),
         BackendOutcome::Unavailable => tool_error("backend unavailable"),
         BackendOutcome::Denied => tool_error("command denied"),
+        BackendOutcome::Failed => tool_error("command failed"),
     }
 }
 

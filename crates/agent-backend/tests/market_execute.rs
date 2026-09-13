@@ -193,6 +193,13 @@ impl RecordingExecution {
         }
     }
 
+    fn failed() -> Self {
+        Self {
+            result: Ok(MarketExecutionOutcome::Failed),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
     fn failing(error: MarketExecutionError) -> Self {
         Self {
             result: Err(error),
@@ -508,6 +515,39 @@ async fn execute_is_served_through_mcp_when_enabled_and_wired() {
         Value::String("submitted".to_string())
     );
     assert_eq!(port.calls(), 1);
+}
+
+#[tokio::test]
+async fn execute_maps_a_definitive_failure_to_an_error_result() {
+    // Directly: a definitively failed execution is a typed error, not a value.
+    let port = Arc::new(RecordingExecution::failed());
+    let backend = backend_with(
+        Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
+        port.clone(),
+    );
+    assert_eq!(
+        run(
+            &backend,
+            execute("USDC", "TOKEN", AmountSpec::TokenAtomic(AMOUNT))
+        )
+        .await,
+        BackendOutcome::Failed
+    );
+    assert_eq!(port.calls(), 1);
+
+    // Through MCP: it renders as an error result, not a successful "failed"
+    // value, and the port is still called exactly once.
+    let mcp_port = Arc::new(RecordingExecution::failed());
+    let server = server(mcp_port.clone(), true, true);
+    let frame = mcp_server::tools_call_frame(EXECUTE_COMMAND).expect("frame");
+    let response = server.handle(&frame).await;
+    let parsed: Value = serde_json::from_str(&response).expect("json");
+    assert_eq!(parsed["result"]["isError"], Value::Bool(true));
+    assert_eq!(
+        parsed["result"]["content"][0]["text"],
+        Value::String("command failed".to_string())
+    );
+    assert_eq!(mcp_port.calls(), 1);
 }
 
 #[tokio::test]

@@ -12,6 +12,11 @@ pub enum BackendOutcome {
     Unavailable,
     /// The backend refused (e.g. policy/risk); redacted.
     Denied,
+    /// The backend accepted the command but the operation definitively failed
+    /// (for example a chain rejection or a definitive pre-submit failure).
+    /// Distinct from [`BackendOutcome::Denied`], which is an authorization
+    /// refusal.
+    Failed,
 }
 
 /// Injected execution of an authorized command.

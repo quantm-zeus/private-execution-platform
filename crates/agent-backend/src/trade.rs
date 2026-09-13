@@ -394,6 +394,8 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     ///
     /// The intent is returned so `execute_market_order` can hand the exact same
     /// trusted intent (and route) to the execution port that produced the quote.
+    /// The caller supplies `now_ms` so one command reads the trusted clock once
+    /// and uses the same instant for pricing and execution.
     #[allow(clippy::too_many_arguments)]
     fn quote_market_preview(
         &self,
@@ -404,6 +406,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount: AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
+        now_ms: i64,
     ) -> Result<(TradeIntent, MarketPreview), BackendError> {
         let (intent, amount_in) = self.preview_intent(
             channel,
@@ -414,7 +417,6 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             max_slippage_bps,
             max_price_impact_bps,
         )?;
-        let now_ms = self.clock.now_ms();
         let preview = plan_market_preview(
             self.market.as_ref(),
             self.gas.as_deref(),
@@ -441,6 +443,9 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
     ) -> BackendOutcome {
+        // Read the trusted clock once: the quote and the execution request must
+        // be stamped with the same instant.
+        let now_ms = self.clock.now_ms();
         let (intent, preview) = match self.quote_market_preview(
             channel,
             token_in,
@@ -449,12 +454,12 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             amount,
             max_slippage_bps,
             max_price_impact_bps,
+            now_ms,
         ) {
             Ok(quoted) => quoted,
             Err(BackendError::Denied) => return BackendOutcome::Denied,
             Err(BackendError::Unavailable) => return BackendOutcome::Unavailable,
         };
-        let now_ms = self.clock.now_ms();
         let request = MarketExecutionRequest {
             intent,
             quote: preview.quote,
@@ -462,7 +467,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             now_ms,
         };
         match self.execution.execute(request).await {
-            Ok(outcome) => BackendOutcome::Value(json!({ "execution": execution_json(outcome) })),
+            Ok(outcome) => execution_outcome(outcome),
             Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
             Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
         }
@@ -542,19 +547,23 @@ where
                 amount,
                 max_slippage_bps,
                 max_price_impact_bps,
-            } => match self.quote_market_preview(
-                channel,
-                token_in,
-                token_out,
-                side,
-                amount,
-                max_slippage_bps,
-                max_price_impact_bps,
-            ) {
-                Ok((_intent, preview)) => BackendOutcome::Value(json!({ "preview": preview })),
-                Err(BackendError::Denied) => BackendOutcome::Denied,
-                Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
-            },
+            } => {
+                let now_ms = self.clock.now_ms();
+                match self.quote_market_preview(
+                    channel,
+                    token_in,
+                    token_out,
+                    side,
+                    amount,
+                    max_slippage_bps,
+                    max_price_impact_bps,
+                    now_ms,
+                ) {
+                    Ok((_intent, preview)) => BackendOutcome::Value(json!({ "preview": preview })),
+                    Err(BackendError::Denied) => BackendOutcome::Denied,
+                    Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
+                }
+            }
             TradeCommand::ExecuteMarketOrder {
                 token_in,
                 token_out,
@@ -886,22 +895,30 @@ fn outcome_for(result: Result<StoredLimitOrder, BackendError>) -> BackendOutcome
     }
 }
 
-/// Shapes a port execution outcome into the authenticated response payload.
+/// Shapes a port execution outcome into the authenticated backend result.
 ///
 /// The payload is intentionally coarse: the state is explicit and realized
-/// amounts are included only when the chain observed them.
-fn execution_json(outcome: MarketExecutionOutcome) -> serde_json::Value {
+/// amounts are included only when the chain observed them. A definitively
+/// failed execution is surfaced as [`BackendOutcome::Failed`] so the MCP layer
+/// renders it as an error rather than a successful `"failed"` value.
+fn execution_outcome(outcome: MarketExecutionOutcome) -> BackendOutcome {
     match outcome {
-        MarketExecutionOutcome::Submitted => json!({ "state": "submitted" }),
+        MarketExecutionOutcome::Submitted => {
+            BackendOutcome::Value(json!({ "execution": { "state": "submitted" } }))
+        }
         MarketExecutionOutcome::Filled {
             net_input,
             net_output,
-        } => json!({
-            "state": "filled",
-            "net_input": net_input,
-            "net_output": net_output,
-        }),
-        MarketExecutionOutcome::Unknown => json!({ "state": "unknown" }),
-        MarketExecutionOutcome::Failed => json!({ "state": "failed" }),
+        } => BackendOutcome::Value(json!({
+            "execution": {
+                "state": "filled",
+                "net_input": net_input,
+                "net_output": net_output,
+            }
+        })),
+        MarketExecutionOutcome::Unknown => {
+            BackendOutcome::Value(json!({ "execution": { "state": "unknown" } }))
+        }
+        MarketExecutionOutcome::Failed => BackendOutcome::Failed,
     }
 }
