@@ -184,10 +184,12 @@ pub fn plan_market_preview(
 
 /// Collapses the router taxonomy into the two redacted preview classes.
 ///
-/// Every "market said no" class (empty/stale/invalid route state, impact or
-/// bridge rejection, zero output) is [`MarketPreviewError::NoViableRoute`]; a
-/// configuration/domain/internal failure is [`MarketPreviewError::Unavailable`]
-/// so an operator misconfiguration is not reported as a tradeable no-route.
+/// Every "market said no" class (empty pool set, stale/resync-required route
+/// state, impact or bridge rejection, zero output) is
+/// [`MarketPreviewError::NoViableRoute`]; a structural pool/assessment fault,
+/// configuration error, domain failure, or internal failure is
+/// [`MarketPreviewError::Unavailable`] so an operator misconfiguration is not
+/// reported as a tradeable no-route.
 fn classify(error: RoutingError) -> MarketPreviewError {
     use RoutingError::*;
     match error {

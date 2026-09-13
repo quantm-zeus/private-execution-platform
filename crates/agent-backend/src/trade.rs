@@ -134,6 +134,13 @@ pub struct TradingBackendConfig {
     /// [`agent_commands::AgentCapabilities::max_trade_usd`], and an asset-bound
     /// `max_total_cost` would otherwise reject every order whose input asset
     /// differs from the configured asset.
+    ///
+    /// A **zero** `max_price_impact` (or `max_slippage`) is the router's
+    /// "unbounded" sentinel, not a zero-tolerance cap: it is the operator's
+    /// configuration and is forwarded as such. Operators who want a real bound
+    /// must set a non-zero cap, because a 0 cannot be distinguished from "no
+    /// cap" downstream. A command-supplied cap can never loosen this value (see
+    /// `effective_cap`).
     pub risk: RiskConstraints,
     /// Minimum partial-fill size; clamped up to 1 and down to the order amount.
     pub min_fill: AtomicAmount,
