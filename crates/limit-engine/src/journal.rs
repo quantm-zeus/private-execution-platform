@@ -91,6 +91,7 @@ use storage::{
 use tokio::sync::Mutex as AsyncMutex;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::attempt::{attempt_stream_blind_index, OrderAttemptEvent, ATTEMPT_SCHEMA_VERSION};
 use crate::error::LimitEngineError;
 use crate::fill::conservation_holds;
 use crate::fsm::{apply_transition, is_terminal};
@@ -252,6 +253,66 @@ pub struct OrderTransitionEvent {
     pub occurred_at_ms: i64,
 }
 
+/// Result of appending an attempt event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptAppendOutcome {
+    /// The event was assigned the next sequence and appended.
+    Applied(OrderAttemptEvent),
+    /// An identical `(attempt_seq, phase)` event already exists; nothing was
+    /// re-sealed and nothing was re-appended.
+    AlreadyApplied(OrderAttemptEvent),
+}
+
+/// One open order whose latest attempt may already have reached the chain.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InFlightAttempt {
+    /// Opaque keyed object id, never the order id.
+    pub object_id: String,
+    /// The reconstructed open order.
+    pub order: StoredLimitOrder,
+    /// Latest attempt event for `order`.
+    pub attempt: OrderAttemptEvent,
+}
+
+impl std::fmt::Debug for InFlightAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The order carries plaintext trading semantics; never render it. The
+        // attempt's own Debug is already redacted.
+        formatter
+            .debug_struct("InFlightAttempt")
+            .field("phase", &self.attempt.phase)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of an attempt-aware recovery pass.
+///
+/// `Debug` is redacted: the orders carry plaintext trading semantics, so only
+/// counts and classification are rendered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttemptRecoveryOutcome {
+    /// Non-terminal orders whose attempt stream also authenticated.
+    pub open: Vec<StoredLimitOrder>,
+    /// Open orders whose latest attempt is non-terminal and possibly sent.
+    pub in_flight: Vec<InFlightAttempt>,
+    /// Quarantined orders, including attempt-stream faults.
+    pub quarantined: Vec<QuarantinedOrder>,
+    /// Whether order enumeration stopped at the hard object cap.
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for AttemptRecoveryOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttemptRecoveryOutcome")
+            .field("open", &self.open.len())
+            .field("in_flight", &self.in_flight.len())
+            .field("quarantined", &self.quarantined.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
 /// One order skipped by recovery because its durable records could not be
 /// trusted.
 ///
@@ -273,7 +334,9 @@ pub struct QuarantinedOrder {
 /// aborting the whole pass. `truncated` is set when the hard object cap
 /// ([`RECOVERY_MAX_OBJECTS`]) was reached, so the caller knows older orders may
 /// not have been examined.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is redacted: only counts are rendered, never the plaintext orders.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoveryOutcome {
     /// Healthy orders that are not terminal.
     pub open: Vec<StoredLimitOrder>,
@@ -283,8 +346,19 @@ pub struct RecoveryOutcome {
     pub truncated: bool,
 }
 
+impl std::fmt::Debug for RecoveryOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryOutcome")
+            .field("open", &self.open.len())
+            .field("quarantined", &self.quarantined.len())
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
 /// Fixed-width canonical chain tag (unkeyed; the outer HMAC keys the result).
-fn chain_tag(chain: &ChainId) -> [u8; 32] {
+pub(crate) fn chain_tag(chain: &ChainId) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(CHAIN_TAG_DOMAIN);
     match chain {
@@ -302,7 +376,7 @@ fn chain_tag(chain: &ChainId) -> [u8; 32] {
 }
 
 /// Keyed HMAC over `domain` followed by each `part`.
-fn derive(
+pub(crate) fn derive(
     key: &BlindIndexKey,
     domain: &[u8],
     parts: &[&[u8]],
@@ -317,7 +391,7 @@ fn derive(
 }
 
 /// Lowercase hex encoding; no dependency and no padding ambiguity.
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -559,6 +633,172 @@ fn open_event(
     Ok(event)
 }
 
+/// Seals an attempt payload under `(attempt_stream, sequence)`.
+///
+/// The attempt stream is domain-separated from both the transition stream and
+/// the object id, so the at-rest deterministic nonce is never reused across
+/// scopes.
+fn seal_attempt(
+    material: &OrderKeyMaterial,
+    stream: &[u8],
+    sequence: u64,
+    event: &OrderAttemptEvent,
+) -> Result<Vec<u8>, LimitEngineError> {
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(event).map_err(|_| LimitEngineError::SealFailed)?);
+    seal_at_rest(
+        &material.seal,
+        &material.kid,
+        sequence,
+        ATTEMPT_SCHEMA_VERSION,
+        stream,
+        &plaintext,
+    )
+    .map_err(|_| LimitEngineError::SealFailed)
+}
+
+/// Opens and validates one attempt record.
+fn open_attempt(
+    keys: &dyn OrderKeyProvider,
+    chain: &ChainId,
+    stream: &[u8],
+    record: &OpaqueEventRecord,
+) -> Result<OrderAttemptEvent, LimitEngineError> {
+    let material = material_for(keys, &record.ciphertext)?;
+    let plaintext = Zeroizing::new(
+        open_at_rest(
+            &material.seal,
+            &material.kid,
+            record.sequence,
+            record.schema_version,
+            stream,
+            &record.ciphertext,
+        )
+        .map_err(|_| LimitEngineError::OpenFailed)?,
+    );
+    let event: OrderAttemptEvent =
+        serde_json::from_slice(&plaintext).map_err(|_| LimitEngineError::RecordMalformed)?;
+    if event.schema_version != record.schema_version || event.sequence != record.sequence {
+        return Err(LimitEngineError::RecordMalformed);
+    }
+    event.validate()?;
+    attempt_identity_binds(&material.blind_index, chain, &event)?;
+    Ok(event)
+}
+
+/// Re-derives the per-attempt identities and requires the record to carry them.
+///
+/// The attempt journal is a reserve-before-sign WAL, so its identities must be
+/// reproducible, not caller-asserted: any component (or a corrupted record) must
+/// not be able to persist an attempt whose idempotency key or intent id belongs
+/// to a different `(order, attempt_seq)`. A mismatch is fail-closed
+/// [`LimitEngineError::RecordMalformed`]. For a `Bound` event the bound intent is
+/// additionally required to be the derived per-attempt intent on the same chain,
+/// so a restarted reconciler can always reconstruct the reservation it names.
+fn attempt_identity_binds(
+    blind_index: &BlindIndexKey,
+    chain: &ChainId,
+    event: &OrderAttemptEvent,
+) -> Result<(), LimitEngineError> {
+    let expected_key =
+        crate::attempt::attempt_key(blind_index, chain, &event.order_id, event.attempt_seq)?;
+    if event.attempt_key != expected_key {
+        return Err(LimitEngineError::RecordMalformed);
+    }
+    if let Some(bound) = &event.bound {
+        let expected_intent = crate::attempt::attempt_intent_id(
+            blind_index,
+            chain,
+            &event.order_id,
+            event.attempt_seq,
+        )?;
+        if bound.intent.idempotency_key != expected_key
+            || bound.intent.id != expected_intent
+            || bound.intent.chain != *chain
+        {
+            return Err(LimitEngineError::RecordMalformed);
+        }
+    }
+    Ok(())
+}
+
+/// Enforces per-order attempt ordering on the authoritative attempt stream.
+///
+/// The attempt stream is the durable reserve-before-sign log, so its ordering is
+/// an invariant, not a convention:
+/// - the first event is `Bound` for attempt `1`;
+/// - a later phase may only continue the *latest* attempt while it is not
+///   terminal (so `Unknown` blocks any new attempt until it is reconciled);
+/// - a new attempt must be `Bound` with `attempt_seq == last + 1` and may only
+///   start after the previous attempt is terminal.
+///
+/// This is what makes "restart never creates a duplicate trade" structural: a
+/// non-terminal attempt can never be followed by a fresh signable `Bound`.
+fn validate_attempt_order(
+    existing: &[OrderAttemptEvent],
+    candidate: &OrderAttemptEvent,
+) -> Result<(), LimitEngineError> {
+    let Some(last) = existing.last() else {
+        if candidate.attempt_seq == 1 && candidate.phase == crate::attempt::AttemptPhase::Bound {
+            return Ok(());
+        }
+        return Err(LimitEngineError::StoreInvalid);
+    };
+    if candidate.attempt_seq == last.attempt_seq {
+        if last.phase.is_terminal() || candidate.phase == crate::attempt::AttemptPhase::Bound {
+            return Err(LimitEngineError::StoreInvalid);
+        }
+        return Ok(());
+    }
+    let expected_next = last
+        .attempt_seq
+        .checked_add(1)
+        .ok_or(LimitEngineError::ArithmeticOverflow)?;
+    if candidate.attempt_seq == expected_next
+        && last.phase.is_terminal()
+        && candidate.phase == crate::attempt::AttemptPhase::Bound
+    {
+        return Ok(());
+    }
+    Err(LimitEngineError::StoreInvalid)
+}
+
+/// Reads and authenticates a contiguous attempt stream from sequence one.
+async fn read_attempt_records<S: OpaqueStore>(
+    store: &S,
+    keys: &dyn OrderKeyProvider,
+    chain: &ChainId,
+    stream: &[u8],
+) -> Result<Vec<OrderAttemptEvent>, LimitEngineError> {
+    let mut expected: u64 = 1;
+    let mut events = Vec::new();
+    loop {
+        let batch = store
+            .read_events(stream, expected, REPLAY_BATCH)
+            .await
+            .map_err(map_storage)?;
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            break;
+        }
+        for record in batch {
+            if record.sequence != expected {
+                return Err(LimitEngineError::RecoveryInconsistent);
+            }
+            let event = open_attempt(keys, chain, stream, &record)?;
+            validate_attempt_order(&events, &event)?;
+            events.push(event);
+            expected = expected
+                .checked_add(1)
+                .ok_or(LimitEngineError::ArithmeticOverflow)?;
+        }
+        if batch_len < REPLAY_BATCH {
+            break;
+        }
+    }
+    Ok(events)
+}
+
 /// Enumerates every object of `class` by paging the deterministic class
 /// ordering, stopping at [`RECOVERY_MAX_OBJECTS`].
 ///
@@ -771,6 +1011,206 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
             }
         }
     }
+
+    /// Reads and authenticates `order_id`'s append-only attempt stream.
+    pub async fn read_attempts(
+        &self,
+        order_id: &OrderId,
+    ) -> Result<Vec<OrderAttemptEvent>, LimitEngineError> {
+        let material = self.keys.current()?;
+        let stream = attempt_stream_blind_index(&material.blind_index, &self.chain, order_id)?;
+        read_attempt_records(
+            self.store.as_ref(),
+            self.keys.as_ref(),
+            &self.chain,
+            &stream,
+        )
+        .await
+    }
+
+    /// Returns the latest attempt event for `order_id`, if any.
+    pub async fn latest_attempt(
+        &self,
+        order_id: &OrderId,
+    ) -> Result<Option<OrderAttemptEvent>, LimitEngineError> {
+        Ok(self.read_attempts(order_id).await?.pop())
+    }
+
+    /// Appends one attempt-lifecycle event idempotently.
+    ///
+    /// The identity of an append is `(attempt_seq, phase)`: re-appending the
+    /// same phase returns [`AttemptAppendOutcome::AlreadyApplied`] without
+    /// sealing or writing anything, while a different payload for the same
+    /// `(attempt_seq, phase)` is [`LimitEngineError::PersistenceConflict`]. The
+    /// caller-supplied `sequence` is ignored; the store assigns the next free
+    /// contiguous sequence after reading the authoritative stream. Ordering is
+    /// enforced by [`validate_attempt_order`], so a fresh `Bound` can never
+    /// follow a non-terminal attempt.
+    pub async fn append_attempt(
+        &self,
+        event: &OrderAttemptEvent,
+    ) -> Result<AttemptAppendOutcome, LimitEngineError> {
+        let material = self.keys.current()?;
+        let stream =
+            attempt_stream_blind_index(&material.blind_index, &self.chain, &event.order_id)?;
+
+        // Serialize the authoritative-read -> check -> seal -> append-CAS path so
+        // a racing writer observes the winner before sealing a different event
+        // at the same deterministic nonce scope.
+        let _guard = seal_guard().lock().await;
+
+        // An attempt is only meaningful for an order this store already holds.
+        let object_id = object_id(&material.blind_index, &self.chain, &event.order_id)?;
+        let Some(record) = self.read_record(&object_id).await? else {
+            return Err(LimitEngineError::StoreInvalid);
+        };
+        // A `Bound` event starts a new signable attempt, so it must never be
+        // attached to a terminal order. Later-phase events are permitted so a
+        // late reconciliation can still record an already-observed outcome.
+        if event.phase == crate::attempt::AttemptPhase::Bound
+            && is_terminal(record.current.order.status)
+        {
+            return Err(LimitEngineError::InvalidTransition);
+        }
+
+        let events = read_attempt_records(
+            self.store.as_ref(),
+            self.keys.as_ref(),
+            &self.chain,
+            &stream,
+        )
+        .await?;
+        // Idempotency first: an existing `(attempt_seq, phase)` event wins.
+        if let Some(present) = events.iter().find(|present| {
+            present.attempt_seq == event.attempt_seq && present.phase == event.phase
+        }) {
+            let mut normalized = event.clone();
+            normalized.sequence = present.sequence;
+            normalized.validate()?;
+            attempt_identity_binds(&material.blind_index, &self.chain, &normalized)?;
+            if *present != normalized {
+                return Err(LimitEngineError::PersistenceConflict);
+            }
+            return Ok(AttemptAppendOutcome::AlreadyApplied(present.clone()));
+        }
+
+        let head = events.last().map(|present| present.sequence).unwrap_or(0);
+        let sequence = head
+            .checked_add(1)
+            .ok_or(LimitEngineError::ArithmeticOverflow)?;
+        let mut record_event = event.clone();
+        record_event.sequence = sequence;
+        record_event.validate()?;
+        attempt_identity_binds(&material.blind_index, &self.chain, &record_event)?;
+        validate_attempt_order(&events, &record_event)?;
+
+        let record = OpaqueEventRecord {
+            stream_blind_index: stream.to_vec(),
+            sequence,
+            schema_version: ATTEMPT_SCHEMA_VERSION,
+            ciphertext: seal_attempt(&material, &stream, sequence, &record_event)?,
+            created_bucket: bucket_for_ms(record_event.occurred_at_ms)?,
+        };
+        record
+            .validate()
+            .map_err(|_| LimitEngineError::RecordMalformed)?;
+        match self.store.append_event(record).await {
+            Ok(()) => Ok(AttemptAppendOutcome::Applied(record_event)),
+            Err(StorageError::Conflict) => {
+                // A cross-process writer landed this sequence first. Re-read and
+                // take the idempotent/conflict path; never seal a second event.
+                let existing = self
+                    .store
+                    .read_events(&stream, sequence, 1)
+                    .await
+                    .map_err(map_storage)?;
+                match existing.first() {
+                    Some(record) if record.sequence == sequence => {
+                        let present =
+                            open_attempt(self.keys.as_ref(), &self.chain, &stream, record)?;
+                        let mut normalized = event.clone();
+                        normalized.sequence = present.sequence;
+                        normalized.validate()?;
+                        attempt_identity_binds(&material.blind_index, &self.chain, &normalized)?;
+                        if present != normalized {
+                            return Err(LimitEngineError::PersistenceConflict);
+                        }
+                        Ok(AttemptAppendOutcome::AlreadyApplied(present))
+                    }
+                    _ => Err(LimitEngineError::PersistenceConflict),
+                }
+            }
+            Err(error) => Err(map_storage(error)),
+        }
+    }
+}
+
+/// Enumerates open orders and classifies each one's latest attempt.
+///
+/// This is the restart read path the Phase-5 orchestrator consumes: an order
+/// whose latest attempt is non-terminal is reported in `in_flight` and must be
+/// reconciled, never re-signed. No signing or submission capability exists on
+/// this path.
+///
+/// An order whose attempt stream cannot be authenticated is *not* reported as
+/// healthy: it is quarantined and omitted from `open`, so a caller can never
+/// mistake an unreadable in-flight attempt for an idle order.
+pub async fn recover_in_flight<S: OpaqueStore>(
+    store: &S,
+    keys: &dyn OrderKeyProvider,
+) -> Result<AttemptRecoveryOutcome, LimitEngineError> {
+    let recovery = recover_open(store, keys).await?;
+    let material = keys.current()?;
+    let mut open = Vec::new();
+    let mut in_flight = Vec::new();
+    let mut quarantined = recovery.quarantined;
+    for order in recovery.open {
+        let object_key = object_id(&material.blind_index, &order.order.chain, &order.order.id)?;
+        let stream = match attempt_stream_blind_index(
+            &material.blind_index,
+            &order.order.chain,
+            &order.order.id,
+        ) {
+            Ok(stream) => stream,
+            Err(reason) if is_per_order_fault(reason) => {
+                quarantined.push(QuarantinedOrder {
+                    object_id: object_key,
+                    reason,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match read_attempt_records(store, keys, &order.order.chain, &stream).await {
+            Ok(events) => {
+                if let Some(latest) = events.last() {
+                    if latest.phase.is_in_flight() {
+                        in_flight.push(InFlightAttempt {
+                            object_id: object_key,
+                            order: order.clone(),
+                            attempt: latest.clone(),
+                        });
+                    }
+                }
+                open.push(order);
+            }
+            Err(reason) if is_per_order_fault(reason) => {
+                quarantined.push(QuarantinedOrder {
+                    object_id: object_key,
+                    reason,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    in_flight.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+    open.sort_by(|left, right| left.order.id.as_str().cmp(right.order.id.as_str()));
+    Ok(AttemptRecoveryOutcome {
+        open,
+        in_flight,
+        quarantined,
+        truncated: recovery.truncated,
+    })
 }
 
 #[async_trait]

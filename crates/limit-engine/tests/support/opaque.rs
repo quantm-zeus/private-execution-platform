@@ -144,6 +144,67 @@ impl InMemoryOpaqueStore {
             .objects
             .retain(|object| object.id != id || object.version <= keep_max);
     }
+
+    /// Flips the last ciphertext byte of one stored event (tamper seam).
+    ///
+    /// Returns whether a matching event was found.
+    pub fn tamper_event(&self, stream: &[u8], sequence: u64) -> bool {
+        let mut inner = lock(&self.inner);
+        match inner
+            .events
+            .iter_mut()
+            .find(|stored| stored.stream_blind_index == stream && stored.sequence == sequence)
+        {
+            Some(record) if !record.ciphertext.is_empty() => {
+                let last = record.ciphertext.len() - 1;
+                record.ciphertext[last] ^= 0xff;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops one stored event entirely, simulating a truncated stream.
+    pub fn drop_event(&self, stream: &[u8], sequence: u64) {
+        lock(&self.inner)
+            .events
+            .retain(|stored| stored.stream_blind_index != stream || stored.sequence != sequence);
+    }
+
+    /// Swaps the ciphertext bodies of two stored events (tamper seam).
+    ///
+    /// Returns whether both events were found and swapped.
+    pub fn swap_event_ciphertexts(
+        &self,
+        stream_a: &[u8],
+        seq_a: u64,
+        stream_b: &[u8],
+        seq_b: u64,
+    ) -> bool {
+        let mut inner = lock(&self.inner);
+        let Some(pos_a) = inner
+            .events
+            .iter()
+            .position(|stored| stored.stream_blind_index == stream_a && stored.sequence == seq_a)
+        else {
+            return false;
+        };
+        let Some(pos_b) = inner
+            .events
+            .iter()
+            .position(|stored| stored.stream_blind_index == stream_b && stored.sequence == seq_b)
+        else {
+            return false;
+        };
+        if pos_a == pos_b {
+            return false;
+        }
+        let body_a = inner.events[pos_a].ciphertext.clone();
+        let body_b = inner.events[pos_b].ciphertext.clone();
+        inner.events[pos_a].ciphertext = body_b;
+        inner.events[pos_b].ciphertext = body_a;
+        true
+    }
 }
 
 #[async_trait]
@@ -322,6 +383,16 @@ impl TestOrderKeys {
     /// Fresh blind-index key material.
     pub fn blind_key(&self) -> BlindIndexKey {
         BlindIndexKey::from_bytes(self.blind)
+    }
+
+    /// The raw seal bytes, for building a provider with a different key id.
+    pub fn seal_bytes(&self) -> [u8; 32] {
+        self.seal
+    }
+
+    /// The raw key id.
+    pub fn kid_bytes(&self) -> [u8; 16] {
+        self.kid
     }
 
     /// The provider's material for the current key id.

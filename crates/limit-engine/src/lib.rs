@@ -69,6 +69,7 @@
 //!    target with zero remaining, an all-or-nothing partial fill, and a fill
 //!    that is zero or below `min_fill` are all rejected fail-closed.
 
+pub mod attempt;
 pub mod error;
 pub mod fill;
 pub mod fsm;
@@ -77,13 +78,18 @@ pub mod order;
 pub mod store;
 pub mod trigger;
 
+pub use attempt::{
+    attempt_intent_id, attempt_key, attempt_stream_blind_index, ApprovalSnapshot, AttemptPhase,
+    BoundAttempt, OrderAttemptEvent, ATTEMPT_SCHEMA_VERSION,
+};
 pub use error::LimitEngineError;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
 pub use fsm::{apply_transition, is_terminal, validate_transition};
 pub use journal::{
-    class_blind_index, object_id, order_id_for_creation, owner_blind_index, recover_open,
-    stream_blind_index, BlindIndexKey, DurableLimitOrderStore, DurableOrderRecord,
-    OrderKeyMaterial, OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder, RecoveryOutcome,
+    class_blind_index, object_id, order_id_for_creation, owner_blind_index, recover_in_flight,
+    recover_open, stream_blind_index, AttemptAppendOutcome, AttemptRecoveryOutcome, BlindIndexKey,
+    DurableLimitOrderStore, DurableOrderRecord, InFlightAttempt, OrderKeyMaterial,
+    OrderKeyProvider, OrderTransitionEvent, QuarantinedOrder, RecoveryOutcome,
     UnavailableOrderKeyProvider,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
