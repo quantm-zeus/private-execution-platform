@@ -402,6 +402,13 @@ impl AttemptExecutor for FakeExecutor {
             .pop_front()
             .expect("scripted resolution")
     }
+
+    /// P52 seam: `tick` never reconciles, so the default is an ambiguous state.
+    /// The dedicated P52 recovery tests script this on their own fake, which
+    /// also counts every call.
+    async fn reconcile(&self, _attempt: &BoundAttempt, _now_ms: i64) -> AttemptResolution {
+        AttemptResolution::Unknown
+    }
 }
 
 /// Order shape for a harness fixture.

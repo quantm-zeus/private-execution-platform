@@ -10,6 +10,7 @@
 //! contiguity, and recovery.
 
 use domain::{ExecutionPreview, IdempotencyKey, IntentId, OrderId, RoutePlan, TradeIntent};
+use market_types::AtomicAmount;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LimitEngineError;
@@ -17,6 +18,26 @@ use crate::journal::{chain_tag, derive, to_hex, BlindIndexKey};
 
 /// Schema version stamped on every attempt record.
 pub const ATTEMPT_SCHEMA_VERSION: u16 = 1;
+
+/// Realized net fill reported by the execution seam.
+///
+/// This lives inside the sealed ciphertext of a `Confirmed` attempt event, never
+/// in an outer record field. `Debug` is redacted: it never renders either
+/// amount. It is serializable so a recovered `Confirmed` event can replay the
+/// exact realized economics.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealizedFill {
+    /// Net input actually consumed on chain.
+    pub net_input: AtomicAmount,
+    /// Net output actually received on chain.
+    pub net_output: AtomicAmount,
+}
+
+impl std::fmt::Debug for RealizedFill {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RealizedFill { .. }")
+    }
+}
 
 /// Domain label for the per-order attempt stream.
 pub const ATTEMPT_STREAM_DOMAIN: &[u8] = b"limit.attempt.stream.v1";
@@ -202,6 +223,13 @@ pub struct OrderAttemptEvent {
     pub occurred_at_ms: i64,
     /// Bound context; present exactly on a `Bound` event.
     pub bound: Option<BoundAttempt>,
+    /// Realized net fill, present exactly on a `Confirmed` event written by the
+    /// orchestrator. Sealed inside the ciphertext, never an outer record field.
+    ///
+    /// `#[serde(default)]` keeps a legacy `Confirmed` record (which predates the
+    /// field) decodable as `None`; recovery fails that case closed.
+    #[serde(default)]
+    pub realized_fill: Option<RealizedFill>,
 }
 
 impl std::fmt::Debug for OrderAttemptEvent {
@@ -230,6 +258,7 @@ impl OrderAttemptEvent {
             payload_digest: Some(bound.payload_digest),
             occurred_at_ms,
             bound: Some(bound),
+            realized_fill: None,
         }
     }
 
@@ -255,6 +284,34 @@ impl OrderAttemptEvent {
             payload_digest: None,
             occurred_at_ms,
             bound: None,
+            realized_fill: None,
+        }
+    }
+
+    /// Builds a `Confirmed` event carrying the realized net fill.
+    ///
+    /// A `Confirmed` written by the orchestrator always carries the fill it
+    /// applied, so a restart can replay the exact economics without re-signing.
+    /// `sequence` is assigned by the store when the event is appended.
+    pub fn confirmed(
+        order_id: OrderId,
+        attempt_seq: u64,
+        attempt_key: IdempotencyKey,
+        realized_fill: RealizedFill,
+        occurred_at_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: ATTEMPT_SCHEMA_VERSION,
+            sequence: 0,
+            order_id,
+            attempt_seq,
+            attempt_key,
+            phase: AttemptPhase::Confirmed,
+            request_digest: None,
+            payload_digest: None,
+            occurred_at_ms,
+            bound: None,
+            realized_fill: Some(realized_fill),
         }
     }
 

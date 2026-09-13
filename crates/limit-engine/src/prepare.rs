@@ -221,23 +221,27 @@ pub fn prepare_attempt(
     })
 }
 
-/// Exact `min_out` floor satisfying both the net limit and the slippage cap.
+/// Exact `min_out` floor from the intent's own amount and the route.
 ///
 /// BUY: `net_out >= ceil(net_in * limit_den / limit_num)`.
 /// SELL: `net_out >= ceil(net_in * limit_num / limit_den)`.
 /// Slippage: `net_out >= ceil(expected_net_output * (10_000 - max_slippage) / 10_000)`.
 /// The floor is the maximum of the two (and at least one), which is what the
 /// revalidation gate's step-9 checks accept.
-fn compute_min_out(
+///
+/// `net_in` is `intent.amount`, which is exactly the enforced `net_input` of the
+/// simulated delta (the caller binds the two before this computation). This
+/// shared entry point lets recovery re-derive the same floor from a durable
+/// [`crate::attempt::BoundAttempt`] without a live [`NetDelta`].
+pub(crate) fn min_out_for(
     intent: &TradeIntent,
     route: &RoutePlan,
-    net_delta: &NetDelta,
 ) -> Result<AssetAmount, LimitEngineError> {
     let limit = intent
         .limit_price
         .as_ref()
         .ok_or(LimitEngineError::InvalidOrder)?;
-    let net_in = net_delta.net_input.amount.get();
+    let net_in = intent.amount.get();
     let (num, den) = (
         limit.ratio.numerator_atomic(),
         limit.ratio.denominator_atomic(),
@@ -254,6 +258,19 @@ fn compute_min_out(
         asset: intent.token_out.clone(),
         amount: AtomicAmount::new(floor),
     })
+}
+
+/// `min_out` floor for a simulated delta, after binding `net_input` to the
+/// intent's amount.
+fn compute_min_out(
+    intent: &TradeIntent,
+    route: &RoutePlan,
+    net_delta: &NetDelta,
+) -> Result<AssetAmount, LimitEngineError> {
+    if net_delta.net_input.amount != intent.amount {
+        return Err(LimitEngineError::IntegrityViolation);
+    }
+    min_out_for(intent, route)
 }
 
 /// `ceil(a * b / d)` with a 256-bit product and checked arithmetic.

@@ -82,8 +82,8 @@ pub mod trigger;
 
 pub use attempt::{
     attempt_intent_id, attempt_key, attempt_prepared_reference, attempt_stream_blind_index,
-    ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, ATTEMPT_PREPARED_DOMAIN,
-    ATTEMPT_SCHEMA_VERSION,
+    ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, RealizedFill,
+    ATTEMPT_PREPARED_DOMAIN, ATTEMPT_SCHEMA_VERSION,
 };
 pub use error::LimitEngineError;
 pub use fill::{apply_fill, conservation_holds, FillDelta};
@@ -96,7 +96,7 @@ pub use journal::{
     RecoveryOutcome, UnavailableOrderKeyProvider,
 };
 pub use orchestrator::{
-    AttemptExecutor, AttemptLimits, AttemptResolution, Orchestrator, RealizedFill, TickInput,
+    AttemptExecutor, AttemptLimits, AttemptResolution, Orchestrator, RecoveryReport, TickInput,
     TickOutcome,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};

@@ -53,34 +53,20 @@ use market_types::AtomicAmount;
 use policy::PolicyEngine;
 use storage::OpaqueStore;
 
-use crate::attempt::{ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent};
+use crate::attempt::{
+    ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, RealizedFill,
+};
 use crate::error::LimitEngineError;
 use crate::fill::FillDelta;
 use crate::fsm::{apply_transition, is_terminal};
 use crate::journal::{AttemptAppendOutcome, DurableLimitOrderStore};
 use crate::order::{OrderTransition, StoredLimitOrder};
 use crate::prepare::{
-    prepare_attempt, AttemptTrust, PrepareAttemptInput, PreparedAttempt, PreparedAttemptOutcome,
+    min_out_for, prepare_attempt, AttemptTrust, PrepareAttemptInput, PreparedAttempt,
+    PreparedAttemptOutcome,
 };
 use crate::store::{AppendOutcome, LimitOrderStore};
 use crate::trigger::{evaluate_trigger, QuoteOutcome, QuoteProvider, TriggerDecision};
-
-/// Realized net fill reported by the execution seam.
-///
-/// `Debug` is redacted: it never renders either amount.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RealizedFill {
-    /// Net input actually consumed on chain.
-    pub net_input: AtomicAmount,
-    /// Net output actually received on chain.
-    pub net_output: AtomicAmount,
-}
-
-impl std::fmt::Debug for RealizedFill {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RealizedFill { .. }")
-    }
-}
 
 /// Resolution of one attempt by the execution seam.
 ///
@@ -128,6 +114,11 @@ pub trait AttemptExecutor: Send + Sync {
         attempt: &BoundAttempt,
         now_ms: i64,
     ) -> AttemptResolution;
+
+    /// Queries authoritative chain state for an already-reserved attempt. MUST
+    /// NOT sign or submit. Returns `Unknown` when the state cannot be
+    /// determined.
+    async fn reconcile(&self, attempt: &BoundAttempt, now_ms: i64) -> AttemptResolution;
 }
 
 /// Attempt-level retry policy.
@@ -234,6 +225,66 @@ impl std::fmt::Debug for TickOutcome {
             Self::Rejected { .. } => formatter.write_str("Rejected { .. }"),
             Self::Violation { .. } => formatter.write_str("Violation { .. }"),
         }
+    }
+}
+
+/// Redacted recovery summary; counts only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Non-terminal orders enumerated by the read pass.
+    pub open: u32,
+    /// Open orders whose latest attempt is non-terminal.
+    pub in_flight: u32,
+    /// Possibly-sent attempts reconciled through the injected seam.
+    pub reconciled: u32,
+    /// Confirmed fills applied during this pass.
+    pub fills_applied: u32,
+    /// Orders closed terminal (`Filled`/`Expired`/`FailedFinal`).
+    pub finalized: u32,
+    /// Orders advanced to `FailedRetryable`.
+    pub retryable: u32,
+    /// Orders skipped as untrustworthy by the read pass.
+    pub quarantined: u32,
+    /// Whether order enumeration hit the hard object cap.
+    pub truncated: bool,
+    /// Whether the trading gate was disabled, deferring all recovery work.
+    pub kill_switch_deferred: bool,
+}
+
+/// Effect of applying one attempt resolution to an `Executing` order.
+///
+/// Internal to the orchestrator: it is the shared vocabulary between
+/// [`Orchestrator::tick`] and [`Orchestrator::recover`].
+enum AppliedResolution {
+    /// A compliant fill was applied; `status` is the effective post-state.
+    Filled {
+        realized: RealizedFill,
+        remaining: AtomicAmount,
+        status: OrderStatus,
+    },
+    /// The attempt may still be in flight; the order stays `Executing`.
+    InFlight,
+    /// Definitive pre-send failure; `retryable` mirrors the target choice.
+    FailedBeforeSubmit { retryable: bool },
+    /// The chain rejected the attempt; the order is `FailedFinal`.
+    Rejected,
+    /// The confirmed fill violated the net limit; the order is `FailedFinal`.
+    Violation,
+}
+
+/// Folds one applied resolution into the recovery counts.
+///
+/// `fills_applied` counts successful fills (including a fill that the FSM
+/// coerces to `Expired` past the deadline); `finalized` counts orders closed
+/// terminal *without* a successful fill, matching the spec's per-case
+/// increments.
+fn record_applied(applied: AppliedResolution, report: &mut RecoveryReport) {
+    match applied {
+        AppliedResolution::Filled { .. } => report.fills_applied += 1,
+        AppliedResolution::InFlight => {}
+        AppliedResolution::FailedBeforeSubmit { retryable: true } => report.retryable += 1,
+        AppliedResolution::FailedBeforeSubmit { retryable: false } => report.finalized += 1,
+        AppliedResolution::Rejected | AppliedResolution::Violation => report.finalized += 1,
     }
 }
 
@@ -476,68 +527,307 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
         let resolution = self.executor.execute(&prepared, &bound, input.now_ms).await;
 
         // 14. Record the matching attempt phase, then apply the order effect.
+        // The exact mapping is the same one `recover` replays, so a live tick
+        // and a restart reconciliation cannot drift.
         let attempt_seq = identity.attempt_seq;
         let attempt_key = bound.attempt_key.clone();
+        let applied = self
+            .apply_resolution(
+                &order,
+                prepared.intent.amount,
+                prepared.min_out.amount.get(),
+                attempt_seq,
+                &attempt_key,
+                Some(AttemptPhase::Bound),
+                resolution,
+                input.now_ms,
+            )
+            .await?;
+        Ok(match applied {
+            AppliedResolution::Filled {
+                realized,
+                remaining,
+                status,
+            } => match status {
+                OrderStatus::Filled => TickOutcome::Filled {
+                    attempt_seq,
+                    realized,
+                },
+                OrderStatus::PartiallyFilled => TickOutcome::PartiallyFilled {
+                    attempt_seq,
+                    realized,
+                    remaining,
+                },
+                status => TickOutcome::Terminal { status },
+            },
+            AppliedResolution::InFlight => TickOutcome::InFlight { attempt_seq },
+            AppliedResolution::FailedBeforeSubmit { retryable } => {
+                TickOutcome::FailedBeforeSubmit {
+                    attempt_seq,
+                    retryable,
+                }
+            }
+            AppliedResolution::Rejected => TickOutcome::Rejected { attempt_seq },
+            AppliedResolution::Violation => TickOutcome::Violation { attempt_seq },
+        })
+    }
+
+    /// One idempotent startup recovery pass. Never signs or submits.
+    ///
+    /// Enumerates durable open orders; for every `Executing` order it reads the
+    /// authenticated attempt journal and either closes the P51
+    /// `Executing`-without-`Bound` window, reconciles a possibly-sent attempt
+    /// through the injected seam, or replays a crash-after-`Confirmed`-before-fill
+    /// window. The resolution mapping is the same
+    /// [`Orchestrator::apply_resolution`] that [`Orchestrator::tick`] uses, so a
+    /// live tick and a restart cannot drift.
+    pub async fn recover(&self, now_ms: i64) -> Result<RecoveryReport, LimitEngineError> {
+        let outcome = self.store.recover().await?;
+        let mut report = RecoveryReport {
+            open: outcome.open.len() as u32,
+            in_flight: outcome.in_flight.len() as u32,
+            reconciled: 0,
+            fills_applied: 0,
+            finalized: 0,
+            retryable: 0,
+            quarantined: outcome.quarantined.len() as u32,
+            truncated: outcome.truncated,
+            kill_switch_deferred: false,
+        };
+
+        // Kill switch off: report the classification and defer every write and
+        // every executor call. No order is reconciled.
+        if !self.policy.is_trading_enabled() {
+            report.kill_switch_deferred = true;
+            return Ok(report);
+        }
+
+        for order in &outcome.open {
+            if order.order.status != OrderStatus::Executing {
+                continue;
+            }
+            let events = self.store.read_attempts(&order.order.id).await?;
+            self.recover_executing(order, &events, now_ms, &mut report)
+                .await?;
+        }
+        Ok(report)
+    }
+
+    /// Recovers exactly one `Executing` order from its authenticated attempt
+    /// stream.
+    async fn recover_executing(
+        &self,
+        order: &StoredLimitOrder,
+        events: &[OrderAttemptEvent],
+        now_ms: i64,
+        report: &mut RecoveryReport,
+    ) -> Result<(), LimitEngineError> {
+        // P51 crash window: `Executing` persisted with no attempt event. No
+        // executor call ever ran, so this is a definitive pre-send failure: close
+        // it retryable / final / expired. No attempt event exists to append.
+        let Some(latest) = events.last() else {
+            let target = self.pre_send_target(1, now_ms, order.order.expires_at_ms);
+            self.advance(order, target, now_ms).await?;
+            if target == OrderStatus::FailedRetryable {
+                report.retryable += 1;
+            } else {
+                report.finalized += 1;
+            }
+            return Ok(());
+        };
+
+        // Every later-phase event continues a `Bound` attempt that must still be
+        // durable; without it the record is inconsistent and cannot be
+        // reconciled safely.
+        let bound = events
+            .iter()
+            .find(|event| {
+                event.attempt_seq == latest.attempt_seq && event.phase == AttemptPhase::Bound
+            })
+            .and_then(|event| event.bound.clone());
+        let Some(bound) = bound else {
+            self.advance(order, OrderStatus::FailedFinal, now_ms)
+                .await?;
+            report.finalized += 1;
+            return Ok(());
+        };
+
+        match latest.phase {
+            AttemptPhase::Bound
+            | AttemptPhase::Signed
+            | AttemptPhase::Submitted
+            | AttemptPhase::Unknown => {
+                // Possibly sent: reconcile, never re-sign or re-submit.
+                let resolution = self.executor.reconcile(&bound, now_ms).await;
+                report.reconciled += 1;
+                let min_out = min_out_for(&bound.intent, &bound.route)?.amount.get();
+                let applied = self
+                    .apply_resolution(
+                        order,
+                        bound.intent.amount,
+                        min_out,
+                        latest.attempt_seq,
+                        &latest.attempt_key,
+                        Some(latest.phase),
+                        resolution,
+                        now_ms,
+                    )
+                    .await?;
+                record_applied(applied, report);
+            }
+            AttemptPhase::Confirmed => match latest.realized_fill.clone() {
+                Some(fill) => {
+                    // Crash-after-Confirmed-before-fill: apply the sealed fill
+                    // exactly once. The phase already exists, so it is not
+                    // re-appended.
+                    let min_out = min_out_for(&bound.intent, &bound.route)?.amount.get();
+                    let applied = self
+                        .apply_resolution(
+                            order,
+                            bound.intent.amount,
+                            min_out,
+                            latest.attempt_seq,
+                            &latest.attempt_key,
+                            Some(AttemptPhase::Confirmed),
+                            AttemptResolution::Filled(fill),
+                            now_ms,
+                        )
+                        .await?;
+                    record_applied(applied, report);
+                }
+                None => {
+                    // Unrecoverable legacy/corrupt record: fail closed with no
+                    // ledger mutation.
+                    self.advance(order, OrderStatus::FailedFinal, now_ms)
+                        .await?;
+                    report.finalized += 1;
+                }
+            },
+            AttemptPhase::FailedBeforeSubmit => {
+                let applied = self
+                    .apply_resolution(
+                        order,
+                        bound.intent.amount,
+                        bound.intent.amount.get(),
+                        latest.attempt_seq,
+                        &latest.attempt_key,
+                        Some(AttemptPhase::FailedBeforeSubmit),
+                        AttemptResolution::FailedBeforeSubmit,
+                        now_ms,
+                    )
+                    .await?;
+                record_applied(applied, report);
+            }
+            AttemptPhase::Rejected => {
+                let applied = self
+                    .apply_resolution(
+                        order,
+                        bound.intent.amount,
+                        bound.intent.amount.get(),
+                        latest.attempt_seq,
+                        &latest.attempt_key,
+                        Some(AttemptPhase::Rejected),
+                        AttemptResolution::Rejected,
+                        now_ms,
+                    )
+                    .await?;
+                record_applied(applied, report);
+            }
+        }
+        Ok(())
+    }
+
+    /// Records one attempt resolution and applies its order effect.
+    ///
+    /// Single mapping shared by [`Orchestrator::tick`] and
+    /// [`Orchestrator::recover`]. `expected_input`/`min_out` are the bound chunk
+    /// and net floor; `prior_phase` is the phase already durably recorded for the
+    /// attempt. The phase append is skipped when it already matches, which makes
+    /// re-running recovery idempotent even for a repeated `Unknown`.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_resolution(
+        &self,
+        order: &StoredLimitOrder,
+        expected_input: AtomicAmount,
+        min_out: u128,
+        attempt_seq: u64,
+        attempt_key: &IdempotencyKey,
+        prior_phase: Option<AttemptPhase>,
+        resolution: AttemptResolution,
+        at_ms: i64,
+    ) -> Result<AppliedResolution, LimitEngineError> {
         match resolution {
             AttemptResolution::Filled(fill) => {
-                self.append_phase(
-                    input.order_id,
-                    attempt_seq,
-                    &attempt_key,
-                    AttemptPhase::Confirmed,
-                    input.now_ms,
-                )
-                .await?;
-                self.resolve_fill(&order, &prepared, &fill, attempt_seq, input.now_ms)
+                if prior_phase != Some(AttemptPhase::Confirmed) {
+                    self.append_confirmed(&order.order.id, attempt_seq, attempt_key, &fill, at_ms)
+                        .await?;
+                }
+                self.resolve_fill(order, expected_input, min_out, &fill, at_ms)
                     .await
             }
             AttemptResolution::Unknown => {
-                self.append_phase(
-                    input.order_id,
-                    attempt_seq,
-                    &attempt_key,
-                    AttemptPhase::Unknown,
-                    input.now_ms,
-                )
-                .await?;
-                // The order stays `Executing`: the next tick reports in-flight and
-                // never re-executes (OR-3).
-                Ok(TickOutcome::InFlight { attempt_seq })
+                if prior_phase != Some(AttemptPhase::Unknown) {
+                    self.append_phase(
+                        &order.order.id,
+                        attempt_seq,
+                        attempt_key,
+                        AttemptPhase::Unknown,
+                        at_ms,
+                    )
+                    .await?;
+                }
+                // The order stays `Executing`: a later tick/recovery reconciles
+                // again and never re-executes (OR-3).
+                Ok(AppliedResolution::InFlight)
             }
             AttemptResolution::FailedBeforeSubmit => {
-                self.append_phase(
-                    input.order_id,
-                    attempt_seq,
-                    &attempt_key,
-                    AttemptPhase::FailedBeforeSubmit,
-                    input.now_ms,
-                )
-                .await?;
-                let retryable = attempt_seq < u64::from(self.limits.max_attempts_per_order);
-                let target = if retryable {
-                    OrderStatus::FailedRetryable
-                } else {
-                    OrderStatus::FailedFinal
-                };
-                self.advance(&order, target, input.now_ms).await?;
-                Ok(TickOutcome::FailedBeforeSubmit {
-                    attempt_seq,
-                    retryable,
+                if prior_phase != Some(AttemptPhase::FailedBeforeSubmit) {
+                    self.append_phase(
+                        &order.order.id,
+                        attempt_seq,
+                        attempt_key,
+                        AttemptPhase::FailedBeforeSubmit,
+                        at_ms,
+                    )
+                    .await?;
+                }
+                let target = self.pre_send_target(attempt_seq, at_ms, order.order.expires_at_ms);
+                self.advance(order, target, at_ms).await?;
+                Ok(AppliedResolution::FailedBeforeSubmit {
+                    retryable: target == OrderStatus::FailedRetryable,
                 })
             }
             AttemptResolution::Rejected => {
-                self.append_phase(
-                    input.order_id,
-                    attempt_seq,
-                    &attempt_key,
-                    AttemptPhase::Rejected,
-                    input.now_ms,
-                )
-                .await?;
-                self.advance(&order, OrderStatus::FailedFinal, input.now_ms)
+                if prior_phase != Some(AttemptPhase::Rejected) {
+                    self.append_phase(
+                        &order.order.id,
+                        attempt_seq,
+                        attempt_key,
+                        AttemptPhase::Rejected,
+                        at_ms,
+                    )
                     .await?;
-                Ok(TickOutcome::Rejected { attempt_seq })
+                }
+                self.advance(order, OrderStatus::FailedFinal, at_ms).await?;
+                Ok(AppliedResolution::Rejected)
             }
+        }
+    }
+
+    /// Chooses the retryable/terminal target for a definitive pre-send failure.
+    ///
+    /// A retryable failure in an open window becomes `FailedRetryable`; one with
+    /// no attempts left is final; a retryable failure past the deadline is
+    /// `Expired`, because `apply_transition` expiry-gates every non-terminal
+    /// target.
+    fn pre_send_target(&self, attempt_seq: u64, now_ms: i64, expires_at_ms: i64) -> OrderStatus {
+        let retryable = attempt_seq < u64::from(self.limits.max_attempts_per_order);
+        if retryable && now_ms < expires_at_ms {
+            OrderStatus::FailedRetryable
+        } else if !retryable {
+            OrderStatus::FailedFinal
+        } else {
+            OrderStatus::Expired
         }
     }
 
@@ -547,14 +837,14 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     async fn resolve_fill(
         &self,
         order: &StoredLimitOrder,
-        prepared: &PreparedAttempt,
+        expected_input: AtomicAmount,
+        min_out: u128,
         fill: &RealizedFill,
-        attempt_seq: u64,
         at_ms: i64,
-    ) -> Result<TickOutcome, LimitEngineError> {
-        if fill.net_input != prepared.intent.amount || fill.net_output < prepared.min_out.amount {
+    ) -> Result<AppliedResolution, LimitEngineError> {
+        if fill.net_input != expected_input || fill.net_output.get() < min_out {
             self.advance(order, OrderStatus::FailedFinal, at_ms).await?;
-            return Ok(TickOutcome::Violation { attempt_seq });
+            return Ok(AppliedResolution::Violation);
         }
 
         let remaining_after = order
@@ -582,18 +872,11 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
         // `apply_transition` may coerce `PartiallyFilled` to `Expired` past the
         // deadline (recording the fill) and `Expired` with zero remaining to
         // `Filled`; report the effective post-state.
-        match applied.order.status {
-            OrderStatus::Filled => Ok(TickOutcome::Filled {
-                attempt_seq,
-                realized: fill.clone(),
-            }),
-            OrderStatus::PartiallyFilled => Ok(TickOutcome::PartiallyFilled {
-                attempt_seq,
-                realized: fill.clone(),
-                remaining: applied.order.remaining_input,
-            }),
-            status => Ok(TickOutcome::Terminal { status }),
-        }
+        Ok(AppliedResolution::Filled {
+            realized: fill.clone(),
+            remaining: applied.order.remaining_input,
+            status: applied.order.status,
+        })
     }
 
     /// Persists exactly one transition, accepting both the applied and the
@@ -703,6 +986,29 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             attempt_key.clone(),
             phase,
             None,
+            at_ms,
+        );
+        match self.store.append_attempt(&event).await? {
+            AttemptAppendOutcome::Applied(_) | AttemptAppendOutcome::AlreadyApplied(_) => Ok(()),
+        }
+    }
+
+    /// Appends a `Confirmed` event carrying the realized fill, treating the
+    /// idempotent already-applied outcome as success. Recovery can replay the
+    /// exact fill from this sealed record after a crash.
+    async fn append_confirmed(
+        &self,
+        order_id: &OrderId,
+        attempt_seq: u64,
+        attempt_key: &IdempotencyKey,
+        fill: &RealizedFill,
+        at_ms: i64,
+    ) -> Result<(), LimitEngineError> {
+        let event = OrderAttemptEvent::confirmed(
+            order_id.clone(),
+            attempt_seq,
+            attempt_key.clone(),
+            fill.clone(),
             at_ms,
         );
         match self.store.append_attempt(&event).await? {

@@ -916,6 +916,16 @@ impl<S: OpaqueStore> DurableLimitOrderStore<S> {
         &self.chain
     }
 
+    /// Enumerates open orders and classifies each one's latest attempt.
+    ///
+    /// Locked P52 seam: delegates to the free [`recover_in_flight`] over this
+    /// store's backend and keys. It is read-authoritative (it may repair a
+    /// lagging materialized object) and never signs or submits; a possibly-sent
+    /// attempt is classified for reconciliation, never resubmitted.
+    pub async fn recover(&self) -> Result<AttemptRecoveryOutcome, LimitEngineError> {
+        recover_in_flight(self.store.as_ref(), self.keys.as_ref()).await
+    }
+
     async fn read_record(
         &self,
         object_id: &str,
