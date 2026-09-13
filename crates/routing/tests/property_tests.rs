@@ -40,7 +40,6 @@ fn cpmm_sweep_preserves_conservation_and_bridge_agreement() {
             &scoring,
             None,
             None,
-            true,
         );
         let decision = plan_single_path(&request).expect("viable direct route");
         let selected = decision.selected.as_ref().expect("selected");
@@ -78,7 +77,6 @@ fn two_hop_sweep_preserves_contiguity_and_bridge_agreement() {
             &scoring,
             None,
             None,
-            true,
         );
         let decision = plan_single_path(&request).expect("viable bridge route");
         let selected = decision.selected.as_ref().expect("selected");
@@ -112,11 +110,11 @@ fn planning_is_deterministic_and_permutation_invariant() {
     let scoring = scoring();
 
     let first = plan_single_path(&request(
-        &intent, &forward, 10_000, &tax, 2, &policy, &scoring, None, None, true,
+        &intent, &forward, 10_000, &tax, 2, &policy, &scoring, None, None,
     ))
     .expect("first");
     let second = plan_single_path(&request(
-        &intent, &forward, 10_000, &tax, 2, &policy, &scoring, None, None, true,
+        &intent, &forward, 10_000, &tax, 2, &policy, &scoring, None, None,
     ))
     .expect("second");
     assert_eq!(
@@ -125,7 +123,7 @@ fn planning_is_deterministic_and_permutation_invariant() {
     );
 
     let permuted = plan_single_path(&request(
-        &intent, &reversed, 10_000, &tax, 2, &policy, &scoring, None, None, true,
+        &intent, &reversed, 10_000, &tax, 2, &policy, &scoring, None, None,
     ))
     .expect("permuted");
     assert_eq!(first.selected, permuted.selected);
@@ -151,7 +149,6 @@ fn cpmm_output_is_monotonic_in_input() {
             &scoring,
             None,
             None,
-            true,
         );
         let decision = plan_single_path(&request).expect("viable route");
         let net = decision
@@ -206,11 +203,10 @@ fn zero_tax_direct_never_models_funding() {
         &scoring,
         None,
         None,
-        false,
     );
-    let decision = plan_single_path(&request).expect("route without bridge check");
+    let decision = plan_single_path(&request).expect("bridge-verified route");
     let selected = decision.selected.as_ref().expect("selected");
-    // Without verification the plan is still structurally valid.
+    // The zero-tax route passes unconditional bridge verification and is valid.
     assert!(selected.plan.validate().is_ok());
     assert_eq!(intent.side, TradeSide::Buy);
 }

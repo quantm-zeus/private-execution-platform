@@ -35,7 +35,7 @@ pub mod types;
 
 use domain::{AmountType, RouteScore, TradeIntent};
 use execution_preview::validate_delta_preview_with_assessment;
-use market_types::{AtomicAmount, FreshnessPolicy, PriceRatio};
+use market_types::{AtomicAmount, FreshnessPolicy};
 use serde::{Deserialize, Serialize};
 use tax_engine::TaxAssessment;
 
@@ -45,7 +45,7 @@ pub use label::{PoolRefLabel, VenueLabel};
 pub use leg::{simulate_leg, swap_dir};
 pub use plan::{plan_direct_route, select_best_path, to_route_plan};
 pub use quote::{HopQuote, PoolKindClass, RouteQuote};
-pub use score::{GasEstimator, ScoringInputs};
+pub use score::{GasConversion, GasEstimator, ScoringInputs};
 pub use types::{
     EvaluatedLeg, EvaluatedPath, PoolCandidate, RouteDecision, RoutingConfig, RoutingInput, SwapDir,
 };
@@ -79,10 +79,8 @@ pub struct RouteRequest<'a> {
     pub scoring: &'a ScoringInputs,
     /// Optional injected gas model.
     pub gas: Option<&'a dyn GasEstimator>,
-    /// Exact gas-asset to output-asset conversion, when a gas view is available.
-    pub gas_price_in_output: Option<PriceRatio>,
-    /// When `true`, every surviving candidate is verified through the locked bridge.
-    pub verify_with_bridge: bool,
+    /// Asset-bound gas-asset to output-asset conversion, when a gas view exists.
+    pub gas_price_in_output: Option<GasConversion>,
 }
 
 /// A quoted route together with its assembled score.
@@ -128,6 +126,20 @@ fn aggregate_failure(failures: &[RoutingError]) -> RoutingError {
     {
         return RoutingError::ImpactExceedsCap;
     }
+    // A uniform gas binding/conversion failure is caller configuration, not an
+    // empty route set, so surface it rather than masking it as `NoViableRoute`.
+    if failures
+        .iter()
+        .all(|failure| *failure == RoutingError::GasChainMismatch)
+    {
+        return RoutingError::GasChainMismatch;
+    }
+    if failures
+        .iter()
+        .all(|failure| *failure == RoutingError::GasConversionFailed)
+    {
+        return RoutingError::GasConversionFailed;
+    }
     // A uniform internal composition failure is a bug, not an empty route set;
     // surface it rather than masking it as `NoViableRoute`.
     if failures
@@ -149,19 +161,21 @@ fn aggregate_failure(failures: &[RoutingError]) -> RoutingError {
 
 /// Plans the best bounded linear route for the supplied request.
 ///
-/// Candidate failures are isolated and never abort the search, except for a gas
-/// estimator failure or chain mismatch, which are caller-configuration errors.
-/// The selected route is the first in the deterministic total order; when
-/// [`RouteRequest::verify_with_bridge`] is set, only candidates accepted by
-/// [`validate_delta_preview_with_assessment`] survive. If candidates existed but
-/// none survived verification, the payload-free rejection class is returned.
+/// Candidate failures are isolated and never abort the search: a per-candidate
+/// quote failure, gas-estimation failure, or gas-conversion failure simply drops
+/// that candidate so one bad candidate cannot hide a viable route. Every
+/// surviving candidate is then verified unconditionally through
+/// [`validate_delta_preview_with_assessment`], which binds the route to the
+/// intent's risk constraints (tax caps, limit price, `max_total_cost`, amount)
+/// and to the supplied tax assessment. There is no public opt-out. If candidates
+/// existed but none survived verification, the payload-free rejection class is
+/// returned.
 pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, RoutingError> {
     if req.intent.token_in == req.intent.token_out {
         return Err(RoutingError::SameAssetPair);
     }
-    // R1 is exact-input only; reject output/USD amount types unconditionally so a
-    // caller that disables bridge verification cannot receive a route outside the
-    // locked input-asset scope.
+    // R1 is exact-input only; reject output/USD amount types unconditionally so
+    // no caller can receive a route outside the locked input-asset scope.
     if req.intent.amount_type != AmountType::InputAssetAtomic {
         return Err(RoutingError::Domain(
             domain::DomainError::UnsupportedAmountType,
@@ -183,25 +197,39 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
     let mut failures: Vec<RoutingError> = Vec::new();
 
     for path in &candidate_set.paths {
-        let gas_cost = score::estimate_gas_cost(req, path.legs.len())?;
-        match quote::quote_path(req, req.descriptors, path) {
-            Ok(quote) => {
-                let score = score::build_score(
-                    req.intent,
-                    &quote,
-                    req.scoring,
-                    gas_cost.clone(),
-                    req.now_ms,
-                )?;
-                let net_after = score::net_after_gas(
-                    &quote.net_output,
-                    gas_cost.as_ref(),
-                    req.gas_price_in_output,
-                )?;
-                ranked.push((ScoredRoute { quote, score }, net_after));
+        let gas_cost = match score::estimate_gas_cost(req, path.legs.len()) {
+            Ok(cost) => cost,
+            Err(error) => {
+                failures.push(error);
+                continue;
             }
-            Err(error) => failures.push(error),
-        }
+        };
+        let quote = match quote::quote_path(req, req.descriptors, path) {
+            Ok(quote) => quote,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        let score = score::build_score(
+            req.intent,
+            &quote,
+            req.scoring,
+            gas_cost.clone(),
+            req.now_ms,
+        )?;
+        let net_after = match score::net_after_gas(
+            &quote.net_output,
+            gas_cost.as_ref(),
+            req.gas_price_in_output.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        ranked.push((ScoredRoute { quote, score }, net_after));
     }
 
     if ranked.is_empty() {
@@ -213,34 +241,31 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
     let mut final_routes: Vec<ScoredRoute> = Vec::with_capacity(ranked.len());
     let mut first_reject: Option<BridgeRejectClass> = None;
 
-    if req.verify_with_bridge {
-        for (route, _) in ranked {
-            match validate_delta_preview_with_assessment(
-                req.intent,
-                &route.quote.plan,
-                &route.quote.net_delta,
-                req.assessment,
-                req.now_ms,
-            ) {
-                Ok(_) => final_routes.push(route),
-                Err(error) => {
-                    if first_reject.is_none() {
-                        first_reject = Some(BridgeRejectClass::from_bridge_error(&error));
-                    }
+    // Verification is unconditional: every surviving candidate must pass the
+    // locked bridge against the intent and the fresh assessment. There is no
+    // caller-controlled bypass.
+    for (route, _) in ranked {
+        match validate_delta_preview_with_assessment(
+            req.intent,
+            &route.quote.plan,
+            &route.quote.net_delta,
+            req.assessment,
+            req.now_ms,
+        ) {
+            Ok(_) => final_routes.push(route),
+            Err(error) => {
+                if first_reject.is_none() {
+                    first_reject = Some(BridgeRejectClass::from_bridge_error(&error));
                 }
             }
         }
-        if final_routes.is_empty() {
-            let class = match first_reject {
-                Some(class) => class,
-                None => BridgeRejectClass::Domain,
-            };
-            return Err(RoutingError::SelectedRejected(class));
-        }
-    } else {
-        for (route, _) in ranked {
-            final_routes.push(route);
-        }
+    }
+    if final_routes.is_empty() {
+        let class = match first_reject {
+            Some(class) => class,
+            None => BridgeRejectClass::Domain,
+        };
+        return Err(RoutingError::SelectedRejected(class));
     }
 
     let selected = final_routes.first().map(|route| route.quote.clone());

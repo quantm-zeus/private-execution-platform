@@ -9,9 +9,9 @@ mod common;
 use std::path::Path;
 
 use common::*;
-use domain::{AmountType, DomainError, RiskConstraints, TradeSide};
+use domain::{AmountType, DomainError, LimitPrice, OrderType, RiskConstraints, TradeSide};
 use execution_preview::BridgeError;
-use market_types::{Bps, PoolKindState, Sequence};
+use market_types::{AssetAmount, AtomicAmount, Bps, PoolKindState, PriceRatio, Sequence};
 use routing::{
     plan_single_path, BridgeRejectClass, PoolKindClass, PoolRefLabel, RoutingError, VenueLabel,
     MAX_POOLS_SCANNED, MAX_ROUTE_HOPS,
@@ -44,7 +44,6 @@ fn same_asset_pair_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(plan_single_path(&request), Err(RoutingError::SameAssetPair));
 }
@@ -67,7 +66,6 @@ fn hop_count_bounds_are_enforced() {
             &scoring,
             None,
             None,
-            true,
         );
         assert_eq!(
             plan_single_path(&request),
@@ -93,7 +91,6 @@ fn empty_pool_set_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(plan_single_path(&request), Err(RoutingError::EmptyPoolSet));
 }
@@ -115,7 +112,6 @@ fn pool_set_over_the_scanned_bound_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -155,7 +151,6 @@ fn pool_chain_mismatch_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -184,7 +179,6 @@ fn invalid_pool_state_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -239,7 +233,6 @@ fn stale_under_default_policy_fails_closed() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(plan_single_path(&request), Err(RoutingError::NoViableRoute));
 }
@@ -270,7 +263,6 @@ fn zero_sequence_pool_is_rejected_fail_closed() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -306,7 +298,6 @@ fn disconnected_pools_fail_closed() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(plan_single_path(&request), Err(RoutingError::NoViableRoute));
 }
@@ -332,7 +323,6 @@ fn zero_reserve_hop_surfaces_kernel_class_without_payload() {
         &scoring,
         None,
         None,
-        true,
     );
     let error = plan_single_path(&request).expect_err("zero reserve must fail");
     assert_eq!(
@@ -364,7 +354,6 @@ fn bin_impact_requires_override_when_cap_is_set() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -396,7 +385,6 @@ fn bin_impact_override_allows_route() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("override permits route");
     assert_eq!(
@@ -426,7 +414,6 @@ fn assessment_asset_mismatch_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -458,7 +445,6 @@ fn stale_assessment_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -484,7 +470,6 @@ fn assessment_zero_sequence_is_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -493,14 +478,14 @@ fn assessment_zero_sequence_is_rejected() {
 }
 
 #[test]
-fn non_input_amount_type_is_rejected_without_bridge_verification() {
+fn non_input_amount_type_is_rejected() {
     let mut intent = buy(usdc(), weth(), 1_000);
     intent.amount_type = AmountType::OutputAssetAtomic;
     let tax = zero_tax_for(&intent);
     let descriptors = vec![direct_descriptor()];
     let policy = caller_policy();
     let scoring = scoring();
-    // Even with bridge verification disabled, the exact-input scope is enforced.
+    // The exact-input scope is enforced before any candidate is considered.
     let request = request(
         &intent,
         &descriptors,
@@ -511,7 +496,6 @@ fn non_input_amount_type_is_rejected_without_bridge_verification() {
         &scoring,
         None,
         None,
-        false,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -536,11 +520,68 @@ fn request_amount_above_intent_is_rejected() {
         &scoring,
         None,
         None,
-        false,
     );
     assert_eq!(
         plan_single_path(&request),
         Err(RoutingError::InputConservationViolated)
+    );
+}
+
+#[test]
+fn max_total_cost_is_bound_unconditionally() {
+    let mut intent = buy(usdc(), weth(), 10_000);
+    intent.risk.max_total_cost = Some(AssetAmount {
+        asset: usdc(),
+        amount: AtomicAmount::new(500),
+    });
+    let tax = zero_tax_for(&intent);
+    let descriptors = vec![direct_descriptor()];
+    let policy = caller_policy();
+    let scoring = scoring();
+    let request = request(
+        &intent,
+        &descriptors,
+        1_000,
+        &tax,
+        1,
+        &policy,
+        &scoring,
+        None,
+        None,
+    );
+    assert_eq!(
+        plan_single_path(&request),
+        Err(RoutingError::SelectedRejected(BridgeRejectClass::Domain))
+    );
+}
+
+#[test]
+fn limit_price_is_bound_unconditionally() {
+    let mut intent = buy(usdc(), weth(), 10_000);
+    intent.order_type = OrderType::Limit;
+    intent.limit_price = Some(LimitPrice {
+        numerator_asset: usdc(),
+        denominator_asset: weth(),
+        ratio: PriceRatio::new(1, 10).expect("limit ratio"),
+    });
+    let tax = zero_tax_for(&intent);
+    let descriptors = vec![direct_descriptor()];
+    let policy = caller_policy();
+    let scoring = scoring();
+    let request = request(
+        &intent,
+        &descriptors,
+        10_000,
+        &tax,
+        1,
+        &policy,
+        &scoring,
+        None,
+        None,
+    );
+    assert_eq!(
+        plan_single_path(&request),
+        Err(RoutingError::SelectedRejected(BridgeRejectClass::Domain))
     );
 }
 
@@ -569,7 +610,6 @@ fn tax_cap_rejection_surfaces_selected_rejected() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -594,7 +634,6 @@ fn impact_exceeds_cap_is_surfaced() {
         &scoring,
         None,
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),

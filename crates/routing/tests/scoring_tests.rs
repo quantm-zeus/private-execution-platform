@@ -6,9 +6,40 @@
 
 mod common;
 
+use chain_types::{AssetId, ChainId};
 use common::*;
-use market_types::{PoolKindState, PriceRatio};
-use routing::{plan_single_path, RoutingError};
+use market_types::{AssetAmount, AtomicAmount, PoolKindState, PriceRatio};
+use routing::{plan_single_path, GasConversion, GasEstimator, RoutingError};
+
+/// Asset-bound gas conversion from the native gas asset into `output_asset` at 1:1.
+fn conversion(output_asset: chain_types::AssetId) -> GasConversion {
+    GasConversion {
+        gas_asset: native_gas(),
+        output_asset,
+        ratio: PriceRatio::new(1, 1).expect("price ratio"),
+    }
+}
+
+/// Gas model that fails for every two-hop estimate but prices one-hop routes.
+struct FlakyGas {
+    asset: AssetId,
+}
+
+impl GasEstimator for FlakyGas {
+    fn estimate_gas(
+        &self,
+        _chain: &ChainId,
+        hop_count: usize,
+    ) -> Result<AssetAmount, RoutingError> {
+        if hop_count > 1 {
+            return Err(RoutingError::Internal("gas estimation failed"));
+        }
+        Ok(AssetAmount {
+            asset: self.asset.clone(),
+            amount: AtomicAmount::new(1),
+        })
+    }
+}
 
 fn two_hop_descriptors() -> Vec<routing::PoolDescriptor> {
     vec![
@@ -47,7 +78,6 @@ fn without_gas_higher_net_route_wins() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable routes");
     let selected = decision.selected.as_ref().expect("selected");
@@ -67,7 +97,6 @@ fn gas_makes_higher_gross_route_lose_to_lower_gross_higher_net_route() {
         asset: native_gas(),
         per_hop: 19_000,
     };
-    let price = PriceRatio::new(1, 1).expect("price ratio");
     let request = request(
         &intent,
         &descriptors,
@@ -77,8 +106,7 @@ fn gas_makes_higher_gross_route_lose_to_lower_gross_higher_net_route() {
         &policy,
         &scoring,
         Some(&gas),
-        Some(price),
-        true,
+        Some(conversion(token2())),
     );
 
     let decision = plan_single_path(&request).expect("viable gas-aware routes");
@@ -132,7 +160,6 @@ fn score_populates_all_r1_fields() {
         asset: native_gas(),
         per_hop: 100,
     };
-    let price = PriceRatio::new(1, 1).expect("price ratio");
     let request = request(
         &intent,
         &descriptors,
@@ -142,8 +169,7 @@ fn score_populates_all_r1_fields() {
         &policy,
         &scoring,
         Some(&gas),
-        Some(price),
-        true,
+        Some(conversion(weth())),
     );
     let decision = plan_single_path(&request).expect("viable route");
     let score = &decision.candidates.first().expect("candidate").score;
@@ -189,7 +215,6 @@ fn gas_chain_mismatch_fails_closed() {
         &scoring,
         Some(&gas),
         None,
-        true,
     );
     assert_eq!(
         plan_single_path(&request),
@@ -212,7 +237,6 @@ fn gas_conversion_overflow_fails_closed() {
         asset: native_gas(),
         per_hop: u128::MAX,
     };
-    let price = PriceRatio::new(u128::MAX, 1).expect("price ratio");
     let request = request(
         &intent,
         &descriptors,
@@ -222,8 +246,11 @@ fn gas_conversion_overflow_fails_closed() {
         &policy,
         &scoring,
         Some(&gas),
-        Some(price),
-        true,
+        Some(GasConversion {
+            gas_asset: native_gas(),
+            output_asset: weth(),
+            ratio: PriceRatio::new(u128::MAX, 1).expect("price ratio"),
+        }),
     );
     assert_eq!(
         plan_single_path(&request),
@@ -248,7 +275,6 @@ fn higher_net_orders_first_deterministically() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable routes");
     assert!(decision.candidates.len() >= 2);
@@ -291,7 +317,6 @@ fn equal_economics_tie_breaks_on_canonical_leg_key() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable routes");
     assert_eq!(decision.candidates.len(), 2);
@@ -306,5 +331,163 @@ fn equal_economics_tie_breaks_on_canonical_leg_key() {
             .expect("second")
             .score
             .simulated_net_output
+    );
+}
+
+#[test]
+fn gas_conversion_wrong_gas_asset_fails_closed() {
+    let intent = buy(usdc(), weth(), 10_000);
+    let tax = zero_tax_for(&intent);
+    let descriptors = vec![fresh_descriptor(
+        "uniswap-v2",
+        "0xpool-ab",
+        PoolKindState::Cpmm(cpmm(usdc(), weth(), 1_000_000, 2_000_000, 30)),
+    )];
+    let policy = caller_policy();
+    let scoring = scoring();
+    let gas = FixedGas {
+        asset: native_gas(),
+        per_hop: 100,
+    };
+    // The estimate is denominated in native gas, but the conversion claims weth.
+    let request = request(
+        &intent,
+        &descriptors,
+        10_000,
+        &tax,
+        1,
+        &policy,
+        &scoring,
+        Some(&gas),
+        Some(GasConversion {
+            gas_asset: weth(),
+            output_asset: weth(),
+            ratio: PriceRatio::new(1, 1).expect("price ratio"),
+        }),
+    );
+    assert_eq!(
+        plan_single_path(&request),
+        Err(RoutingError::GasConversionFailed)
+    );
+}
+
+#[test]
+fn gas_conversion_wrong_numeraire_fails_closed() {
+    let intent = buy(usdc(), weth(), 10_000);
+    let tax = zero_tax_for(&intent);
+    let descriptors = vec![fresh_descriptor(
+        "uniswap-v2",
+        "0xpool-ab",
+        PoolKindState::Cpmm(cpmm(usdc(), weth(), 1_000_000, 2_000_000, 30)),
+    )];
+    let policy = caller_policy();
+    let scoring = scoring();
+    let gas = FixedGas {
+        asset: native_gas(),
+        per_hop: 100,
+    };
+    // The route terminal output is weth, but the conversion prices into usdc.
+    let request = request(
+        &intent,
+        &descriptors,
+        10_000,
+        &tax,
+        1,
+        &policy,
+        &scoring,
+        Some(&gas),
+        Some(GasConversion {
+            gas_asset: native_gas(),
+            output_asset: usdc(),
+            ratio: PriceRatio::new(1, 1).expect("price ratio"),
+        }),
+    );
+    assert_eq!(
+        plan_single_path(&request),
+        Err(RoutingError::GasConversionFailed)
+    );
+}
+
+#[test]
+fn correct_gas_conversion_prices_the_route() {
+    let intent = buy(usdc(), weth(), 10_000);
+    let tax = zero_tax_for(&intent);
+    let descriptors = vec![fresh_descriptor(
+        "uniswap-v2",
+        "0xpool-ab",
+        PoolKindState::Cpmm(cpmm(usdc(), weth(), 1_000_000, 2_000_000, 30)),
+    )];
+    let policy = caller_policy();
+    let scoring = scoring();
+    let gas = FixedGas {
+        asset: native_gas(),
+        per_hop: 100,
+    };
+    let request = request(
+        &intent,
+        &descriptors,
+        10_000,
+        &tax,
+        1,
+        &policy,
+        &scoring,
+        Some(&gas),
+        Some(GasConversion {
+            gas_asset: native_gas(),
+            output_asset: weth(),
+            ratio: PriceRatio::new(1, 2).expect("price ratio"),
+        }),
+    );
+    let decision = plan_single_path(&request).expect("bound gas conversion prices");
+    let selected = decision.selected.as_ref().expect("selected");
+    // Gas only adjusts the ranking key; the quoted net output is unchanged.
+    assert_eq!(selected.net_output.amount.get(), 19_743);
+    let candidate = decision.candidates.first().expect("candidate");
+    assert_eq!(
+        candidate
+            .score
+            .gas_cost
+            .as_ref()
+            .map(|cost| cost.asset.clone()),
+        Some(native_gas())
+    );
+}
+
+#[test]
+fn gas_estimate_failure_drops_only_that_candidate() {
+    let intent = buy(usdc(), token2(), 10_000);
+    let tax = zero_tax_for(&intent);
+    let descriptors = two_hop_descriptors();
+    let policy = caller_policy();
+    let scoring = scoring();
+    let gas = FlakyGas {
+        asset: native_gas(),
+    };
+    let request = request(
+        &intent,
+        &descriptors,
+        10_000,
+        &tax,
+        2,
+        &policy,
+        &scoring,
+        Some(&gas),
+        Some(conversion(token2())),
+    );
+    let decision = plan_single_path(&request).expect("one-hop candidate survives");
+    // Every two-hop estimate failed; only the direct path remains selectable.
+    assert!(decision
+        .candidates
+        .iter()
+        .all(|candidate| candidate.quote.plan.legs.len() == 1));
+    assert_eq!(
+        decision
+            .selected
+            .as_ref()
+            .expect("selected")
+            .plan
+            .legs
+            .len(),
+        1
     );
 }

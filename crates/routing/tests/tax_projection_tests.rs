@@ -35,7 +35,6 @@ fn direct_buy_with_tax_matches_pinned_vector_and_bridge_constructor() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable buy");
@@ -90,7 +89,6 @@ fn direct_sell_with_tax_matches_pinned_vector_and_bridge_constructor() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable sell");
@@ -135,7 +133,6 @@ fn zero_fee_pool_yields_none_never_some_zero() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable zero-fee route");
@@ -167,7 +164,6 @@ fn zero_tax_buy_has_no_tax_cost_and_exact_conservation() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable route");
     let selected = decision.selected.as_ref().expect("selected");

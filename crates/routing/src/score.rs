@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use chain_types::ChainId;
+use chain_types::{AssetId, ChainId};
 use domain::{RouteScore, TradeIntent};
 use market_types::{AssetAmount, Bps, PriceRatio};
 use serde::{Deserialize, Serialize};
@@ -41,15 +41,33 @@ pub trait GasEstimator: Send + Sync {
     fn estimate_gas(&self, chain: &ChainId, hop_count: usize) -> Result<AssetAmount, RoutingError>;
 }
 
+/// Asset-bound gas-asset to route-output conversion.
+///
+/// [`PriceRatio`] carries no asset identity, so a conversion must name the gas
+/// asset it consumes and the route terminal output asset (the numeraire) it
+/// prices into. Both bindings are checked before any arithmetic, so a ratio can
+/// never be silently applied to the wrong asset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasConversion {
+    /// Asset the gas estimate is denominated in.
+    pub gas_asset: AssetId,
+    /// Route terminal output asset the ratio converts into.
+    pub output_asset: AssetId,
+    /// Exact gas-asset to output-asset price ratio.
+    pub ratio: PriceRatio,
+}
+
 fn zero_bps() -> Result<Bps, RoutingError> {
     Bps::new(0).map_err(|_| RoutingError::Internal("zero bps invalid"))
 }
 
-/// Estimates the gas cost for a route, enforcing chain binding and zero handling.
+/// Estimates the gas cost for a route, enforcing chain and asset binding.
 ///
-/// A zero estimate maps to `None`, never `Some(0)`. A chain mismatch fails the
-/// whole call with [`RoutingError::GasChainMismatch`]; an estimator failure is
-/// propagated as the caller's typed error.
+/// A zero estimate maps to `None`, never `Some(0)`. A chain mismatch fails with
+/// [`RoutingError::GasChainMismatch`]; a supplied conversion whose declared gas
+/// asset disagrees with the estimate fails with
+/// [`RoutingError::GasConversionFailed`]. An estimator failure is propagated as
+/// the caller's typed error.
 pub(crate) fn estimate_gas_cost(
     req: &RouteRequest<'_>,
     hop_count: usize,
@@ -60,6 +78,11 @@ pub(crate) fn estimate_gas_cost(
             let estimate = estimator.estimate_gas(&req.intent.chain, hop_count)?;
             if estimate.asset.chain != req.intent.chain {
                 return Err(RoutingError::GasChainMismatch);
+            }
+            if let Some(conversion) = &req.gas_price_in_output {
+                if estimate.asset != conversion.gas_asset {
+                    return Err(RoutingError::GasConversionFailed);
+                }
             }
             if estimate.amount.is_zero() {
                 Ok(None)
@@ -72,17 +95,22 @@ pub(crate) fn estimate_gas_cost(
 
 /// Exact gas-asset to output-asset conversion, floor-rounded.
 ///
-/// Returns `None` when no complete gas view is available. A conversion overflow
-/// fails closed with [`RoutingError::GasConversionFailed`].
+/// Returns `None` when no complete gas view is available. The supplied
+/// conversion must name the estimate's gas asset and the route's terminal
+/// output asset; any other pairing fails closed with
+/// [`RoutingError::GasConversionFailed`], as does a conversion overflow.
 pub(crate) fn net_after_gas(
     net_output: &AssetAmount,
     gas_cost: Option<&AssetAmount>,
-    gas_price_in_output: Option<PriceRatio>,
+    gas_price_in_output: Option<&GasConversion>,
 ) -> Result<Option<u128>, RoutingError> {
     match (gas_cost, gas_price_in_output) {
-        (Some(gas), Some(ratio)) => {
-            let (hi, lo) = mul_u128_wide(gas.amount.get(), ratio.numerator_atomic());
-            let converted = div_u256_by_u128_floor(hi, lo, ratio.denominator_atomic())
+        (Some(gas), Some(conversion)) => {
+            if gas.asset != conversion.gas_asset || net_output.asset != conversion.output_asset {
+                return Err(RoutingError::GasConversionFailed);
+            }
+            let (hi, lo) = mul_u128_wide(gas.amount.get(), conversion.ratio.numerator_atomic());
+            let converted = div_u256_by_u128_floor(hi, lo, conversion.ratio.denominator_atomic())
                 .ok_or(RoutingError::GasConversionFailed)?;
             Ok(Some(net_output.amount.get().saturating_sub(converted)))
         }

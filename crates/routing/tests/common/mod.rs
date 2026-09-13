@@ -14,11 +14,11 @@ use domain::{
 use market_types::{
     AssetAmount, AtomicAmount, BinPoolState, Bps, ClmmPoolState, ClmmTick, CpmmPoolState,
     FreshnessPolicy, FreshnessStatus, LiquidityBin, PoolId, PoolKindState, PoolStateEnvelope,
-    PriceRatio, SafeFreshnessMeta, Sequence,
+    SafeFreshnessMeta, Sequence,
 };
 use routing::{
-    GasEstimator, PoolDescriptor, PoolRefLabel, RouteRequest, RoutingError, ScoringInputs,
-    VenueLabel,
+    GasConversion, GasEstimator, PoolDescriptor, PoolRefLabel, RouteRequest, RoutingError,
+    ScoringInputs, VenueLabel,
 };
 use tax_engine::TaxAssessment;
 
@@ -297,8 +297,7 @@ pub fn request<'a>(
     freshness_policy: &'a FreshnessPolicy,
     scoring_inputs: &'a ScoringInputs,
     gas: Option<&'a dyn GasEstimator>,
-    gas_price_in_output: Option<PriceRatio>,
-    verify_with_bridge: bool,
+    gas_price_in_output: Option<GasConversion>,
 ) -> RouteRequest<'a> {
     RouteRequest {
         intent,
@@ -311,6 +310,5 @@ pub fn request<'a>(
         scoring: scoring_inputs,
         gas,
         gas_price_in_output,
-        verify_with_bridge,
     }
 }

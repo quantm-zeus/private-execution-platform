@@ -37,7 +37,6 @@ fn direct_cpmm_buy_is_pinned_and_passes_bridge() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable direct route");
@@ -100,7 +99,6 @@ fn two_hop_bridge_buy_is_pinned_and_contiguous() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable bridge route");
@@ -183,7 +181,6 @@ fn two_hop_bridge_buy_with_tax_matches_hand_derived_vector() {
         &scoring,
         None,
         None,
-        true,
     );
 
     let decision = plan_single_path(&request).expect("viable taxed bridge route");
@@ -233,7 +230,7 @@ fn enumeration_is_bounded_and_truncation_is_flagged() {
     let policy = caller_policy();
     let scoring = scoring();
     let planned = plan_single_path(&request(
-        &intent, &state, 10_000, &tax, 1, &policy, &scoring, None, None, true,
+        &intent, &state, 10_000, &tax, 1, &policy, &scoring, None, None,
     ))
     .expect("bounded planning");
     assert!(planned.truncated);
@@ -253,6 +250,52 @@ fn enumeration_dedupes_same_pool_id() {
     let intent = buy(usdc(), weth(), 10_000);
     let enumerated = enumerate_candidates(&intent, 2, &descriptors).expect("enumeration");
     assert_eq!(enumerated.paths.len(), 1);
+}
+
+#[test]
+fn bridge_enumeration_dedupes_conflicting_duplicate_pools() {
+    let intent = buy(usdc(), token2(), 10_000);
+
+    // Without bridge-side dedupe these 41x41 descriptors would emit 1_681
+    // identical two-hop candidates and truncate at MAX_ROUTE_CANDIDATES.
+    let ab = PoolKindState::Cpmm(cpmm(usdc(), weth(), 1_000_000, 2_000_000, 30));
+    let ab_conflicting = PoolKindState::Cpmm(cpmm(usdc(), weth(), 5_000_000, 2_000_000, 30));
+    let bc = PoolKindState::Cpmm(cpmm(weth(), token2(), 500_000, 1_000_000, 30));
+    let bc_conflicting = PoolKindState::Cpmm(cpmm(weth(), token2(), 1_000_000, 1_000_000, 30));
+
+    let mut forward = Vec::new();
+    for _ in 0..40 {
+        forward.push(fresh_descriptor("uniswap-v2", "0xpool-ab", ab.clone()));
+        forward.push(fresh_descriptor("sushi-v2", "0xpool-bc", bc.clone()));
+    }
+    forward.push(fresh_descriptor("uniswap-v2", "0xpool-ab", ab_conflicting));
+    forward.push(fresh_descriptor("sushi-v2", "0xpool-bc", bc_conflicting));
+
+    let enumerated = enumerate_candidates(&intent, 2, &forward).expect("enumeration");
+    assert!(
+        !enumerated.truncated,
+        "dedupe must avoid route-cap truncation"
+    );
+    assert_eq!(enumerated.paths.len(), 1);
+
+    let mut reversed = forward.clone();
+    reversed.reverse();
+
+    let tax = zero_tax_for(&intent);
+    let policy = caller_policy();
+    let scoring = scoring();
+    let first = plan_single_path(&request(
+        &intent, &forward, 10_000, &tax, 2, &policy, &scoring, None, None,
+    ))
+    .expect("forward planning");
+    let second = plan_single_path(&request(
+        &intent, &reversed, 10_000, &tax, 2, &policy, &scoring, None, None,
+    ))
+    .expect("reversed planning");
+
+    assert!(!first.truncated);
+    assert_eq!(first.candidates.len(), 1);
+    assert_eq!(first.selected, second.selected);
 }
 
 #[test]
@@ -295,7 +338,6 @@ fn amount_comes_from_request_not_intent() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("partial route");
     let selected = decision.selected.as_ref().expect("selected");
@@ -327,7 +369,6 @@ fn sell_route_is_linear_and_uses_input_tax() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable sell");
     let selected = decision.selected.as_ref().expect("selected");
@@ -370,7 +411,6 @@ fn clmm_hop_composes_through_public_api_with_override() {
         &scoring,
         None,
         None,
-        true,
     );
     let decision = plan_single_path(&request).expect("viable clmm route");
     let selected = decision.selected.as_ref().expect("selected");

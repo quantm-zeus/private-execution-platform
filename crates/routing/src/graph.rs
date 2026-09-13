@@ -8,11 +8,14 @@
 //! [`crate::MAX_ROUTE_CANDIDATES`]. Every emitted order is sorted, so hash-map
 //! iteration never influences output.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use chain_types::AssetId;
 use domain::TradeIntent;
-use market_types::{Bps, PoolStateEnvelope};
+use market_types::{
+    BinPoolState, Bps, ClmmPoolState, CpmmPoolState, LiquidityBin, PoolKindState, PoolStateEnvelope,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RoutingError;
@@ -105,6 +108,161 @@ fn descriptor_index(desc: &PoolDescriptor) -> String {
     desc.envelope.pool_id.address.clone()
 }
 
+fn dir_code(dir: EdgeDir) -> u8 {
+    match dir {
+        EdgeDir::ZeroForOne => 0,
+        EdgeDir::OneForZero => 1,
+    }
+}
+
+fn asset_cmp(left: &AssetId, right: &AssetId) -> Ordering {
+    // Enumeration already rejects cross-chain descriptors, so the chain is equal
+    // and the address alone gives a deterministic order.
+    left.address.cmp(&right.address)
+}
+
+fn cmp_slices_by<T>(
+    left: &[T],
+    right: &[T],
+    mut compare: impl FnMut(&T, &T) -> Ordering,
+) -> Ordering {
+    let common = left.len().min(right.len());
+    for index in 0..common {
+        let ordering = compare(&left[index], &right[index]);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn cpmm_cmp(left: &CpmmPoolState, right: &CpmmPoolState) -> Ordering {
+    asset_cmp(&left.token_0, &right.token_0)
+        .then_with(|| asset_cmp(&left.token_1, &right.token_1))
+        .then_with(|| left.decimals_0.cmp(&right.decimals_0))
+        .then_with(|| left.decimals_1.cmp(&right.decimals_1))
+        .then_with(|| left.reserve_0.cmp(&right.reserve_0))
+        .then_with(|| left.reserve_1.cmp(&right.reserve_1))
+        .then_with(|| left.total_lp_supply.cmp(&right.total_lp_supply))
+        .then_with(|| left.fee_bps.cmp(&right.fee_bps))
+}
+
+fn clmm_cmp(left: &ClmmPoolState, right: &ClmmPoolState) -> Ordering {
+    asset_cmp(&left.token_0, &right.token_0)
+        .then_with(|| asset_cmp(&left.token_1, &right.token_1))
+        .then_with(|| left.decimals_0.cmp(&right.decimals_0))
+        .then_with(|| left.decimals_1.cmp(&right.decimals_1))
+        .then_with(|| left.tick_spacing.cmp(&right.tick_spacing))
+        .then_with(|| left.current_tick.cmp(&right.current_tick))
+        .then_with(|| left.sqrt_price_x64.cmp(&right.sqrt_price_x64))
+        .then_with(|| left.liquidity.cmp(&right.liquidity))
+        .then_with(|| left.fee_bps.cmp(&right.fee_bps))
+        .then_with(|| {
+            cmp_slices_by(&left.ticks, &right.ticks, |a, b| {
+                a.index
+                    .cmp(&b.index)
+                    .then_with(|| a.liquidity_gross.cmp(&b.liquidity_gross))
+                    .then_with(|| a.liquidity_net.cmp(&b.liquidity_net))
+            })
+        })
+}
+
+fn bin_cmp(left: &BinPoolState, right: &BinPoolState) -> Ordering {
+    asset_cmp(&left.token_0, &right.token_0)
+        .then_with(|| asset_cmp(&left.token_1, &right.token_1))
+        .then_with(|| left.decimals_0.cmp(&right.decimals_0))
+        .then_with(|| left.decimals_1.cmp(&right.decimals_1))
+        .then_with(|| left.active_bin_id.cmp(&right.active_bin_id))
+        .then_with(|| left.bin_step.cmp(&right.bin_step))
+        .then_with(|| left.fee_bps.cmp(&right.fee_bps))
+        .then_with(|| {
+            cmp_slices_by(
+                &left.bins,
+                &right.bins,
+                |a: &LiquidityBin, b: &LiquidityBin| {
+                    a.id.cmp(&b.id)
+                        .then_with(|| a.reserve_0.cmp(&b.reserve_0))
+                        .then_with(|| a.reserve_1.cmp(&b.reserve_1))
+                },
+            )
+        })
+}
+
+fn state_rank(state: &PoolKindState) -> u8 {
+    match state {
+        PoolKindState::Cpmm(_) => 0,
+        PoolKindState::Clmm(_) => 1,
+        PoolKindState::Bin(_) => 2,
+    }
+}
+
+fn state_cmp(left: &PoolKindState, right: &PoolKindState) -> Ordering {
+    match (left, right) {
+        (PoolKindState::Cpmm(a), PoolKindState::Cpmm(b)) => cpmm_cmp(a, b),
+        (PoolKindState::Clmm(a), PoolKindState::Clmm(b)) => clmm_cmp(a, b),
+        (PoolKindState::Bin(a), PoolKindState::Bin(b)) => bin_cmp(a, b),
+        _ => state_rank(left).cmp(&state_rank(right)),
+    }
+}
+
+/// Canonical order over two descriptors that share a `(pool_id, direction)`.
+///
+/// The comparison never consults descriptor slice position, so the retained
+/// representative is independent of the caller's ordering even when duplicate
+/// descriptors carry conflicting state.
+fn descriptor_cmp(left: &PoolDescriptor, right: &PoolDescriptor) -> Ordering {
+    left.venue
+        .as_str()
+        .cmp(right.venue.as_str())
+        .then_with(|| left.leg_pool_ref.as_str().cmp(right.leg_pool_ref.as_str()))
+        .then_with(|| {
+            left.envelope
+                .observed_at_ms
+                .cmp(&right.envelope.observed_at_ms)
+        })
+        .then_with(|| {
+            left.envelope
+                .sequence
+                .get()
+                .cmp(&right.envelope.sequence.get())
+        })
+        .then_with(|| left.impact_override_bps.cmp(&right.impact_override_bps))
+        .then_with(|| state_cmp(&left.envelope.state, &right.envelope.state))
+}
+
+/// Deduplicates directed edges by `(pool_id, direction)`.
+///
+/// For each directed pool edge the canonically smallest descriptor (per
+/// [`descriptor_cmp`]) is retained, and the surviving edges keep their incoming
+/// deterministic order. Duplicate descriptors can therefore never emit an
+/// identical second bridge candidate, consume the route cap, or make the winner
+/// order-dependent under conflicting duplicate state.
+fn dedupe_edges(edges: Vec<Edge>, descriptors: &[PoolDescriptor]) -> Vec<Edge> {
+    let mut deduped: Vec<Edge> = Vec::with_capacity(edges.len());
+    let mut seen: HashMap<(String, u8), usize> = HashMap::new();
+    for edge in edges {
+        let key = (
+            descriptor_index(&descriptors[edge.desc_idx]),
+            dir_code(edge.dir),
+        );
+        match seen.get(&key).copied() {
+            Some(existing) => {
+                let current = deduped[existing];
+                if descriptor_cmp(&descriptors[edge.desc_idx], &descriptors[current.desc_idx])
+                    == Ordering::Less
+                {
+                    deduped[existing] = edge;
+                }
+            }
+            None => {
+                seen.insert(key, deduped.len());
+                deduped.push(edge);
+            }
+        }
+    }
+    deduped
+}
+
 fn candidate_leg(desc: &PoolDescriptor, dir: EdgeDir, descriptor_index: usize) -> CandidateLeg {
     CandidateLeg {
         descriptor_index,
@@ -179,6 +337,11 @@ pub fn enumerate_candidates(
     edges.sort_by(|left, right| {
         edge_sort_key(descriptors, *left).cmp(&edge_sort_key(descriptors, *right))
     });
+
+    // Duplicate descriptors collapse to one directed edge each, so they cannot
+    // flood the candidate cap with identical bridge candidates or trade places
+    // under caller reordering.
+    let edges = dedupe_edges(edges, descriptors);
 
     // Lookup-only map: iteration order never drives emitted output.
     let mut by_input: HashMap<AssetId, Vec<usize>> = HashMap::new();
