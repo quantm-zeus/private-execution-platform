@@ -21,6 +21,7 @@ members = [
     "crates/provider-broker",
     "crates/simulation",
     "crates/tax-engine",
+    "crates/execution-preview",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ mcp-adapters = { path = "crates/mcp-adapters" }
 provider-broker = { path = "crates/provider-broker" }
 simulation = { path = "crates/simulation" }
 tax-engine = { path = "crates/tax-engine" }
+execution-preview = { path = "crates/execution-preview" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

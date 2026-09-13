@@ -703,6 +703,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "execution-preview"
+version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "domain",
+ "market-types",
+ "serde",
+ "serde_json",
+ "simulation",
+ "tax-engine",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
