@@ -91,11 +91,15 @@ pub enum LimitEngineError {
     /// must never be swallowed as an idle order.
     #[error("trigger input failed an integrity binding check")]
     IntegrityViolation,
+    /// The policy engine refused to authorize the prepared attempt (kill switch,
+    /// size, turnover, venue, chain, or risk limits).
+    #[error("policy rejected the attempt")]
+    PolicyRejected,
 }
 
 impl LimitEngineError {
     /// Every error variant, for the redaction roster test.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::InvalidTransition,
         Self::InvalidOrder,
         Self::Expired,
@@ -122,6 +126,7 @@ impl LimitEngineError {
         Self::ArithmeticOverflow,
         Self::StoreInvalid,
         Self::IntegrityViolation,
+        Self::PolicyRejected,
     ];
 }
 
@@ -159,15 +164,16 @@ mod tests {
             LimitEngineError::ArithmeticOverflow => "ArithmeticOverflow",
             LimitEngineError::StoreInvalid => "StoreInvalid",
             LimitEngineError::IntegrityViolation => "IntegrityViolation",
+            LimitEngineError::PolicyRejected => "PolicyRejected",
         }
     }
 
     #[test]
     fn roster_names_every_variant_once() {
         let mut names: Vec<&'static str> = LimitEngineError::ALL.iter().map(variant_name).collect();
-        assert_eq!(names.len(), 26);
+        assert_eq!(names.len(), 27);
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 26, "ALL duplicates a variant");
+        assert_eq!(names.len(), 27, "ALL duplicates a variant");
     }
 }

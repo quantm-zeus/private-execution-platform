@@ -75,6 +75,7 @@ pub mod fill;
 pub mod fsm;
 pub mod journal;
 pub mod order;
+pub mod prepare;
 pub mod store;
 pub mod trigger;
 
@@ -93,6 +94,9 @@ pub use journal::{
     UnavailableOrderKeyProvider,
 };
 pub use order::{OrderTransition, StoredLimitOrder, DEFAULT_SCHEMA_VERSION};
+pub use prepare::{
+    prepare_attempt, AttemptTrust, PrepareAttemptInput, PreparedAttempt, PreparedAttemptOutcome,
+};
 pub use store::{AppendOutcome, CreateOutcome, InMemoryLimitOrderStore, LimitOrderStore};
 pub use trigger::{
     attempt_is_executable, evaluate_trigger, max_safe_fill, QuoteOutcome, QuoteProvider,

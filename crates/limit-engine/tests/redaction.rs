@@ -4,14 +4,14 @@ use limit_engine::LimitEngineError;
 
 #[test]
 fn error_roster_is_complete() {
-    assert_eq!(LimitEngineError::ALL.len(), 26);
+    assert_eq!(LimitEngineError::ALL.len(), 27);
     let mut names: Vec<String> = LimitEngineError::ALL
         .iter()
         .map(|e| format!("{e:?}"))
         .collect();
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 26, "error roster contains duplicates");
+    assert_eq!(names.len(), 27, "error roster contains duplicates");
 }
 
 #[test]
