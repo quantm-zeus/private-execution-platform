@@ -214,11 +214,26 @@ impl fmt::Display for RevalidationReason {
 /// `Valid` can only be produced by the P38 bridge plus canonical domain
 /// validation, so holding it proves that locked validation ran.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum RevalidationOutcome {
     Valid(ValidatedExecutionPreview),
     AbortRequote(RevalidationReason),
     AbortFinal(RevalidationReason),
+}
+
+/// Redacted `Debug`: `Valid` never prints its inner [`ExecutionPreview`] (which
+/// carries assets, amounts, and intent ids); aborts print only the payload-free
+/// [`RevalidationReason`].
+impl fmt::Debug for RevalidationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Valid(_) => formatter.write_str("Valid"),
+            Self::AbortRequote(reason) => {
+                formatter.debug_tuple("AbortRequote").field(reason).finish()
+            }
+            Self::AbortFinal(reason) => formatter.debug_tuple("AbortFinal").field(reason).finish(),
+        }
+    }
 }
 
 /// Revalidates all pre-sign facts and returns a validated execution preview.
@@ -288,16 +303,32 @@ pub fn revalidate_pre_sign(input: &RevalidationInput<'_>) -> RevalidationOutcome
         }
     }
     if let Some(observation) = input.tax_observation {
-        if observation.chain == ChainId::Solana
-            && !input.allowed_programs.contains(&observation.router_ref)
+        if observation.chain == ChainId::Solana {
+            if !input.allowed_programs.contains(&observation.router_ref) {
+                return AbortFinal(Reason::ProgramNotAllowlisted);
+            }
+        } else if expected_spender_ref(input.approved_route_binding, &input.intent.chain)
+            != Some(observation.router_ref.as_str())
         {
-            return AbortFinal(Reason::ProgramNotAllowlisted);
+            // The EVM router ref is the allowance spender; it must be the
+            // approved route's first-leg venue, never an attacker-supplied value.
+            return AbortFinal(Reason::AllowanceSpenderMismatch);
         }
     }
 
     // 4. The selected route must be structurally identical to the approved one.
     if RouteBinding::from_route(input.route) != *input.approved_route_binding {
         return AbortRequote(Reason::SelectedRouteMismatch);
+    }
+
+    // 4b. Route state must also be fresh under the caller-supplied policy. The
+    //     P38 bridge pins `FreshnessPolicy::default()` internally, so evaluating
+    //     it explicitly here honors the caller's policy instead of ignoring it.
+    match classify_freshness(input.freshness_policy, &input.route.state, input.now_ms) {
+        Some(FreshnessStatus::Fresh) => {}
+        Some(FreshnessStatus::Stale) => return AbortRequote(Reason::StaleState),
+        Some(FreshnessStatus::ResyncRequired) => return AbortFinal(Reason::ResyncRequired),
+        None => return AbortFinal(Reason::StateRegression),
     }
 
     // 5. Wallet and (when required) allowance freshness.
@@ -348,9 +379,12 @@ pub fn revalidate_pre_sign(input: &RevalidationInput<'_>) -> RevalidationOutcome
         return AbortRequote(Reason::InsufficientBalance);
     }
 
-    // 8. Allowance, when the route requires one.
+    // 8. Allowance, when the route requires one. The spender must be the
+    //    approved route's expected spender on every chain.
     if let Some(allowance) = input.allowance.state() {
-        if allowance.spender_ref.as_str() != expected_allowance_spender(input.route, observation) {
+        if expected_spender_ref(input.approved_route_binding, &input.intent.chain)
+            != Some(allowance.spender_ref.as_str())
+        {
             return AbortFinal(Reason::AllowanceSpenderMismatch);
         }
         if allowance.asset != input.net_delta.net_input.asset {
@@ -397,31 +431,37 @@ pub fn revalidate_pre_sign(input: &RevalidationInput<'_>) -> RevalidationOutcome
     }
 }
 
-/// The selected route's router/program ref that must be the allowance spender.
+/// The approved route's expected spender/router ref.
 ///
-/// Solana routes delegate to the final swap program (`pool_ref`); other chains
-/// use the router contract ref carried by the tax observation.
-fn expected_allowance_spender<'a>(
-    route: &'a RoutePlan,
-    observation: &'a TaxObservation,
-) -> &'a str {
-    if observation.chain == ChainId::Solana {
-        route
-            .legs
-            .last()
-            .map(|leg| leg.pool_ref.as_str())
-            .unwrap_or(observation.router_ref.as_str())
+/// Solana routes delegate to the FIRST leg's program (`pool_ref`) — the program
+/// that pulls `token_in`; every other chain uses the FIRST leg's venue (the
+/// router contract). Deriving this from the approved route binding (rather than
+/// from the untrusted tax observation) is what binds the allowance spender and
+/// the EVM router ref to the route that policy actually approved.
+fn expected_spender_ref<'a>(
+    approved_route_binding: &'a RouteBinding,
+    chain: &ChainId,
+) -> Option<&'a str> {
+    let first = approved_route_binding.legs.first()?;
+    if matches!(chain, ChainId::Solana) {
+        Some(first.pool_ref.as_str())
     } else {
-        observation.router_ref.as_str()
+        Some(first.venue.as_str())
     }
 }
 
 /// Classifies explicit freshness metadata; `None` means it could not be evaluated.
+///
+/// A zero sequence means no valid data exists yet, so it fails closed as
+/// `ResyncRequired` before the timestamp is even considered.
 fn classify_freshness(
     policy: &FreshnessPolicy,
     freshness: &Freshness,
     now_ms: i64,
 ) -> Option<FreshnessStatus> {
+    if freshness.sequence.is_zero() {
+        return Some(FreshnessStatus::ResyncRequired);
+    }
     evaluate_freshness(
         policy,
         freshness.observed_at_ms,

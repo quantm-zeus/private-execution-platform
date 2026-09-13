@@ -141,7 +141,7 @@ fn tax_observation() -> TaxObservation {
         chain: ChainId::Base,
         token: token(),
         pool_ref: "0xpool-p39".to_string(),
-        router_ref: "0xrouter-p39".to_string(),
+        router_ref: "uniswap_v3".to_string(),
         wallet_ref: wallet_ref(),
         amount: AtomicAmount::new(1_000),
         block_or_slot: 1,
@@ -184,10 +184,10 @@ fn turnover() -> TurnoverSnapshot {
     TurnoverSnapshot::from_trusted_backend_state(UsdMicros::new(0), UsdMicros::new(0))
 }
 
-fn engine() -> PolicyEngine {
+fn engine_with_limits(limits: PolicyLimits) -> PolicyEngine {
     PolicyEngine::new(
         TradingGate::from_trusted_startup(Some("true")).unwrap(),
-        limits(),
+        limits,
     )
     .unwrap()
 }
@@ -202,10 +202,18 @@ fn policy_context(now_ms: i64) -> PolicyContext {
     .unwrap()
 }
 
-fn approval_for(intent: &TradeIntent, now_ms: i64) -> ApprovedExecution {
-    engine()
+fn approval_for_with_limits(
+    intent: &TradeIntent,
+    now_ms: i64,
+    limits: PolicyLimits,
+) -> ApprovedExecution {
+    engine_with_limits(limits)
         .authorize_trade(intent, &policy_context(now_ms))
         .unwrap()
+}
+
+fn approval_for(intent: &TradeIntent, now_ms: i64) -> ApprovedExecution {
+    approval_for_with_limits(intent, now_ms, limits())
 }
 
 fn allowance(value: u128) -> AllowanceObservation {
@@ -213,7 +221,7 @@ fn allowance(value: u128) -> AllowanceObservation {
         wallet_ref: wallet_ref(),
         chain: ChainId::Base,
         asset: usdc(),
-        spender_ref: "0xrouter-p39".to_string(),
+        spender_ref: "uniswap_v3".to_string(),
         amount: AtomicAmount::new(value),
         freshness: freshness(),
     })
@@ -279,6 +287,126 @@ impl Fixture {
             allowance: &self.allowance,
         };
         revalidate_pre_sign(&input)
+    }
+}
+
+/// A complete two-leg Solana route fixture used to prove the spender binding is
+/// the FIRST leg's program (`pool_ref`), not the last leg's.
+fn solana_fixture() -> Fixture {
+    let sol_in = AssetId::new(
+        ChainId::Solana,
+        "So11111111111111111111111111111111111111112",
+    )
+    .unwrap();
+    let sol_mid = AssetId::new(ChainId::Solana, "mid-mint-p39").unwrap();
+    let sol_out = AssetId::new(
+        ChainId::Solana,
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    )
+    .unwrap();
+
+    let mut intent = intent();
+    intent.chain = ChainId::Solana;
+    intent.token_in = sol_in.clone();
+    intent.token_out = sol_out.clone();
+
+    let route = RoutePlan {
+        legs: vec![
+            RouteLeg {
+                venue: "uniswap_v3".to_string(),
+                pool_ref: "program-first".to_string(),
+                token_in: sol_in.clone(),
+                token_out: sol_mid.clone(),
+                amount_in: AtomicAmount::new(1_000),
+                expected_amount_out: AtomicAmount::new(500),
+            },
+            RouteLeg {
+                venue: "uniswap_v3".to_string(),
+                pool_ref: "program-last".to_string(),
+                token_in: sol_mid,
+                token_out: sol_out.clone(),
+                amount_in: AtomicAmount::new(500),
+                expected_amount_out: AtomicAmount::new(250),
+            },
+        ],
+        expected_net_output: amount(&sol_out, 240),
+        state: freshness(),
+    };
+
+    let mut solana_limits = limits();
+    solana_limits.allowed_chains = [ChainId::Solana].into_iter().collect();
+    let approval = approval_for_with_limits(&intent, NOW, solana_limits.clone());
+
+    let allowed_programs = ["program-first", "program-last", "router-program"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    Fixture {
+        intent,
+        approval: Some(approval),
+        limits: solana_limits,
+        allowed_programs,
+        trading_enabled: true,
+        freshness_policy: FreshnessPolicy::default(),
+        approved_route_binding: RouteBinding::from_route(&route),
+        route,
+        net_delta: NetDelta {
+            token_in: sol_in.clone(),
+            token_out: sol_out.clone(),
+            net_input: amount(&sol_in, 1_000),
+            gross_output: amount(&sol_out, 250),
+            net_output: amount(&sol_out, 240),
+            dex_fee: Some(amount(&sol_in, 3)),
+            tax_cost: Some(amount(&sol_out, 10)),
+        },
+        basis_assessment: TaxAssessment::new(
+            sol_out.clone(),
+            ChainId::Solana,
+            Bps::new(400).unwrap(),
+            Bps::new(0).unwrap(),
+            SafeFreshnessMeta {
+                status: FreshnessStatus::Fresh,
+                observed_at_ms: OBSERVED,
+                evaluated_at_ms: OBSERVED,
+                age_ms: 1_000,
+                sequence: Sequence(1),
+            },
+            1,
+        ),
+        tax_observation: Some(TaxObservation {
+            chain: ChainId::Solana,
+            token: sol_out.clone(),
+            pool_ref: "program-last".to_string(),
+            router_ref: "router-program".to_string(),
+            wallet_ref: wallet_ref(),
+            amount: AtomicAmount::new(1_000),
+            block_or_slot: 1,
+            buy_tax: Bps::new(400).unwrap(),
+            sell_tax: Bps::new(0).unwrap(),
+            buy_succeeds: true,
+            sell_succeeds: true,
+            sellable: true,
+            confidence: Bps::new(9_000).unwrap(),
+            observed_at_ms: OBSERVED,
+            expires_at_ms: NOW + 60_000,
+        }),
+        min_out: amount(&sol_out, 240),
+        wallet_balance: WalletBalance {
+            wallet_ref: wallet_ref(),
+            chain: ChainId::Solana,
+            asset: sol_in.clone(),
+            available: AtomicAmount::new(1_000),
+            freshness: freshness(),
+        },
+        allowance: AllowanceObservation::Required(AllowanceState {
+            wallet_ref: wallet_ref(),
+            chain: ChainId::Solana,
+            asset: sol_in,
+            spender_ref: "program-first".to_string(),
+            amount: AtomicAmount::new(1_000),
+            freshness: freshness(),
+        }),
     }
 }
 
@@ -532,6 +660,143 @@ fn valid_requires_bridge_domain_validation() {
 
     // Control: the unmodified fixture is Valid.
     expect_valid(Fixture::new().run());
+}
+
+#[test]
+fn evm_router_ref_must_bind_approved_first_leg_venue() {
+    // The EVM router ref is the allowance spender: it must equal the approved
+    // route's first-leg venue, so an attacker-controlled value fails closed.
+    let mut fixture = Fixture::new();
+    fixture.tax_observation.as_mut().unwrap().router_ref = "0xattacker".to_string();
+    expect_final(fixture.run(), RevalidationReason::AllowanceSpenderMismatch);
+}
+
+#[test]
+fn solana_spender_is_first_leg_pool_not_last_leg() {
+    // The program that pulls `token_in` is the FIRST leg.
+    expect_valid(solana_fixture().run());
+
+    let mut last_leg = solana_fixture();
+    if let AllowanceObservation::Required(state) = &mut last_leg.allowance {
+        state.spender_ref = "program-last".to_string();
+    }
+    expect_final(last_leg.run(), RevalidationReason::AllowanceSpenderMismatch);
+}
+
+#[test]
+fn wallet_freshness_boundary_is_valid_and_stale_is_requote() {
+    // Age exactly 10000 with the default 10s policy is still Fresh.
+    let mut boundary = Fixture::new();
+    boundary.wallet_balance.freshness.observed_at_ms = NOW - 10_000;
+    expect_valid(boundary.run());
+
+    // One millisecond past the boundary is Stale and only requoteable.
+    let mut stale = Fixture::new();
+    stale.wallet_balance.freshness.observed_at_ms = NOW - 10_001;
+    expect_requote(stale.run(), RevalidationReason::StaleState);
+}
+
+#[test]
+fn allowance_freshness_stale_is_requote() {
+    let mut fixture = Fixture::new();
+    fixture.allowance = allowance(1_000);
+    if let AllowanceObservation::Required(state) = &mut fixture.allowance {
+        state.freshness.observed_at_ms = NOW - 10_001;
+    }
+    expect_requote(fixture.run(), RevalidationReason::StaleState);
+}
+
+#[test]
+fn zero_wallet_sequence_requires_resync() {
+    let mut fixture = Fixture::new();
+    fixture.wallet_balance.freshness.sequence = Sequence(0);
+    expect_final(fixture.run(), RevalidationReason::ResyncRequired);
+}
+
+#[test]
+fn zero_allowance_sequence_requires_resync() {
+    let mut fixture = Fixture::new();
+    fixture.allowance = allowance(1_000);
+    if let AllowanceObservation::Required(state) = &mut fixture.allowance {
+        state.freshness.sequence = Sequence(0);
+    }
+    expect_final(fixture.run(), RevalidationReason::ResyncRequired);
+}
+
+#[test]
+fn caller_freshness_policy_applies_to_route_state() {
+    // Under the default 10s policy this route (age 1000) is Fresh and Valid;
+    // a tighter caller policy must be honored by the route pre-check.
+    let mut tight = Fixture::new();
+    tight.wallet_balance.freshness.observed_at_ms = NOW;
+    tight.freshness_policy = FreshnessPolicy::new(500, 2_000).unwrap();
+    expect_requote(tight.run(), RevalidationReason::StaleState);
+}
+
+#[test]
+fn approval_wallet_binding_mismatch_is_final() {
+    let mut fixture = Fixture::new();
+    let mut other = fixture.intent.clone();
+    other.wallet_ref = WalletRef::new("wallet-attacker").unwrap();
+    fixture.approval = Some(approval_for(&other, NOW));
+    expect_final(fixture.run(), RevalidationReason::ApprovalBindingMismatch);
+}
+
+#[test]
+fn approval_idempotency_binding_mismatch_is_final() {
+    let mut fixture = Fixture::new();
+    let mut other = fixture.intent.clone();
+    other.idempotency_key = IdempotencyKey::new("idem-attacker").unwrap();
+    fixture.approval = Some(approval_for(&other, NOW));
+    expect_final(fixture.run(), RevalidationReason::ApprovalBindingMismatch);
+}
+
+#[test]
+fn approval_chain_binding_mismatch_is_final() {
+    let mut fixture = Fixture::new();
+    let mut other = fixture.intent.clone();
+    other.chain = ChainId::BnbChain;
+    other.token_in = AssetId::new(ChainId::BnbChain, "0xbnb-in-p39").unwrap();
+    other.token_out = AssetId::new(ChainId::BnbChain, "0xbnb-out-p39").unwrap();
+    let mut bnb_limits = limits();
+    bnb_limits.allowed_chains.insert(ChainId::BnbChain);
+    fixture.approval = Some(approval_for_with_limits(&other, NOW, bnb_limits));
+    expect_final(fixture.run(), RevalidationReason::ApprovalBindingMismatch);
+}
+
+#[test]
+fn min_out_asset_mismatch_is_final() {
+    let mut fixture = Fixture::new();
+    fixture.min_out = amount(&usdc(), 240);
+    expect_final(fixture.run(), RevalidationReason::MinOutNotMet);
+}
+
+#[test]
+fn valid_outcome_debug_is_redacted() {
+    let outcome = Fixture::new().run();
+    assert!(matches!(outcome, RevalidationOutcome::Valid(_)));
+    let debug = format!("{outcome:?}");
+    assert_eq!(debug, "Valid");
+    for pattern in [
+        "intent-p39",
+        "wallet-p39",
+        "usdc",
+        "token",
+        "0x",
+        "1000",
+        "240",
+    ] {
+        assert!(
+            !debug.contains(pattern),
+            "Valid Debug leaked '{pattern}': {debug}"
+        );
+    }
+
+    // Abort arms still expose only the redacted reason.
+    let mut drifted = Fixture::new();
+    drifted.route.legs[0].pool_ref = "0xother-pool".to_string();
+    let abort = drifted.run();
+    assert_eq!(format!("{abort:?}"), "AbortRequote(SelectedRouteMismatch)");
 }
 
 #[test]
