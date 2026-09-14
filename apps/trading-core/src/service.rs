@@ -62,13 +62,19 @@ impl std::fmt::Display for ReconcileConfigError {
 
 impl std::error::Error for ReconcileConfigError {}
 
+/// Largest accepted reconcile interval, so a valid-but-absurd value cannot
+/// silently disable the loop.
+pub const MAX_RECONCILE_INTERVAL_MS: u64 = 86_400_000;
+
 /// Strictly parses `RECONCILE_INTERVAL_MS`.
 ///
 /// - `None` (absent) -> `Ok(None)` (loop disabled).
 /// - `"0"` -> `Ok(None)` (explicitly disabled).
-/// - non-empty ASCII digits only -> `Ok(Some(Duration::from_millis(n)))`.
+/// - non-empty ASCII digits only, `<= MAX_RECONCILE_INTERVAL_MS` ->
+///   `Ok(Some(Duration::from_millis(n)))`.
 /// - anything else, including an empty string, a sign, whitespace, scientific
-///   notation, or `u64` overflow -> `Err(ReconcileConfigError::InvalidInterval)`.
+///   notation, an out-of-range value, or `u64` overflow ->
+///   `Err(ReconcileConfigError::InvalidInterval)`.
 pub fn parse_reconcile_interval_ms(
     value: Option<&str>,
 ) -> Result<Option<Duration>, ReconcileConfigError> {
@@ -84,6 +90,9 @@ pub fn parse_reconcile_interval_ms(
         .map_err(|_| ReconcileConfigError::InvalidInterval)?;
     if millis == 0 {
         return Ok(None);
+    }
+    if millis > MAX_RECONCILE_INTERVAL_MS {
+        return Err(ReconcileConfigError::InvalidInterval);
     }
     Ok(Some(Duration::from_millis(millis)))
 }
@@ -159,8 +168,8 @@ mod tests {
             Ok(Some(Duration::from_millis(250)))
         );
         assert_eq!(
-            parse_reconcile_interval_ms(Some("18446744073709551615")),
-            Ok(Some(Duration::from_millis(u64::MAX)))
+            parse_reconcile_interval_ms(Some("86400000")),
+            Ok(Some(Duration::from_millis(MAX_RECONCILE_INTERVAL_MS)))
         );
         for invalid in ["", "+5", " 5", "1e3", "-1", "5 ", "0x10", "1_000"] {
             assert_eq!(
@@ -169,6 +178,15 @@ mod tests {
                 "value {invalid:?} must be rejected"
             );
         }
+        // An out-of-range value must not silently disable the loop.
+        assert_eq!(
+            parse_reconcile_interval_ms(Some("86400001")),
+            Err(ReconcileConfigError::InvalidInterval)
+        );
+        assert_eq!(
+            parse_reconcile_interval_ms(Some("18446744073709551615")),
+            Err(ReconcileConfigError::InvalidInterval)
+        );
         // `u64` overflow is not a valid interval.
         assert_eq!(
             parse_reconcile_interval_ms(Some("18446744073709551616")),

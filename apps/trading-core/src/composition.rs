@@ -37,7 +37,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -421,21 +421,48 @@ impl std::fmt::Debug for PendingMarketAttempt {
     }
 }
 
+/// Opaque reservation ticket for one market-attempt reference.
+///
+/// Carries the registry generation (`epoch`) of the entry it reserved, so a
+/// delayed [`MarketAttemptRegistry::release`] after a terminal
+/// [`MarketAttemptRegistry::remove`] cannot decrement a *new* entry created for
+/// the same attempt identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Reservation {
+    attempt: PendingMarketAttempt,
+    epoch: u64,
+}
+
+impl Reservation {
+    /// The attempt this ticket refers to.
+    pub fn attempt(&self) -> &PendingMarketAttempt {
+        &self.attempt
+    }
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Reservation { .. }")
+    }
+}
+
 /// Result of reserving a slot for one market attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReserveOutcome {
     /// The attempt was newly stored with a first reference.
-    Reserved,
+    Reserved(Reservation),
     /// An identical attempt was already stored; its reference count grew.
-    AlreadyPending,
+    AlreadyPending(Reservation),
     /// The registry is full of distinct attempts; nothing was stored.
     AtCapacity,
 }
 
-/// One stored attempt plus its in-process reservation reference count.
+/// One stored attempt plus its in-process reservation reference count and
+/// generation.
 struct PendingEntry {
     attempt: PendingMarketAttempt,
     refs: usize,
+    epoch: u64,
 }
 
 /// Process-local, bounded, deduplicating registry of pending market attempts.
@@ -446,15 +473,18 @@ struct PendingEntry {
 /// [`MAX_PENDING_MARKET_ATTEMPTS`] distinct attempts are retained a new distinct
 /// attempt is refused ([`ReserveOutcome::AtCapacity`]) rather than dropped
 /// silently, which lets the recorder deny before forwarding an untrackable
-/// attempt.
+/// attempt. Each entry carries a generation so a stale
+/// [`Self::release`] ticket cannot affect a later entry for the same identity.
 pub struct MarketAttemptRegistry {
     pending: Mutex<Vec<PendingEntry>>,
+    next_epoch: AtomicU64,
 }
 
 impl Default for MarketAttemptRegistry {
     fn default() -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
+            next_epoch: AtomicU64::new(0),
         }
     }
 }
@@ -475,22 +505,34 @@ impl MarketAttemptRegistry {
         let mut pending = lock(&self.pending);
         if let Some(entry) = pending.iter_mut().find(|entry| entry.attempt == attempt) {
             entry.refs = entry.refs.saturating_add(1);
-            return ReserveOutcome::AlreadyPending;
+            return ReserveOutcome::AlreadyPending(Reservation {
+                attempt: entry.attempt.clone(),
+                epoch: entry.epoch,
+            });
         }
         if pending.len() >= MAX_PENDING_MARKET_ATTEMPTS {
             return ReserveOutcome::AtCapacity;
         }
-        pending.push(PendingEntry { attempt, refs: 1 });
-        ReserveOutcome::Reserved
+        let epoch = self.next_epoch.fetch_add(1, Ordering::SeqCst);
+        pending.push(PendingEntry {
+            attempt: attempt.clone(),
+            refs: 1,
+            epoch,
+        });
+        ReserveOutcome::Reserved(Reservation { attempt, epoch })
     }
 
-    /// Drops one reference to `attempt`, removing it at zero.
+    /// Drops the reference held by `reservation`, removing the entry at zero.
     ///
-    /// Releasing an attempt that is not present is a no-op: a rejected or
-    /// already-reconciled attempt is never re-added.
-    pub fn release(&self, attempt: &PendingMarketAttempt) {
+    /// The generation (`epoch`) must match: a ticket from an entry that was
+    /// already force-removed is a no-op, so it cannot decrement a freshly
+    /// reserved entry with the same attempt identity. Releasing an absent
+    /// attempt is likewise a no-op.
+    pub fn release(&self, reservation: &Reservation) {
         let mut pending = lock(&self.pending);
-        if let Some(index) = pending.iter().position(|entry| &entry.attempt == attempt) {
+        if let Some(index) = pending.iter().position(|entry| {
+            entry.epoch == reservation.epoch && entry.attempt == reservation.attempt
+        }) {
             if pending[index].refs <= 1 {
                 pending.remove(index);
             } else {
@@ -502,7 +544,8 @@ impl MarketAttemptRegistry {
     /// Force-removes `attempt`, returning `true` when it was present.
     ///
     /// Used for terminal reconcile results, where every outstanding reference is
-    /// resolved at once.
+    /// resolved at once. Outstanding tickets for the removed entry become stale
+    /// and their later [`Self::release`] is a no-op.
     pub fn remove(&self, attempt: &PendingMarketAttempt) -> bool {
         let mut pending = lock(&self.pending);
         match pending.iter().position(|entry| &entry.attempt == attempt) {
@@ -517,11 +560,20 @@ impl MarketAttemptRegistry {
     /// Seeds `attempt` as if by [`Self::reserve`], returning `true` only when it
     /// was newly stored.
     ///
-    /// This is the seeding/observational surface for tests and startup load; the
-    /// runtime recorder uses [`Self::reserve`] directly so it can deny at
-    /// capacity.
+    /// A duplicate is a true no-op (the transient reference from
+    /// [`Self::reserve`] is released before returning `false`), so a seeder can
+    /// never strand a reference. This is the seeding/observational surface for
+    /// tests and startup load; the runtime recorder uses [`Self::reserve`]
+    /// directly so it can deny at capacity.
     pub fn record(&self, attempt: PendingMarketAttempt) -> bool {
-        matches!(self.reserve(attempt), ReserveOutcome::Reserved)
+        match self.reserve(attempt) {
+            ReserveOutcome::Reserved(_) => true,
+            ReserveOutcome::AlreadyPending(reservation) => {
+                self.release(&reservation);
+                false
+            }
+            ReserveOutcome::AtCapacity => false,
+        }
     }
 
     /// Snapshots the pending attempts in insertion order.
@@ -594,20 +646,21 @@ impl<B: AgentBackend> AgentBackend for RecordingAgentBackend<B> {
         // attempt the registry cannot track (losslessness / fail-closed).
         let reserved = match observed {
             None => None,
-            Some(attempt) => match self.registry.reserve(attempt.clone()) {
+            Some(attempt) => match self.registry.reserve(attempt) {
                 ReserveOutcome::AtCapacity => return BackendOutcome::Denied,
-                ReserveOutcome::Reserved | ReserveOutcome::AlreadyPending => Some(attempt),
+                ReserveOutcome::Reserved(reservation)
+                | ReserveOutcome::AlreadyPending(reservation) => Some(reservation),
             },
         };
         let outcome = self.inner.execute(channel, command).await;
         // Every outcome other than `Value` is a definitive non-delegation signal
         // (pre-port denial or a provably pre-submit terminal), so the reservation
         // is released. `Value` means the port may be in flight: keep it pending.
-        // Refcounts make the release race-safe; a cancelled call conservatively
-        // leaves the reservation in place.
+        // The epoch-carrying ticket makes the release race-safe; a cancelled call
+        // conservatively leaves the reservation in place.
         if !matches!(outcome, BackendOutcome::Value(_)) {
-            if let Some(attempt) = &reserved {
-                self.registry.release(attempt);
+            if let Some(reservation) = &reserved {
+                self.registry.release(reservation);
             }
         }
         outcome
@@ -1216,24 +1269,29 @@ mod tests {
     #[test]
     fn reserve_dedups_counts_refs_and_gates_capacity() {
         let registry = MarketAttemptRegistry::new();
-        assert_eq!(registry.reserve(attempt(1)), ReserveOutcome::Reserved);
-        assert_eq!(
-            registry.reserve(attempt(1)),
-            ReserveOutcome::AlreadyPending,
-            "a duplicate grows the refcount instead of double-storing"
-        );
+        let first = match registry.reserve(attempt(1)) {
+            ReserveOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        let duplicate = match registry.reserve(attempt(1)) {
+            ReserveOutcome::AlreadyPending(reservation) => reservation,
+            other => panic!("expected AlreadyPending, got {other:?}"),
+        };
         assert_eq!(registry.len(), 1);
         // Two references: one release keeps the entry, the second removes it.
-        registry.release(&attempt(1));
+        registry.release(&first);
         assert_eq!(registry.len(), 1);
-        registry.release(&attempt(1));
+        registry.release(&duplicate);
         assert!(registry.is_empty());
-        // Releasing an absent attempt is a no-op.
-        registry.release(&attempt(1));
+        // Releasing an absent/stale ticket is a no-op.
+        registry.release(&first);
         assert!(registry.is_empty());
 
         for value in 1..=MAX_PENDING_MARKET_ATTEMPTS as u128 {
-            assert_eq!(registry.reserve(attempt(value)), ReserveOutcome::Reserved);
+            assert!(matches!(
+                registry.reserve(attempt(value)),
+                ReserveOutcome::Reserved(_)
+            ));
         }
         assert_eq!(registry.len(), MAX_PENDING_MARKET_ATTEMPTS);
         assert_eq!(
@@ -1241,19 +1299,45 @@ mod tests {
             ReserveOutcome::AtCapacity,
             "a distinct newcomer is refused at capacity"
         );
-        assert_eq!(
+        assert!(matches!(
             registry.reserve(attempt(1)),
-            ReserveOutcome::AlreadyPending,
-            "an already-tracked attempt still reserves at capacity"
-        );
+            ReserveOutcome::AlreadyPending(_)
+        ));
         assert_eq!(registry.len(), MAX_PENDING_MARKET_ATTEMPTS);
+    }
+
+    #[test]
+    fn stale_release_cannot_evict_a_re_reserved_attempt() {
+        let registry = MarketAttemptRegistry::new();
+        let stale = match registry.reserve(attempt(1)) {
+            ReserveOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        // Reconcile terminalizes the entry while the original reservation is
+        // still outstanding.
+        assert!(registry.remove(&attempt(1)));
+        assert!(registry.is_empty());
+        // A concurrent execute re-reserves the same identity (fresh generation).
+        let fresh = match registry.reserve(attempt(1)) {
+            ReserveOutcome::Reserved(reservation) => reservation,
+            other => panic!("expected Reserved, got {other:?}"),
+        };
+        // The delayed release from the drained generation must not evict it.
+        registry.release(&stale);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.pending()[0], attempt(1));
+        registry.release(&fresh);
+        assert!(registry.is_empty());
     }
 
     #[tokio::test]
     async fn recorder_denies_before_forward_at_capacity() {
         let registry = Arc::new(MarketAttemptRegistry::new());
         for value in 1..=MAX_PENDING_MARKET_ATTEMPTS as u128 {
-            assert_eq!(registry.reserve(attempt(value)), ReserveOutcome::Reserved);
+            assert!(matches!(
+                registry.reserve(attempt(value)),
+                ReserveOutcome::Reserved(_)
+            ));
         }
         let inner = Arc::new(FixedOutcomeBackend::new(BackendOutcome::Unavailable));
         let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
@@ -1311,7 +1395,7 @@ mod tests {
             "a delegated Value outcome is kept pending"
         );
         assert_eq!(registry.pending()[0], attempt(7));
-        recorder.registry().release(&attempt(7));
+        assert!(registry.remove(&attempt(7)));
         assert!(registry.is_empty());
     }
 

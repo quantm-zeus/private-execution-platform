@@ -418,7 +418,10 @@ async fn full_registry_never_yields_an_untracked_delegated_attempt() {
 
     let registry = Arc::new(MarketAttemptRegistry::new());
     for value in 1..=MAX_PENDING_MARKET_ATTEMPTS as u128 {
-        assert_eq!(registry.reserve(attempt(value)), ReserveOutcome::Reserved);
+        assert!(matches!(
+            registry.reserve(attempt(value)),
+            ReserveOutcome::Reserved(_)
+        ));
     }
     let inner = Arc::new(TrackingAgentBackend::new(registry.clone()));
     let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
@@ -466,7 +469,10 @@ async fn spawned_loop_is_read_only_bounded_and_graceful() {
     );
     let registry = core.registry();
     for amount in 1..=3u128 {
-        assert_eq!(registry.reserve(attempt(amount)), ReserveOutcome::Reserved);
+        assert!(matches!(
+            registry.reserve(attempt(amount)),
+            ReserveOutcome::Reserved(_)
+        ));
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
