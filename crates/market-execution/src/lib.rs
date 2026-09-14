@@ -282,10 +282,13 @@ where
     /// Reconciles a previously delegated attempt by its idempotency key.
     ///
     /// # Invariants
-    /// - **MR-1 (read-only).** This delegates to [`ExecutionRelay::reconcile`],
+    /// - **MR-1 (no sign/submit).** This delegates to [`ExecutionRelay::reconcile`],
     ///   which only queries/reconciles the process-local journal and the chain
     ///   adapter. It never runs the policy/trust/revalidation gates, never signs,
-    ///   and never submits.
+    ///   never submits, and never advances a reservation; the only write is a
+    ///   best-effort record of the observed outcome in the process-local
+    ///   reservation store (the reservation digest is unchanged, so at-most-once
+    ///   holds).
     /// - **MR-2 (no fabricated fill).** The result goes through the same private
     ///   [`map_outcome`]: a `Filled` is produced only from a relay
     ///   `Confirmed { fill: Some }` observation carrying exact amounts; a
