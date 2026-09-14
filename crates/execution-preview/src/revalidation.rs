@@ -29,7 +29,7 @@ use std::fmt;
 
 use chain_types::{AssetId, ChainId};
 use domain::{
-    cmp_u128_products, DomainError, RoutePlan, TaxObservation, TradeIntent,
+    cmp_u128_products, DomainError, RoutePlan, SplitPlan, TaxObservation, TradeIntent,
     ValidatedExecutionPreview, WalletRef,
 };
 use market_types::{
@@ -39,7 +39,10 @@ use policy::{ApprovedExecution, PolicyLimits};
 use serde::{Deserialize, Serialize};
 use tax_engine::{evaluate_tax_safety, TaxAssessment, TaxSafetyError};
 
-use crate::{validate_delta_preview_with_assessment, BridgeError, NetDelta};
+use crate::{
+    validate_delta_preview_with_assessment, validate_split_delta_preview_with_assessment,
+    BridgeError, NetDelta,
+};
 
 /// Trusted wallet balance snapshot for the trade's input asset.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +432,354 @@ pub fn revalidate_pre_sign(input: &RevalidationInput<'_>) -> RevalidationOutcome
         Ok(preview) => Valid(preview),
         Err(error) => map_bridge_error(error),
     }
+}
+
+/// Structural identity of one split branch, excluding freshness.
+///
+/// The gross branch budget is included because it is part of the approved
+/// execution binding; the branch route is amount-free, mirroring [`RouteLegRef`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitLegRef {
+    pub amount_in: AtomicAmount,
+    pub legs: Vec<RouteLegRef>,
+}
+
+/// Structural identity of the whole approved split.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitRouteBinding {
+    pub branches: Vec<SplitLegRef>,
+}
+
+impl SplitRouteBinding {
+    /// Projects a split plan onto its amount-explicit structural identity.
+    pub fn from_split(split: &SplitPlan) -> Self {
+        Self {
+            branches: split
+                .legs
+                .iter()
+                .map(|branch| SplitLegRef {
+                    amount_in: branch.amount_in,
+                    legs: branch
+                        .route
+                        .legs
+                        .iter()
+                        .map(|leg| RouteLegRef {
+                            venue: leg.venue.clone(),
+                            pool_ref: leg.pool_ref.clone(),
+                            token_in: leg.token_in.clone(),
+                            token_out: leg.token_out.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// All inputs required by [`revalidate_split_pre_sign`].
+///
+/// Every trusted fact is passed by reference and never mutated; the caller
+/// supplies the explicit `now_ms` and this module never reads a clock.
+pub struct SplitRevalidationInput<'a> {
+    pub intent: &'a TradeIntent,
+    pub approval: Option<&'a ApprovedExecution>,
+    pub policy_limits: &'a PolicyLimits,
+    pub allowed_programs: &'a HashSet<String>,
+    /// Explicit kill-switch snapshot; never the shared mutable gate.
+    pub trading_enabled: bool,
+    pub now_ms: i64,
+    pub freshness_policy: &'a FreshnessPolicy,
+    pub split: &'a SplitPlan,
+    /// Per-branch exact deltas; aggregated inside. Length == `split.legs.len()`.
+    pub branch_deltas: &'a [NetDelta],
+    /// Assessment that was used to simulate the branch deltas.
+    pub basis_assessment: &'a TaxAssessment,
+    pub tax_observation: Option<&'a TaxObservation>,
+    pub approved_split_binding: &'a SplitRouteBinding,
+    /// Minimum acceptable aggregate output, in `token_out`.
+    pub min_out: &'a AssetAmount,
+    pub wallet_balance: &'a WalletBalance,
+    /// One observation per required spender; `NotRequired` only when no branch
+    /// needs an allowance.
+    pub allowances: &'a [AllowanceObservation],
+}
+
+/// Revalidates all pre-sign facts for an aggregate split and returns a validated
+/// aggregate execution preview.
+///
+/// The check order mirrors [`revalidate_pre_sign`] and fails closed on the first
+/// violation. `Valid` is reachable only through
+/// [`validate_split_delta_preview_with_assessment`], which applies the intent
+/// tax caps to every branch and delegates to the locked split validator.
+pub fn revalidate_split_pre_sign(input: &SplitRevalidationInput<'_>) -> RevalidationOutcome {
+    use RevalidationOutcome::{AbortFinal, AbortRequote, Valid};
+    use RevalidationReason as Reason;
+
+    // 0. Explicit kill-switch snapshot.
+    if !input.trading_enabled {
+        return AbortFinal(Reason::TradingDisabled);
+    }
+
+    // 1. Approval must bind identity, chain, and idempotency.
+    let Some(approval) = input.approval else {
+        return AbortFinal(Reason::ApprovalMissing);
+    };
+    if approval.intent_id() != &input.intent.id
+        || approval.wallet_ref() != &input.intent.wallet_ref
+        || approval.chain() != &input.intent.chain
+        || approval.idempotency_key() != &input.intent.idempotency_key
+    {
+        return AbortFinal(Reason::ApprovalBindingMismatch);
+    }
+    if matches!(approval.expires_at_ms(), Some(expires) if expires <= input.now_ms) {
+        return AbortFinal(Reason::PolicyExpired);
+    }
+
+    // 2. Recipient / chain binding across every present trusted snapshot.
+    if input.wallet_balance.wallet_ref != input.intent.wallet_ref
+        || input.wallet_balance.chain != input.intent.chain
+    {
+        return AbortFinal(Reason::RecipientMismatch);
+    }
+    if let Some(observation) = input.tax_observation {
+        if observation.wallet_ref != input.intent.wallet_ref
+            || observation.chain != input.intent.chain
+        {
+            return AbortFinal(Reason::RecipientMismatch);
+        }
+    }
+    for observation in input.allowances {
+        let Some(allowance) = observation.state() else {
+            continue;
+        };
+        if allowance.wallet_ref != input.intent.wallet_ref || allowance.chain != input.intent.chain
+        {
+            return AbortFinal(Reason::RecipientMismatch);
+        }
+    }
+
+    // 3. Venue / program allowlists over every branch route leg.
+    if !input.policy_limits.allowed_venues.is_empty() {
+        for branch in &input.split.legs {
+            for leg in &branch.route.legs {
+                if !input.policy_limits.allowed_venues.contains(&leg.venue) {
+                    return AbortFinal(Reason::VenueNotAllowlisted);
+                }
+            }
+        }
+    }
+    for branch in &input.split.legs {
+        for leg in &branch.route.legs {
+            let is_solana =
+                leg.token_in.chain == ChainId::Solana || leg.token_out.chain == ChainId::Solana;
+            if is_solana && !input.allowed_programs.contains(&leg.pool_ref) {
+                return AbortFinal(Reason::ProgramNotAllowlisted);
+            }
+        }
+    }
+
+    // Required spenders derive ONLY from the approved binding, never from the
+    // untrusted observation slice.
+    let Some(required) = required_split_spenders(input.approved_split_binding, &input.intent.chain)
+    else {
+        return AbortFinal(Reason::AmountPolicyViolation);
+    };
+
+    if let Some(observation) = input.tax_observation {
+        if observation.chain == ChainId::Solana {
+            if !input.allowed_programs.contains(&observation.router_ref) {
+                return AbortFinal(Reason::ProgramNotAllowlisted);
+            }
+        } else if !required
+            .iter()
+            .any(|(spender, _)| *spender == observation.router_ref)
+        {
+            return AbortFinal(Reason::AllowanceSpenderMismatch);
+        }
+    }
+
+    // 3b. Exactly one required allowance observation per distinct spender.
+    if required.is_empty() {
+        if !input.allowances.is_empty() {
+            return AbortFinal(Reason::AllowanceSpenderMismatch);
+        }
+    } else {
+        let mut seen: Vec<&str> = Vec::new();
+        for observation in input.allowances {
+            match observation {
+                AllowanceObservation::NotRequired => {
+                    return AbortFinal(Reason::MissingAllowanceObservation);
+                }
+                AllowanceObservation::Required(state) => {
+                    if !required
+                        .iter()
+                        .any(|(spender, _)| *spender == state.spender_ref)
+                    {
+                        return AbortFinal(Reason::AllowanceSpenderMismatch);
+                    }
+                    if seen.contains(&state.spender_ref.as_str()) {
+                        return AbortFinal(Reason::AllowanceSpenderMismatch);
+                    }
+                    seen.push(state.spender_ref.as_str());
+                }
+            }
+        }
+        if required
+            .iter()
+            .any(|(spender, _)| !seen.contains(&spender.as_str()))
+        {
+            return AbortFinal(Reason::MissingAllowanceObservation);
+        }
+    }
+
+    // 4. The selected split must be structurally identical to the approved one.
+    if SplitRouteBinding::from_split(input.split) != *input.approved_split_binding {
+        return AbortRequote(Reason::SelectedRouteMismatch);
+    }
+
+    // 4b. Aggregate split state must be fresh under the caller policy.
+    match classify_freshness(input.freshness_policy, &input.split.state, input.now_ms) {
+        Some(FreshnessStatus::Fresh) => {}
+        Some(FreshnessStatus::Stale) => return AbortRequote(Reason::StaleState),
+        Some(FreshnessStatus::ResyncRequired) => return AbortFinal(Reason::ResyncRequired),
+        None => return AbortFinal(Reason::StateRegression),
+    }
+
+    // 5. Wallet and every allowance must be fresh.
+    match classify_freshness(
+        input.freshness_policy,
+        &input.wallet_balance.freshness,
+        input.now_ms,
+    ) {
+        Some(FreshnessStatus::Fresh) => {}
+        Some(FreshnessStatus::Stale) => return AbortRequote(Reason::StaleState),
+        Some(FreshnessStatus::ResyncRequired) => return AbortFinal(Reason::ResyncRequired),
+        None => return AbortFinal(Reason::StateRegression),
+    }
+    for observation in input.allowances {
+        if let Some(allowance) = observation.state() {
+            match classify_freshness(input.freshness_policy, &allowance.freshness, input.now_ms) {
+                Some(FreshnessStatus::Fresh) => {}
+                Some(FreshnessStatus::Stale) => return AbortRequote(Reason::StaleState),
+                Some(FreshnessStatus::ResyncRequired) => return AbortFinal(Reason::ResyncRequired),
+                None => return AbortFinal(Reason::StateRegression),
+            }
+        }
+    }
+
+    // 6. A tax observation is mandatory; the fresh assessment must reproduce the
+    //    simulated basis exactly.
+    let Some(observation) = input.tax_observation else {
+        return AbortFinal(Reason::MissingTaxObservation);
+    };
+    let fresh_assessment = match evaluate_tax_safety(
+        input.intent,
+        Some(observation),
+        input.now_ms,
+        input.freshness_policy,
+    ) {
+        Ok(assessment) => assessment,
+        Err(error) => return map_tax_error(error),
+    };
+    if fresh_assessment.buy_tax != input.basis_assessment.buy_tax
+        || fresh_assessment.sell_tax != input.basis_assessment.sell_tax
+    {
+        return AbortRequote(Reason::TaxChanged);
+    }
+
+    // 7. Aggregate the exact branch deltas; the wallet must cover the aggregate
+    //    gross debit in `token_in`.
+    let aggregate = match NetDelta::aggregate(input.branch_deltas) {
+        Ok(delta) => delta,
+        Err(_) => return AbortFinal(Reason::NetDeltaInconsistent),
+    };
+    if input.wallet_balance.asset != aggregate.net_input.asset {
+        return AbortFinal(Reason::StateRegression);
+    }
+    if input.wallet_balance.available < aggregate.net_input.amount {
+        return AbortRequote(Reason::InsufficientBalance);
+    }
+
+    // 8. Every required spender's allowance must cover the gross input routed
+    //    through that spender, not the whole aggregate.
+    for (spender, attributed) in &required {
+        let state = input
+            .allowances
+            .iter()
+            .filter_map(AllowanceObservation::state)
+            .find(|state| state.spender_ref == *spender);
+        let Some(state) = state else {
+            return AbortFinal(Reason::MissingAllowanceObservation);
+        };
+        if state.asset != aggregate.net_input.asset {
+            return AbortFinal(Reason::StateRegression);
+        }
+        if state.amount < AtomicAmount::new(*attributed) {
+            return AbortRequote(Reason::InsufficientAllowance);
+        }
+    }
+
+    // 9. Aggregate minimum-output floor and slippage floor, exactly as the
+    //    single-route gate.
+    if input.min_out.asset != input.intent.token_out {
+        return AbortFinal(Reason::MinOutNotMet);
+    }
+    if aggregate.net_output.amount < input.min_out.amount {
+        return AbortRequote(Reason::MinOutNotMet);
+    }
+    let slippage_floor_bps =
+        10_000u128.saturating_sub(u128::from(input.intent.risk.max_slippage.get()));
+    let expected_output = input.split.expected_net_output.amount.get();
+    if cmp_u128_products(
+        input.min_out.amount.get(),
+        10_000,
+        expected_output,
+        slippage_floor_bps,
+    ) == Ordering::Less
+    {
+        return AbortFinal(Reason::AmountPolicyViolation);
+    }
+
+    // 10. Delegate to the aggregate bridge, which enforces the intent tax caps on
+    //     every branch and the locked split validator. `Valid` is only here.
+    match validate_split_delta_preview_with_assessment(
+        input.intent,
+        input.split,
+        input.branch_deltas,
+        &fresh_assessment,
+        input.now_ms,
+    ) {
+        Ok(preview) => Valid(preview),
+        Err(error) => map_bridge_error(error),
+    }
+}
+
+/// Distinct allowance spenders required by an approved split binding, with the
+/// summed gross branch input attributed to each (deterministic branch order).
+/// `None` means the attribution sum overflowed `u128`.
+fn required_split_spenders(
+    binding: &SplitRouteBinding,
+    chain: &ChainId,
+) -> Option<Vec<(String, u128)>> {
+    let mut required: Vec<(String, u128)> = Vec::new();
+    for branch in &binding.branches {
+        let first = branch.legs.first()?;
+        let spender = if matches!(chain, ChainId::Solana) {
+            first.pool_ref.clone()
+        } else {
+            first.venue.clone()
+        };
+        match required
+            .iter_mut()
+            .find(|(existing, _)| *existing == spender)
+        {
+            Some((_, total)) => {
+                *total = total.checked_add(branch.amount_in.get())?;
+            }
+            None => required.push((spender, branch.amount_in.get())),
+        }
+    }
+    Some(required)
 }
 
 /// The approved route's expected spender/router ref.

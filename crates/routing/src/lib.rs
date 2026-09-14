@@ -17,9 +17,12 @@
 //! never brute-forces the token graph.
 //!
 //! # Non-goals
-//! Split/spatial multi-path execution, exact-output quotes, depth-aware ranking,
-//! provider benchmarks, DEX adapters, and any signing/policy/storage/relay wiring
-//! are explicitly out of scope; no split-plan type exists here.
+//! Exact-output quotes, depth-aware ranking, provider benchmarks, DEX adapters,
+//! and any signing/policy/storage/relay wiring are explicitly out of scope. The
+//! split optimizer in [`split`] produces a [`domain::SplitPlan`] but never
+//! validates, signs, or digests it: aggregate validation stays in
+//! `execution-preview`/`domain`, and signing stays behind the dedicated signing
+//! boundary. There is no signing, digest, or validation symbol in this crate.
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +34,7 @@ pub mod leg;
 pub mod plan;
 pub mod quote;
 pub mod score;
+pub mod split;
 pub mod types;
 
 use domain::{AmountType, RouteScore, TradeIntent};
@@ -46,6 +50,9 @@ pub use leg::{simulate_leg, swap_dir};
 pub use plan::{plan_direct_route, select_best_path, to_route_plan};
 pub use quote::{HopQuote, PoolKindClass, RouteQuote};
 pub use score::{GasConversion, GasEstimator, ScoringInputs};
+pub use split::{
+    plan_split, SplitConfig, SplitDecision, SplitLegQuote, SplitQuote, SplitUsdConversion,
+};
 pub use types::{
     EvaluatedLeg, EvaluatedPath, PoolCandidate, RouteDecision, RoutingConfig, RoutingInput, SwapDir,
 };
@@ -58,6 +65,19 @@ pub const MAX_POOLS_SCANNED: usize = 256;
 pub const MAX_BRIDGE_ASSETS: usize = 32;
 /// Deterministic route-candidate truncation bound (clipping sets `truncated`).
 pub const MAX_ROUTE_CANDIDATES: usize = 64;
+
+/// Hard bound on parallel split branches (re-exported from `domain`).
+pub use domain::MAX_SPLIT_LEGS;
+/// Minimum committed split leg count (a split always has at least two branches).
+pub const MIN_SPLIT_LEGS: usize = 2;
+/// Top-`N` single paths considered for two-path pairing (<= 28 unordered pairs).
+pub const MAX_SPLIT_PAIRS: usize = 8;
+/// Coarse two-path grid resolution.
+pub const SPLIT_GRID_STEPS: u128 = 8;
+/// Maximum local refinement steps per split search.
+pub const MAX_SPLIT_REFINE_STEPS: usize = 16;
+/// Hard fail-closed exact-quote budget for one `plan_split` call.
+pub const MAX_SPLIT_QUOTES: usize = 2_048;
 
 /// Fully injected, deterministic single-path planning request.
 pub struct RouteRequest<'a> {

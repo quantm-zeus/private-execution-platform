@@ -5,11 +5,14 @@
 
 use chain_types::{AssetId, ChainId};
 use market_types::{
-    evaluate_freshness, AssetAmount, AtomicAmount, FreshnessPolicy, FreshnessStatus, PriceRatio,
+    evaluate_freshness, AssetAmount, AtomicAmount, Freshness, FreshnessPolicy, FreshnessStatus,
+    PriceRatio,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{AmountType, DomainError, IntentId, LimitPrice, RoutePlan, TradeIntent, TradeSide};
+use crate::{
+    AmountType, DomainError, IntentId, LimitPrice, RoutePlan, SplitPlan, TradeIntent, TradeSide,
+};
 
 /// Exact 256-bit multiplication of two `u128` values: `a * b -> (hi_128, lo_128)`.
 /// Free of floating point, wall clock, or external dependencies.
@@ -436,6 +439,130 @@ impl ExecutionPreview {
 
         Ok(ValidatedExecutionPreview(self.clone()))
     }
+
+    /// Fully validates an aggregate preview against an intent and a split plan.
+    ///
+    /// Reuses [`ExecutionPreview::validate_internal`] and private helpers that
+    /// mirror (but do not call) the locked [`ExecutionPreview::validate`]'s
+    /// intent/freshness/risk/amount/limit steps, so the locked `validate` stays
+    /// byte-for-byte unchanged. `Valid` is reachable only through this method.
+    pub fn validate_split(
+        &self,
+        intent: &TradeIntent,
+        split: &SplitPlan,
+        now_ms: i64,
+    ) -> Result<ValidatedExecutionPreview, DomainError> {
+        intent.validate(now_ms)?;
+        split.validate(intent)?;
+        self.validate_internal()?;
+
+        // (a) Exact intent binding, identical semantics to `validate` step 3.
+        if self.intent_id != intent.id {
+            return Err(DomainError::IntentIdMismatch);
+        }
+        if self.chain != intent.chain {
+            return Err(DomainError::ChainMismatch);
+        }
+        if self.token_in != intent.token_in {
+            return Err(DomainError::InputAssetMismatch);
+        }
+        if self.token_out != intent.token_out {
+            return Err(DomainError::OutputAssetMismatch);
+        }
+        if self.side != intent.side {
+            return Err(DomainError::TradeSideMismatch);
+        }
+
+        // (b) Exact split binding: the executed input must equal the gross
+        //     budgets, and the aggregate output must match the branch sum.
+        let mut input_sum: u128 = 0;
+        for leg in &split.legs {
+            input_sum = input_sum
+                .checked_add(leg.amount_in.get())
+                .ok_or(DomainError::SplitInputConservationViolated)?;
+        }
+        if input_sum != self.simulated_net_input.amount.get() {
+            return Err(DomainError::SplitInputConservationViolated);
+        }
+        if split.expected_net_output != self.simulated_net_output {
+            return Err(DomainError::SplitOutputConservationViolated);
+        }
+
+        // (c) Freshness over the aggregate split state.
+        self.validate_aggregate_freshness(&split.state, now_ms)?;
+
+        // (d) Risk / amount_type / limit, identical to `validate` steps 7-9.
+        self.validate_intent_risk_and_amount(intent)?;
+        if let Some(limit) = &intent.limit_price {
+            if !self.satisfies_limit_price(limit)? {
+                return Err(DomainError::LimitPriceViolated);
+            }
+        }
+
+        Ok(ValidatedExecutionPreview(self.clone()))
+    }
+
+    fn validate_aggregate_freshness(
+        &self,
+        state: &Freshness,
+        now_ms: i64,
+    ) -> Result<(), DomainError> {
+        match self.local_state_freshness {
+            FreshnessStatus::Fresh => {}
+            FreshnessStatus::Stale => return Err(DomainError::StaleMarketState),
+            FreshnessStatus::ResyncRequired => return Err(DomainError::ResyncRequired),
+        }
+        if state.observed_at_ms <= 0 {
+            return Err(DomainError::StaleMarketState);
+        }
+        if state.sequence.is_zero() {
+            return Err(DomainError::ResyncRequired);
+        }
+        let meta = evaluate_freshness(
+            &FreshnessPolicy::default(),
+            state.observed_at_ms,
+            now_ms,
+            state.sequence,
+            false,
+        )
+        .map_err(|_| DomainError::StaleMarketState)?;
+        match meta.status {
+            FreshnessStatus::Fresh => Ok(()),
+            FreshnessStatus::Stale => Err(DomainError::StaleMarketState),
+            FreshnessStatus::ResyncRequired => Err(DomainError::ResyncRequired),
+        }
+    }
+
+    fn validate_intent_risk_and_amount(&self, intent: &TradeIntent) -> Result<(), DomainError> {
+        if let Some(max_cost) = &intent.risk.max_total_cost {
+            if self.simulated_net_input.asset != max_cost.asset {
+                return Err(DomainError::MaxTotalCostAssetMismatch);
+            }
+            if self.simulated_net_input.amount > max_cost.amount {
+                return Err(DomainError::InconsistentNetEconomics(
+                    "simulated net input exceeds intent max_total_cost",
+                ));
+            }
+        }
+        match intent.amount_type {
+            AmountType::InputAssetAtomic => {
+                if self.simulated_net_input.amount > intent.amount {
+                    return Err(DomainError::InconsistentNetEconomics(
+                        "simulated net input exceeds intent amount",
+                    ));
+                }
+                if !intent.allow_partial_fill && self.simulated_net_input.amount != intent.amount {
+                    return Err(DomainError::InconsistentNetEconomics(
+                        "all-or-nothing intent cannot accept partial simulated input",
+                    ));
+                }
+            }
+            AmountType::OutputAssetAtomic | AmountType::UsdMicros => {
+                return Err(DomainError::UnsupportedAmountType);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// An execution preview that has passed deterministic domain validation.
@@ -475,6 +602,18 @@ pub fn validate_execution_preview(
     now_ms: i64,
 ) -> Result<ValidatedExecutionPreview, DomainError> {
     preview.validate(intent, route, now_ms)
+}
+
+/// Functional entry point validating an aggregate preview against an intent and
+/// a split plan. `ValidatedExecutionPreview` is only produced through the locked
+/// split validator.
+pub fn validate_split_execution_preview(
+    intent: &TradeIntent,
+    split: &SplitPlan,
+    preview: &ExecutionPreview,
+    now_ms: i64,
+) -> Result<ValidatedExecutionPreview, DomainError> {
+    preview.validate_split(intent, split, now_ms)
 }
 
 #[cfg(test)]

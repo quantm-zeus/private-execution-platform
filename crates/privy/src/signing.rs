@@ -110,7 +110,7 @@ use std::fmt;
 
 use chain_types::{AssetId, ChainId};
 use domain::{
-    AmountType, IdempotencyKey, IntentId, OrderType, RoutePlan, TradeIntent, TradeSide,
+    AmountType, IdempotencyKey, IntentId, OrderType, RoutePlan, SplitPlan, TradeIntent, TradeSide,
     TradeSource, ValidatedExecutionPreview, WalletRef,
 };
 use policy::{ApprovedExecution, PolicyEngine};
@@ -119,6 +119,7 @@ use sha2::{Digest, Sha256};
 use crate::{PreparedExecutionRef, PrivyError};
 
 const ROUTE_TAG: &[u8] = b"privy.signing.route.v1";
+const SPLIT_ROUTE_TAG: &[u8] = b"privy.signing.split_route.v1";
 const REQUEST_TAG: &[u8] = b"privy.signing.request.v1";
 const INTENT_TAG: &[u8] = b"privy.signing.intent.v1";
 const SCHEMA_VERSION: u16 = 1;
@@ -262,6 +263,90 @@ impl SigningRequest {
         }
 
         let route_digest = compute_route_digest(route)?;
+        let intent_digest = compute_intent_digest(intent)?;
+        let request_digest = compute_request_digest(
+            approval,
+            prepared,
+            intent,
+            preview,
+            &payload_digest,
+            &route_digest,
+            &intent_digest,
+        )?;
+
+        Ok(Self {
+            request_digest,
+            intent_id: intent.id.clone(),
+            idempotency_key: intent.idempotency_key.clone(),
+            wallet_ref: intent.wallet_ref.clone(),
+            chain: intent.chain.clone(),
+            nonce: intent.nonce,
+            payload_digest,
+        })
+    }
+
+    /// Binds a policy approval, prepared execution, intent, split plan, and
+    /// validated aggregate preview into a canonical signing request.
+    ///
+    /// The checks are the same ordered fail-closed sequence as [`SigningRequest::bind`];
+    /// step 7 re-runs the locked split validator, and the split route digest is
+    /// domain-separated from the single-route digest inside the unchanged 32-byte
+    /// `route_digest` slot of `compute_request_digest`. `SCHEMA_VERSION` and the
+    /// request byte layout are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_split(
+        policy: &PolicyEngine,
+        approval: &ApprovedExecution,
+        prepared: &PreparedExecutionRef,
+        intent: &TradeIntent,
+        split: &SplitPlan,
+        preview: &ValidatedExecutionPreview,
+        payload_digest: PayloadDigest,
+        now_ms: i64,
+    ) -> Result<Self, PrivyError> {
+        // 1. Identity binding.
+        if intent.id != *approval.intent_id() || intent.id != preview.intent_id {
+            return Err(PrivyError::ApprovalBindingMismatch);
+        }
+        // 2. Wallet and chain binding.
+        if intent.wallet_ref != *approval.wallet_ref()
+            || intent.chain != *approval.chain()
+            || intent.chain != preview.chain
+        {
+            return Err(PrivyError::ApprovalBindingMismatch);
+        }
+        // 3. Idempotency + prepared-execution binding.
+        if intent.idempotency_key != *approval.idempotency_key()
+            || intent.idempotency_key != *prepared.idempotency_key()
+            || prepared.intent_id() != &intent.id
+        {
+            return Err(PrivyError::ApprovalBindingMismatch);
+        }
+        // 4. Preview must describe the same pair and side as the intent.
+        if preview.token_in != intent.token_in
+            || preview.token_out != intent.token_out
+            || preview.side != intent.side
+        {
+            return Err(PrivyError::PreviewRevalidationFailed);
+        }
+        // 5. Global kill switch.
+        if !policy.is_trading_enabled() {
+            return Err(PrivyError::TradingDisabled);
+        }
+        // 6. Approval expiry.
+        if matches!(approval.expires_at_ms(), Some(expires) if expires <= now_ms) {
+            return Err(PrivyError::ApprovalExpired);
+        }
+        // 7. Re-run the locked split validator (intent + split + preview).
+        preview
+            .validate_split(intent, split, now_ms)
+            .map_err(|_| PrivyError::PreviewRevalidationFailed)?;
+        // 8. A zero digest is an absent payload.
+        if payload_digest.is_zero() {
+            return Err(PrivyError::MissingPayloadDigest);
+        }
+
+        let route_digest = compute_split_route_digest(split)?;
         let intent_digest = compute_intent_digest(intent)?;
         let request_digest = compute_request_digest(
             approval,
@@ -458,6 +543,61 @@ fn compute_route_digest(route: &RoutePlan) -> Result<RequestDigest, PrivyError> 
     Ok(RequestDigest(sha256(&bytes)))
 }
 
+/// `split_route_digest = SHA-256(split_route_bytes)`.
+///
+/// The split encoding is domain-separated from the single-route encoding by a
+/// distinct first tag, so a signature request bound to a split can never be
+/// replayed as a single-route request (or vice versa) with the same
+/// `route_digest`. See the module-level layout.
+///
+/// ```text
+/// split_route_bytes =
+///   b"privy.signing.split_route.v1"
+///   u32-be branch_count
+///   for each branch:
+///     u128-be branch.amount_in
+///     u32-be branch.route.leg_count
+///     for each route leg:
+///       lp(venue) lp(pool_ref) asset(token_in) asset(token_out)
+///       u128-be amount_in  u128-be expected_amount_out
+///     asset(branch.route.expected_net_output.asset)
+///     u128-be branch.route.expected_net_output.amount
+///   asset(split.expected_net_output.asset)
+///   u128-be aggregate_input                  (checked sum of branch.amount_in)
+///   u128-be split.expected_net_output.amount
+/// ```
+fn compute_split_route_digest(split: &SplitPlan) -> Result<RequestDigest, PrivyError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(SPLIT_ROUTE_TAG);
+    let branch_count =
+        u32::try_from(split.legs.len()).map_err(|_| PrivyError::ApprovalBindingMismatch)?;
+    bytes.extend_from_slice(&branch_count.to_be_bytes());
+    let mut aggregate_input: u128 = 0;
+    for branch in &split.legs {
+        bytes.extend_from_slice(&branch.amount_in.get().to_be_bytes());
+        let route_legs = u32::try_from(branch.route.legs.len())
+            .map_err(|_| PrivyError::ApprovalBindingMismatch)?;
+        bytes.extend_from_slice(&route_legs.to_be_bytes());
+        for leg in &branch.route.legs {
+            push_len_prefixed(&mut bytes, leg.venue.as_bytes())?;
+            push_len_prefixed(&mut bytes, leg.pool_ref.as_bytes())?;
+            push_asset(&mut bytes, &leg.token_in)?;
+            push_asset(&mut bytes, &leg.token_out)?;
+            bytes.extend_from_slice(&leg.amount_in.get().to_be_bytes());
+            bytes.extend_from_slice(&leg.expected_amount_out.get().to_be_bytes());
+        }
+        push_asset(&mut bytes, &branch.route.expected_net_output.asset)?;
+        bytes.extend_from_slice(&branch.route.expected_net_output.amount.get().to_be_bytes());
+        aggregate_input = aggregate_input
+            .checked_add(branch.amount_in.get())
+            .ok_or(PrivyError::ApprovalBindingMismatch)?;
+    }
+    push_asset(&mut bytes, &split.expected_net_output.asset)?;
+    bytes.extend_from_slice(&aggregate_input.to_be_bytes());
+    bytes.extend_from_slice(&split.expected_net_output.amount.get().to_be_bytes());
+    Ok(RequestDigest(sha256(&bytes)))
+}
+
 /// `intent_digest = SHA-256(intent_bytes)`, committing the request to the
 /// COMPLETE intent so a mutated public intent with the same id cannot reuse the
 /// digest. See the module-level layout.
@@ -618,7 +758,7 @@ pub(crate) mod fixtures {
     use chain_types::{AssetId, ChainId};
     use domain::{
         AmountType, ExecutionCostComponents, ExecutionPreview, OrderType, RiskConstraints,
-        RouteLeg, TradeSource, UserId,
+        RouteLeg, SplitLeg, SplitPlan, TradeSource, UserId,
     };
     use market_types::{AssetAmount, AtomicAmount, Bps, Freshness, Sequence};
     use policy::{PolicyContext, PolicyLimits, TradingGate, TurnoverSnapshot, UsdMicros};
@@ -731,6 +871,12 @@ pub(crate) mod fixtures {
         intent: &TradeIntent,
         route: &RoutePlan,
     ) -> ValidatedExecutionPreview {
+        aggregate_preview(intent)
+            .validate(intent, route, NOW_MS)
+            .unwrap()
+    }
+
+    fn aggregate_preview(intent: &TradeIntent) -> ExecutionPreview {
         ExecutionPreview {
             intent_id: intent.id.clone(),
             chain: intent.chain.clone(),
@@ -752,8 +898,63 @@ pub(crate) mod fixtures {
             cost_components: ExecutionCostComponents::default(),
             local_state_freshness: market_types::FreshnessStatus::Fresh,
         }
-        .validate(intent, route, NOW_MS)
-        .unwrap()
+    }
+
+    /// One branch of the standard fixture split.
+    fn split_branch(amount_in: u128, expected_out: u128, pool_ref: &str) -> SplitLeg {
+        let token_in = AssetId::new(ChainId::Base, "USDC").unwrap();
+        let token_out = AssetId::new(ChainId::Base, "TOKEN").unwrap();
+        SplitLeg {
+            amount_in: AtomicAmount::new(amount_in),
+            route: RoutePlan {
+                legs: vec![RouteLeg {
+                    venue: "uniswap_v3".to_string(),
+                    pool_ref: pool_ref.to_string(),
+                    token_in,
+                    token_out: token_out.clone(),
+                    amount_in: AtomicAmount::new(amount_in),
+                    expected_amount_out: AtomicAmount::new(expected_out + 6),
+                }],
+                expected_net_output: AssetAmount {
+                    asset: token_out,
+                    amount: AtomicAmount::new(expected_out),
+                },
+                state: Freshness {
+                    observed_at_ms: NOW_MS,
+                    chain_height: 100,
+                    sequence: Sequence(1),
+                },
+            },
+        }
+    }
+
+    /// A two-leg split whose aggregate economics equal [`aggregate_preview`]:
+    /// 1000 in, 250 gross, 240 net.
+    pub(crate) fn split_two() -> SplitPlan {
+        SplitPlan {
+            legs: vec![
+                split_branch(600, 144, "0xpool1"),
+                split_branch(400, 96, "0xpool2"),
+            ],
+            expected_net_output: AssetAmount {
+                asset: AssetId::new(ChainId::Base, "TOKEN").unwrap(),
+                amount: AtomicAmount::new(240),
+            },
+            state: Freshness {
+                observed_at_ms: NOW_MS,
+                chain_height: 100,
+                sequence: Sequence(1),
+            },
+        }
+    }
+
+    pub(crate) fn split_execution_preview(
+        intent: &TradeIntent,
+        split: &SplitPlan,
+    ) -> ValidatedExecutionPreview {
+        aggregate_preview(intent)
+            .validate_split(intent, split, NOW_MS)
+            .unwrap()
     }
 
     pub(crate) fn signing_request() -> SigningRequest {
@@ -825,6 +1026,196 @@ mod tests {
         assert_eq!(
             compute_intent_digest(&intent),
             Err(PrivyError::UnsupportedChain)
+        );
+    }
+
+    #[test]
+    fn split_digest_field_sensitivity() {
+        use market_types::AtomicAmount;
+        type SplitMutation = Box<dyn Fn(&mut SplitPlan)>;
+        let base = fixtures::split_two();
+        let baseline = compute_split_route_digest(&base).expect("digest");
+        let mutations: Vec<SplitMutation> = vec![
+            Box::new(|split: &mut SplitPlan| split.legs[0].amount_in = AtomicAmount::new(601)),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs[0].route.legs[0].venue = "other".to_string()
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs[0].route.legs[0].pool_ref = "0xother".to_string()
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs[0].route.legs[0].token_in =
+                    AssetId::new(ChainId::Base, "OTHER").expect("asset")
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs[0].route.legs[0].expected_amount_out = AtomicAmount::new(151)
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs[0].route.legs[0].amount_in = AtomicAmount::new(599)
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.expected_net_output.amount = AtomicAmount::new(241)
+            }),
+            Box::new(|split: &mut SplitPlan| {
+                split.legs.pop();
+                split.expected_net_output.amount = AtomicAmount::new(144)
+            }),
+        ];
+        for mutate in mutations {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            let digest = compute_split_route_digest(&candidate).expect("digest");
+            assert_ne!(
+                baseline.as_bytes(),
+                digest.as_bytes(),
+                "a bound split field change must change the split route digest"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_split_positive_and_intent_sensitive() {
+        let engine = fixtures::engine();
+        let intent = fixtures::intent();
+        let split = fixtures::split_two();
+        let approved = fixtures::approved(&engine, &intent);
+        let prepared = fixtures::prepared(&intent);
+        let preview = fixtures::split_execution_preview(&intent, &split);
+        let request = SigningRequest::bind_split(
+            &engine,
+            &approved,
+            &prepared,
+            &intent,
+            &split,
+            &preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("split binds");
+        let again = SigningRequest::bind_split(
+            &engine,
+            &approved,
+            &prepared,
+            &intent,
+            &split,
+            &preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("split rebinds");
+        assert_eq!(request.request_digest(), again.request_digest());
+
+        let mut other = fixtures::intent();
+        other.nonce = 8;
+        let other_approved = fixtures::approved(&engine, &other);
+        let other_prepared = fixtures::prepared(&other);
+        let other_preview = fixtures::split_execution_preview(&other, &split);
+        let other_request = SigningRequest::bind_split(
+            &engine,
+            &other_approved,
+            &other_prepared,
+            &other,
+            &split,
+            &other_preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("other intent binds");
+        assert_ne!(request.request_digest(), other_request.request_digest());
+    }
+
+    #[test]
+    fn single_vs_split_tag_separation() {
+        let engine = fixtures::engine();
+        let intent = fixtures::intent();
+        let route = fixtures::route();
+        let approved = fixtures::approved(&engine, &intent);
+        let prepared = fixtures::prepared(&intent);
+        let single_preview = fixtures::execution_preview(&intent, &route);
+        let single = SigningRequest::bind(
+            &engine,
+            &approved,
+            &prepared,
+            &intent,
+            &route,
+            &single_preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("single binds");
+
+        let one_leg = SplitPlan {
+            legs: vec![domain::SplitLeg {
+                amount_in: market_types::AtomicAmount::new(1_000),
+                route: route.clone(),
+            }],
+            expected_net_output: route.expected_net_output.clone(),
+            state: route.state,
+        };
+        let split_preview = fixtures::split_execution_preview(&intent, &one_leg);
+        let split = SigningRequest::bind_split(
+            &engine,
+            &approved,
+            &prepared,
+            &intent,
+            &one_leg,
+            &split_preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("split binds");
+
+        assert_ne!(single.request_digest(), split.request_digest());
+        assert!(!ROUTE_TAG.starts_with(SPLIT_ROUTE_TAG));
+        assert!(!SPLIT_ROUTE_TAG.starts_with(ROUTE_TAG));
+        assert_ne!(ROUTE_TAG, SPLIT_ROUTE_TAG);
+    }
+
+    #[test]
+    fn bind_split_rejects_preview_that_fails_split_validation() {
+        let engine = fixtures::engine();
+        let intent = fixtures::intent();
+        let mut split = fixtures::split_two();
+        split.legs[0].amount_in = market_types::AtomicAmount::new(601);
+        let approved = fixtures::approved(&engine, &intent);
+        let prepared = fixtures::prepared(&intent);
+        // Preview bound to the untouched aggregate conservation (1000 in).
+        let preview = fixtures::split_execution_preview(&intent, &fixtures::split_two());
+        assert_eq!(
+            SigningRequest::bind_split(
+                &engine,
+                &approved,
+                &prepared,
+                &intent,
+                &split,
+                &preview,
+                fixtures::payload(),
+                fixtures::NOW_MS,
+            ),
+            Err(PrivyError::PreviewRevalidationFailed)
+        );
+    }
+
+    #[test]
+    fn bind_split_zero_payload_rejected() {
+        let engine = fixtures::engine();
+        let intent = fixtures::intent();
+        let split = fixtures::split_two();
+        let approved = fixtures::approved(&engine, &intent);
+        let prepared = fixtures::prepared(&intent);
+        let preview = fixtures::split_execution_preview(&intent, &split);
+        assert_eq!(
+            SigningRequest::bind_split(
+                &engine,
+                &approved,
+                &prepared,
+                &intent,
+                &split,
+                &preview,
+                PayloadDigest::from_bytes([0u8; 32]),
+                fixtures::NOW_MS,
+            ),
+            Err(PrivyError::MissingPayloadDigest)
         );
     }
 }

@@ -805,19 +805,28 @@ fn source_has_no_ambient_io_or_panic_macros() {
 }
 
 #[test]
-fn source_has_no_split_symbols() {
+fn split_source_has_no_split_bypass() {
+    // The split optimizer may produce a `SplitPlan`, but `routing` must never
+    // validate, sign, or digest it: aggregate validation lives in
+    // `execution-preview`/`domain` and signing lives in `privy`.
     let source = routing_src();
     for forbidden in [
-        "mod split",
-        "struct SplitPlan",
-        "enum SplitPlan",
-        "fn split_plan",
+        "privy",
+        "compute_route_digest",
+        "fn validate_split",
+        "fn validate_split_preview",
+        "route_digest",
     ] {
         assert!(
             !source.contains(forbidden),
-            "split symbol present: {forbidden}"
+            "forbidden split-bypass symbol present: {forbidden}"
         );
     }
+    // Positive control: the test is non-vacuous only if the optimizer exists.
+    assert!(
+        source.contains("pub fn plan_split"),
+        "split optimizer is missing from the routing source"
+    );
 }
 
 #[test]
