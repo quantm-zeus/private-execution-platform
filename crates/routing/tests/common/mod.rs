@@ -299,6 +299,34 @@ pub fn request<'a>(
     gas: Option<&'a dyn GasEstimator>,
     gas_price_in_output: Option<GasConversion>,
 ) -> RouteRequest<'a> {
+    request_with_depth(
+        intent,
+        descriptors,
+        amount_in,
+        assessment,
+        max_hops,
+        freshness_policy,
+        scoring_inputs,
+        gas,
+        gas_price_in_output,
+        &[],
+    )
+}
+
+/// Like [`request`] but with an explicit depth-target list.
+#[allow(clippy::too_many_arguments)]
+pub fn request_with_depth<'a>(
+    intent: &'a TradeIntent,
+    descriptors: &'a [PoolDescriptor],
+    amount_in: u128,
+    assessment: &'a TaxAssessment,
+    max_hops: usize,
+    freshness_policy: &'a FreshnessPolicy,
+    scoring_inputs: &'a ScoringInputs,
+    gas: Option<&'a dyn GasEstimator>,
+    gas_price_in_output: Option<GasConversion>,
+    depth_targets: &'a [Bps],
+) -> RouteRequest<'a> {
     RouteRequest {
         intent,
         descriptors,
@@ -310,5 +338,6 @@ pub fn request<'a>(
         scoring: scoring_inputs,
         gas,
         gas_price_in_output,
+        depth_targets,
     }
 }
