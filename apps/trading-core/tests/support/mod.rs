@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
-    OrderValuation,
 };
 use agent_commands::{AgentChannel, AgentCommand, AmountSpec, AssetRef};
 use async_trait::async_trait;
@@ -194,15 +193,6 @@ impl OrderKeyProvider for FixedOrderKeys {
         } else {
             Err(LimitEngineError::UnknownKeyId)
         }
-    }
-}
-
-/// Trusted valuation that prices every asset.
-pub struct FixedValuation;
-
-impl OrderValuation for FixedValuation {
-    fn usd_micros(&self, _asset: &AssetId, _amount: AtomicAmount) -> Option<u64> {
-        Some(1_000)
     }
 }
 

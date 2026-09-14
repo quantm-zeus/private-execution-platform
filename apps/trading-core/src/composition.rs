@@ -1265,4 +1265,14 @@ mod tests {
         assert!(!rendered.contains("USDC"));
         assert!(!rendered.contains("TOKEN"));
     }
+
+    #[test]
+    fn tokio_tick_floors_a_zero_interval() {
+        let zero = TokioTick::new(Duration::ZERO);
+        assert_eq!(format!("{zero:?}"), "TokioTick { interval: 1ms }");
+        let tiny = TokioTick::new(Duration::from_nanos(1));
+        assert_eq!(format!("{tiny:?}"), "TokioTick { interval: 1ms }");
+        let normal = TokioTick::new(Duration::from_millis(250));
+        assert_eq!(format!("{normal:?}"), "TokioTick { interval: 250ms }");
+    }
 }
