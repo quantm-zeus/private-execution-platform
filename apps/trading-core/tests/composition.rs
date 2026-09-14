@@ -13,7 +13,7 @@ use std::sync::Arc;
 use agent_backend::{FixedClock, MarketExecutionError, MarketExecutionOutcome};
 use execution_relay::ChainHealthBreaker;
 use limit_engine::RecoveryReport;
-use mcp_server::McpServer;
+use mcp_server::{AgentBackend, BackendOutcome, McpServer};
 use serde_json::json;
 use trading_core::composition::{
     build_fail_closed_market_port, MarketReconcileLoop, ReconcilePassReport, ReconcileSchedule,
@@ -23,7 +23,7 @@ use trading_core::composition::{
 use support::{
     attempt, config, disabled_policy, enabled_policy, lock, market_arguments, parse, result,
     tools_call, CountingAgentBackend, CountingMarketPort, FixedOrderKeys, InMemoryOpaqueStore,
-    RecordingReservationStore, StubLimitRecovery, NOW,
+    RecordingReservationStore, ScriptedAgentBackend, StubLimitRecovery, NOW,
 };
 
 #[tokio::test]
@@ -324,4 +324,54 @@ async fn composition_debug_output_is_redacted() {
     };
     assert!(format!("{report:?}").contains("examined"));
     assert_eq!(format!("{:?}", attempt(1)), "PendingMarketAttempt { .. }");
+}
+
+#[tokio::test]
+async fn recording_backend_records_only_market_executes_and_forwards_valuation() {
+    use agent_commands::{
+        AgentChannel, AgentCommand, AmountSpec, AssetRef, ReadCommand, TradeCommand,
+    };
+    use chain_types::ChainId;
+    use domain::TradeSide;
+    use trading_core::composition::{MarketAttemptRegistry, PendingMarketAttempt};
+
+    let inner = Arc::new(ScriptedAgentBackend::new(Some(4_242)));
+    let registry = Arc::new(MarketAttemptRegistry::new());
+    let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
+
+    let token_in = AssetRef::new(ChainId::Base, "USDC").expect("asset");
+    let token_out = AssetRef::new(ChainId::Base, "TOKEN").expect("asset");
+    let trade = AgentCommand::Trade(TradeCommand::ExecuteMarketOrder {
+        token_in: token_in.clone(),
+        token_out: token_out.clone(),
+        side: TradeSide::Buy,
+        amount: AmountSpec::TokenAtomic(1_000),
+        max_slippage_bps: Some(100),
+        max_price_impact_bps: Some(200),
+    });
+    let outcome = recorder.execute(AgentChannel::Mcp, trade.clone()).await;
+    assert!(matches!(outcome, BackendOutcome::Unavailable));
+    assert_eq!(inner.execute_calls(), 1);
+    assert_eq!(registry.len(), 1);
+    assert_eq!(
+        registry.pending()[0],
+        PendingMarketAttempt::new(
+            AgentChannel::Mcp,
+            token_in,
+            token_out,
+            TradeSide::Buy,
+            AmountSpec::TokenAtomic(1_000),
+            Some(100),
+            Some(200),
+        )
+    );
+    // The trusted valuation is forwarded verbatim; dropping it would deny
+    // otherwise-valid mutations.
+    assert_eq!(recorder.valuation_usd_micros(&trade).await, Some(4_242));
+
+    // A read is forwarded but never recorded.
+    let read = AgentCommand::Read(ReadCommand::GetPortfolio);
+    let _ = recorder.execute(AgentChannel::Telegram, read).await;
+    assert_eq!(inner.execute_calls(), 2);
+    assert_eq!(registry.len(), 1, "reads must not be recorded");
 }

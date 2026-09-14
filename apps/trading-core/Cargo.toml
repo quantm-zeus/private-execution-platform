@@ -25,7 +25,6 @@ policy.workspace = true
 privy.workspace = true
 routing.workspace = true
 storage.workspace = true
-tax-engine.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
 

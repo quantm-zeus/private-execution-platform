@@ -738,15 +738,23 @@ pub trait ReconcileTick: Send {
 /// Production tick backed by `tokio::time::sleep` and the system clock.
 ///
 /// This is the only wall-clock read in the composition: the reconcile logic
-/// itself takes explicit `now_ms` values.
+/// itself takes explicit `now_ms` values. The interval is floored at 1 ms so a
+/// zero/absurdly-small interval cannot spin the loop; the default
+/// [`ReconcileSchedule`] is unbounded, so a caller wiring this tick must set a
+/// non-zero `max_passes` or stop the loop externally.
 pub struct TokioTick {
     interval: Duration,
 }
 
+/// Minimum `TokioTick` wait, preventing a zero-interval hot loop.
+const MIN_TICK_INTERVAL: Duration = Duration::from_millis(1);
+
 impl TokioTick {
-    /// Builds a tick that waits `interval` between passes.
+    /// Builds a tick that waits `interval` (floored at 1 ms) between passes.
     pub fn new(interval: Duration) -> Self {
-        Self { interval }
+        Self {
+            interval: interval.max(MIN_TICK_INTERVAL),
+        }
     }
 }
 

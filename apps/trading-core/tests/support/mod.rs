@@ -298,6 +298,39 @@ impl<B: AgentBackend> AgentBackend for CountingAgentBackend<B> {
     }
 }
 
+/// Terminal backend double: counts `execute` calls and reports a fixed valuation.
+pub struct ScriptedAgentBackend {
+    execute_calls: AtomicUsize,
+    valuation: Option<u64>,
+}
+
+impl ScriptedAgentBackend {
+    /// Builds a double whose `valuation_usd_micros` returns `valuation`.
+    pub fn new(valuation: Option<u64>) -> Self {
+        Self {
+            execute_calls: AtomicUsize::new(0),
+            valuation,
+        }
+    }
+
+    /// Number of `execute` calls observed.
+    pub fn execute_calls(&self) -> usize {
+        self.execute_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl AgentBackend for ScriptedAgentBackend {
+    async fn execute(&self, _channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        BackendOutcome::Unavailable
+    }
+
+    async fn valuation_usd_micros(&self, _command: &AgentCommand) -> Option<u64> {
+        self.valuation
+    }
+}
+
 /// Reservation store that counts `reserve` calls, delegating to an in-memory store.
 pub struct RecordingReservationStore {
     inner: InMemoryReservationStore,
