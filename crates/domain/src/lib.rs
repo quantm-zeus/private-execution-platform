@@ -519,6 +519,10 @@ impl SplitPlan {
         let mut output_sum: u128 = 0;
         let mut observed_min = i64::MAX;
         let mut sequence_min: Option<Sequence> = None;
+        // Parallel branches are simulated independently against the *initial*
+        // pool state, so a pool must not appear in two branches (or twice in one
+        // branch): that would double-count its liquidity and overstate output.
+        let mut used_pools: Vec<&str> = Vec::new();
 
         for leg in &self.legs {
             if leg.amount_in.is_zero() {
@@ -536,6 +540,10 @@ impl SplitPlan {
                 {
                     return Err(DomainError::ChainMismatch);
                 }
+                if used_pools.contains(&route_leg.pool_ref.as_str()) {
+                    return Err(DomainError::SplitPoolReused);
+                }
+                used_pools.push(route_leg.pool_ref.as_str());
             }
             // Multi-hop funding: each hop must be funded by the previous hop's
             // realized output, mirroring the locked single-route validator.
@@ -720,6 +728,8 @@ pub enum DomainError {
     SplitStateMismatch,
     #[error("split input sum must equal the executed simulated net input")]
     SplitInputConservationViolated,
+    #[error("split branches must not reuse a pool")]
+    SplitPoolReused,
 }
 
 #[cfg(test)]

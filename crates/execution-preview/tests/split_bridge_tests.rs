@@ -545,3 +545,23 @@ fn revalidate_split_rejects_selected_route_mismatch() {
         RevalidationOutcome::AbortRequote(RevalidationReason::SelectedRouteMismatch)
     );
 }
+
+#[test]
+fn validate_split_rejects_shared_pool_branches() {
+    let intent = buy_intent(1_000);
+    let mut split = split_two(510);
+    // Both branches would independently quote the same pool, overstating output.
+    split.legs[1].route.legs[0].pool_ref = "0xpoolA".to_string();
+    let branches = [delta(600, 300, 300, None), delta(400, 210, 210, None)];
+    let assessment = fresh_basis(0);
+    assert_eq!(
+        execution_preview::validate_split_delta_preview_with_assessment(
+            &intent,
+            &split,
+            &branches,
+            &assessment,
+            NOW_MS
+        ),
+        Err(BridgeError::Domain(domain::DomainError::SplitPoolReused))
+    );
+}

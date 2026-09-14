@@ -371,3 +371,12 @@ fn split_multihop_funding_rejected() {
         Err(DomainError::SplitLegUnmodeledFunding)
     );
 }
+
+#[test]
+fn split_pool_reuse_rejected() {
+    let intent = buy_intent();
+    let mut split = split_two();
+    // Both branches would independently quote the same pool state.
+    split.legs[1].route.legs[0].pool_ref = "0xpoolA".to_string();
+    assert_eq!(split.validate(&intent), Err(DomainError::SplitPoolReused));
+}

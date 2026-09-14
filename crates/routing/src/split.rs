@@ -284,7 +284,7 @@ fn path_pool_refs<'a>(descriptors: &'a [PoolDescriptor], path: &CandidatePath) -
     path.legs
         .iter()
         .filter_map(|leg| descriptors.get(leg.descriptor_index))
-        .map(|descriptor| descriptor.leg_pool_ref.as_str())
+        .map(|descriptor| descriptor.envelope.pool_id.address.as_str())
         .collect()
 }
 
