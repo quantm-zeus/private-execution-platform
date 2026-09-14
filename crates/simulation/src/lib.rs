@@ -16,7 +16,8 @@ pub mod roundtrip_tax;
 pub mod sell_tax;
 
 pub use bin::{
-    simulate_bin_exact_input, BinExactInputRequest, BinSimulationQuote, MAX_BIN_CROSSES,
+    simulate_bin_exact_input, simulate_bin_exact_output, BinExactInputRequest, BinExactOutputQuote,
+    BinExactOutputRequest, BinSimulationQuote, MAX_BIN_CROSSES,
 };
 pub use buy_tax::{
     simulate_cpmm_exact_input_buy_tax, simulate_tax_aware_cpmm_buy,
@@ -25,7 +26,8 @@ pub use buy_tax::{
     TaxAwareCpmmSimulationQuote,
 };
 pub use clmm::{
-    simulate_clmm_exact_input, ClmmExactInputRequest, ClmmSimulationQuote, MAX_CLMM_TICK_CROSSES,
+    simulate_clmm_exact_input, simulate_clmm_exact_output, ClmmExactInputRequest,
+    ClmmExactOutputQuote, ClmmExactOutputRequest, ClmmSimulationQuote, MAX_CLMM_TICK_CROSSES,
 };
 pub use clmm_buy_tax::{simulate_tax_aware_clmm_buy_exact_input, TaxAwareClmmBuyQuote};
 pub use clmm_roundtrip_tax::{

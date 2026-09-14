@@ -464,6 +464,7 @@ fn test_error_redaction_debug_and_display() {
         ClmmSimulationError::ZeroOutputAmount,
         ClmmSimulationError::ArithmeticOverflow,
         ClmmSimulationError::InvariantViolated,
+        ClmmSimulationError::OutputUnreachable,
         ClmmSimulationError::StaleOrUnavailableState,
     ];
 

@@ -497,6 +497,7 @@ fn test_error_redaction_debug_and_display() {
         BinSimulationError::ZeroOutputAmount,
         BinSimulationError::ArithmeticOverflow,
         BinSimulationError::InvariantViolated,
+        BinSimulationError::OutputUnreachable,
         BinSimulationError::StaleOrUnavailableState,
     ];
 

@@ -228,6 +228,10 @@ pub enum ClmmSimulationError {
     #[error("invariant violated")]
     InvariantViolated,
 
+    /// No representable gross input can reach the requested exact output.
+    #[error("requested output is unreachable")]
+    OutputUnreachable,
+
     /// State is stale, resync is required, or state is unavailable.
     #[error("state is stale or unavailable")]
     StaleOrUnavailableState,
@@ -310,6 +314,10 @@ pub enum BinSimulationError {
     /// Bin traversal invariant was violated.
     #[error("invariant violated")]
     InvariantViolated,
+
+    /// No representable gross input can reach the requested exact output.
+    #[error("requested output is unreachable")]
+    OutputUnreachable,
 
     /// State is stale, resync is required, or state is unavailable.
     #[error("state is stale or unavailable")]

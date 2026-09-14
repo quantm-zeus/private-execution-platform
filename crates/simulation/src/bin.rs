@@ -12,6 +12,7 @@ use chain_types::AssetId;
 use market_types::{AssetAmount, AtomicAmount, BinPoolState, Bps};
 use serde::{Deserialize, Serialize};
 
+use crate::clmm::{find_min_gross_input, MinimalInputSearch, ProbeClass};
 use crate::cpmm::{cmp_u128_products, div_u256_by_u128_floor, mul_u128_wide};
 use crate::error::BinSimulationError;
 
@@ -78,6 +79,102 @@ pub struct BinSimulationQuote {
     pub resulting_active_bin_id: i32,
     /// Number of bin-to-bin transitions performed during traversal.
     pub bins_crossed: usize,
+}
+
+/// Request parameters for an exact-output direct Bin/DLMM swap simulation.
+///
+/// The caller asks for a desired output amount and receives the **minimal** gross
+/// input whose exact-input bin traversal yields at least that output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinExactOutputRequest {
+    /// Asset offered as input to the pool.
+    pub token_in: AssetId,
+    /// Desired output amount from the pool.
+    pub amount_out: AtomicAmount,
+    /// Optional caller-asserted target output asset.
+    /// If provided, must match the pool's counter-asset direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_out: Option<AssetId>,
+}
+
+impl BinExactOutputRequest {
+    /// Creates an exact-output request with inferred output asset.
+    pub const fn new(token_in: AssetId, amount_out: AtomicAmount) -> Self {
+        Self {
+            token_in,
+            amount_out,
+            token_out: None,
+        }
+    }
+
+    /// Creates an exact-output request with caller-asserted output asset.
+    pub const fn new_directed(
+        token_in: AssetId,
+        amount_out: AtomicAmount,
+        token_out: AssetId,
+    ) -> Self {
+        Self {
+            token_in,
+            amount_out,
+            token_out: Some(token_out),
+        }
+    }
+
+    /// Simulates this request against the given pool state.
+    pub fn simulate(&self, pool: &BinPoolState) -> Result<BinExactOutputQuote, BinSimulationError> {
+        simulate_bin_exact_output(pool, self)
+    }
+}
+
+/// Deterministic quote produced by Bin/DLMM exact-output simulation.
+///
+/// `input` is the minimal gross input whose exact-input output is `>= requested_output`.
+/// Because integer floor rounding makes an exact hit rare, the realized `output`
+/// may exceed the requested amount by a bounded rounding remainder; `input - 1`
+/// is proven insufficient fail-closed before returning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinExactOutputQuote {
+    /// Minimal gross input, denominated in the input asset.
+    pub input: AssetAmount,
+    /// Requested output, denominated in the output asset.
+    pub requested_output: AssetAmount,
+    /// Realized output of `input`, denominated in the output asset (`>= requested_output`).
+    pub output: AssetAmount,
+    /// Pool fee taken from `input`, denominated in the input asset.
+    pub fee: AssetAmount,
+    /// Effective post-fee input entering the bin price calculation.
+    pub effective_input: AssetAmount,
+    /// Fee basis points of the pool.
+    pub fee_bps: Bps,
+    /// Id of the last represented bin in which output was produced.
+    pub resulting_active_bin_id: i32,
+    /// Number of bin-to-bin transitions performed during traversal.
+    pub bins_crossed: usize,
+}
+
+impl BinExactOutputQuote {
+    /// The realized rounding overshoot (`output - requested_output`), never negative.
+    pub fn output_overshoot(&self) -> AtomicAmount {
+        AtomicAmount::new(
+            self.output
+                .amount
+                .get()
+                .saturating_sub(self.requested_output.amount.get()),
+        )
+    }
+}
+
+/// Classifies a Bin exact-input failure for the minimal-input search.
+fn bin_probe_class(err: &BinSimulationError) -> ProbeClass {
+    match err {
+        BinSimulationError::ZeroOutputAmount
+        | BinSimulationError::ZeroEffectiveInput
+        | BinSimulationError::InvariantViolated => ProbeClass::Low,
+        BinSimulationError::BinCrossingExceeded | BinSimulationError::ArithmeticOverflow => {
+            ProbeClass::High
+        }
+        _ => ProbeClass::Unexpected,
+    }
 }
 
 /// Greatest common divisor of two positive `u128` values.
@@ -374,5 +471,117 @@ pub fn simulate_bin_exact_input(
         fee_bps: pool.fee_bps,
         resulting_active_bin_id,
         bins_crossed,
+    })
+}
+
+/// Simulates a direct exact-output swap over a Bin/DLMM pool state.
+///
+/// Returns the **minimal** gross input whose exact-input bin traversal yields at
+/// least the requested output. The inverse is realized entirely through
+/// [`simulate_bin_exact_input`] (the single authoritative kernel) with a bounded
+/// exact integer search: the covering ceiling is located by doubling and a
+/// smallest-high-error binary search, the minimal covering input is
+/// binary-searched, and `input - 1` is proven insufficient before returning.
+///
+/// Validates pool state, requested output, direction, caller-asserted output,
+/// and fee bounds fail-closed. A target above the pool's reachable output returns
+/// [`BinSimulationError::OutputUnreachable`]. Never mutates the supplied pool.
+pub fn simulate_bin_exact_output(
+    pool: &BinPoolState,
+    request: &BinExactOutputRequest,
+) -> Result<BinExactOutputQuote, BinSimulationError> {
+    // 1. Validate pool contract invariants.
+    pool.validate().map_err(BinSimulationError::from)?;
+
+    // 2. Reject a zero requested output (mirrors the exact-input zero-input guard).
+    if request.amount_out.is_zero() {
+        return Err(BinSimulationError::ZeroOutputAmount);
+    }
+
+    // 3. Validate chain binding.
+    if request.token_in.chain != pool.token_0.chain {
+        return Err(BinSimulationError::ChainMismatch);
+    }
+
+    // 4. Determine the swap direction and expected counter-asset.
+    let is_token_0_in = if request.token_in == pool.token_0 {
+        true
+    } else if request.token_in == pool.token_1 {
+        false
+    } else {
+        return Err(BinSimulationError::InvalidAssetDirection);
+    };
+    let expected_out = if is_token_0_in {
+        pool.token_1.clone()
+    } else {
+        pool.token_0.clone()
+    };
+
+    // 5. Validate caller-asserted output asset if provided.
+    if let Some(ref caller_out) = request.token_out {
+        if caller_out.chain != pool.token_0.chain {
+            return Err(BinSimulationError::ChainMismatch);
+        }
+        if caller_out == &request.token_in {
+            return Err(BinSimulationError::InvalidAssetDirection);
+        }
+        if caller_out != &expected_out {
+            return Err(BinSimulationError::OutputAssetMismatch);
+        }
+    }
+
+    // 6. Validate fee bounds.
+    let fee_bps_val = pool.fee_bps.get();
+    if fee_bps_val >= Bps::MAX {
+        return Err(BinSimulationError::InvalidFee);
+    }
+
+    // 7. The active-bin/range validation is enforced by the exact-input oracle on
+    //    the first probe and propagates fail-closed.
+
+    let requested_out = request.amount_out.get();
+    let token_in = request.token_in.clone();
+
+    // 8. Bounded minimal gross-input search, with the exact-input kernel as the
+    //    only output oracle.
+    let outcome = find_min_gross_input(
+        requested_out,
+        |g| {
+            simulate_bin_exact_input(
+                pool,
+                &BinExactInputRequest::new(token_in.clone(), AtomicAmount::new(g)),
+            )
+            .map(|quote| quote.output.amount.get())
+        },
+        bin_probe_class,
+    )?;
+
+    let minimal_in = match outcome {
+        MinimalInputSearch::Found(g) => g,
+        MinimalInputSearch::Unreachable => return Err(BinSimulationError::OutputUnreachable),
+        MinimalInputSearch::Invariant => return Err(BinSimulationError::InvariantViolated),
+    };
+
+    // 9. Realize the authoritative exact-input quote at the proven-minimal input.
+    let realized = simulate_bin_exact_input(
+        pool,
+        &BinExactInputRequest::new(token_in, AtomicAmount::new(minimal_in)),
+    )?;
+    if realized.output.amount.get() < requested_out {
+        return Err(BinSimulationError::InvariantViolated);
+    }
+
+    Ok(BinExactOutputQuote {
+        input: realized.input,
+        requested_output: AssetAmount {
+            asset: expected_out,
+            amount: request.amount_out,
+        },
+        output: realized.output,
+        fee: realized.fee,
+        effective_input: realized.effective_input,
+        fee_bps: realized.fee_bps,
+        resulting_active_bin_id: realized.resulting_active_bin_id,
+        bins_crossed: realized.bins_crossed,
     })
 }

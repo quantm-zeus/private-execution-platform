@@ -56,6 +56,260 @@ pub struct ClmmSimulationQuote {
     pub resulting_liquidity: u128,
 }
 
+/// Request parameters for an exact-output direct CLMM swap simulation.
+///
+/// The caller asks for a desired output amount and receives the **minimal** gross
+/// input whose exact-input traversal yields at least that output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClmmExactOutputRequest {
+    /// Asset offered as input to the pool.
+    pub token_in: AssetId,
+    /// Desired output amount from the pool.
+    pub amount_out: AtomicAmount,
+    /// Optional caller-asserted target output asset.
+    /// If provided, must match the pool's counter-asset direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_out: Option<AssetId>,
+}
+
+impl ClmmExactOutputRequest {
+    /// Creates an exact-output request with inferred output asset.
+    pub const fn new(token_in: AssetId, amount_out: AtomicAmount) -> Self {
+        Self {
+            token_in,
+            amount_out,
+            token_out: None,
+        }
+    }
+
+    /// Creates an exact-output request with caller-asserted output asset.
+    pub const fn new_directed(
+        token_in: AssetId,
+        amount_out: AtomicAmount,
+        token_out: AssetId,
+    ) -> Self {
+        Self {
+            token_in,
+            amount_out,
+            token_out: Some(token_out),
+        }
+    }
+
+    /// Simulates this request against the given pool state.
+    pub fn simulate(
+        &self,
+        pool: &ClmmPoolState,
+    ) -> Result<ClmmExactOutputQuote, ClmmSimulationError> {
+        simulate_clmm_exact_output(pool, self)
+    }
+}
+
+/// Deterministic quote produced by CLMM exact-output simulation.
+///
+/// `input` is the minimal gross input whose exact-input output is `>= requested_output`.
+/// Because integer floor rounding makes an exact hit rare, the realized `output`
+/// may exceed the requested amount by a bounded rounding remainder; `input - 1`
+/// is proven insufficient fail-closed before returning.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClmmExactOutputQuote {
+    /// Minimal gross input, denominated in the input asset.
+    pub input: AssetAmount,
+    /// Requested output, denominated in the output asset.
+    pub requested_output: AssetAmount,
+    /// Realized output of `input`, denominated in the output asset (`>= requested_output`).
+    pub output: AssetAmount,
+    /// Pool fee taken from `input`, denominated in the input asset.
+    pub fee: AssetAmount,
+    /// Effective post-fee input entering the CLMM price calculation.
+    pub effective_input: AssetAmount,
+    /// Fee basis points of the pool.
+    pub fee_bps: Bps,
+    /// Resulting sqrt price in Q64.64 after the required swap.
+    pub resulting_sqrt_price_x64: u128,
+    /// Resulting price tick after the required swap.
+    pub resulting_tick: i32,
+    /// Resulting active liquidity after the required swap.
+    pub resulting_liquidity: u128,
+}
+
+impl ClmmExactOutputQuote {
+    /// The realized rounding overshoot (`output - requested_output`), never negative.
+    pub fn output_overshoot(&self) -> AtomicAmount {
+        AtomicAmount::new(
+            self.output
+                .amount
+                .get()
+                .saturating_sub(self.requested_output.amount.get()),
+        )
+    }
+}
+
+/// Classification of an exact-input oracle failure for the bounded search.
+///
+/// The feasibility lemma partitions failures into a contiguous low end
+/// (`ZeroOutputAmount`/`ZeroEffectiveInput`/`InvariantViolated`), a contiguous high
+/// end (`TickCrossingExceeded`/`BinCrossingExceeded`/`ArithmeticOverflow`), and
+/// everything else, which must abort the search fail-closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeClass {
+    /// Low-end failure: the input is below the feasible interval.
+    Low,
+    /// High-end failure: the input is above the feasible ceiling.
+    High,
+    /// Any other failure: abort the search fail-closed.
+    Unexpected,
+}
+
+/// Resolution of the bounded minimal gross-input search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MinimalInputSearch {
+    /// The minimal gross input whose exact-input output covers the target.
+    Found(u128),
+    /// No representable gross input can cover the target.
+    Unreachable,
+    /// The feasibility-interval lemma was contradicted; fail closed.
+    Invariant,
+}
+
+/// Finds the minimal gross input `g >= 1` whose exact-input output `f(g)` is
+/// `>= target`, using `f` as the only output oracle.
+///
+/// **Lemma.** For a fixed valid pool and direction, the exact-input output `f(g)`
+/// is non-decreasing over the inputs for which the kernel returns `Ok`, and that
+/// `Ok` set is a contiguous interval `[g_min, g_max]` (possibly empty). Low-end
+/// failures are `ZeroOutputAmount`/`ZeroEffectiveInput`/`InvariantViolated`;
+/// high-end failures are `TickCrossingExceeded`/`BinCrossingExceeded`/
+/// `ArithmeticOverflow`. Non-monotonicity is never assumed where the algorithm
+/// refuses to return.
+///
+/// The ceiling is located by doubling and, on the first high-end failure, by
+/// binary-searching the **smallest** high-error input (the high predicate is
+/// monotone, unlike `Ok`, which is followed by high errors). The minimal input is
+/// then binary-searched for on `[1, hi]`, and `g - 1` is re-probed to prove
+/// minimality before returning. `f` is never called with `g == 0`.
+pub(crate) fn find_min_gross_input<E>(
+    target: u128,
+    mut f: impl FnMut(u128) -> Result<u128, E>,
+    classify: impl Fn(&E) -> ProbeClass,
+) -> Result<MinimalInputSearch, E> {
+    // --- 1. Locate a covering upper bound `hi`. ---
+    let mut prev: u128 = 0;
+    let mut g: u128 = 1;
+    let hi: u128 = loop {
+        match f(g) {
+            Ok(out) => {
+                if out >= target {
+                    break g;
+                }
+                prev = g;
+            }
+            Err(err) => match classify(&err) {
+                ProbeClass::Low => prev = g,
+                ProbeClass::High => {
+                    // `g` is above the ceiling while `prev` is not: binary-search
+                    // the smallest high-error input `x` in `(prev, g]`.
+                    let mut lo = prev;
+                    let mut high = g;
+                    while high - lo > 1 {
+                        // `high >= lo + 2`, so `mid >= lo + 1 >= 1`: never zero.
+                        let mid = lo + (high - lo) / 2;
+                        match f(mid) {
+                            Ok(_) => lo = mid,
+                            Err(inner) => match classify(&inner) {
+                                ProbeClass::High => high = mid,
+                                ProbeClass::Low => lo = mid,
+                                ProbeClass::Unexpected => return Err(inner),
+                            },
+                        }
+                    }
+                    let x = high;
+                    // `x >= 1`, so `x - 1` is a legal probe. If it is zero the
+                    // feasible interval is empty (`f(1)` already failed high).
+                    let g_max = x - 1;
+                    if g_max == 0 {
+                        return Ok(MinimalInputSearch::Unreachable);
+                    }
+                    match f(g_max) {
+                        Ok(out) => {
+                            if out >= target {
+                                break g_max;
+                            }
+                            return Ok(MinimalInputSearch::Unreachable);
+                        }
+                        Err(inner) => match classify(&inner) {
+                            ProbeClass::Low => return Ok(MinimalInputSearch::Unreachable),
+                            ProbeClass::High => return Ok(MinimalInputSearch::Invariant),
+                            ProbeClass::Unexpected => return Err(inner),
+                        },
+                    }
+                }
+                ProbeClass::Unexpected => return Err(err),
+            },
+        }
+
+        // Advance the doubling probe without ever calling `f(0)` or overflowing.
+        if g == u128::MAX {
+            return Ok(MinimalInputSearch::Unreachable);
+        }
+        if g > u128::MAX / 2 {
+            g = u128::MAX;
+        } else {
+            g *= 2;
+        }
+    };
+
+    // --- 2. Minimal covering input in `[1, hi]` (predicate is monotone here). ---
+    let mut lo: u128 = 1;
+    let mut bound: u128 = hi;
+    while lo < bound {
+        let mid = lo + (bound - lo) / 2;
+        let covers = match f(mid) {
+            Ok(out) => out >= target,
+            Err(_) => false,
+        };
+        if covers {
+            bound = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let g_star = lo;
+
+    // --- 3. Realize and prove minimality. ---
+    match f(g_star) {
+        Ok(out) if out >= target => {}
+        _ => return Ok(MinimalInputSearch::Invariant),
+    }
+    if g_star > 1 {
+        match f(g_star - 1) {
+            Ok(previous) => {
+                if previous >= target {
+                    return Ok(MinimalInputSearch::Invariant);
+                }
+            }
+            Err(err) => match classify(&err) {
+                ProbeClass::Low => {}
+                ProbeClass::High | ProbeClass::Unexpected => return Err(err),
+            },
+        }
+    }
+
+    Ok(MinimalInputSearch::Found(g_star))
+}
+
+/// Classifies a CLMM exact-input failure for the minimal-input search.
+fn clmm_probe_class(err: &ClmmSimulationError) -> ProbeClass {
+    match err {
+        ClmmSimulationError::ZeroOutputAmount
+        | ClmmSimulationError::ZeroEffectiveInput
+        | ClmmSimulationError::InvariantViolated => ProbeClass::Low,
+        ClmmSimulationError::TickCrossingExceeded | ClmmSimulationError::ArithmeticOverflow => {
+            ProbeClass::High
+        }
+        _ => ProbeClass::Unexpected,
+    }
+}
+
 /// 512-bit unsigned integer represented as four 128-bit limbs in little-endian order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct U512([u128; 4]);
@@ -896,5 +1150,145 @@ pub fn simulate_clmm_exact_input(
         resulting_sqrt_price_x64: current_s,
         resulting_tick: current_tick,
         resulting_liquidity: current_liquidity,
+    })
+}
+
+/// Simulates a direct exact-output swap over a CLMM pool state.
+///
+/// Returns the **minimal** gross input whose exact-input traversal yields at
+/// least the requested output. The inverse is realized entirely through
+/// [`simulate_clmm_exact_input`] (the single authoritative kernel) with a
+/// bounded exact integer search: the covering ceiling is located by doubling and
+/// a smallest-high-error binary search, the minimal covering input is
+/// binary-searched, and `input - 1` is proven insufficient before returning.
+///
+/// Validates pool state, requested output, direction, caller-asserted output,
+/// and fee bounds fail-closed. A target above the pool's reachable output returns
+/// [`ClmmSimulationError::OutputUnreachable`]. Never mutates the supplied pool.
+pub fn simulate_clmm_exact_output(
+    pool: &ClmmPoolState,
+    request: &ClmmExactOutputRequest,
+) -> Result<ClmmExactOutputQuote, ClmmSimulationError> {
+    // 1. Validate pool contract invariants.
+    pool.validate().map_err(ClmmSimulationError::from)?;
+
+    // 2. Reject a zero requested output (mirrors the exact-input zero-input guard).
+    if request.amount_out.is_zero() {
+        return Err(ClmmSimulationError::ZeroOutputAmount);
+    }
+
+    // 3. Reject zero or invalid liquidity.
+    if pool.liquidity == 0 {
+        return Err(ClmmSimulationError::InvalidLiquidity);
+    }
+
+    // 4. Validate sqrt price bounds.
+    if pool.sqrt_price_x64 == 0
+        || !(MIN_SQRT_PRICE_X64..=MAX_SQRT_PRICE_X64).contains(&pool.sqrt_price_x64)
+    {
+        return Err(ClmmSimulationError::InvalidPrice);
+    }
+
+    // 5. Validate tick range.
+    if !(MIN_TICK..=MAX_TICK).contains(&pool.current_tick) {
+        return Err(ClmmSimulationError::InvalidTick);
+    }
+
+    // 6. Validate fee bounds.
+    let fee_bps_val = pool.fee_bps.get();
+    if fee_bps_val >= Bps::MAX {
+        return Err(ClmmSimulationError::InvalidFee);
+    }
+
+    // 7. Validate chain binding.
+    if request.token_in.chain != pool.token_0.chain {
+        return Err(ClmmSimulationError::ChainMismatch);
+    }
+
+    // 8. Determine the swap direction and expected counter-asset.
+    let is_token_0_in = if request.token_in == pool.token_0 {
+        true
+    } else if request.token_in == pool.token_1 {
+        false
+    } else {
+        return Err(ClmmSimulationError::InvalidAssetDirection);
+    };
+    let expected_out = if is_token_0_in {
+        pool.token_1.clone()
+    } else {
+        pool.token_0.clone()
+    };
+
+    // 9. Validate caller-asserted output asset if provided.
+    if let Some(ref caller_out) = request.token_out {
+        if caller_out.chain != pool.token_0.chain {
+            return Err(ClmmSimulationError::ChainMismatch);
+        }
+        if caller_out == &request.token_in {
+            return Err(ClmmSimulationError::InvalidAssetDirection);
+        }
+        if caller_out != &expected_out {
+            return Err(ClmmSimulationError::OutputAssetMismatch);
+        }
+    }
+
+    // 10. The remaining pool range/coherence validation is enforced by the
+    //     exact-input oracle on the first probe and propagates fail-closed.
+
+    let requested_out = request.amount_out.get();
+    let token_in = request.token_in.clone();
+
+    // 11. Bounded minimal gross-input search, with the exact-input kernel as the
+    //     only output oracle.
+    let outcome = find_min_gross_input(
+        requested_out,
+        |g| {
+            simulate_clmm_exact_input(
+                pool,
+                &ClmmExactInputRequest {
+                    token_in: token_in.clone(),
+                    amount_in: AtomicAmount::new(g),
+                    token_out: None,
+                },
+            )
+            .map(|quote| quote.output.amount.get())
+        },
+        clmm_probe_class,
+    )?;
+
+    let minimal_in = match outcome {
+        MinimalInputSearch::Found(g) => g,
+        MinimalInputSearch::Unreachable => {
+            return Err(ClmmSimulationError::OutputUnreachable);
+        }
+        MinimalInputSearch::Invariant => return Err(ClmmSimulationError::InvariantViolated),
+    };
+
+    // 12. Realize the authoritative exact-input quote at the proven-minimal input.
+    let realized = simulate_clmm_exact_input(
+        pool,
+        &ClmmExactInputRequest {
+            token_in,
+            amount_in: AtomicAmount::new(minimal_in),
+            token_out: None,
+        },
+    )?;
+    if realized.output.amount.get() < requested_out {
+        return Err(ClmmSimulationError::InvariantViolated);
+    }
+
+    Ok(ClmmExactOutputQuote {
+        input: realized.input,
+        requested_output: AssetAmount {
+            asset: expected_out,
+            amount: request.amount_out,
+        },
+        output: realized.output,
+        fee: realized.fee,
+        effective_input: realized.effective_input,
+        fee_bps: realized.fee_bps,
+        resulting_sqrt_price_x64: realized.resulting_sqrt_price_x64,
+        resulting_tick: realized.resulting_tick,
+        resulting_liquidity: realized.resulting_liquidity,
     })
 }

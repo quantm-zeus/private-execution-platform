@@ -1177,6 +1177,7 @@ fn test_display_and_debug_redaction_comprehensive() {
         ClmmSimulationError::ZeroOutputAmount,
         ClmmSimulationError::ArithmeticOverflow,
         ClmmSimulationError::InvariantViolated,
+        ClmmSimulationError::OutputUnreachable,
         ClmmSimulationError::StaleOrUnavailableState,
     ];
     for variant in clmm_variants {
