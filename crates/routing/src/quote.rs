@@ -10,7 +10,7 @@
 //! the quote is returned.
 
 use chain_types::AssetId;
-use domain::{RouteLeg, RoutePlan, TradeSide};
+use domain::{RouteLeg, RoutePlan, TradeIntent, TradeSide};
 use execution_preview::NetDelta;
 use market_types::{
     evaluate_freshness, AssetAmount, AtomicAmount, Bps, Freshness, FreshnessPolicy,
@@ -21,7 +21,7 @@ use simulation::{
     simulate_bin_exact_input, simulate_clmm_exact_input, simulate_cpmm_exact_input,
     BinExactInputRequest, ClmmExactInputRequest, CpmmExactInputRequest,
 };
-use tax_engine::{assessed_asset_for_intent, TaxSafetyError};
+use tax_engine::{assessed_asset_for_intent, TaxAssessment, TaxSafetyError};
 
 use crate::error::RoutingError;
 use crate::graph::{CandidatePath, PoolDescriptor};
@@ -94,7 +94,7 @@ pub struct RouteQuote {
 }
 
 #[inline]
-fn nonzero(amount: AssetAmount) -> Option<AssetAmount> {
+pub(crate) fn nonzero(amount: AssetAmount) -> Option<AssetAmount> {
     if amount.amount.is_zero() {
         None
     } else {
@@ -107,11 +107,24 @@ fn nonzero(amount: AssetAmount) -> Option<AssetAmount> {
 /// Fails closed on a chain/asset mismatch or when the assessment is not fresh
 /// under either the caller policy or [`FreshnessPolicy::default`].
 pub(crate) fn validate_assessment(req: &RouteRequest<'_>) -> Result<(), RoutingError> {
-    let assessment = req.assessment;
-    if assessment.chain != req.intent.chain {
+    validate_assessment_fields(req.intent, req.assessment, req.freshness_policy, req.now_ms)
+}
+
+/// Field-level form of [`validate_assessment`] for non-[`RouteRequest`] callers.
+///
+/// The exact same binding and dual-freshness checks run, so a provider-route
+/// builder that only has the intent, assessment, policy, and reference time
+/// cannot weaken the assessment gate.
+pub(crate) fn validate_assessment_fields(
+    intent: &TradeIntent,
+    assessment: &TaxAssessment,
+    freshness_policy: &FreshnessPolicy,
+    now_ms: i64,
+) -> Result<(), RoutingError> {
+    if assessment.chain != intent.chain {
         return Err(RoutingError::TaxAssessmentMismatch);
     }
-    if assessment.assessed_asset != *assessed_asset_for_intent(req.intent) {
+    if assessment.assessed_asset != *assessed_asset_for_intent(intent) {
         return Err(RoutingError::TaxAssessmentMismatch);
     }
     if assessment.freshness.status != FreshnessStatus::Fresh {
@@ -124,9 +137,9 @@ pub(crate) fn validate_assessment(req: &RouteRequest<'_>) -> Result<(), RoutingE
     }
 
     let caller_meta = evaluate_freshness(
-        req.freshness_policy,
+        freshness_policy,
         assessment.freshness.observed_at_ms,
-        req.now_ms,
+        now_ms,
         assessment.freshness.sequence,
         false,
     )
@@ -139,7 +152,7 @@ pub(crate) fn validate_assessment(req: &RouteRequest<'_>) -> Result<(), RoutingE
     let default_meta = evaluate_freshness(
         &default_policy,
         assessment.freshness.observed_at_ms,
-        req.now_ms,
+        now_ms,
         assessment.freshness.sequence,
         false,
     )
@@ -151,7 +164,7 @@ pub(crate) fn validate_assessment(req: &RouteRequest<'_>) -> Result<(), RoutingE
     Ok(())
 }
 
-fn map_tax_error(error: TaxSafetyError) -> RoutingError {
+pub(crate) fn map_tax_error(error: TaxSafetyError) -> RoutingError {
     match error {
         TaxSafetyError::StaleObservation | TaxSafetyError::ResyncRequired => {
             RoutingError::TaxAssessmentNotFresh

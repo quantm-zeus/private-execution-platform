@@ -38,6 +38,7 @@ pub mod impact;
 pub mod label;
 pub mod leg;
 pub mod plan;
+pub mod provider;
 pub mod quote;
 pub mod score;
 pub mod split;
@@ -63,6 +64,7 @@ pub use graph::{enumerate_candidates, CandidateLeg, CandidatePath, CandidateSet,
 pub use label::{PoolRefLabel, VenueLabel};
 pub use leg::{simulate_leg, swap_dir};
 pub use plan::{plan_direct_route, select_best_path, to_route_plan};
+pub use provider::{quote_provider_route, ProviderRouteInput, ProviderRouteQuote};
 pub use quote::{HopQuote, PoolKindClass, RouteQuote};
 pub use score::{GasConversion, GasEstimator, ScoringInputs};
 pub use split::{

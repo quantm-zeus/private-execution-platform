@@ -29,6 +29,6 @@ mod error;
 pub use authorize::{authorize, AgentCapabilities, AuthorizedCommand, DenyReason};
 pub use command::{
     AgentChannel, AgentCommand, AmountSpec, AssetRef, ChartWindow, LimitPriceSpec, ReadCommand,
-    TradeCommand, MAX_ASSET_ADDRESS_LEN,
+    RouterSource, TradeCommand, MAX_ASSET_ADDRESS_LEN,
 };
 pub use error::AgentCommandError;

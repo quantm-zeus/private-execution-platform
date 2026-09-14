@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use agent_commands::{
     authorize, AgentCapabilities, AgentChannel, AgentCommand, AgentCommandError, AmountSpec,
     AssetRef, AuthorizedCommand, ChartWindow, DenyReason, LimitPriceSpec, ReadCommand,
-    TradeCommand,
+    RouterSource, TradeCommand,
 };
 use chain_types::ChainId;
 use domain::TradeSide;
@@ -194,6 +194,7 @@ fn amount_decoding_is_member_order_independent() {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::TokenAtomic(u128::MAX),
+            router: RouterSource::Okx,
         })
     );
 
@@ -206,6 +207,7 @@ fn amount_decoding_is_member_order_independent() {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::StablecoinAtomic(5000),
+            router: RouterSource::Okx,
         })
     );
     let usd_value_first =
@@ -216,6 +218,7 @@ fn amount_decoding_is_member_order_independent() {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::UsdMicros(1234),
+            router: RouterSource::Okx,
         })
     );
 
@@ -834,16 +837,19 @@ fn all_commands() -> Vec<AgentCommand> {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::TokenAtomic(u128::MAX),
+            router: RouterSource::Okx,
         }),
         AgentCommand::Read(ReadCommand::GetQuote {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::StablecoinAtomic(42),
+            router: RouterSource::Okx,
         }),
         AgentCommand::Read(ReadCommand::GetQuote {
             token_in: sol(),
             token_out: usdc(),
             amount: AmountSpec::UsdMicros(u64::MAX),
+            router: RouterSource::Okx,
         }),
         AgentCommand::Read(ReadCommand::GetOrders {
             status: Some("open".to_string()),
@@ -857,6 +863,7 @@ fn all_commands() -> Vec<AgentCommand> {
             amount: AmountSpec::UsdMicros(1_000_000),
             max_slippage_bps: Some(100),
             max_price_impact_bps: Some(200),
+            router: RouterSource::Okx,
         }),
         AgentCommand::Trade(TradeCommand::PreviewMarketOrder {
             token_in: sol(),
@@ -865,6 +872,7 @@ fn all_commands() -> Vec<AgentCommand> {
             amount: AmountSpec::TokenAtomic(7),
             max_slippage_bps: None,
             max_price_impact_bps: None,
+            router: RouterSource::Okx,
         }),
         AgentCommand::Trade(TradeCommand::ExecuteMarketOrder {
             token_in: sol(),
@@ -873,6 +881,7 @@ fn all_commands() -> Vec<AgentCommand> {
             amount: AmountSpec::StablecoinAtomic(5000),
             max_slippage_bps: Some(50),
             max_price_impact_bps: None,
+            router: RouterSource::Okx,
         }),
         AgentCommand::Trade(TradeCommand::PlaceLimitOrder {
             token_in: sol(),
@@ -923,4 +932,62 @@ fn direct_asset_and_price_helpers_convert_to_canonical_types() {
         AssetRef::new(ChainId::Solana, "   "),
         Err(AgentCommandError::InvalidAsset)
     );
+}
+
+#[test]
+fn router_preference_defaults_to_okx_and_is_explicitly_selectable() {
+    let explicit_local = AgentCommand::Read(ReadCommand::GetQuote {
+        token_in: sol(),
+        token_out: usdc(),
+        amount: AmountSpec::TokenAtomic(1),
+        router: RouterSource::Local,
+    });
+
+    // Explicit Local round-trips through serialization and parsing.
+    let local_json = serde_json::to_string(&explicit_local).expect("json");
+    assert!(local_json.contains("\"router\":\"local\""));
+    assert_eq!(
+        AgentCommand::parse(&local_json).expect("parse"),
+        explicit_local
+    );
+
+    let mut value: serde_json::Value = serde_json::from_str(&local_json).expect("value");
+
+    // An omitted router field resolves to OKX (the new-session default).
+    let mut omitted = value.clone();
+    omitted.as_object_mut().expect("object").remove("router");
+    assert_eq!(
+        AgentCommand::parse(&serde_json::to_string(&omitted).expect("json")).expect("parse"),
+        AgentCommand::Read(ReadCommand::GetQuote {
+            token_in: sol(),
+            token_out: usdc(),
+            amount: AmountSpec::TokenAtomic(1),
+            router: RouterSource::Okx,
+        })
+    );
+
+    // An unknown selector fails closed rather than defaulting.
+    let mut unknown = value.clone();
+    unknown
+        .as_object_mut()
+        .expect("object")
+        .insert("router".to_string(), serde_json::json!("binance"));
+    assert_eq!(
+        AgentCommand::parse(&serde_json::to_string(&unknown).expect("json")),
+        Err(AgentCommandError::Malformed)
+    );
+
+    // A duplicate router key fails closed (last-win is never accepted).
+    let duplicate = local_json.replace(
+        "\"router\":\"local\"",
+        "\"router\":\"local\",\"router\":\"okx\"",
+    );
+    assert_eq!(
+        AgentCommand::parse(&duplicate),
+        Err(AgentCommandError::Malformed)
+    );
+    let _ = value.as_object_mut().expect("object").remove("router");
+    assert_eq!(RouterSource::default(), RouterSource::Okx);
+    assert_eq!(RouterSource::Okx.as_str(), "okx");
+    assert_eq!(RouterSource::Local.as_str(), "local");
 }
