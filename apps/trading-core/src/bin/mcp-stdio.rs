@@ -10,6 +10,11 @@
 //! fail-closed defaults, so no credentials, key material, or network are needed
 //! to start; reads and the read-only reconcile path stay available, and every
 //! mutation is denied before any port call while disabled.
+//!
+//! It also strictly parses `RECONCILE_INTERVAL_MS` (absent/`"0"` disables the
+//! loop; invalid/non-Unicode refuses startup). When set, the read-only reconcile
+//! loop runs for the lifetime of the stdio session and is stopped promptly when
+//! `StdioServer::run` returns on EOF or a transport error.
 
 #![forbid(unsafe_code)]
 
@@ -25,9 +30,13 @@ use market_types::{AtomicAmount, Bps};
 use mcp_server::{McpServer, StdioLimits, StdioServer};
 use policy::{PolicyLimits, UsdMicros};
 use tokio::io::BufReader;
+use tokio::sync::watch;
 use trading_core::composition::{
-    build_capabilities, build_policy, CompositionConfig, RecordingAgentBackend, TradingCore,
-    TradingCoreSeams, UnavailableOpaqueStore,
+    build_capabilities, build_policy, CompositionConfig, MarketReconcileLoop,
+    RecordingAgentBackend, TradingCore, TradingCoreSeams, UnavailableOpaqueStore,
+};
+use trading_core::service::{
+    parse_reconcile_interval_ms, spawn_reconcile_loop, RECONCILE_SCHEDULE,
 };
 
 /// Fixed frame bound: 1 MiB per frame, unlimited frame count.
@@ -42,11 +51,23 @@ async fn main() -> ExitCode {
         // A non-Unicode value is not a recognized gate value: refuse to start.
         Err(std::env::VarError::NotUnicode(_)) => return ExitCode::FAILURE,
     };
-    run(trading_enabled.as_deref()).await
+    let reconcile_interval = match std::env::var("RECONCILE_INTERVAL_MS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        // A non-Unicode interval is not a recognized value: refuse to start.
+        Err(std::env::VarError::NotUnicode(_)) => return ExitCode::FAILURE,
+    };
+    run(trading_enabled.as_deref(), reconcile_interval.as_deref()).await
 }
 
 /// Builds the composition root and serves MCP over stdin/stdout.
-async fn run(trading_enabled: Option<&str>) -> ExitCode {
+async fn run(trading_enabled: Option<&str>, reconcile_interval: Option<&str>) -> ExitCode {
+    // Strict parse first: an invalid/non-Unicode interval refuses startup before
+    // any port is built. Absent or `"0"` leaves the read-only loop off.
+    let interval = match parse_reconcile_interval_ms(reconcile_interval) {
+        Ok(interval) => interval,
+        Err(_) => return ExitCode::FAILURE,
+    };
     let limits = match policy_limits() {
         Some(limits) => limits,
         None => return ExitCode::FAILURE,
@@ -77,9 +98,26 @@ async fn run(trading_enabled: Option<&str>) -> ExitCode {
             max_frames: MAX_FRAMES,
         },
     );
+
+    // The loop is read-only and off by default; it is spawned only when an
+    // interval is configured.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let reconcile_task = interval.map(|interval| {
+        let reconcile =
+            MarketReconcileLoop::new(core.backend(), core.registry(), RECONCILE_SCHEDULE);
+        spawn_reconcile_loop(reconcile, interval, shutdown_rx)
+    });
+
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
-    match stdio.run(reader, writer).await {
+    let result = stdio.run(reader, writer).await;
+    // `stdio.run` returns on EOF or a transport error: stop the loop promptly
+    // and wait for it before reporting the transport result.
+    if let Some(task) = reconcile_task {
+        let _ = shutdown_tx.send(true);
+        let _ = task.await;
+    }
+    match result {
         Ok(_processed) => ExitCode::SUCCESS,
         Err(_transport) => ExitCode::FAILURE,
     }

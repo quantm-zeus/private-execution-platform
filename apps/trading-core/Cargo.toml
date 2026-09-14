@@ -26,7 +26,7 @@ privy.workspace = true
 routing.workspace = true
 storage.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "io-util", "time", "sync"] }
 
 [dev-dependencies]
 crypto-envelope.workspace = true

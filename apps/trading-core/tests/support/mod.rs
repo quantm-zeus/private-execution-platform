@@ -11,6 +11,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
@@ -38,7 +39,7 @@ use storage::{
     OpaqueStore, StorageError,
 };
 use trading_core::composition::{
-    build_policy, CompositionConfig, LimitRecovery, PendingMarketAttempt,
+    build_policy, CompositionConfig, LimitRecovery, MarketAttemptRegistry, PendingMarketAttempt,
 };
 
 /// Reference instant used by every test.
@@ -255,6 +256,55 @@ impl MarketExecutionPort for CountingMarketPort {
     }
 }
 
+/// Market port wrapper that counts `execute` and `reconcile` calls over an inner
+/// port (used to prove the spawned loop is read-only over the real relay port).
+pub struct CountingPort {
+    inner: Arc<dyn MarketExecutionPort>,
+    execute_calls: Arc<AtomicUsize>,
+    reconcile_calls: Arc<AtomicUsize>,
+}
+
+impl CountingPort {
+    /// Wraps `inner`.
+    pub fn new(inner: Arc<dyn MarketExecutionPort>) -> Self {
+        Self {
+            inner,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            reconcile_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Shared execute-call counter.
+    pub fn execute_calls(&self) -> Arc<AtomicUsize> {
+        self.execute_calls.clone()
+    }
+
+    /// Shared reconcile-call counter.
+    pub fn reconcile_calls(&self) -> Arc<AtomicUsize> {
+        self.reconcile_calls.clone()
+    }
+}
+
+#[async_trait]
+impl MarketExecutionPort for CountingPort {
+    async fn execute(
+        &self,
+        request: MarketExecutionRequest,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.execute(request).await
+    }
+
+    async fn reconcile(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.reconcile(idempotency_key, now_ms).await
+    }
+}
+
 /// Backend wrapper that counts `execute` calls and forwards everything.
 pub struct CountingAgentBackend<B: AgentBackend> {
     inner: Arc<B>,
@@ -292,14 +342,27 @@ impl<B: AgentBackend> AgentBackend for CountingAgentBackend<B> {
 pub struct ScriptedAgentBackend {
     execute_calls: AtomicUsize,
     valuation: Option<u64>,
+    returns_value: bool,
 }
 
 impl ScriptedAgentBackend {
-    /// Builds a double whose `valuation_usd_micros` returns `valuation`.
+    /// Builds a double whose `execute` reports `Unavailable` and whose
+    /// `valuation_usd_micros` returns `valuation`.
     pub fn new(valuation: Option<u64>) -> Self {
         Self {
             execute_calls: AtomicUsize::new(0),
             valuation,
+            returns_value: false,
+        }
+    }
+
+    /// Like [`Self::new`], but `execute` reports a (redacted) `Value` so the
+    /// recorder keeps the attempt pending.
+    pub fn returning_value(valuation: Option<u64>) -> Self {
+        Self {
+            execute_calls: AtomicUsize::new(0),
+            valuation,
+            returns_value: true,
         }
     }
 
@@ -313,12 +376,70 @@ impl ScriptedAgentBackend {
 impl AgentBackend for ScriptedAgentBackend {
     async fn execute(&self, _channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
-        BackendOutcome::Unavailable
+        if self.returns_value {
+            BackendOutcome::Value(serde_json::Value::Null)
+        } else {
+            BackendOutcome::Unavailable
+        }
     }
 
     async fn valuation_usd_micros(&self, _command: &AgentCommand) -> Option<u64> {
         self.valuation
     }
+}
+
+/// Backend double that snapshots the registry at the instant it is forwarded to.
+///
+/// This proves the recorder reserves *before* delegating: the snapshot captured
+/// by the backend already contains the delegated attempt.
+pub struct TrackingAgentBackend {
+    registry: Arc<MarketAttemptRegistry>,
+    execute_calls: Arc<AtomicUsize>,
+    observed: Arc<Mutex<Vec<PendingMarketAttempt>>>,
+}
+
+impl TrackingAgentBackend {
+    /// Builds a backend that returns a `Value` outcome and snapshots `registry`.
+    pub fn new(registry: Arc<MarketAttemptRegistry>) -> Self {
+        Self {
+            registry,
+            execute_calls: Arc::new(AtomicUsize::new(0)),
+            observed: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Number of `execute` calls observed.
+    pub fn execute_calls(&self) -> usize {
+        self.execute_calls.load(Ordering::SeqCst)
+    }
+
+    /// The registry snapshot captured at the last `execute` call.
+    pub fn observed_at_last_call(&self) -> Vec<PendingMarketAttempt> {
+        lock(&self.observed).clone()
+    }
+}
+
+#[async_trait]
+impl AgentBackend for TrackingAgentBackend {
+    async fn execute(&self, _channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.observed) = self.registry.pending();
+        BackendOutcome::Value(serde_json::Value::Null)
+    }
+}
+
+/// Polls `predicate` until it holds or a bounded wait elapses.
+///
+/// Returns whether the predicate held within the bound. Used to await a
+/// background loop without sleeping for a fixed period.
+pub async fn wait_until<F: Fn() -> bool>(predicate: F) -> bool {
+    for _ in 0..400 {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
 }
 
 /// Reservation store that counts `reserve` calls, delegating to an in-memory store.

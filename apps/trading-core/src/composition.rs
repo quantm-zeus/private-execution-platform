@@ -27,7 +27,7 @@
 //! or advances a reservation, and it is safe to run repeatedly.
 //!
 //! # Redaction
-//! Every payload-bearing type has a hand-written, payload-free [`fmt::Debug`]:
+//! Every payload-bearing type has a hand-written, payload-free [`std::fmt::Debug`]:
 //! no amounts, assets, ids, wallets, chains, or policy values are rendered.
 //! There is no logging.
 //!
@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -420,13 +421,34 @@ impl std::fmt::Debug for PendingMarketAttempt {
     }
 }
 
+/// Result of reserving a slot for one market attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// The attempt was newly stored with a first reference.
+    Reserved,
+    /// An identical attempt was already stored; its reference count grew.
+    AlreadyPending,
+    /// The registry is full of distinct attempts; nothing was stored.
+    AtCapacity,
+}
+
+/// One stored attempt plus its in-process reservation reference count.
+struct PendingEntry {
+    attempt: PendingMarketAttempt,
+    refs: usize,
+}
+
 /// Process-local, bounded, deduplicating registry of pending market attempts.
 ///
-/// Insertion order is preserved. An identical attempt is never stored twice, and
-/// once [`MAX_PENDING_MARKET_ATTEMPTS`] distinct attempts are retained a new
-/// distinct attempt is dropped rather than growing the registry without bound.
+/// Insertion order is preserved. An identical attempt is never stored twice;
+/// instead [`Self::reserve`] grows a reference count so concurrent/sibling
+/// reservations cannot evict each other's entry. Once
+/// [`MAX_PENDING_MARKET_ATTEMPTS`] distinct attempts are retained a new distinct
+/// attempt is refused ([`ReserveOutcome::AtCapacity`]) rather than dropped
+/// silently, which lets the recorder deny before forwarding an untrackable
+/// attempt.
 pub struct MarketAttemptRegistry {
-    pending: Mutex<Vec<PendingMarketAttempt>>,
+    pending: Mutex<Vec<PendingEntry>>,
 }
 
 impl Default for MarketAttemptRegistry {
@@ -443,26 +465,47 @@ impl MarketAttemptRegistry {
         Self::default()
     }
 
-    /// Records `attempt`, returning `true` when it was newly stored.
+    /// Reserves a tracking slot for `attempt`.
     ///
-    /// A duplicate is a no-op (`false`); a full registry drops the newcomer
-    /// (`false`).
-    pub fn record(&self, attempt: PendingMarketAttempt) -> bool {
+    /// An existing identical attempt increments its reference count
+    /// ([`ReserveOutcome::AlreadyPending`]); a new attempt is stored with one
+    /// reference ([`ReserveOutcome::Reserved`]); a full registry refuses the
+    /// newcomer without storing anything ([`ReserveOutcome::AtCapacity`]).
+    pub fn reserve(&self, attempt: PendingMarketAttempt) -> ReserveOutcome {
         let mut pending = lock(&self.pending);
-        if pending.contains(&attempt) {
-            return false;
+        if let Some(entry) = pending.iter_mut().find(|entry| entry.attempt == attempt) {
+            entry.refs = entry.refs.saturating_add(1);
+            return ReserveOutcome::AlreadyPending;
         }
         if pending.len() >= MAX_PENDING_MARKET_ATTEMPTS {
-            return false;
+            return ReserveOutcome::AtCapacity;
         }
-        pending.push(attempt);
-        true
+        pending.push(PendingEntry { attempt, refs: 1 });
+        ReserveOutcome::Reserved
     }
 
-    /// Removes `attempt`, returning `true` when it was present.
+    /// Drops one reference to `attempt`, removing it at zero.
+    ///
+    /// Releasing an attempt that is not present is a no-op: a rejected or
+    /// already-reconciled attempt is never re-added.
+    pub fn release(&self, attempt: &PendingMarketAttempt) {
+        let mut pending = lock(&self.pending);
+        if let Some(index) = pending.iter().position(|entry| &entry.attempt == attempt) {
+            if pending[index].refs <= 1 {
+                pending.remove(index);
+            } else {
+                pending[index].refs -= 1;
+            }
+        }
+    }
+
+    /// Force-removes `attempt`, returning `true` when it was present.
+    ///
+    /// Used for terminal reconcile results, where every outstanding reference is
+    /// resolved at once.
     pub fn remove(&self, attempt: &PendingMarketAttempt) -> bool {
         let mut pending = lock(&self.pending);
-        match pending.iter().position(|stored| stored == attempt) {
+        match pending.iter().position(|entry| &entry.attempt == attempt) {
             Some(index) => {
                 pending.remove(index);
                 true
@@ -471,9 +514,22 @@ impl MarketAttemptRegistry {
         }
     }
 
+    /// Seeds `attempt` as if by [`Self::reserve`], returning `true` only when it
+    /// was newly stored.
+    ///
+    /// This is the seeding/observational surface for tests and startup load; the
+    /// runtime recorder uses [`Self::reserve`] directly so it can deny at
+    /// capacity.
+    pub fn record(&self, attempt: PendingMarketAttempt) -> bool {
+        matches!(self.reserve(attempt), ReserveOutcome::Reserved)
+    }
+
     /// Snapshots the pending attempts in insertion order.
     pub fn pending(&self) -> Vec<PendingMarketAttempt> {
-        lock(&self.pending).clone()
+        lock(&self.pending)
+            .iter()
+            .map(|entry| entry.attempt.clone())
+            .collect()
     }
 
     /// Number of pending attempts.
@@ -533,10 +589,28 @@ impl<B: AgentBackend> AgentBackend for RecordingAgentBackend<B> {
             AgentCommand::Trade(trade) => PendingMarketAttempt::from_execute(channel, trade),
             AgentCommand::Read(_) => None,
         };
-        if let Some(attempt) = observed {
-            self.registry.record(attempt);
+        // Reserve the tracking slot *before* forwarding. A full registry refuses
+        // the attempt here, so the inner backend/port never receives a delegated
+        // attempt the registry cannot track (losslessness / fail-closed).
+        let reserved = match observed {
+            None => None,
+            Some(attempt) => match self.registry.reserve(attempt.clone()) {
+                ReserveOutcome::AtCapacity => return BackendOutcome::Denied,
+                ReserveOutcome::Reserved | ReserveOutcome::AlreadyPending => Some(attempt),
+            },
+        };
+        let outcome = self.inner.execute(channel, command).await;
+        // Every outcome other than `Value` is a definitive non-delegation signal
+        // (pre-port denial or a provably pre-submit terminal), so the reservation
+        // is released. `Value` means the port may be in flight: keep it pending.
+        // Refcounts make the release race-safe; a cancelled call conservatively
+        // leaves the reservation in place.
+        if !matches!(outcome, BackendOutcome::Value(_)) {
+            if let Some(attempt) = &reserved {
+                self.registry.release(attempt);
+            }
         }
-        self.inner.execute(channel, command).await
+        outcome
     }
 
     async fn valuation_usd_micros(&self, command: &AgentCommand) -> Option<u64> {
@@ -654,6 +728,10 @@ pub struct MarketReconcileLoop<T> {
     target: T,
     registry: Arc<MarketAttemptRegistry>,
     schedule: ReconcileSchedule,
+    /// Rotating start offset (modulo the pending length) so a `max_per_pass`
+    /// smaller than the pending set still examines every attempt within
+    /// `ceil(n / max_per_pass)` passes.
+    cursor: AtomicUsize,
 }
 
 impl<T: MarketReconcileTarget> MarketReconcileLoop<T> {
@@ -667,6 +745,7 @@ impl<T: MarketReconcileTarget> MarketReconcileLoop<T> {
             target,
             registry,
             schedule,
+            cursor: AtomicUsize::new(0),
         }
     }
 
@@ -682,16 +761,31 @@ impl<T: MarketReconcileTarget> MarketReconcileLoop<T> {
     /// ([`TradingAgentBackend`]) stamps the reconcile with its own injected
     /// [`TrustedClock`], so the instant is not re-derived here.
     ///
-    /// Classification is exact: `Filled`/`Failed` and a `Denied` error remove the
-    /// attempt; `Submitted`/`Unknown` and an `Unavailable` error keep it. Nothing
-    /// but the local registry is mutated, and `execute` is never called.
+    /// The examined set starts at a private rotating cursor and wraps around the
+    /// pending snapshot, so with `max_per_pass < n` the same prefix is not
+    /// re-examined forever: every pending attempt is examined within
+    /// `ceil(n / max_per_pass)` passes. Classification is exact:
+    /// `Filled`/`Failed` and a `Denied` error remove the attempt;
+    /// `Submitted`/`Unknown` and an `Unavailable` error keep it. Nothing but the
+    /// local registry is mutated, and `execute` is never called.
     pub async fn reconcile_pass(&self, _now_ms: i64) -> ReconcilePassReport {
-        let mut pending = self.registry.pending();
-        if self.schedule.max_per_pass > 0 {
-            pending.truncate(self.schedule.max_per_pass);
-        }
+        let snapshot = self.registry.pending();
+        let n = snapshot.len();
         let mut report = ReconcilePassReport::default();
-        for attempt in &pending {
+        if n == 0 {
+            return report;
+        }
+        let limit = if self.schedule.max_per_pass == 0 {
+            n
+        } else {
+            self.schedule.max_per_pass.min(n)
+        };
+        let start = self.cursor.load(Ordering::SeqCst) % n;
+        let examined: Vec<PendingMarketAttempt> = (0..limit)
+            .map(|offset| snapshot[(start + offset) % n].clone())
+            .collect();
+        self.cursor.store((start + limit) % n, Ordering::SeqCst);
+        for attempt in &examined {
             report.examined += 1;
             match self.target.reconcile(attempt).await {
                 Ok(MarketExecutionOutcome::Filled { .. }) => {
@@ -746,8 +840,11 @@ pub struct TokioTick {
     interval: Duration,
 }
 
-/// Minimum `TokioTick` wait, preventing a zero-interval hot loop.
-const MIN_TICK_INTERVAL: Duration = Duration::from_millis(1);
+/// Minimum wait between passes, preventing a zero-interval hot loop.
+///
+/// Shared with [`crate::service::ShutdownTick`] so the graceful service tick
+/// applies the same floor.
+pub(crate) const MIN_TICK_INTERVAL: Duration = Duration::from_millis(1);
 
 impl TokioTick {
     /// Builds a tick that waits `interval` (floored at 1 ms) between passes.
@@ -958,7 +1055,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Current wall-clock time in milliseconds, saturating on out-of-range values.
-fn system_now_ms() -> i64 {
+///
+/// Shared with [`crate::service::ShutdownTick`]; the reconcile logic itself only
+/// takes explicit `now_ms` values.
+pub(crate) fn system_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
@@ -989,6 +1089,68 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn trade(amount: u128) -> AgentCommand {
+        AgentCommand::Trade(TradeCommand::ExecuteMarketOrder {
+            token_in: asset("USDC"),
+            token_out: asset("TOKEN"),
+            side: TradeSide::Buy,
+            amount: AmountSpec::TokenAtomic(amount),
+            max_slippage_bps: None,
+            max_price_impact_bps: None,
+        })
+    }
+
+    /// Inner backend that counts calls and returns a fixed outcome.
+    struct FixedOutcomeBackend {
+        calls: AtomicUsize,
+        outcome: BackendOutcome,
+    }
+
+    impl FixedOutcomeBackend {
+        fn new(outcome: BackendOutcome) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                outcome,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentBackend for FixedOutcomeBackend {
+        async fn execute(&self, _channel: AgentChannel, _command: AgentCommand) -> BackendOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
+        }
+    }
+
+    /// Reconcile target that records the examined amounts and keeps them pending.
+    struct RecordingTarget {
+        seen: Mutex<Vec<u128>>,
+    }
+
+    impl RecordingTarget {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MarketReconcileTarget for RecordingTarget {
+        async fn reconcile(
+            &self,
+            attempt: &PendingMarketAttempt,
+        ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+            let value = match attempt.amount() {
+                AmountSpec::TokenAtomic(value) => value,
+                _ => 0,
+            };
+            lock(&self.seen).push(value);
+            Ok(MarketExecutionOutcome::Unknown)
+        }
     }
 
     #[test]
@@ -1049,6 +1211,148 @@ mod tests {
             "full registry drops the newcomer"
         );
         assert_eq!(registry.len(), MAX_PENDING_MARKET_ATTEMPTS);
+    }
+
+    #[test]
+    fn reserve_dedups_counts_refs_and_gates_capacity() {
+        let registry = MarketAttemptRegistry::new();
+        assert_eq!(registry.reserve(attempt(1)), ReserveOutcome::Reserved);
+        assert_eq!(
+            registry.reserve(attempt(1)),
+            ReserveOutcome::AlreadyPending,
+            "a duplicate grows the refcount instead of double-storing"
+        );
+        assert_eq!(registry.len(), 1);
+        // Two references: one release keeps the entry, the second removes it.
+        registry.release(&attempt(1));
+        assert_eq!(registry.len(), 1);
+        registry.release(&attempt(1));
+        assert!(registry.is_empty());
+        // Releasing an absent attempt is a no-op.
+        registry.release(&attempt(1));
+        assert!(registry.is_empty());
+
+        for value in 1..=MAX_PENDING_MARKET_ATTEMPTS as u128 {
+            assert_eq!(registry.reserve(attempt(value)), ReserveOutcome::Reserved);
+        }
+        assert_eq!(registry.len(), MAX_PENDING_MARKET_ATTEMPTS);
+        assert_eq!(
+            registry.reserve(attempt(MAX_PENDING_MARKET_ATTEMPTS as u128 + 1)),
+            ReserveOutcome::AtCapacity,
+            "a distinct newcomer is refused at capacity"
+        );
+        assert_eq!(
+            registry.reserve(attempt(1)),
+            ReserveOutcome::AlreadyPending,
+            "an already-tracked attempt still reserves at capacity"
+        );
+        assert_eq!(registry.len(), MAX_PENDING_MARKET_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn recorder_denies_before_forward_at_capacity() {
+        let registry = Arc::new(MarketAttemptRegistry::new());
+        for value in 1..=MAX_PENDING_MARKET_ATTEMPTS as u128 {
+            assert_eq!(registry.reserve(attempt(value)), ReserveOutcome::Reserved);
+        }
+        let inner = Arc::new(FixedOutcomeBackend::new(BackendOutcome::Unavailable));
+        let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
+
+        let outcome = recorder
+            .execute(
+                AgentChannel::Mcp,
+                trade(MAX_PENDING_MARKET_ATTEMPTS as u128 + 1),
+            )
+            .await;
+        assert_eq!(outcome, BackendOutcome::Denied);
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "the capacity gate must not call the inner backend/port"
+        );
+        assert_eq!(
+            registry.len(),
+            MAX_PENDING_MARKET_ATTEMPTS,
+            "the refused attempt must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorder_releases_non_delegation_and_keeps_value() {
+        for outcome in [
+            BackendOutcome::Denied,
+            BackendOutcome::Unavailable,
+            BackendOutcome::Failed,
+        ] {
+            let registry = Arc::new(MarketAttemptRegistry::new());
+            let inner = Arc::new(FixedOutcomeBackend::new(outcome.clone()));
+            let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
+            assert_eq!(recorder.execute(AgentChannel::Mcp, trade(1)).await, outcome);
+            assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                registry.is_empty(),
+                "a definitive non-delegation outcome must release the reservation"
+            );
+        }
+
+        let registry = Arc::new(MarketAttemptRegistry::new());
+        let inner = Arc::new(FixedOutcomeBackend::new(BackendOutcome::Value(
+            serde_json::Value::Null,
+        )));
+        let recorder = RecordingAgentBackend::new(inner.clone(), registry.clone());
+        assert!(matches!(
+            recorder.execute(AgentChannel::Mcp, trade(7)).await,
+            BackendOutcome::Value(_)
+        ));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.len(),
+            1,
+            "a delegated Value outcome is kept pending"
+        );
+        assert_eq!(registry.pending()[0], attempt(7));
+        recorder.registry().release(&attempt(7));
+        assert!(registry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_pass_rotates_the_prefix() {
+        let registry = registry_with(&[1, 2, 3, 4, 5]);
+        let target = Arc::new(RecordingTarget::new());
+        let schedule = ReconcileSchedule {
+            max_per_pass: 2,
+            max_passes: 0,
+        };
+        let loop_ = MarketReconcileLoop::new(target.clone(), registry.clone(), schedule);
+        let mut passes = Vec::new();
+        for _ in 0..4 {
+            lock(&target.seen).clear();
+            assert_eq!(loop_.reconcile_pass(1_000).await.examined, 2);
+            passes.push(lock(&target.seen).clone());
+        }
+        assert_eq!(passes[0], vec![1, 2]);
+        assert_eq!(passes[1], vec![3, 4]);
+        assert_eq!(
+            passes[2],
+            vec![5, 1],
+            "the cursor wraps the pending snapshot"
+        );
+        assert_eq!(passes[3], vec![2, 3]);
+
+        // Every pending attempt is examined within ceil(5 / 2) == 3 passes.
+        let first_three: Vec<u128> = passes[0]
+            .iter()
+            .chain(&passes[1])
+            .chain(&passes[2])
+            .copied()
+            .collect();
+        for value in 1..=5u128 {
+            assert!(
+                first_three.contains(&value),
+                "attempt {value} missed a pass"
+            );
+        }
+        assert_eq!(registry.len(), 5, "Unknown keeps every attempt pending");
     }
 
     struct ScriptedTarget {
