@@ -17,15 +17,18 @@
 //! never brute-forces the token graph.
 //!
 //! # Non-goals
-//! Exact-output quotes, depth-aware ranking, provider benchmarks, DEX adapters,
-//! and any signing/policy/storage/relay wiring are explicitly out of scope. The
-//! split optimizer in [`split`] produces a [`domain::SplitPlan`] but never
-//! validates, signs, or digests it: aggregate validation stays in
+//! Exact-output quotes, depth-aware ranking, DEX adapters, and any
+//! signing/policy/storage/relay wiring are explicitly out of scope. Provider
+//! benchmarking is provided by the additive [`benchmark`] comparator, which only
+//! compares externally supplied quotes; the planner never calls it. The split
+//! optimizer in [`split`] produces a [`domain::SplitPlan`] but never validates,
+//! signs, or digests it: aggregate validation stays in
 //! `execution-preview`/`domain`, and signing stays behind the dedicated signing
 //! boundary. There is no signing, digest, or validation symbol in this crate.
 
 #![forbid(unsafe_code)]
 
+pub mod benchmark;
 pub mod error;
 pub mod graph;
 pub mod impact;
@@ -43,6 +46,11 @@ use market_types::{AtomicAmount, FreshnessPolicy};
 use serde::{Deserialize, Serialize};
 use tax_engine::TaxAssessment;
 
+pub use benchmark::{
+    compare_route, BenchmarkDirection, BenchmarkError, BenchmarkPolicy, BenchmarkSkip,
+    BenchmarkSource, BenchmarkVerdict, LocalRouteQuote, ProviderQuote, RealizedExecution,
+    RouteComparisonRecord,
+};
 pub use error::{BridgeRejectClass, RoutingError};
 pub use graph::{enumerate_candidates, CandidateLeg, CandidatePath, CandidateSet, PoolDescriptor};
 pub use label::{PoolRefLabel, VenueLabel};
