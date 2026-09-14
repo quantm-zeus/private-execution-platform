@@ -4,13 +4,18 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "solid-js": "1.9.15"
   },
   "devDependencies": {
+    "@solidjs/testing-library": "0.8.10",
+    "jsdom": "30.0.1",
     "vite": "8.2.2",
-    "vite-plugin-solid": "2.11.14"
+    "vite-plugin-solid": "2.11.14",
+    "vitest": "5.0.0"
   }
 }

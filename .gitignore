@@ -8,6 +8,7 @@ edge-gateway
 private-api
 trading-core
 node_modules/
+.pnpm-store/
 web/public/.output/
 web/public/.solidjs/
 web/public/dist/

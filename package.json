@@ -8,6 +8,7 @@
     "build:workspace-payload": "pnpm --filter @evergreen/workspace-payload build",
     "build:workspace": "pnpm --filter @evergreen/workspace-payload build",
     "typecheck": "pnpm -r typecheck",
+    "test:web": "pnpm --filter @evergreen/workspace-payload test",
     "build:crypto-wasm-bindings": "node scripts/build-crypto-wasm-bindings.mjs",
     "build:workspace:encrypted": "node scripts/build-workspace-encrypted.mjs",
     "verify:web-boundary": "node scripts/verify-web-boundary.mjs"

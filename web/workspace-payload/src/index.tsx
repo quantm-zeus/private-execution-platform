@@ -1,13 +1,18 @@
 import { render } from "solid-js/web";
 import "./style.css";
+import { AppShell } from "./app/AppShell";
+import { WorkspaceProvider } from "./state/session";
 
-function App() {
-  return (
-    <main>
-      <h1>Workspace</h1>
-      <p>Private workspace payload execution.</p>
-    </main>
-  );
+const root = document.getElementById("root");
+if (!root) {
+  throw new Error("workspace root element missing");
 }
 
-render(() => <App />, document.getElementById("root")!);
+render(
+  () => (
+    <WorkspaceProvider>
+      <AppShell />
+    </WorkspaceProvider>
+  ),
+  root,
+);

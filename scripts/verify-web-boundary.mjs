@@ -71,6 +71,12 @@ let brokerProc;
 
 try {
   // =========================================================================
+  // 0. Private payload focused suite (state, transport allowlist, protocol,
+  //    component fail-closed behaviour). Runs inside the CI web-boundary job.
+  // =========================================================================
+  run(["test:web"]);
+
+  // =========================================================================
   // 1. Verify public build does not leak private terms or source maps
   // =========================================================================
   run(["build:public"]);
@@ -506,6 +512,68 @@ try {
     if (rel === "_headers" || rel.endsWith("/_headers") || rel.toLowerCase().includes("header")) {
       throw new Error(`payload dist contains forbidden header artifact: ${rel}`);
     }
+  }
+
+  // 7a. Private payload privacy boundary: no persistent browser storage, no
+  // direct external origins (own neutral paths only), no analytics/session
+  // recording, and no source maps. Private trading semantics ARE expected here
+  // (this is the encrypted private app), unlike the cleartext shell.
+  for (const p of payloadRawFiles) {
+    if (p.endsWith(".map")) {
+      throw new Error(`payload emitted forbidden source map: ${p}`);
+    }
+    if (!/\.(?:m?js|html|css)$/i.test(p)) continue;
+    const text = await readFile(p, "utf8");
+    for (const term of forbiddenStorageTerms) {
+      if (text.includes(term)) {
+        throw new Error(`payload file ${p} references forbidden storage API: ${term}`);
+      }
+    }
+    for (const match of text.matchAll(/https?:\/\/[^"'`\s)]+/g)) {
+      const url = match[0];
+      if (
+        url.startsWith("http://localhost") ||
+        url.startsWith("https://localhost") ||
+        url.includes("w3.org/")
+      ) {
+        continue;
+      }
+      throw new Error(`payload file ${p} contains non-own-origin URL: ${url}`);
+    }
+    for (const tracker of ["google-analytics", "googletagmanager", "mixpanel", "segment", "sentry"]) {
+      if (text.toLowerCase().includes(tracker)) {
+        throw new Error(`payload file ${p} references external tracker: ${tracker}`);
+      }
+    }
+    if (text.includes("sourceMappingURL")) {
+      throw new Error(`payload file ${p} references a source map`);
+    }
+  }
+
+  // 7b. Private payload CSP must stay own-origin, forbid object/base, and pin an
+  // explicit worker policy. `blob:`/`data:` are permitted ONLY for the
+  // build-time-inlined in-memory worker script; no external origin is allowed.
+  const payloadHtml = await readFile(join(payloadDist, "index.html"), "utf8");
+  const payloadCspMatch = payloadHtml.match(
+    /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/i,
+  );
+  if (!payloadCspMatch) {
+    throw new Error("payload index.html missing Content-Security-Policy meta tag");
+  }
+  const payloadCsp = payloadCspMatch[1];
+  for (const directive of [
+    "default-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "worker-src 'self'",
+  ]) {
+    if (!payloadCsp.includes(directive)) {
+      throw new Error(`payload CSP missing directive: ${directive}`);
+    }
+  }
+  if (/https?:\/\//i.test(payloadCsp) || payloadCsp.includes("*")) {
+    throw new Error(`payload CSP contains a non-own-origin or wildcard directive: ${payloadCsp}`);
   }
   const expectedPackedPayload = await packDirectory(payloadDist);
   const expectedPayloadHash = digest(expectedPackedPayload);
