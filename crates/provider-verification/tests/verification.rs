@@ -276,6 +276,11 @@ fn tamper_matrix_fails_closed_with_the_exact_class() {
             ProviderVerificationError::MinReceiveTooLow,
         ),
         (
+            "min_receive_above_output",
+            Box::new(|p| p.min_receive_amount = Some(GROSS_OUT + 1)),
+            ProviderVerificationError::SlippageExceeded,
+        ),
+        (
             "value",
             Box::new(|p| p.value = 1),
             ProviderVerificationError::ValueExceeded,
@@ -379,6 +384,50 @@ fn assessment_binding_is_enforced() {
         ),
         Err(ProviderVerificationError::AssessmentMismatch)
     );
+}
+
+#[test]
+fn route_and_delta_asset_binding_is_enforced() {
+    // The proposal echoes the intent pair, but a caller-trusted route/delta that
+    // names a different asset must be rejected.
+    let mut mutated_route = route();
+    mutated_route.legs[0].token_out = asset("0xother");
+    assert_eq!(
+        verify_provider_proposal(
+            &intent(),
+            &mutated_route,
+            &delta(),
+            &assessment(),
+            &proposal(),
+            &policy(),
+            NOW
+        ),
+        Err(ProviderVerificationError::TokenMismatch)
+    );
+
+    let mut delta = delta();
+    delta.token_in = asset("0xother");
+    assert_eq!(
+        verify_provider_proposal(
+            &intent(),
+            &route(),
+            &delta,
+            &assessment(),
+            &proposal(),
+            &policy(),
+            NOW
+        ),
+        Err(ProviderVerificationError::TokenMismatch)
+    );
+}
+
+#[test]
+fn approved_payload_carries_the_exact_calldata() {
+    let approved = verify(&proposal(), &policy()).expect("approved");
+    assert_eq!(approved.calldata(), calldata().as_slice());
+    assert_eq!(approved.calldata_digest(), calldata_digest(&calldata()));
+    // The approved payload renders no calldata.
+    assert!(!format!("{approved:?}").contains("1, 2, 3"));
 }
 
 #[test]

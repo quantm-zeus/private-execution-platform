@@ -34,7 +34,7 @@ use provider_verification::{
 };
 use tax_engine::evaluate_tax_safety;
 
-use crate::{market_min_out, MarketExecutionTrustSource};
+use crate::{market_min_out, MarketExecutionTrust, MarketExecutionTrustSource};
 
 /// Redacted provider-proposal source failure taxonomy.
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -126,6 +126,44 @@ impl ApprovedProviderSink for UnavailableApprovedProviderSink {
     }
 }
 
+/// Pre-sign revalidation gate for the verified provider path.
+///
+/// A [`VerifiedProviderExecutionPort`] calls this immediately before handing an
+/// approved payload to the sink. Implementations MUST run the same authoritative
+/// gates the local relay path runs: policy authorization
+/// (`policy::PolicyEngine::authorize_trade`, i.e. the kill switch, limits,
+/// turnover, and allowed venue) and the locked
+/// `execution_preview::revalidate_pre_sign` gate (route/recipient binding, wallet
+/// balance, allowance + spender, tax freshness/caps, and the net-delta/min-out
+/// binding). The shipped default fails closed, so an approved payload can never
+/// reach a signing sink until a real gate is installed.
+#[async_trait]
+pub trait ProviderRevalidationGate: Send + Sync {
+    /// Revalidates the request, trusted state, and minimum output before signing.
+    async fn revalidate(
+        &self,
+        request: &MarketExecutionRequest,
+        trust: &MarketExecutionTrust,
+        min_out: &market_types::AssetAmount,
+    ) -> Result<(), MarketExecutionError>;
+}
+
+/// Fail-closed default: no revalidation gate is installed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableProviderRevalidationGate;
+
+#[async_trait]
+impl ProviderRevalidationGate for UnavailableProviderRevalidationGate {
+    async fn revalidate(
+        &self,
+        _request: &MarketExecutionRequest,
+        _trust: &MarketExecutionTrust,
+        _min_out: &market_types::AssetAmount,
+    ) -> Result<(), MarketExecutionError> {
+        Err(MarketExecutionError::Unavailable)
+    }
+}
+
 /// Trusted configuration for the verified provider port.
 pub struct OkxExecutionConfig {
     /// Trusted verification policy (allowlists, recipient, caps, freshness).
@@ -150,26 +188,28 @@ impl fmt::Debug for OkxExecutionConfig {
 ///
 /// `Debug` is redacted: the source, sink, config, and every payload-derived value
 /// are never rendered.
-pub struct VerifiedProviderExecutionPort<S, K, T> {
+pub struct VerifiedProviderExecutionPort<S, K, T, G> {
     source: S,
     sink: K,
     trust: T,
+    gate: G,
     config: OkxExecutionConfig,
 }
 
-impl<S, K, T> VerifiedProviderExecutionPort<S, K, T> {
+impl<S, K, T, G> VerifiedProviderExecutionPort<S, K, T, G> {
     /// Wires the port from its injected seams.
-    pub fn new(source: S, sink: K, trust: T, config: OkxExecutionConfig) -> Self {
+    pub fn new(source: S, sink: K, trust: T, gate: G, config: OkxExecutionConfig) -> Self {
         Self {
             source,
             sink,
             trust,
+            gate,
             config,
         }
     }
 }
 
-impl<S, K, T> fmt::Debug for VerifiedProviderExecutionPort<S, K, T> {
+impl<S, K, T, G> fmt::Debug for VerifiedProviderExecutionPort<S, K, T, G> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("VerifiedProviderExecutionPort")
@@ -201,11 +241,12 @@ fn project(proposal: &OkxSwapProposal) -> ProviderSwapProposal {
 }
 
 #[async_trait]
-impl<S, K, T> MarketExecutionPort for VerifiedProviderExecutionPort<S, K, T>
+impl<S, K, T, G> MarketExecutionPort for VerifiedProviderExecutionPort<S, K, T, G>
 where
     S: ProviderProposalSource,
     K: ApprovedProviderSink,
     T: MarketExecutionTrustSource,
+    G: ProviderRevalidationGate,
 {
     async fn execute(
         &self,
@@ -265,6 +306,11 @@ where
             request.now_ms,
         )
         .map_err(|_| MarketExecutionError::Denied)?;
+
+        // The authoritative pre-sign gate must pass before any signing boundary
+        // may act. The default gate fails closed, so an approved payload cannot
+        // reach a sink without policy authorization and P39 revalidation.
+        self.gate.revalidate(&request, &trust, &min_out).await?;
 
         // Only the approved, bound payload crosses this boundary.
         self.sink.submit(approved, &request).await

@@ -47,8 +47,8 @@ pub mod okx;
 
 pub use okx::{
     ApprovedProviderSink, OkxExecutionConfig, ProviderProposalError, ProviderProposalSource,
-    UnavailableApprovedProviderSink, UnavailableProviderProposalSource,
-    VerifiedProviderExecutionPort,
+    ProviderRevalidationGate, UnavailableApprovedProviderSink, UnavailableProviderProposalSource,
+    UnavailableProviderRevalidationGate, VerifiedProviderExecutionPort,
 };
 
 use std::cmp::Ordering;

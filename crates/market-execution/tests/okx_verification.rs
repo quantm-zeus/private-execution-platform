@@ -15,8 +15,9 @@ use agent_backend::{
 use agent_commands::RouterSource;
 use async_trait::async_trait;
 use market_execution::{
-    ApprovedProviderSink, OkxExecutionConfig, UnavailableApprovedProviderSink,
-    UnavailableProviderProposalSource, VerifiedProviderExecutionPort,
+    ApprovedProviderSink, OkxExecutionConfig, ProviderRevalidationGate,
+    UnavailableApprovedProviderSink, UnavailableProviderProposalSource,
+    UnavailableProviderRevalidationGate, VerifiedProviderExecutionPort,
 };
 use market_types::{AtomicAmount, Bps};
 use okx_client::{
@@ -176,6 +177,7 @@ async fn valid_proposal_is_verified_then_reaches_the_sink() {
         source(valid_body()),
         RecordingSinkAdapter(sink.clone()),
         trust_source(),
+        PermissiveGate,
         config(),
     );
 
@@ -199,6 +201,21 @@ impl ApprovedProviderSink for RecordingSinkAdapter {
     }
 }
 
+/// Permissive pre-sign gate for tests whose focus is not the gate itself.
+struct PermissiveGate;
+
+#[async_trait]
+impl ProviderRevalidationGate for PermissiveGate {
+    async fn revalidate(
+        &self,
+        _request: &MarketExecutionRequest,
+        _trust: &market_execution::MarketExecutionTrust,
+        _min_out: &market_types::AssetAmount,
+    ) -> Result<(), MarketExecutionError> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn non_allowlisted_router_is_denied_and_never_reaches_the_sink() {
     let sink = Arc::new(RecordingSink::new());
@@ -206,6 +223,7 @@ async fn non_allowlisted_router_is_denied_and_never_reaches_the_sink() {
         source(body_with_router("0xevil")),
         RecordingSinkAdapter(sink.clone()),
         trust_source(),
+        PermissiveGate,
         config(),
     );
 
@@ -223,6 +241,7 @@ async fn min_receive_below_the_pep_floor_is_denied() {
         source(body_with_min_receive("1")),
         RecordingSinkAdapter(sink.clone()),
         trust_source(),
+        PermissiveGate,
         config(),
     );
 
@@ -236,10 +255,15 @@ async fn min_receive_below_the_pep_floor_is_denied() {
 #[tokio::test]
 async fn local_source_is_denied_before_any_work() {
     let sink = Arc::new(RecordingSink::new());
+    let trust_calls = Arc::new(AtomicUsize::new(0));
     let port = VerifiedProviderExecutionPort::new(
         source(valid_body()),
         RecordingSinkAdapter(sink.clone()),
-        trust_source(),
+        FakeTrust {
+            trust: trust(),
+            calls: trust_calls.clone(),
+        },
+        PermissiveGate,
         config(),
     );
 
@@ -247,6 +271,11 @@ async fn local_source_is_denied_before_any_work() {
     local.router_source = RouterSource::Local;
     assert_eq!(port.execute(local).await, Err(MarketExecutionError::Denied));
     assert_eq!(sink.calls(), 0);
+    assert_eq!(
+        trust_calls.load(Ordering::SeqCst),
+        0,
+        "a source mismatch must be denied before the trust read"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +285,7 @@ async fn unavailable_proposal_source_fails_closed() {
         UnavailableProviderProposalSource,
         RecordingSinkAdapter(sink.clone()),
         trust_source(),
+        PermissiveGate,
         config(),
     );
 
@@ -274,10 +304,62 @@ async fn default_sink_keeps_live_submission_unavailable() {
         source(valid_body()),
         UnavailableApprovedProviderSink,
         trust_source(),
+        PermissiveGate,
         config(),
     );
     assert_eq!(
         port.execute(okx_request()).await,
         Err(MarketExecutionError::Unavailable)
     );
+}
+
+/// Gate that always denies, to prove the port cannot bypass revalidation.
+struct DenyingGate;
+
+#[async_trait]
+impl ProviderRevalidationGate for DenyingGate {
+    async fn revalidate(
+        &self,
+        _request: &MarketExecutionRequest,
+        _trust: &market_execution::MarketExecutionTrust,
+        _min_out: &market_types::AssetAmount,
+    ) -> Result<(), MarketExecutionError> {
+        Err(MarketExecutionError::Denied)
+    }
+}
+
+#[tokio::test]
+async fn default_revalidation_gate_keeps_signing_unavailable() {
+    // A valid, verifiable proposal still cannot reach the sink until an
+    // authoritative pre-sign gate is installed.
+    let sink = Arc::new(RecordingSink::new());
+    let port = VerifiedProviderExecutionPort::new(
+        source(valid_body()),
+        RecordingSinkAdapter(sink.clone()),
+        trust_source(),
+        UnavailableProviderRevalidationGate,
+        config(),
+    );
+    assert_eq!(
+        port.execute(okx_request()).await,
+        Err(MarketExecutionError::Unavailable)
+    );
+    assert_eq!(sink.calls(), 0);
+}
+
+#[tokio::test]
+async fn failing_revalidation_gate_denies_and_never_reaches_the_sink() {
+    let sink = Arc::new(RecordingSink::new());
+    let port = VerifiedProviderExecutionPort::new(
+        source(valid_body()),
+        RecordingSinkAdapter(sink.clone()),
+        trust_source(),
+        DenyingGate,
+        config(),
+    );
+    assert_eq!(
+        port.execute(okx_request()).await,
+        Err(MarketExecutionError::Denied)
+    );
+    assert_eq!(sink.calls(), 0);
 }

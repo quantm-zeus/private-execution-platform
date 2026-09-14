@@ -8,10 +8,11 @@
 //! [`ApprovedProviderPayload`]. No signing, submission, network, clock, RNG, or
 //! floating point is involved; the reference time is supplied by the caller.
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use chain_types::{AssetId, ChainId};
-use domain::{RoutePlan, TradeIntent};
+use domain::{cmp_u128_products, RoutePlan, TradeIntent};
 use execution_preview::NetDelta;
 use market_types::{Bps, FreshnessStatus};
 use sha2::{Digest, Sha256};
@@ -125,6 +126,7 @@ pub struct ApprovedProviderPayload {
     min_receive_amount: u128,
     value: u128,
     approval_amount: Option<u128>,
+    calldata: Vec<u8>,
     calldata_digest: [u8; 32],
 }
 
@@ -172,6 +174,12 @@ impl ApprovedProviderPayload {
     /// The committed calldata digest (32 bytes).
     pub fn calldata_digest(&self) -> [u8; 32] {
         self.calldata_digest
+    }
+    /// The exact verified calldata a signing boundary must sign.
+    ///
+    /// Never rendered by `Debug`; the digest accessor commits these bytes.
+    pub fn calldata(&self) -> &[u8] {
+        &self.calldata
     }
 }
 
@@ -245,6 +253,17 @@ pub fn verify_provider_proposal(
     {
         return Err(ProviderVerificationError::AmountOutMismatch);
     }
+    // Bind the route/delta assets to the intent, not just the proposal: a
+    // caller-trusted route whose leg or delta names a different asset must be
+    // rejected even though the provider echoed the intent pair.
+    if leg.token_in != intent.token_in
+        || leg.token_out != intent.token_out
+        || delta.token_in != intent.token_in
+        || delta.token_out != intent.token_out
+        || delta.gross_output.asset != intent.token_out
+    {
+        return Err(ProviderVerificationError::TokenMismatch);
+    }
 
     let min_receive = proposal
         .min_receive_amount
@@ -256,11 +275,11 @@ pub fn verify_provider_proposal(
         return Err(ProviderVerificationError::SlippageExceeded);
     }
     let deviation = proposal.amount_out - min_receive;
-    let scaled = deviation
-        .checked_mul(10_000)
-        .ok_or(ProviderVerificationError::SlippageExceeded)?;
-    let slippage_bps = scaled / proposal.amount_out;
-    if slippage_bps > u128::from(policy.max_slippage_bps.get()) {
+    if slippage_exceeds(
+        deviation,
+        proposal.amount_out,
+        policy.max_slippage_bps.get(),
+    ) {
         return Err(ProviderVerificationError::SlippageExceeded);
     }
 
@@ -282,8 +301,10 @@ pub fn verify_provider_proposal(
     if proposal.observed_at_ms > now_ms {
         return Err(ProviderVerificationError::ProposalFromFuture);
     }
-    let age_ms = (now_ms - proposal.observed_at_ms) as u64;
-    if age_ms > policy.max_age_ms {
+    let age_ms = now_ms
+        .checked_sub(proposal.observed_at_ms)
+        .ok_or(ProviderVerificationError::ProposalStale)?;
+    if age_ms as u64 > policy.max_age_ms {
         return Err(ProviderVerificationError::ProposalStale);
     }
 
@@ -305,6 +326,7 @@ pub fn verify_provider_proposal(
         min_receive_amount: min_receive,
         value: proposal.value,
         approval_amount: proposal.approval_amount,
+        calldata: proposal.calldata.clone(),
         calldata_digest: digest,
     })
 }
@@ -312,6 +334,18 @@ pub fn verify_provider_proposal(
 /// Computes the canonical calldata digest an adapter must commit to.
 pub fn calldata_digest(calldata: &[u8]) -> [u8; 32] {
     Sha256::digest(calldata).into()
+}
+
+/// Returns `true` when `deviation / amount_out` exceeds `cap_bps`.
+///
+/// Computed with an exact 256-bit cross-multiplication (`deviation * 10_000 >
+/// amount_out * cap`) so the cap cannot be exceeded by a fraction of a basis
+/// point, which floor division would hide.
+fn slippage_exceeds(deviation: u128, amount_out: u128, cap_bps: u16) -> bool {
+    if amount_out == 0 {
+        return true;
+    }
+    cmp_u128_products(deviation, 10_000, amount_out, u128::from(cap_bps)) == Ordering::Greater
 }
 
 /// Validates a trusted policy label (address/identifier) structurally.
@@ -322,4 +356,44 @@ pub fn is_valid_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_LABEL_BYTES
         && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_basis_point_slippage_overflow_is_rejected() {
+        // 10_099 / 1_000_000 = 100.99 bps: floor division would hide the excess.
+        assert!(slippage_exceeds(10_099, 1_000_000, 100));
+        // Exactly 100 bps is admitted; one atomic unit above is rejected.
+        assert!(!slippage_exceeds(10_000, 1_000_000, 100));
+        assert!(slippage_exceeds(10_001, 1_000_000, 100));
+        // Zero output is always rejected.
+        assert!(slippage_exceeds(0, 0, 100));
+        assert!(!slippage_exceeds(0, 1_000, 0));
+    }
+
+    #[test]
+    fn digit_rendering_hides_calldata() {
+        let payload = ApprovedProviderPayload {
+            chain: ChainId::Base,
+            router: "0xrouter".to_string(),
+            spender: None,
+            token_in: AssetId::new(ChainId::Base, "0xin").expect("asset"),
+            token_out: AssetId::new(ChainId::Base, "0xout").expect("asset"),
+            amount_in: 1,
+            amount_out: 2,
+            min_receive_amount: 2,
+            value: 0,
+            approval_amount: None,
+            calldata: vec![0xde, 0xad],
+            calldata_digest: [7u8; 32],
+        };
+        let rendered = format!("{payload:?}");
+        assert_eq!(rendered, "ApprovedProviderPayload { .. }");
+        assert!(!rendered.contains("0xrouter"));
+        assert!(!rendered.contains("222"));
+        assert!(!rendered.contains("[7, 7"));
+    }
 }
