@@ -3261,11 +3261,24 @@ dependencies = [
 name = "trading-core"
 version = "0.1.0"
 dependencies = [
+ "agent-backend",
+ "agent-commands",
+ "async-trait",
  "chain-types",
+ "crypto-envelope",
  "domain",
+ "execution-preview",
+ "execution-relay",
+ "limit-engine",
+ "market-execution",
  "market-types",
+ "mcp-server",
  "policy",
  "privy",
+ "routing",
+ "serde_json",
+ "storage",
+ "tax-engine",
  "thiserror 2.0.20",
  "tokio",
 ]

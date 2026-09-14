@@ -475,17 +475,19 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         }
     }
 
-    /// Reconciles an already-submitted market order identified by the same
-    /// command parameters that produced it. Read-only: it never signs or submits.
+    /// Reconciles a previously delegated market attempt, returning the typed
+    /// [`MarketExecutionOutcome`] instead of a rendered [`BackendOutcome`].
     ///
-    /// The deterministic preview identity is rebuilt from the same parameters
-    /// [`Self::execute_market_order`] uses (via `preview_intent`), so the
-    /// idempotency key handed to the port is byte-identical to the one the
-    /// execution used; a structural denial is returned without touching the port.
-    /// No quote is needed to derive the identity, so no [`MarketSnapshotSource`]
-    /// is consulted.
+    /// This is the additive typed seam used by the composition root's read-only
+    /// reconcile loop. It rebuilds the deterministic preview identity from the
+    /// same parameters [`Self::execute_market_order`] uses (via `preview_intent`),
+    /// so the idempotency key handed to the port is byte-identical to the one the
+    /// execution used (P76 MR-4 identity parity); a structural denial is returned
+    /// without touching the port. No quote is needed to derive the identity, so
+    /// no [`MarketSnapshotSource`] is consulted, and the call never signs or
+    /// submits.
     #[allow(clippy::too_many_arguments)]
-    pub async fn reconcile_market_order(
+    pub async fn reconcile_market_order_outcome(
         &self,
         channel: AgentChannel,
         token_in: agent_commands::AssetRef,
@@ -494,7 +496,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount: AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
-    ) -> BackendOutcome {
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         // Read the trusted clock once, exactly as `execute_market_order` does.
         let now_ms = self.clock.now_ms();
         let (intent, _amount_in) = match self.preview_intent(
@@ -507,12 +509,42 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             max_price_impact_bps,
         ) {
             Ok(intent) => intent,
-            Err(BackendError::Denied) => return BackendOutcome::Denied,
-            Err(BackendError::Unavailable) => return BackendOutcome::Unavailable,
+            Err(BackendError::Denied) => return Err(MarketExecutionError::Denied),
+            Err(BackendError::Unavailable) => return Err(MarketExecutionError::Unavailable),
         };
-        match self
-            .execution
+        self.execution
             .reconcile(&intent.idempotency_key, now_ms)
+            .await
+    }
+
+    /// Reconciles an already-submitted market order identified by the same
+    /// command parameters that produced it. Read-only: it never signs or submits.
+    ///
+    /// Thin rendering wrapper over [`Self::reconcile_market_order_outcome`], so
+    /// the typed and backend-shaped surfaces can never drift: it delegates the
+    /// identity rebuild and the port call exactly once, then maps the outcome via
+    /// `execution_outcome` identically to before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_market_order(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+    ) -> BackendOutcome {
+        match self
+            .reconcile_market_order_outcome(
+                channel,
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+            )
             .await
         {
             Ok(outcome) => execution_outcome(outcome),
