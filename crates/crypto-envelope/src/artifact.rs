@@ -279,6 +279,28 @@ pub fn decrypt_artifact_with_secret(
     decrypt_artifact(&keypair, artifact_wire)
 }
 
+/// Re-seals an existing workspace artifact from the old unlock keypair to a new
+/// recipient public key + kid, executing one rotation step.
+///
+/// Decrypts `artifact_wire` with `old_keypair`, then re-seals the recovered
+/// plaintext to `new_recipient` under `new_kid` at [`ARTIFACT_VERSION`]. The
+/// intermediate plaintext is held in a zeroizing buffer and never rendered.
+/// Fails closed on any wrong key/kid/version/tamper (via [`decrypt_artifact`])
+/// or an invalid payload/recipient (via [`seal_artifact`]); no rotated wire is
+/// produced on failure. The input wire is never mutated.
+pub fn rotate_artifact(
+    old_keypair: &WorkspaceUnlockKeyPair,
+    new_recipient: &HpkePublicKey,
+    new_kid: &[u8; KID_LEN],
+    artifact_wire: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    // Old side: authenticated decrypt with the existing primitive. The
+    // recovered plaintext is wiped when this binding drops.
+    let plaintext = Zeroizing::new(decrypt_artifact(old_keypair, artifact_wire)?);
+    // New side: re-seal under the new recipient/kid at the current version.
+    seal_artifact(new_recipient, ARTIFACT_VERSION, new_kid, &plaintext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
