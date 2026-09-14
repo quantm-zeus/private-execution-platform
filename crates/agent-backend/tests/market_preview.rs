@@ -10,7 +10,7 @@ use agent_backend::{
     UnavailableOrderValuation, UnavailablePortfolioReadModel,
 };
 use agent_commands::{
-    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, TradeCommand,
+    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
@@ -228,6 +228,8 @@ fn preview(token_in: &str, token_out: &str, side: TradeSide, amount: AmountSpec)
         amount,
         max_slippage_bps: None,
         max_price_impact_bps: None,
+        // Every pre-P84B test in this file pins the byte-identical Local path.
+        router: RouterSource::Local,
     }
 }
 
@@ -426,6 +428,7 @@ async fn preview_rejects_structural_denials() {
         amount: AmountSpec::TokenAtomic(AMOUNT),
         max_slippage_bps: None,
         max_price_impact_bps: None,
+        router: RouterSource::Local,
     };
     assert_eq!(run(&backend, foreign).await, BackendOutcome::Denied);
 }
@@ -441,6 +444,7 @@ async fn preview_enforces_trusted_caps() {
         amount: AmountSpec::TokenAtomic(AMOUNT),
         max_slippage_bps: Some(slippage),
         max_price_impact_bps: Some(impact),
+        router: RouterSource::Local,
     };
     // Looser than the wallet hard cap: denied, not clamped.
     assert_eq!(
@@ -486,6 +490,7 @@ async fn preview_zero_impact_cap_cannot_disable_the_trusted_cap() {
         amount: AmountSpec::TokenAtomic(AMOUNT),
         max_slippage_bps: slippage,
         max_price_impact_bps: impact,
+        router: RouterSource::Local,
     };
 
     // The trusted cap alone rejects the route.
@@ -557,7 +562,7 @@ async fn preview_is_available_while_trading_is_disabled() {
     chains.insert(ChainId::Base);
     let server = McpServer::new(backend, AgentCapabilities::new(false, chains, 0));
 
-    let command = r#"{"tool":"preview_market_order","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"side":"buy","amount":{"unit":"token_atomic","value":1000000000}}"#;
+    let command = r#"{"tool":"preview_market_order","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"side":"buy","amount":{"unit":"token_atomic","value":1000000000},"router_preference":"local"}"#;
     let frame = mcp_server::tools_call_frame(command).expect("frame");
     let response = server.handle(&frame).await;
     let parsed: Value = serde_json::from_str(&response).expect("json");

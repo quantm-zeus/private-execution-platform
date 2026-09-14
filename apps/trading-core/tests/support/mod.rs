@@ -16,7 +16,7 @@ use std::time::Duration;
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
 };
-use agent_commands::{AgentChannel, AgentCommand, AmountSpec, AssetRef};
+use agent_commands::{AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource};
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use crypto_envelope::at_rest::SealKey;
@@ -622,6 +622,7 @@ pub fn dummy_request() -> MarketExecutionRequest {
         quote: quote(),
         score: score(),
         now_ms: NOW,
+        router_source: RouterSource::Local,
     }
 }
 
@@ -641,6 +642,7 @@ pub fn attempt(amount: u128) -> PendingMarketAttempt {
         AmountSpec::TokenAtomic(amount),
         None,
         None,
+        RouterSource::Local,
     )
 }
 

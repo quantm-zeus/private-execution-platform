@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agent_backend::{MarketExecutionError, MarketExecutionRequest};
+use agent_commands::RouterSource;
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use domain::{
@@ -179,6 +180,7 @@ pub fn request_with(
         quote: quote_with(expected_net_output, net_output),
         score: score(),
         now_ms: NOW_MS,
+        router_source: RouterSource::Local,
     }
 }
 

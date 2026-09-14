@@ -9,7 +9,7 @@ use agent_backend::{
     UnavailablePortfolioReadModel,
 };
 use agent_commands::{
-    AgentChannel, AgentCommand, AmountSpec, AssetRef, LimitPriceSpec, TradeCommand,
+    AgentChannel, AgentCommand, AmountSpec, AssetRef, LimitPriceSpec, RouterSource, TradeCommand,
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
@@ -523,6 +523,7 @@ async fn market_commands_fail_closed() {
         amount: AmountSpec::TokenAtomic(100),
         max_slippage_bps: None,
         max_price_impact_bps: None,
+        router: RouterSource::Local,
     };
     assert_eq!(
         execute(&backend, preview.clone()).await,
@@ -536,6 +537,7 @@ async fn market_commands_fail_closed() {
             amount,
             max_slippage_bps,
             max_price_impact_bps,
+            router,
         } => TradeCommand::ExecuteMarketOrder {
             token_in,
             token_out,
@@ -543,6 +545,7 @@ async fn market_commands_fail_closed() {
             amount,
             max_slippage_bps,
             max_price_impact_bps,
+            router,
         },
         _ => unreachable!(),
     };

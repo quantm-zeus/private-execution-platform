@@ -12,7 +12,7 @@ use agent_backend::{
     UnavailableOrderValuation, UnavailablePortfolioReadModel,
 };
 use agent_commands::{
-    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, TradeCommand,
+    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
@@ -304,6 +304,8 @@ fn execute(token_in: &str, token_out: &str, amount: AmountSpec) -> TradeCommand 
         amount,
         max_slippage_bps: None,
         max_price_impact_bps: None,
+        // Every pre-P84B test in this file pins the byte-identical Local path.
+        router: RouterSource::Local,
     }
 }
 
@@ -447,6 +449,7 @@ async fn execute_rejects_structural_denials_before_the_port() {
         amount: AmountSpec::TokenAtomic(AMOUNT),
         max_slippage_bps: None,
         max_price_impact_bps: None,
+        router: RouterSource::Local,
     };
     assert_eq!(run(&backend, foreign).await, BackendOutcome::Denied);
     // A zero (unbounded-sentinel) impact cap is refused by the shared intent
@@ -458,6 +461,7 @@ async fn execute_rejects_structural_denials_before_the_port() {
         amount: AmountSpec::TokenAtomic(AMOUNT),
         max_slippage_bps: None,
         max_price_impact_bps: Some(0),
+        router: RouterSource::Local,
     };
     assert_eq!(run(&backend, zero_cap).await, BackendOutcome::Denied);
     assert_eq!(port.calls(), 0, "denied commands must never reach the port");
@@ -509,7 +513,7 @@ fn server(
     )
 }
 
-const EXECUTE_COMMAND: &str = r#"{"tool":"execute_market_order","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"side":"buy","amount":{"unit":"token_atomic","value":1000000000}}"#;
+const EXECUTE_COMMAND: &str = r#"{"tool":"execute_market_order","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"side":"buy","amount":{"unit":"token_atomic","value":1000000000},"router_preference":"local"}"#;
 
 #[tokio::test]
 async fn execute_is_denied_while_trading_is_disabled() {
@@ -633,6 +637,7 @@ async fn execution_types_debug_is_payload_free() {
             latency_ms: 0,
         },
         now_ms,
+        router_source: RouterSource::Local,
     };
     let rendered = format!("{request:?}");
     assert!(!rendered.contains("USDC"));
@@ -658,6 +663,7 @@ fn reconcile_args(
     AmountSpec,
     Option<u16>,
     Option<u16>,
+    RouterSource,
 ) {
     (
         AssetRef::new(ChainId::Base, "USDC").expect("in"),
@@ -666,6 +672,8 @@ fn reconcile_args(
         amount,
         None,
         None,
+        // Reconcile parity tests use the Local path of the paired execute.
+        RouterSource::Local,
     )
 }
 
@@ -686,7 +694,7 @@ async fn reconcile_market_order_uses_the_same_identity_as_execute() {
         BackendOutcome::Value(serde_json::json!({ "execution": { "state": "submitted" } }))
     );
 
-    let (token_in, token_out, side, amount, slippage, impact) =
+    let (token_in, token_out, side, amount, slippage, impact, router) =
         reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
     let reconciled = backend
         .reconcile_market_order(
@@ -697,6 +705,7 @@ async fn reconcile_market_order_uses_the_same_identity_as_execute() {
             amount,
             slippage,
             impact,
+            router,
         )
         .await;
 
@@ -729,7 +738,7 @@ async fn reconcile_market_order_default_port_is_unknown() {
         Arc::new(FixedClock(NOW)),
         Arc::new(OneAssetValuation { asset: usdc() }),
     );
-    let (token_in, token_out, side, amount, slippage, impact) =
+    let (token_in, token_out, side, amount, slippage, impact, router) =
         reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
     let outcome = backend
         .reconcile_market_order(
@@ -740,6 +749,7 @@ async fn reconcile_market_order_default_port_is_unknown() {
             amount,
             slippage,
             impact,
+            router,
         )
         .await;
     assert_eq!(
@@ -760,7 +770,7 @@ async fn reconcile_market_order_surfaces_a_filled_observation() {
         Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
         port.clone(),
     );
-    let (token_in, token_out, side, amount, slippage, impact) =
+    let (token_in, token_out, side, amount, slippage, impact, router) =
         reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
     let outcome = backend
         .reconcile_market_order(
@@ -771,6 +781,7 @@ async fn reconcile_market_order_surfaces_a_filled_observation() {
             amount,
             slippage,
             impact,
+            router,
         )
         .await;
     let BackendOutcome::Value(value) = outcome else {
@@ -792,7 +803,7 @@ async fn reconcile_market_order_denies_structural_mismatch_without_the_port() {
         Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
         port.clone(),
     );
-    let (token_in, token_out, side, amount, slippage, impact) =
+    let (token_in, token_out, side, amount, slippage, impact, router) =
         reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
 
     // Same asset.
@@ -805,6 +816,7 @@ async fn reconcile_market_order_denies_structural_mismatch_without_the_port() {
             amount,
             slippage,
             impact,
+            router,
         )
         .await;
     assert_eq!(same_asset, BackendOutcome::Denied);
@@ -819,6 +831,7 @@ async fn reconcile_market_order_denies_structural_mismatch_without_the_port() {
             AmountSpec::UsdMicros(1),
             slippage,
             impact,
+            router,
         )
         .await;
     assert_eq!(usd, BackendOutcome::Denied);
@@ -833,6 +846,7 @@ async fn reconcile_market_order_denies_structural_mismatch_without_the_port() {
             amount,
             slippage,
             impact,
+            router,
         )
         .await;
     assert_eq!(foreign, BackendOutcome::Denied);

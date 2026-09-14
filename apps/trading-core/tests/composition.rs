@@ -336,7 +336,7 @@ async fn composition_debug_output_is_redacted() {
 #[tokio::test]
 async fn recording_backend_records_only_market_executes_and_forwards_valuation() {
     use agent_commands::{
-        AgentChannel, AgentCommand, AmountSpec, AssetRef, ReadCommand, TradeCommand,
+        AgentChannel, AgentCommand, AmountSpec, AssetRef, ReadCommand, RouterSource, TradeCommand,
     };
     use chain_types::ChainId;
     use domain::TradeSide;
@@ -351,6 +351,7 @@ async fn recording_backend_records_only_market_executes_and_forwards_valuation()
         amount: AmountSpec::TokenAtomic(1_000),
         max_slippage_bps: Some(100),
         max_price_impact_bps: Some(200),
+        router: RouterSource::Local,
     });
 
     // A `Value` inner means the attempt reached the port: keep it pending.
@@ -371,6 +372,7 @@ async fn recording_backend_records_only_market_executes_and_forwards_valuation()
             AmountSpec::TokenAtomic(1_000),
             Some(100),
             Some(200),
+            RouterSource::Local,
         )
     );
     assert_eq!(recorder.valuation_usd_micros(&trade).await, Some(7));
@@ -401,7 +403,9 @@ async fn recording_backend_records_only_market_executes_and_forwards_valuation()
 
 #[tokio::test]
 async fn full_registry_never_yields_an_untracked_delegated_attempt() {
-    use agent_commands::{AgentChannel, AgentCommand, AmountSpec, AssetRef, TradeCommand};
+    use agent_commands::{
+        AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
+    };
     use chain_types::ChainId;
     use domain::TradeSide;
 
@@ -413,6 +417,7 @@ async fn full_registry_never_yields_an_untracked_delegated_attempt() {
             amount: AmountSpec::TokenAtomic(amount),
             max_slippage_bps: None,
             max_price_impact_bps: None,
+            router: RouterSource::Local,
         })
     }
 

@@ -43,12 +43,12 @@ use std::time::Duration;
 
 use agent_backend::{
     AgentReadBackend, DurableOrderReadModel, MarketExecutionError, MarketExecutionOutcome,
-    MarketExecutionPort, MarketExecutionRequest, MarketSnapshotSource, OrderReadModel,
-    OrderValuation, PortfolioReadModel, TradingAgentBackend, TradingBackendConfig, TrustedClock,
-    UnavailableOrderValuation, UnavailablePortfolioReadModel,
+    MarketExecutionPort, MarketExecutionRequest, MarketSnapshotSource, OkxQuoteSource,
+    OrderReadModel, OrderValuation, PortfolioReadModel, TradingAgentBackend, TradingBackendConfig,
+    TrustedClock, UnavailableOrderValuation, UnavailablePortfolioReadModel,
 };
 use agent_commands::{
-    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, TradeCommand,
+    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
 };
 use async_trait::async_trait;
 use chain_types::ChainId;
@@ -296,6 +296,12 @@ pub struct TradingCoreSeams {
     pub market_snapshot: Option<Arc<dyn MarketSnapshotSource>>,
     /// Deterministic gas model used by preview/execution scoring.
     pub gas: Option<Arc<dyn GasEstimator>>,
+    /// Read-only OKX quote source used by the `Okx` route (P84B).
+    ///
+    /// Defaults to absent; the backend then installs its fail-closed
+    /// [`agent_backend::UnavailableOkxQuoteSource`], so an OKX-selected command
+    /// fails closed and never silently falls back to Local.
+    pub okx_quote_source: Option<Arc<dyn OkxQuoteSource>>,
     /// Concrete market-execution port (defaults to the fail-closed relay port).
     pub market_execution: Option<Arc<dyn MarketExecutionPort>>,
     /// Full limit-orchestrator recovery, operator-injected.
@@ -309,6 +315,7 @@ impl std::fmt::Debug for TradingCoreSeams {
             .field("valuation", &self.valuation.is_some())
             .field("market_snapshot", &self.market_snapshot.is_some())
             .field("gas", &self.gas.is_some())
+            .field("okx_quote_source", &self.okx_quote_source.is_some())
             .field("market_execution", &self.market_execution.is_some())
             .field("limit_recovery", &self.limit_recovery.is_some())
             .finish()
@@ -329,6 +336,7 @@ pub struct PendingMarketAttempt {
     amount: AmountSpec,
     max_slippage_bps: Option<u16>,
     max_price_impact_bps: Option<u16>,
+    router: RouterSource,
 }
 
 impl PendingMarketAttempt {
@@ -342,6 +350,7 @@ impl PendingMarketAttempt {
         amount: AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
+        router: RouterSource,
     ) -> Self {
         Self {
             channel,
@@ -351,6 +360,7 @@ impl PendingMarketAttempt {
             amount,
             max_slippage_bps,
             max_price_impact_bps,
+            router,
         }
     }
 
@@ -364,6 +374,7 @@ impl PendingMarketAttempt {
                 amount,
                 max_slippage_bps,
                 max_price_impact_bps,
+                router,
             } => Some(Self {
                 channel,
                 token_in: token_in.clone(),
@@ -372,6 +383,7 @@ impl PendingMarketAttempt {
                 amount: *amount,
                 max_slippage_bps: *max_slippage_bps,
                 max_price_impact_bps: *max_price_impact_bps,
+                router: *router,
             }),
             _ => None,
         }
@@ -410,6 +422,11 @@ impl PendingMarketAttempt {
     /// The requested price-impact cap, if any.
     pub fn max_price_impact_bps(&self) -> Option<u16> {
         self.max_price_impact_bps
+    }
+
+    /// The selected routing source.
+    pub fn router(&self) -> RouterSource {
+        self.router
     }
 }
 
@@ -761,6 +778,7 @@ where
             attempt.amount(),
             attempt.max_slippage_bps(),
             attempt.max_price_impact_bps(),
+            attempt.router(),
         )
         .await
     }
@@ -993,6 +1011,7 @@ impl<S: OpaqueStore> TradingCore<S> {
             valuation,
             market_snapshot,
             gas,
+            okx_quote_source,
             market_execution,
             limit_recovery,
         } = seams;
@@ -1021,6 +1040,9 @@ impl<S: OpaqueStore> TradingCore<S> {
         }
         if let Some(gas) = gas {
             backend = backend.with_gas_estimator(gas);
+        }
+        if let Some(source) = okx_quote_source {
+            backend = backend.with_okx_quote_source(source);
         }
         let execution = market_execution.unwrap_or_else(|| {
             build_fail_closed_market_port(
@@ -1141,6 +1163,7 @@ mod tests {
             AmountSpec::TokenAtomic(amount),
             None,
             None,
+            RouterSource::Local,
         )
     }
 
@@ -1152,6 +1175,7 @@ mod tests {
             amount: AmountSpec::TokenAtomic(amount),
             max_slippage_bps: None,
             max_price_impact_bps: None,
+            router: RouterSource::Local,
         })
     }
 

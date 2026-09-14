@@ -22,6 +22,7 @@ simulation.workspace = true
 tax-engine.workspace = true
 
 [dev-dependencies]
+agent-commands.workspace = true
 chain-types.workspace = true
 routing.workspace = true
 tokio.workspace = true

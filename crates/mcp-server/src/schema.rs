@@ -61,6 +61,7 @@ pub(crate) fn tools() -> Vec<Value> {
                     ("token_in", asset_schema()),
                     ("token_out", asset_schema()),
                     ("amount", amount_schema()),
+                    ("router_preference", router_schema()),
                 ],
                 &["token_in", "token_out", "amount"],
             ),
@@ -146,6 +147,12 @@ fn side_schema() -> Value {
     json!({ "type": "string", "enum": ["buy", "sell"] })
 }
 
+/// The optional `router_preference` selector shared by the quote/preview/execute
+/// tools. It is not required: an omitted value resolves to OKX in the decoder.
+fn router_schema() -> Value {
+    json!({ "type": "string", "enum": ["okx", "local"] })
+}
+
 fn window_schema() -> Value {
     json!({ "type": "string", "enum": ["m5", "m15", "h1", "h4", "d1"] })
 }
@@ -222,6 +229,7 @@ fn market_order_schema() -> Value {
                 "max_price_impact_bps",
                 json!({ "type": "integer", "minimum": 0 }),
             ),
+            ("router_preference", router_schema()),
         ],
         &["token_in", "token_out", "side", "amount"],
     )

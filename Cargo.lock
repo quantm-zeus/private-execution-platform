@@ -35,6 +35,7 @@ dependencies = [
  "limit-engine",
  "market-types",
  "mcp-server",
+ "okx-client",
  "routing",
  "serde",
  "serde_json",
@@ -1436,6 +1437,7 @@ name = "market-execution"
 version = "0.1.0"
 dependencies = [
  "agent-backend",
+ "agent-commands",
  "async-trait",
  "chain-types",
  "domain",
