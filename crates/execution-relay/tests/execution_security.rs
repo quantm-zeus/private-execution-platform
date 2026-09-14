@@ -339,26 +339,42 @@ enum Surface {
     Display,
 }
 
+/// Names every [`RelayError`] variant exactly once and expands to both the swept
+/// array and a wildcard-free `match` over the same list.
+///
+/// Because the generated `match` is exhaustive and has no wildcard arm, adding a
+/// `RelayError` variant makes this macro invocation fail to compile until the
+/// variant is listed here — and the array is built from that same single list, so
+/// the sweep can never silently omit a variant.
+macro_rules! relay_error_sweep {
+    ($($variant:ident),+ $(,)?) => {{
+        let _: fn(&RelayError) = |error| match error {
+            $(RelayError::$variant => {}),+
+        };
+        [$(RelayError::$variant),+]
+    }};
+}
+
 #[test]
 fn every_relay_error_variant_is_redacted() {
-    let errors = [
-        RelayError::TradingDisabled,
-        RelayError::ChainHealthUnavailable,
-        RelayError::SigningFailed,
-        RelayError::SigningRequestMismatch,
-        RelayError::ChainMismatch,
-        RelayError::MissingSignedPayload,
-        RelayError::SignedPayloadEmpty,
-        RelayError::SignedPayloadTooLarge,
-        RelayError::SignedPayloadDigestMismatch,
-        RelayError::ReservationUnavailable,
-        RelayError::IdempotencyConflict,
-        RelayError::AdapterUnavailable,
-        RelayError::AdapterRejected,
-        RelayError::AdapterTimeout,
-        RelayError::UnknownSubmissionState,
-        RelayError::InvalidTransition,
-        RelayError::StoreUnavailable,
+    let errors = relay_error_sweep![
+        TradingDisabled,
+        ChainHealthUnavailable,
+        SigningFailed,
+        SigningRequestMismatch,
+        ChainMismatch,
+        MissingSignedPayload,
+        SignedPayloadEmpty,
+        SignedPayloadTooLarge,
+        SignedPayloadDigestMismatch,
+        ReservationUnavailable,
+        IdempotencyConflict,
+        AdapterUnavailable,
+        AdapterRejected,
+        AdapterTimeout,
+        UnknownSubmissionState,
+        InvalidTransition,
+        StoreUnavailable,
     ];
 
     for error in &errors {
@@ -367,29 +383,66 @@ fn every_relay_error_variant_is_redacted() {
     }
 }
 
+/// Lists every [`RelayOutcome`] variant exactly once with its hostile carrier
+/// and redaction label, then expands to both the carrier array and a
+/// wildcard-free `match` over that same list.
+///
+/// The match has no wildcard arm, so a new `RelayOutcome` variant — or a
+/// duplicated/omitted entry — fails to compile here until the list is fixed.
+/// Because the carriers and the match arms are generated from this one list, a
+/// variant cannot silently escape the sweep while the carrier count stays the
+/// same.
+macro_rules! relay_outcome_sweep {
+    ($($pattern:pat => ($label:expr, $carrier:expr $(,)?)),+ $(,)?) => {{
+        let carriers = [$($carrier),+];
+        for carrier in &carriers {
+            let _: &'static str = match carrier {
+                $($pattern => $label),+
+            };
+        }
+        carriers
+    }};
+}
+
 #[test]
 fn every_relay_outcome_variant_is_redacted() {
-    let outcomes = [
-        RelayOutcome::Prepared,
-        RelayOutcome::Reserved,
-        RelayOutcome::Signed,
-        RelayOutcome::Submitted {
-            reference: HOSTILE.to_string(),
-            state: SubmissionState::Unknown,
-        },
-        RelayOutcome::Unknown,
-        RelayOutcome::Confirmed {
-            reference: HOSTILE.to_string(),
-            fill: Some(ObservedFill {
-                net_input: 987_654_321,
-                net_output: 123_456_789,
-            }),
-        },
-        RelayOutcome::Rejected {
-            final_reason: HOSTILE.to_string(),
-        },
-        RelayOutcome::FailedBeforeSubmit,
+    let outcomes = relay_outcome_sweep![
+        RelayOutcome::Prepared => ("Prepared", RelayOutcome::Prepared),
+        RelayOutcome::Reserved => ("Reserved", RelayOutcome::Reserved),
+        RelayOutcome::Signed => ("Signed", RelayOutcome::Signed),
+        RelayOutcome::Submitted { .. } => (
+            "Submitted",
+            RelayOutcome::Submitted {
+                reference: HOSTILE.to_string(),
+                state: SubmissionState::Unknown,
+            },
+        ),
+        RelayOutcome::Unknown => ("Unknown", RelayOutcome::Unknown),
+        RelayOutcome::Confirmed { .. } => (
+            "Confirmed",
+            RelayOutcome::Confirmed {
+                reference: HOSTILE.to_string(),
+                fill: Some(ObservedFill {
+                    net_input: 987_654_321,
+                    net_output: 123_456_789,
+                }),
+            },
+        ),
+        RelayOutcome::Rejected { .. } => (
+            "Rejected",
+            RelayOutcome::Rejected {
+                final_reason: HOSTILE.to_string(),
+            },
+        ),
+        RelayOutcome::FailedBeforeSubmit => ("FailedBeforeSubmit", RelayOutcome::FailedBeforeSubmit),
     ];
+    // Keep this count in lockstep with the exhaustive match generated by
+    // `relay_outcome_sweep!`, so an accidentally dropped carrier is caught.
+    assert_eq!(
+        outcomes.len(),
+        8,
+        "the hostile carriers must cover every variant handled by the exhaustive match"
+    );
 
     for outcome in &outcomes {
         assert_redacted(&format!("{outcome:?}"), Surface::Debug);
@@ -402,6 +455,10 @@ fn assert_redacted(surface: &str, kind: Surface) {
     assert!(
         !surface.chars().any(|c| c.is_ascii_digit()),
         "ASCII digit leaked in `{surface}`"
+    );
+    assert!(
+        !has_hex_run(surface, 8),
+        "hex run of length >= 8 leaked in `{surface}`"
     );
     for marker in ["0x", "http", "://", "wallet", "intent", "asset", "pool"] {
         assert!(
@@ -416,6 +473,25 @@ fn assert_redacted(surface: &str, kind: Surface) {
     for value in ["idem-1", "wallet-1", "intent-1", "USDC", "TOKEN", "pool-1"] {
         assert!(!surface.contains(value), "`{value}` leaked in `{surface}`");
     }
+}
+
+/// Detects a run of at least `min_len` ASCII hex digits (leaked digest bytes).
+///
+/// The digit guard above only rejects `0x..` payloads that happen to carry a
+/// numeric digit; this catches a pure-hex-letter run such as `deadbeef`.
+fn has_hex_run(value: &str, min_len: usize) -> bool {
+    let mut run = 0usize;
+    for ch in value.chars() {
+        if ch.is_ascii_hexdigit() {
+            run += 1;
+            if run >= min_len {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 /// A runtime kill switch disables the *same* engine the relay consults and must
