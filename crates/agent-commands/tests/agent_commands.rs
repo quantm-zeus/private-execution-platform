@@ -943,9 +943,10 @@ fn router_preference_defaults_to_okx_and_is_explicitly_selectable() {
         router: RouterSource::Local,
     });
 
-    // Explicit Local round-trips through serialization and parsing.
+    // Explicit Local round-trips through serialization and parsing. The wire key
+    // is `router_preference`; the Rust field is `router`.
     let local_json = serde_json::to_string(&explicit_local).expect("json");
-    assert!(local_json.contains("\"router\":\"local\""));
+    assert!(local_json.contains("\"router_preference\":\"local\""));
     assert_eq!(
         AgentCommand::parse(&local_json).expect("parse"),
         explicit_local
@@ -953,9 +954,12 @@ fn router_preference_defaults_to_okx_and_is_explicitly_selectable() {
 
     let mut value: serde_json::Value = serde_json::from_str(&local_json).expect("value");
 
-    // An omitted router field resolves to OKX (the new-session default).
+    // An omitted router_preference resolves to OKX (the new-session default).
     let mut omitted = value.clone();
-    omitted.as_object_mut().expect("object").remove("router");
+    omitted
+        .as_object_mut()
+        .expect("object")
+        .remove("router_preference");
     assert_eq!(
         AgentCommand::parse(&serde_json::to_string(&omitted).expect("json")).expect("parse"),
         AgentCommand::Read(ReadCommand::GetQuote {
@@ -968,26 +972,94 @@ fn router_preference_defaults_to_okx_and_is_explicitly_selectable() {
 
     // An unknown selector fails closed rather than defaulting.
     let mut unknown = value.clone();
-    unknown
-        .as_object_mut()
-        .expect("object")
-        .insert("router".to_string(), serde_json::json!("binance"));
+    unknown.as_object_mut().expect("object").insert(
+        "router_preference".to_string(),
+        serde_json::json!("binance"),
+    );
     assert_eq!(
         AgentCommand::parse(&serde_json::to_string(&unknown).expect("json")),
         Err(AgentCommandError::Malformed)
     );
 
-    // A duplicate router key fails closed (last-win is never accepted).
+    // The legacy `router` spelling is rejected as an unknown key, so there is
+    // exactly one accepted wire name.
+    let mut legacy = value.clone();
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .insert("router".to_string(), serde_json::json!("local"));
+    assert_eq!(
+        AgentCommand::parse(&serde_json::to_string(&legacy).expect("json")),
+        Err(AgentCommandError::Malformed)
+    );
+
+    // A duplicate router_preference key fails closed (last-win is never accepted).
     let duplicate = local_json.replace(
-        "\"router\":\"local\"",
-        "\"router\":\"local\",\"router\":\"okx\"",
+        "\"router_preference\":\"local\"",
+        "\"router_preference\":\"local\",\"router_preference\":\"okx\"",
     );
     assert_eq!(
         AgentCommand::parse(&duplicate),
         Err(AgentCommandError::Malformed)
     );
-    let _ = value.as_object_mut().expect("object").remove("router");
+    let _ = value
+        .as_object_mut()
+        .expect("object")
+        .remove("router_preference");
     assert_eq!(RouterSource::default(), RouterSource::Okx);
     assert_eq!(RouterSource::Okx.as_str(), "okx");
     assert_eq!(RouterSource::Local.as_str(), "local");
+}
+
+#[test]
+fn market_order_router_preference_defaults_to_okx_and_is_explicitly_selectable() {
+    // An omitted router_preference resolves to OKX for both market-order tools.
+    assert_eq!(
+        parse(PREVIEW_JSON),
+        AgentCommand::Trade(TradeCommand::PreviewMarketOrder {
+            token_in: sol(),
+            token_out: usdc(),
+            side: TradeSide::Buy,
+            amount: AmountSpec::UsdMicros(1_000_000),
+            max_slippage_bps: Some(100),
+            max_price_impact_bps: Some(200),
+            router: RouterSource::Okx,
+        })
+    );
+    assert_eq!(
+        parse(EXECUTE_JSON),
+        AgentCommand::Trade(TradeCommand::ExecuteMarketOrder {
+            token_in: sol(),
+            token_out: usdc(),
+            side: TradeSide::Buy,
+            amount: AmountSpec::UsdMicros(1_000_000),
+            max_slippage_bps: Some(100),
+            max_price_impact_bps: Some(200),
+            router: RouterSource::Okx,
+        })
+    );
+
+    // Explicit local is preserved for both tools, and the wire key round-trips.
+    let local_preview = PREVIEW_JSON.replace(
+        "\"max_slippage_bps\":100",
+        "\"router_preference\":\"local\",\"max_slippage_bps\":100",
+    );
+    let parsed = parse(&local_preview);
+    let AgentCommand::Trade(TradeCommand::PreviewMarketOrder { router, .. }) = parsed else {
+        panic!("expected a preview command");
+    };
+    assert_eq!(router, RouterSource::Local);
+
+    let local_execute = EXECUTE_JSON.replace(
+        "\"max_slippage_bps\":100",
+        "\"router_preference\":\"local\",\"max_slippage_bps\":100",
+    );
+    let parsed = parse(&local_execute);
+    let AgentCommand::Trade(TradeCommand::ExecuteMarketOrder { router, .. }) = parsed else {
+        panic!("expected an execute command");
+    };
+    assert_eq!(router, RouterSource::Local);
+    assert!(serde_json::to_string(&parsed)
+        .expect("json")
+        .contains("\"router_preference\":\"local\""));
 }

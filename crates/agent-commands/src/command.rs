@@ -147,8 +147,8 @@ impl AmountSpec {
 
 /// Routing source preference for a market quote/preview/execute.
 ///
-/// The default is [`RouterSource::Okx`]: an omitted `router` field resolves to
-/// OKX. A caller that wants the PEP local router must select
+/// The default is [`RouterSource::Okx`]: an omitted `router_preference` field
+/// resolves to OKX. A caller that wants the PEP local router must select
 /// [`RouterSource::Local`] explicitly, so an OKX outage can never silently fall
 /// back to Local.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +312,7 @@ pub enum ReadCommand {
         token_out: AssetRef,
         amount: AmountSpec,
         /// Routing source preference; omitted resolves to [`RouterSource::Okx`].
+        #[serde(rename = "router_preference")]
         router: RouterSource,
     },
     GetOrders {
@@ -348,6 +349,7 @@ pub enum TradeCommand {
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
         /// Routing source preference; omitted resolves to [`RouterSource::Okx`].
+        #[serde(rename = "router_preference")]
         router: RouterSource,
     },
     ExecuteMarketOrder {
@@ -358,6 +360,7 @@ pub enum TradeCommand {
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
         /// Routing source preference; omitted resolves to [`RouterSource::Okx`].
+        #[serde(rename = "router_preference")]
         router: RouterSource,
     },
     PlaceLimitOrder {
@@ -654,7 +657,7 @@ fn build_read(tool: &str, fields: &RawFields) -> Result<ReadCommand, AgentComman
                     "token_in",
                     "token_out",
                     "amount",
-                    "router",
+                    "router_preference",
                 ],
             )?;
             Ok(ReadCommand::GetQuote {
@@ -692,7 +695,7 @@ fn build_trade(tool: &str, fields: &RawFields) -> Result<TradeCommand, AgentComm
                     "amount",
                     "max_slippage_bps",
                     "max_price_impact_bps",
-                    "router",
+                    "router_preference",
                 ],
             )?;
             Ok(TradeCommand::PreviewMarketOrder {
@@ -717,7 +720,7 @@ fn build_trade(tool: &str, fields: &RawFields) -> Result<TradeCommand, AgentComm
                     "amount",
                     "max_slippage_bps",
                     "max_price_impact_bps",
-                    "router",
+                    "router_preference",
                 ],
             )?;
             Ok(TradeCommand::ExecuteMarketOrder {
@@ -814,12 +817,14 @@ fn field_optional_u16(fields: &RawFields, name: &str) -> Result<Option<u16>, Age
     }
 }
 
-/// Decodes the optional `router` preference; an omitted field defaults to OKX.
+/// Decodes the optional `router_preference`; an omitted field defaults to OKX.
 ///
 /// Only the exact `"okx"` and `"local"` spellings are accepted, so an unknown or
-/// malformed selector fails closed instead of resolving to a default.
+/// malformed selector fails closed instead of resolving to a default. The wire
+/// key is `router_preference`; the legacy `router` spelling is rejected as an
+/// unknown field, so there is exactly one accepted wire name.
 fn field_router(fields: &RawFields) -> Result<RouterSource, AgentCommandError> {
-    match fields.get("router") {
+    match fields.get("router_preference") {
         None => Ok(RouterSource::default()),
         Some(raw) => serde_json::from_str::<RouterSource>(raw.get())
             .map_err(|_| AgentCommandError::Malformed),
