@@ -46,6 +46,13 @@ pub const MIN_CIPHERTEXT_LEN: usize = MIN_FRAME_LEN + AEAD_TAG_LEN;
 /// Maximum valid ciphertext length: header + 1 MiB payload + AEAD tag (1,048,606 bytes).
 pub const MAX_CIPHERTEXT_LEN: usize = MAX_FRAME_LEN + AEAD_TAG_LEN;
 
+/// Bytes of the real-length prefix inside a padded payload.
+///
+/// A padded frame's inner plaintext is `[real_len: u32 BE][payload][0x00 ...]`,
+/// so the prefix accounts for the length field while the real payload remains
+/// recoverable (`real_len + PADDED_LEN_PREFIX <= padded_payload_len`).
+pub const PADDED_LEN_PREFIX: usize = 4;
+
 // =========================================================================
 // Frame Kind
 // =========================================================================
@@ -164,6 +171,9 @@ pub enum StreamFrameError {
 
     #[error("malformed frame structure")]
     MalformedFrame,
+
+    #[error("malformed padded frame payload")]
+    PaddedFrameMalformed,
 
     #[error("encryption failed")]
     EncryptFailed,
@@ -598,6 +608,147 @@ impl StreamFrameCodec {
             .map_err(StreamFrameError::from)?;
 
         Ok(frame)
+    }
+
+    /// Seals `frame` with its inner payload expanded to exactly `padded_payload_len`.
+    ///
+    /// The inner plaintext is `[real_len: u32 BE][payload][0x00 padding]`, total
+    /// `padded_payload_len`; the whole thing is AEAD-sealed, so the wire ciphertext
+    /// length hides the real payload length. `padded_payload_len` must satisfy
+    /// `real_len + PADDED_LEN_PREFIX <= padded_payload_len <= effective_max_payload_len()`;
+    /// otherwise `PayloadTooLarge` and no envelope is produced (the session is unchanged).
+    /// `frame.version()`/`kind()`/`sequence()` are preserved; only the payload is padded.
+    /// The envelope sequence binding (`frame.sequence == envelope_sequence`) is enforced
+    /// exactly as [`StreamFrameCodec::seal_bound`].
+    ///
+    /// A frame produced here is only consumable by
+    /// [`StreamFrameCodec::receive_padded`]; the unpadded
+    /// [`StreamFrameCodec::receive`] performs no padding detection. The producer
+    /// computes `padded_payload_len` with the out-of-crate padding policy and never
+    /// hands this codec a bucket above `effective_max_payload_len()` (it fails closed
+    /// rather than truncating).
+    pub fn seal_padded(
+        &self,
+        session: &mut SendSession,
+        kid: [u8; KID_LEN],
+        envelope_sequence: u64,
+        frame: &StreamFrame,
+        padded_payload_len: usize,
+    ) -> Result<Envelope, StreamFrameError> {
+        if frame.sequence == 0 || envelope_sequence == 0 {
+            return Err(StreamFrameError::ZeroSequence);
+        }
+        if frame.sequence != envelope_sequence {
+            return Err(StreamFrameError::SequenceMismatch);
+        }
+
+        let real_len = frame.payload.len();
+        let minimum_len = real_len
+            .checked_add(PADDED_LEN_PREFIX)
+            .ok_or(StreamFrameError::PayloadTooLarge)?;
+        let effective_limit = self.effective_max_payload_len();
+        if padded_payload_len < minimum_len
+            || padded_payload_len > effective_limit
+            || padded_payload_len > MAX_FRAME_PAYLOAD_LEN
+        {
+            return Err(StreamFrameError::PayloadTooLarge);
+        }
+
+        let real_len_u32 =
+            u32::try_from(real_len).map_err(|_| StreamFrameError::PayloadTooLarge)?;
+
+        let mut padded = Vec::with_capacity(padded_payload_len);
+        padded.extend_from_slice(&real_len_u32.to_be_bytes());
+        padded.extend_from_slice(frame.payload());
+        padded.resize(padded_payload_len, 0);
+
+        let padded_frame =
+            StreamFrame::with_version(frame.version, frame.kind, frame.sequence, padded)?;
+        let encoded = self.encode_frame(&padded_frame)?;
+        session
+            .seal(kid, envelope_sequence, &encoded)
+            .map_err(StreamFrameError::from)
+    }
+
+    /// Receives and authenticates a padded frame, returning the original frame.
+    ///
+    /// Performs the same preflight/AEAD/decode/sequence-binding steps as
+    /// [`StreamFrameCodec::receive`], then parses the authenticated padded payload:
+    /// the first `PADDED_LEN_PREFIX` bytes are `real_len` (u32 BE);
+    /// `real_len + PADDED_LEN_PREFIX <= payload.len()` and every trailing byte must be
+    /// zero, else `PaddedFrameMalformed` (fail closed; the replay window is not
+    /// advanced). The returned frame has the real payload and the original
+    /// version/kind/sequence.
+    ///
+    /// This is the only valid reader for a frame produced by
+    /// [`StreamFrameCodec::seal_padded`]; the two APIs are paired and the unpadded
+    /// [`StreamFrameCodec::receive`] never heuristically guesses padding.
+    pub fn receive_padded(
+        &self,
+        session: &mut ReceiveSession,
+        envelope: &Envelope,
+    ) -> Result<StreamFrame, StreamFrameError> {
+        // Preflight sequence and ciphertext length bounds before decryption or replay tracking.
+        if envelope.sequence == 0 {
+            return Err(StreamFrameError::ZeroSequence);
+        }
+        let max_cipher = self.max_ciphertext_len()?;
+        let effective_max_cipher = max_cipher.min(MAX_CIPHERTEXT_LEN);
+        if envelope.ciphertext.len() < MIN_CIPHERTEXT_LEN
+            || envelope.ciphertext.len() > effective_max_cipher
+            || envelope.ciphertext.len() > MAX_CIPHERTEXT_LEN
+        {
+            return Err(StreamFrameError::CiphertextOutOfBounds);
+        }
+
+        // Authenticate and decrypt under session key without advancing replay window.
+        let plaintext = session
+            .open_only(envelope)
+            .map_err(|_| StreamFrameError::DecryptFailed)?;
+
+        // Decode and validate frame structure against configured limits.
+        let frame = self.decode_frame(&plaintext)?;
+
+        // Cryptographically bind inner frame sequence to authenticated envelope sequence.
+        if frame.sequence != envelope.sequence {
+            return Err(StreamFrameError::SequenceMismatch);
+        }
+
+        // Parse the padded payload. Every malformed length prefix or nonzero
+        // trailing byte fails closed before the replay window can advance.
+        let payload = frame.payload();
+        if payload.len() < PADDED_LEN_PREFIX {
+            return Err(StreamFrameError::PaddedFrameMalformed);
+        }
+        let len_bytes: [u8; PADDED_LEN_PREFIX] = payload[..PADDED_LEN_PREFIX]
+            .try_into()
+            .map_err(|_| StreamFrameError::PaddedFrameMalformed)?;
+        let real_len = u32::from_be_bytes(len_bytes) as usize;
+        let real_end = real_len
+            .checked_add(PADDED_LEN_PREFIX)
+            .ok_or(StreamFrameError::PaddedFrameMalformed)?;
+        if real_end > payload.len() {
+            return Err(StreamFrameError::PaddedFrameMalformed);
+        }
+        if payload[real_end..].iter().any(|byte| *byte != 0) {
+            return Err(StreamFrameError::PaddedFrameMalformed);
+        }
+        let real_payload = payload[PADDED_LEN_PREFIX..real_end].to_vec();
+
+        let received = StreamFrame::with_version(
+            frame.version(),
+            frame.kind(),
+            frame.sequence(),
+            real_payload,
+        )?;
+
+        // Only after all structural, semantic, padding, and sequence invariants
+        // pass, advance the replay window.
+        session
+            .accept_replay(envelope.sequence)
+            .map_err(StreamFrameError::from)?;
+
+        Ok(received)
     }
 
     // ---------------------------------------------------------------------
@@ -1128,6 +1279,7 @@ mod tests {
             StreamFrameError::CiphertextOutOfBounds,
             StreamFrameError::PayloadLengthMismatch,
             StreamFrameError::MalformedFrame,
+            StreamFrameError::PaddedFrameMalformed,
             StreamFrameError::EncryptFailed,
             StreamFrameError::DecryptFailed,
             StreamFrameError::Crypto,

@@ -33,7 +33,7 @@ pub use artifact::{
 pub use frame::{
     Frame, FrameError, FrameKind, StreamFrame, StreamFrameCodec, StreamFrameError, StreamFrameKind,
     FRAME_HEADER_LEN, FRAME_VERSION, MAX_CIPHERTEXT_LEN, MAX_FRAME_LEN, MAX_FRAME_PAYLOAD_LEN,
-    MIN_CIPHERTEXT_LEN, MIN_FRAME_LEN,
+    MIN_CIPHERTEXT_LEN, MIN_FRAME_LEN, PADDED_LEN_PREFIX,
 };
 
 pub mod stream_frame {

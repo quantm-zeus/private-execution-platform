@@ -6,8 +6,8 @@
 //! pair for each side. All key material is RAM-only and zeroized.
 
 use crate::{
-    CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, StreamFrame, StreamFrameError,
-    KID_LEN,
+    CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, StreamFrame, StreamFrameCodec,
+    StreamFrameError, KID_LEN,
 };
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::SeedableRng,
@@ -160,6 +160,33 @@ impl HpkeInitiatorSession {
         }
         self.receive.receive_frame(envelope)
     }
+
+    /// Seal a stream frame with a padded inner payload of exactly
+    /// `padded_payload_len` bytes. See [`StreamFrameCodec::seal_padded`].
+    pub fn seal_padded(
+        &mut self,
+        envelope_sequence: u64,
+        frame: &StreamFrame,
+        padded_payload_len: usize,
+    ) -> Result<Envelope, StreamFrameError> {
+        StreamFrameCodec::new().seal_padded(
+            &mut self.send,
+            self.kid,
+            envelope_sequence,
+            frame,
+            padded_payload_len,
+        )
+    }
+
+    /// Receive a padded stream frame produced by [`Self::seal_padded`].
+    ///
+    /// See [`StreamFrameCodec::receive_padded`].
+    pub fn receive_padded(&mut self, envelope: &Envelope) -> Result<StreamFrame, StreamFrameError> {
+        if envelope.kid != self.kid {
+            return Err(StreamFrameError::DecryptFailed);
+        }
+        StreamFrameCodec::new().receive_padded(&mut self.receive, envelope)
+    }
 }
 
 impl std::fmt::Debug for HpkeInitiatorSession {
@@ -205,6 +232,33 @@ impl HpkeResponderSession {
             return Err(StreamFrameError::DecryptFailed);
         }
         self.receive.receive_frame(envelope)
+    }
+
+    /// Seal a stream frame with a padded inner payload of exactly
+    /// `padded_payload_len` bytes. See [`StreamFrameCodec::seal_padded`].
+    pub fn seal_padded(
+        &mut self,
+        envelope_sequence: u64,
+        frame: &StreamFrame,
+        padded_payload_len: usize,
+    ) -> Result<Envelope, StreamFrameError> {
+        StreamFrameCodec::new().seal_padded(
+            &mut self.send,
+            self.kid,
+            envelope_sequence,
+            frame,
+            padded_payload_len,
+        )
+    }
+
+    /// Receive a padded stream frame produced by [`Self::seal_padded`].
+    ///
+    /// See [`StreamFrameCodec::receive_padded`].
+    pub fn receive_padded(&mut self, envelope: &Envelope) -> Result<StreamFrame, StreamFrameError> {
+        if envelope.kid != self.kid {
+            return Err(StreamFrameError::DecryptFailed);
+        }
+        StreamFrameCodec::new().receive_padded(&mut self.receive, envelope)
     }
 }
 
