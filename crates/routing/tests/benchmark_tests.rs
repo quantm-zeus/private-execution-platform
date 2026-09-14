@@ -293,6 +293,106 @@ fn future_timestamps_fail_closed_before_skips() {
 }
 
 // ---------------------------------------------------------------------------
+// Check-order precedence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chain_mismatch_precedes_pair_mismatch() {
+    // Both conditions hold: different chain AND a different asset pair.
+    let cross_chain_and_pair = ProviderQuote::new(
+        source("okx"),
+        ChainId::Solana,
+        token2(),
+        weth(),
+        1_000,
+        10_000,
+        NOW_MS,
+        "ref-1",
+    )
+    .expect("valid provider quote");
+    assert_eq!(
+        compare_route(
+            &local(1_000, 10_000),
+            &cross_chain_and_pair,
+            &policy(50),
+            NOW_MS
+        ),
+        Err(BenchmarkError::ChainMismatch)
+    );
+}
+
+#[test]
+fn pair_mismatch_precedes_input_mismatch() {
+    // Both conditions hold: different input asset AND a different input amount.
+    let pair_and_input = ProviderQuote::new(
+        source("okx"),
+        ChainId::Base,
+        token2(),
+        weth(),
+        1_001,
+        10_000,
+        NOW_MS,
+        "ref-1",
+    )
+    .expect("valid provider quote");
+    assert_eq!(
+        compare_route(&local(1_000, 10_000), &pair_and_input, &policy(50), NOW_MS),
+        Err(BenchmarkError::PairMismatch)
+    );
+}
+
+#[test]
+fn zero_input_precedes_zero_local_output() {
+    // Input binding holds at zero; both the input and the local output are zero.
+    assert_eq!(
+        compare_route(&local(0, 0), &provider(0, 0), &policy(50), NOW_MS),
+        Err(BenchmarkError::ZeroInput)
+    );
+}
+
+#[test]
+fn local_from_future_precedes_provider_from_future() {
+    // Both quotes are timestamped after the reference time.
+    let mut future_local = local(1_000, 10_000);
+    future_local.observed_at_ms = NOW_MS + 1;
+    let mut future_provider = provider(1_000, 10_000);
+    future_provider.observed_at_ms = NOW_MS + 1;
+    assert_eq!(
+        compare_route(&future_local, &future_provider, &policy(50), NOW_MS),
+        Err(BenchmarkError::LocalFromFuture)
+    );
+}
+
+#[test]
+fn local_stale_precedes_provider_stale() {
+    // Both states are older than their respective maximum ages.
+    let mut stale_local = local(1_000, 10_000);
+    stale_local.observed_at_ms = NOW_MS - 2_001;
+    let mut stale_provider = provider(1_000, 10_000);
+    stale_provider.observed_at_ms = NOW_MS - 5_001;
+    assert_eq!(
+        compare_route(&stale_local, &stale_provider, &policy(50), NOW_MS),
+        Ok(BenchmarkVerdict::Skipped(BenchmarkSkip::LocalStateStale))
+    );
+}
+
+#[test]
+fn provider_stale_precedes_zero_provider_output() {
+    // The provider quote is stale AND the provider output is zero; the skip wins.
+    let mut stale_zero_provider = provider(1_000, 0);
+    stale_zero_provider.observed_at_ms = NOW_MS - 5_001;
+    assert_eq!(
+        compare_route(
+            &local(1_000, 10_000),
+            &stale_zero_provider,
+            &policy(50),
+            NOW_MS
+        ),
+        Ok(BenchmarkVerdict::Skipped(BenchmarkSkip::ProviderStale))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Freshness and size skips
 // ---------------------------------------------------------------------------
 
@@ -368,6 +468,36 @@ fn quotient_above_u16_fails_closed() {
         compare_route(
             &local(1_000, 100_000),
             &provider(1_000, 1),
+            &policy(50),
+            NOW_MS
+        ),
+        Err(BenchmarkError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn exact_u16_max_deviation_is_representable_and_one_more_overflows() {
+    // floor(10_000 * 65_535 / 10_000) == 65_535 == u16::MAX, still representable.
+    let at_max = compare_route(
+        &local(10_000, 75_535),
+        &provider(10_000, 10_000),
+        &policy(50),
+        NOW_MS,
+    )
+    .expect("comparison");
+    assert_eq!(
+        at_max,
+        BenchmarkVerdict::Disagree {
+            deviation_bps: 65_535,
+            direction: BenchmarkDirection::LocalBetter,
+        }
+    );
+
+    // One more output unit yields the exact quotient 65_536, above u16::MAX.
+    assert_eq!(
+        compare_route(
+            &local(10_000, 75_536),
+            &provider(10_000, 10_000),
             &policy(50),
             NOW_MS
         ),
@@ -586,6 +716,16 @@ fn provider_record_and_realized_are_redacted() {
     // The opaque reference and all amount/asset values stay out of Debug.
     assert_no_payload(&format!("{provider:?}"));
     assert_no_payload(&format!("{record:?}"));
+    // `RouteComparisonRecord`'s Debug prints only `realized.is_some()`, so the
+    // realized amounts must be formatted directly or a leak in
+    // `RealizedExecution::fmt` would stay hidden behind the record.
+    assert_no_payload(&format!(
+        "{:?}",
+        RealizedExecution {
+            amount_in: 987_654_321,
+            amount_out: 987_654_321,
+        }
+    ));
     assert_eq!(
         provider.reference(),
         format!("ref-{sentinel_amount}").as_str()
