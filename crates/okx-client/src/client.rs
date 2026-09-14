@@ -13,6 +13,7 @@ use crate::error::OkxClientError;
 use crate::quote::{
     normalize_quote, OkxApiConfig, OkxNormalizedQuote, OkxQuoteEnvelope, OkxQuoteRequest,
 };
+use crate::swap::{normalize_swap, OkxSwapEnvelope, OkxSwapProposal, OkxSwapRequest};
 use crate::transport::OkxTransport;
 
 /// OKX quote client over an injected transport.
@@ -90,6 +91,50 @@ impl<T: OkxTransport> OkxClient<T> {
         let envelope: OkxQuoteEnvelope = serde_json::from_slice(response.body())
             .map_err(|_| OkxClientError::MalformedResponse)?;
         normalize_quote(request, envelope, now_ms)
+    }
+
+    /// Fetches and strictly parses one untrusted swap transaction proposal at
+    /// `now_ms`.
+    ///
+    /// Fail-closed: a transport failure, a non-200 status, an oversized or
+    /// malformed body, a provider error envelope, a missing or malformed
+    /// transaction, empty/oversized/non-hex calldata, or a proposal that does
+    /// not match the requested chain/pair/amount is rejected with a redacted
+    /// [`OkxClientError`]. The response body is checked against the configured
+    /// bound before parsing.
+    ///
+    /// This method never signs, submits, or verifies the returned proposal; it
+    /// is untrusted provider data. As with [`Self::quote`], the client-side body
+    /// bound is defense in depth only: a production [`OkxTransport`]
+    /// implementation MUST bound or stream the provider response before
+    /// materializing it in memory.
+    pub async fn swap(
+        &self,
+        request: &OkxSwapRequest,
+        now_ms: i64,
+    ) -> Result<OkxSwapProposal, OkxClientError> {
+        let http = request.to_http(&self.config)?;
+        let auth = sign_request(
+            &self.credentials,
+            http.method().as_str(),
+            &http.signed_path(),
+            http.body(),
+            now_ms,
+        )?;
+        let response = self
+            .transport
+            .send(http, &auth)
+            .await
+            .map_err(|error| error.into_client_error())?;
+        if response.status() != 200 {
+            return Err(OkxClientError::ProviderError);
+        }
+        if response.body().len() > self.config.max_response_bytes() {
+            return Err(OkxClientError::OversizedResponse);
+        }
+        let envelope: OkxSwapEnvelope = serde_json::from_slice(response.body())
+            .map_err(|_| OkxClientError::MalformedResponse)?;
+        normalize_swap(request, envelope, now_ms)
     }
 }
 

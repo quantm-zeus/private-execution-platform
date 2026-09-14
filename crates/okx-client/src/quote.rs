@@ -390,7 +390,9 @@ pub(crate) struct OkxQuoteDataWire {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OkxTokenWire {
     #[serde(default)]
-    token_contract_address: Option<String>,
+    pub(crate) token_contract_address: Option<String>,
+    #[serde(default)]
+    pub(crate) receiver: Option<String>,
 }
 
 /// Validates an untrusted envelope against `request` and normalizes it.
@@ -526,7 +528,7 @@ fn percent_to_bps_ceil(value: &str) -> Result<Bps, OkxClientError> {
     Bps::new(total).map_err(|_| OkxClientError::MalformedResponse)
 }
 
-fn resolve_address<'a>(
+pub(crate) fn resolve_address<'a>(
     top_level: Option<&'a str>,
     nested: Option<&'a OkxTokenWire>,
 ) -> Result<&'a str, OkxClientError> {
@@ -551,7 +553,7 @@ fn resolve_address<'a>(
 /// Parses a strict non-negative decimal integer atomic amount.
 ///
 /// `require_nonzero` additionally rejects a zero output.
-fn parse_atomic_decimal(
+pub(crate) fn parse_atomic_decimal(
     value: Option<&str>,
     require_nonzero: bool,
 ) -> Result<u128, OkxClientError> {
@@ -631,6 +633,7 @@ mod tests {
     fn ambiguous_address_spellings_fail_closed() {
         let nested = |address: &str| OkxTokenWire {
             token_contract_address: Some(address.to_string()),
+            receiver: None,
         };
 
         // (a) both present and equal -> accepted.
