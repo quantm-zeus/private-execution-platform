@@ -619,6 +619,22 @@ pub fn validate_split_delta_preview(
         ));
     }
     let aggregate = NetDelta::aggregate(branch_deltas)?;
+    // Per-branch binding: the aggregate alone is not enough. Each realized
+    // branch delta must match its own leg's gross budget and expected output, so
+    // a plan whose branch routes differ from the simulated branches cannot be
+    // certified even when the totals happen to line up.
+    for (delta, leg) in branch_deltas.iter().zip(&split.legs) {
+        if delta.net_input.amount.get() != leg.amount_in.get() {
+            return Err(BridgeError::NetDeltaInconsistent(
+                "split branch delta input does not equal its gross budget",
+            ));
+        }
+        if delta.net_output != leg.route.expected_net_output {
+            return Err(BridgeError::NetDeltaInconsistent(
+                "split branch delta output does not equal its route expected output",
+            ));
+        }
+    }
     let local = evaluate_freshness(
         &FreshnessPolicy::default(),
         split.state.observed_at_ms,

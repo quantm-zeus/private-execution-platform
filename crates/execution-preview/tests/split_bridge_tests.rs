@@ -373,6 +373,26 @@ fn validate_split_with_assessment_checks_each_branch() {
 }
 
 #[test]
+fn validate_split_rejects_per_branch_route_mismatch() {
+    let intent = buy_intent(1_000);
+    // Branch routes claim 300 and 210; the second realized delta claims 207.
+    // Per-branch binding must reject it even though the totals are close.
+    let split = split_two(510);
+    let branches = [delta(600, 300, 300, None), delta(400, 210, 207, None)];
+    let assessment = fresh_basis(0);
+    assert!(matches!(
+        execution_preview::validate_split_delta_preview_with_assessment(
+            &intent,
+            &split,
+            &branches,
+            &assessment,
+            NOW_MS
+        ),
+        Err(BridgeError::NetDeltaInconsistent(_))
+    ));
+}
+
+#[test]
 fn revalidate_split_positive_with_per_spender_allowances() {
     let intent = buy_intent(1_000);
     let split = split_two(510);

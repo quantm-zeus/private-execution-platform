@@ -54,12 +54,24 @@ fn request<'a>(
     policy: &'a market_types::FreshnessPolicy,
     scoring: &'a routing::ScoringInputs,
 ) -> routing::RouteRequest<'a> {
+    request_hops(intent, descriptors, assessment, policy, scoring, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_hops<'a>(
+    intent: &'a domain::TradeIntent,
+    descriptors: &'a [PoolDescriptor],
+    assessment: &'a tax_engine::TaxAssessment,
+    policy: &'a market_types::FreshnessPolicy,
+    scoring: &'a routing::ScoringInputs,
+    max_hops: usize,
+) -> routing::RouteRequest<'a> {
     common::request(
         intent,
         descriptors,
         intent.amount.get(),
         assessment,
-        1,
+        max_hops,
         policy,
         scoring,
         None,
@@ -332,4 +344,85 @@ fn split_conservation_fuzz_over_bounded_reserves() {
             .is_ok());
         }
     }
+}
+
+#[test]
+fn split_respects_configured_max_legs() {
+    let intent = intent(150_000);
+    let assessment = common::zero_tax_for(&intent);
+    let descriptors: Vec<PoolDescriptor> = (0..8)
+        .map(|index| pool(&format!("0xpool{index}"), 1_000_000, 1_000_000, 0))
+        .collect();
+    let policy = common::caller_policy();
+    let scoring = common::scoring();
+    let req = request(&intent, &descriptors, &assessment, &policy, &scoring);
+
+    let decision = plan_split(&req, &config(3, 1, 1)).expect("plan");
+    let selected = decision.selected.expect("split selected");
+    assert!(
+        selected.legs.len() <= 3,
+        "legs {} exceeded configured max_legs=3",
+        selected.legs.len()
+    );
+    assert!(selected.legs.len() >= 2);
+    let total: u128 = selected
+        .split
+        .legs
+        .iter()
+        .map(|leg| leg.amount_in.get())
+        .sum();
+    assert_eq!(total, 150_000);
+}
+
+#[test]
+fn split_excludes_pool_overlapping_branches() {
+    // Two bridge candidates share their first pool (`0xshared`), so pairing them
+    // would quote the same pool state twice and overstate the aggregate.
+    let intent = intent(100_000);
+    let assessment = common::zero_tax_for(&intent);
+    let descriptors = [
+        common::fresh_descriptor(
+            "uniswap",
+            "0xshared",
+            PoolKindState::Cpmm(common::cpmm(
+                common::usdc(),
+                common::token2(),
+                1_000_000,
+                1_000_000,
+                0,
+            )),
+        ),
+        common::fresh_descriptor(
+            "uniswap",
+            "0xsecondA",
+            PoolKindState::Cpmm(common::cpmm(
+                common::token2(),
+                common::weth(),
+                1_000_000,
+                1_000_000,
+                0,
+            )),
+        ),
+        common::fresh_descriptor(
+            "uniswap",
+            "0xsecondB",
+            PoolKindState::Cpmm(common::cpmm(
+                common::token2(),
+                common::weth(),
+                1_000_000,
+                1_000_000,
+                0,
+            )),
+        ),
+    ];
+    let policy = common::caller_policy();
+    let scoring = common::scoring();
+    let req = request_hops(&intent, &descriptors, &assessment, &policy, &scoring, 2);
+
+    let decision = plan_split(&req, &config(2, 1, 1)).expect("plan");
+    assert!(
+        decision.selected.is_none(),
+        "overlapping-pool branches must never be committed"
+    );
+    assert!(decision.candidates.is_empty());
 }

@@ -317,3 +317,57 @@ fn validate_split_reuses_intent_risk_and_amount() {
         ))
     );
 }
+
+#[test]
+fn split_multihop_funding_rejected() {
+    let intent = buy_intent();
+    let branch = SplitLeg {
+        amount_in: AtomicAmount::new(600),
+        route: RoutePlan {
+            legs: vec![
+                RouteLeg {
+                    venue: "uniswap".to_string(),
+                    pool_ref: "0xhop1".to_string(),
+                    token_in: usdc(),
+                    token_out: other(),
+                    amount_in: AtomicAmount::new(600),
+                    expected_amount_out: AtomicAmount::new(100),
+                },
+                RouteLeg {
+                    venue: "uniswap".to_string(),
+                    pool_ref: "0xhop2".to_string(),
+                    token_in: other(),
+                    token_out: token(),
+                    amount_in: AtomicAmount::new(200),
+                    expected_amount_out: AtomicAmount::new(50),
+                },
+            ],
+            expected_net_output: AssetAmount {
+                asset: token(),
+                amount: AtomicAmount::new(50),
+            },
+            state: Freshness {
+                observed_at_ms: NOW_MS,
+                chain_height: 0,
+                sequence: Sequence(1),
+            },
+        },
+    };
+    let split = SplitPlan {
+        legs: vec![branch],
+        expected_net_output: AssetAmount {
+            asset: token(),
+            amount: AtomicAmount::new(50),
+        },
+        state: Freshness {
+            observed_at_ms: NOW_MS,
+            chain_height: 0,
+            sequence: Sequence(1),
+        },
+    };
+    // The second hop needs 200 but the first hop only yields 100.
+    assert_eq!(
+        split.validate(&intent),
+        Err(DomainError::SplitLegUnmodeledFunding)
+    );
+}

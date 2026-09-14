@@ -537,6 +537,13 @@ impl SplitPlan {
                     return Err(DomainError::ChainMismatch);
                 }
             }
+            // Multi-hop funding: each hop must be funded by the previous hop's
+            // realized output, mirroring the locked single-route validator.
+            for window in leg.route.legs.windows(2) {
+                if window[1].amount_in > window[0].expected_amount_out {
+                    return Err(DomainError::SplitLegUnmodeledFunding);
+                }
+            }
             if leg.route.expected_net_output.asset != intent.token_out {
                 return Err(DomainError::SplitOutputAssetMismatch);
             }

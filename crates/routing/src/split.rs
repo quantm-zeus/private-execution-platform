@@ -32,9 +32,9 @@ use serde::{Deserialize, Serialize};
 use simulation::{div_u256_by_u128_floor, mul_u128_wide};
 
 use crate::error::{BridgeRejectClass, RoutingError};
-use crate::graph::{enumerate_candidates, CandidatePath};
+use crate::graph::{enumerate_candidates, CandidatePath, PoolDescriptor};
 use crate::quote::{self, RouteQuote};
-use crate::score;
+use crate::score::{self, GasConversion};
 use crate::{
     RouteRequest, ScoredRoute, MAX_ROUTE_HOPS, MAX_SPLIT_LEGS, MAX_SPLIT_PAIRS, MAX_SPLIT_QUOTES,
     MAX_SPLIT_REFINE_STEPS, MIN_SPLIT_LEGS, SPLIT_GRID_STEPS,
@@ -238,11 +238,13 @@ fn passes_dust(
             .usd_conversion
             .as_ref()
             .ok_or(RoutingError::InvalidSplitConfig)?;
-        let usd = mul_div_floor(
-            budget,
-            conversion.usd_micros_per_atomic.numerator_atomic(),
+        let (hi, lo) = mul_u128_wide(budget, conversion.usd_micros_per_atomic.numerator_atomic());
+        let usd = div_u256_by_u128_floor(
+            hi,
+            lo,
             conversion.usd_micros_per_atomic.denominator_atomic(),
-        )?;
+        )
+        .ok_or(RoutingError::InvalidSplitConfig)?;
         if usd < u128::from(config.min_leg_usd_micros) {
             return Ok(false);
         }
@@ -253,6 +255,41 @@ fn passes_dust(
 /// Strict improvement gate: `split * 10_000 > single * (10_000 + bps)`.
 fn split_improves(split: u128, single: u128, bps: u16) -> bool {
     domain::cmp_u128_products(split, 10_000, single, 10_000 + u128::from(bps)) == Ordering::Greater
+}
+
+/// The split's comparable primary value: net-after-gas when a complete gas view
+/// exists, otherwise the raw aggregate net output. Mirrors `score::primary_net`
+/// for single paths so the improvement gate is apples-to-apples.
+fn split_primary_net(
+    candidate: &SplitQuote,
+    gas_price_in_output: Option<&GasConversion>,
+) -> Result<u128, RoutingError> {
+    match score::net_after_gas(
+        &candidate.net_output,
+        candidate.score.gas_cost.as_ref(),
+        gas_price_in_output,
+    )? {
+        Some(value) => Ok(value),
+        None => Ok(candidate.net_output.amount.get()),
+    }
+}
+
+/// The distinct pool references used by a candidate path.
+///
+/// Two branches that reuse a pool must never be quoted independently: each
+/// branch is simulated against the *initial* pool state, so reusing a pool in
+/// two branches would overstate the aggregate. Splits are therefore restricted
+/// to pool-disjoint branches.
+fn path_pool_refs<'a>(descriptors: &'a [PoolDescriptor], path: &CandidatePath) -> Vec<&'a str> {
+    path.legs
+        .iter()
+        .filter_map(|leg| descriptors.get(leg.descriptor_index))
+        .map(|descriptor| descriptor.leg_pool_ref.as_str())
+        .collect()
+}
+
+fn pools_overlap(left: &[&str], right: &[&str]) -> bool {
+    left.iter().any(|pool| right.contains(pool))
 }
 
 /// Aggregate branch freshness: min observed_at_ms and min sequence.
@@ -366,6 +403,9 @@ fn build_split_quote(
     config: &SplitConfig,
 ) -> Result<Option<SplitQuote>, RoutingError> {
     if legs.len() < MIN_SPLIT_LEGS {
+        return Ok(None);
+    }
+    if legs.len() > MAX_SPLIT_LEGS {
         return Ok(None);
     }
     for (budget, quote) in legs {
@@ -739,10 +779,17 @@ pub fn plan_split(
     let top: Vec<SingleBaseline> = baseline.iter().take(TOP_LIMIT).cloned().collect();
 
     let mut split_candidates: Vec<CandidateWithPaths> = Vec::new();
+    let pool_sets: Vec<Vec<&str>> = top
+        .iter()
+        .map(|entry| path_pool_refs(req.descriptors, &entry.path))
+        .collect();
 
     // Phase 1: continuous two-path search over the top single paths.
     for i in 0..top.len() {
         for j in (i + 1)..top.len() {
+            if pools_overlap(&pool_sets[i], &pool_sets[j]) {
+                continue;
+            }
             let Some(point) = best_two_path(
                 req,
                 total,
@@ -762,7 +809,7 @@ pub fn plan_split(
                 continue;
             };
             if split_improves(
-                candidate.net_output.amount.get(),
+                split_primary_net(&candidate, req.gas_price_in_output.as_ref())?,
                 incumbent_net,
                 config.min_split_improvement_bps.get(),
             ) {
@@ -800,7 +847,18 @@ pub fn plan_split(
             let mut adopted_any = false;
 
             for p in 0..top.len() {
+                // `current_legs` can grow inside this loop, so the hard branch cap
+                // must be re-checked before every extension attempt.
+                if current_legs.len() >= config.max_legs {
+                    break;
+                }
                 if current_legs.iter().any(|leg| leg.top_index == p) {
+                    continue;
+                }
+                if current_legs
+                    .iter()
+                    .any(|leg| pools_overlap(&pool_sets[leg.top_index], &pool_sets[p]))
+                {
                     continue;
                 }
                 let n = current_legs.len();
@@ -938,13 +996,6 @@ pub fn plan_split(
                 if trial_net <= current_net {
                     continue;
                 }
-                if !split_improves(
-                    trial_net,
-                    incumbent_net,
-                    config.min_split_improvement_bps.get(),
-                ) {
-                    continue;
-                }
 
                 let legs: Vec<(u128, RouteQuote)> = trial
                     .iter()
@@ -954,6 +1005,13 @@ pub fn plan_split(
                     continue;
                 };
                 if candidate.net_output.amount.get() != trial_net {
+                    continue;
+                }
+                if !split_improves(
+                    split_primary_net(&candidate, req.gas_price_in_output.as_ref())?,
+                    incumbent_net,
+                    config.min_split_improvement_bps.get(),
+                ) {
                     continue;
                 }
                 let paths: Vec<usize> = trial.iter().map(|leg| leg.top_index).collect();

@@ -700,6 +700,9 @@ fn all_errors() -> Vec<RoutingError> {
         RoutingError::SelectedRejected(BridgeRejectClass::Domain),
         RoutingError::SelectedRejected(BridgeRejectClass::NetDeltaInconsistent),
         RoutingError::Internal("fixed reason"),
+        RoutingError::UnsupportedSplitLegCount,
+        RoutingError::InvalidSplitConfig,
+        RoutingError::SplitBudgetExceeded,
     ]
 }
 

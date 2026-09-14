@@ -84,9 +84,11 @@ impl AllowanceObservation {
 
 /// Structural identity of a single route leg, excluding amounts and freshness.
 ///
-/// Amounts are intentionally excluded: the locked domain validation independently
-/// binds route amounts to the realized net delta, so revalidation only needs to
-/// prove the selected route is the approved one.
+/// Amounts are intentionally excluded from this structural binding: the bridge
+/// independently binds the realized net delta to the route economics
+/// (`route.expected_net_output` for a single route; each branch delta's gross
+/// budget and expected output for a split), so revalidation only needs to prove
+/// the selected route/branches are the approved ones.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteLegRef {
     pub venue: String,
