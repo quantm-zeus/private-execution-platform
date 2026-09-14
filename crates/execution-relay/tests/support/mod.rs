@@ -218,6 +218,7 @@ pub struct MockStore {
     pub reserve_calls: Arc<AtomicUsize>,
     pub record_signed_calls: Arc<AtomicUsize>,
     fail_record_signed: bool,
+    conflict: bool,
 }
 
 impl MockStore {
@@ -227,6 +228,7 @@ impl MockStore {
             reserve_calls: Arc::new(AtomicUsize::new(0)),
             record_signed_calls: Arc::new(AtomicUsize::new(0)),
             fail_record_signed: false,
+            conflict: false,
         })
     }
 
@@ -236,6 +238,19 @@ impl MockStore {
             reserve_calls: Arc::new(AtomicUsize::new(0)),
             record_signed_calls: Arc::new(AtomicUsize::new(0)),
             fail_record_signed: true,
+            conflict: false,
+        })
+    }
+
+    /// A store that rejects every reservation as an idempotency conflict, so the
+    /// relay's conflict arm is reachable on the very first attempt.
+    pub fn conflicting() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryReservationStore::new(),
+            reserve_calls: Arc::new(AtomicUsize::new(0)),
+            record_signed_calls: Arc::new(AtomicUsize::new(0)),
+            fail_record_signed: false,
+            conflict: true,
         })
     }
 }
@@ -247,6 +262,9 @@ impl AttemptReservationStore for MockStore {
         digest: &RequestDigest,
     ) -> Result<Reservation, RelayError> {
         self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+        if self.conflict {
+            return Ok(Reservation::Conflict);
+        }
         self.inner.reserve(key, digest)
     }
 
