@@ -67,6 +67,10 @@ pub enum RoutingError {
     #[error("unsupported pool kind")]
     UnsupportedPoolKind,
 
+    /// A swap instruction's output floor exceeds the quote's available output.
+    #[error("minimum output exceeds the quoted amount")]
+    MinAmountOutExceedsQuote,
+
     /// Tax composition is unsupported for the Bin/DLMM leg configuration.
     #[error("unsupported bin tax composition")]
     UnsupportedBinTaxComposition,

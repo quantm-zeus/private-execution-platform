@@ -17,8 +17,10 @@
 //! never brute-forces the token graph.
 //!
 //! # Non-goals
-//! Exact-output quotes, depth-aware ranking, DEX adapters, and any
-//! signing/policy/storage/relay wiring are explicitly out of scope. Provider
+//! Exact-output *planning*, depth-aware ranking, and any signing/policy/storage/
+//! relay wiring are explicitly out of scope; the additive [`adapter`] boundary
+//! provides pure exact-in/exact-out quotes and swap-instruction construction over
+//! the same kernels without touching the planner. Provider
 //! benchmarking is provided by the additive [`benchmark`] comparator, which only
 //! compares externally supplied quotes; the planner never calls it. The split
 //! optimizer in [`split`] produces a [`domain::SplitPlan`] but never validates,
@@ -28,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapter;
 pub mod benchmark;
 pub mod error;
 pub mod graph;
@@ -46,6 +49,10 @@ use market_types::{AtomicAmount, FreshnessPolicy};
 use serde::{Deserialize, Serialize};
 use tax_engine::TaxAssessment;
 
+pub use adapter::{
+    AdapterQuote, AdapterRegistry, BinAdapter, ClmmAdapter, CpmmAdapter, DexAdapter,
+    SwapInstruction, MAX_ADAPTERS,
+};
 pub use benchmark::{
     compare_route, BenchmarkDirection, BenchmarkError, BenchmarkPolicy, BenchmarkSkip,
     BenchmarkSource, BenchmarkVerdict, LocalRouteQuote, ProviderQuote, RealizedExecution,

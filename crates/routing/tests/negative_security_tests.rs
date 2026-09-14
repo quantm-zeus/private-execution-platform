@@ -673,6 +673,7 @@ fn all_errors() -> Vec<RoutingError> {
         RoutingError::StalePoolState,
         RoutingError::ResyncRequired,
         RoutingError::UnsupportedPoolKind,
+        RoutingError::MinAmountOutExceedsQuote,
         RoutingError::UnsupportedBinTaxComposition,
         RoutingError::InputConservationViolated,
         RoutingError::BudgetExceeded,
