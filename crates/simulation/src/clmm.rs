@@ -146,10 +146,13 @@ impl ClmmExactOutputQuote {
 
 /// Classification of an exact-input oracle failure for the bounded search.
 ///
-/// The feasibility lemma partitions failures into a contiguous low end
-/// (`ZeroOutputAmount`/`ZeroEffectiveInput`/`InvariantViolated`), a contiguous high
-/// end (`TickCrossingExceeded`/`BinCrossingExceeded`/`ArithmeticOverflow`), and
-/// everything else, which must abort the search fail-closed.
+/// Failures are partitioned into a low end (`ZeroOutputAmount`/
+/// `ZeroEffectiveInput`, which occur only below the first `Ok` input), a high end
+/// (a genuine ceiling: `TickCrossingExceeded`/`BinCrossingExceeded`/
+/// `ArithmeticOverflow`), a non-terminal `Hole` (`InvariantViolated`), and
+/// everything else, which must abort the search fail-closed. The `Ok` set is
+/// **not** assumed contiguous: a `Hole` is handled explicitly rather than being
+/// folded into the low end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProbeClass {
     /// Low-end failure: the input is below the feasible interval.
@@ -181,19 +184,23 @@ pub(crate) enum MinimalInputSearch {
 /// Finds the minimal gross input `g >= 1` whose exact-input output `f(g)` is
 /// `>= target`, using `f` as the only output oracle.
 ///
-/// **Lemma.** For a fixed valid pool and direction, the exact-input output `f(g)`
-/// is non-decreasing over the inputs for which the kernel returns `Ok`, and that
-/// `Ok` set is a contiguous interval `[g_min, g_max]` (possibly empty). Low-end
-/// failures are `ZeroOutputAmount`/`ZeroEffectiveInput`/`InvariantViolated`;
-/// high-end failures are `TickCrossingExceeded`/`BinCrossingExceeded`/
-/// `ArithmeticOverflow`. Non-monotonicity is never assumed where the algorithm
-/// refuses to return.
+/// **Assumptions (both hold for the landed exact-input kernels; neither is
+/// re-derived here).** For a fixed valid pool and direction:
+/// (A) the exact-input output is non-decreasing over the inputs for which the
+/// kernel returns `Ok`; and (B) `ZeroOutputAmount`/`ZeroEffectiveInput` occur only
+/// below the first `Ok` input.
 ///
-/// The ceiling is located by doubling and, on the first high-end failure, by
-/// binary-searching the **smallest** high-error input (the high predicate is
-/// monotone, unlike `Ok`, which is followed by high errors). The minimal input is
-/// then binary-searched for on `[1, hi]`, and `g - 1` is re-probed to prove
-/// minimality before returning. `f` is never called with `g == 0`.
+/// The `Ok` set is **not** assumed contiguous: the kernel can return
+/// `InvariantViolated` in the middle of an otherwise `Ok` range (a rounding
+/// artifact when a swap crosses into a much larger liquidity range with a small
+/// residual). That class is a [`ProbeClass::Hole`]: it is tolerated only before
+/// any `Ok` input has been observed; once the feasible region has begun, a hole
+/// contradicts monotonicity and the search **fails closed** (returns the typed
+/// error) rather than risk returning a non-minimal input. A genuine ceiling
+/// (`High`) is terminal and located by binary-searching the smallest high-error
+/// input. The minimal input is binary-searched on `[1, hi]` (failing closed on
+/// any hole it probes) and `g - 1` is re-probed to prove minimality before
+/// returning. `f` is never called with `g == 0`.
 pub(crate) fn find_min_gross_input<E>(
     target: u128,
     mut f: impl FnMut(u128) -> Result<u128, E>,
