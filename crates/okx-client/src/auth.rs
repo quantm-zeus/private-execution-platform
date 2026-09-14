@@ -33,6 +33,10 @@ pub const OK_ACCESS_PASSPHRASE: &str = "OK-ACCESS-PASSPHRASE";
 /// Maximum accepted signed request-path length in bytes.
 pub const MAX_REQUEST_PATH_BYTES: usize = 2048;
 
+/// Latest representable instant: `9999-12-31T23:59:59.999Z` in epoch
+/// milliseconds. Accepting anything later would emit a five-digit year.
+pub const MAX_EPOCH_MILLIS: i64 = 253_402_300_799_999;
+
 /// Redacted per-request authentication headers.
 ///
 /// The values are secret material: this type deliberately does not implement
@@ -122,7 +126,7 @@ fn is_valid_request_path(path: &str) -> bool {
 /// Pure integer arithmetic (Howard Hinnant's `civil_from_days`); no clock,
 /// timezone database, or floating point is involved.
 pub(crate) fn format_rfc3339_millis(epoch_ms: i64) -> Result<String, OkxClientError> {
-    if epoch_ms < 0 {
+    if !(0..=MAX_EPOCH_MILLIS).contains(&epoch_ms) {
         return Err(OkxClientError::InvalidRequest);
     }
     let millis_total = epoch_ms as u64;
@@ -190,6 +194,23 @@ mod tests {
     fn negative_timestamp_fails_closed() {
         assert_eq!(
             format_rfc3339_millis(-1),
+            Err(OkxClientError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn timestamps_beyond_year_9999_fail_closed() {
+        // The latest representable instant formats with a four-digit year.
+        assert_eq!(
+            format_rfc3339_millis(MAX_EPOCH_MILLIS).expect("max"),
+            "9999-12-31T23:59:59.999Z"
+        );
+        assert_eq!(
+            format_rfc3339_millis(MAX_EPOCH_MILLIS + 1),
+            Err(OkxClientError::InvalidRequest)
+        );
+        assert_eq!(
+            format_rfc3339_millis(i64::MAX),
             Err(OkxClientError::InvalidRequest)
         );
     }

@@ -312,6 +312,63 @@ async fn multi_row_or_wrong_chain_index_fails_closed() {
 }
 
 #[tokio::test]
+async fn missing_chain_index_is_rejected() {
+    // A row without `chainIndex` was accepted before chain binding became
+    // mandatory; it must now fail closed as malformed.
+    let body = br#"{"code":"0","data":[{
+        "fromTokenAddress":"0xaaaa",
+        "toTokenAddress":"0xbbbb",
+        "fromTokenAmount":"1000",
+        "toTokenAmount":"2500"
+    }]}"#
+        .to_vec();
+    let transport = ScriptedTransport::single(OkxHttpResponse::new(200, body));
+    let client = OkxClient::new(transport, credentials());
+    assert_eq!(
+        client.quote(&base_request(), 0).await.err(),
+        Some(OkxClientError::MalformedResponse)
+    );
+}
+
+#[tokio::test]
+async fn reserved_token_address_bytes_are_percent_encoded_end_to_end() {
+    // Reserved characters in a token address must be percent-encoded in the
+    // signed path, so they cannot be smuggled in as extra query parameters.
+    let reserved_address = "0xaa&amount=999";
+    let request = OkxQuoteRequest::new(
+        ChainId::Base,
+        base_asset(reserved_address),
+        base_asset("0xbbbb"),
+        AtomicAmount::new(1_000),
+        None,
+    )
+    .expect("request");
+    let transport = ScriptedTransport::single(OkxHttpResponse::new(
+        200,
+        quote_body(reserved_address, "0xbbbb", "1000", "2500").into_bytes(),
+    ));
+    let client = OkxClient::new(transport, credentials());
+    client.quote(&request, 0).await.expect("quote");
+
+    let calls = client.transport().captured();
+    let signed_path = &calls[0].signed_path;
+    assert!(
+        signed_path.contains("%26"),
+        "& must be encoded: {signed_path}"
+    );
+    assert!(
+        signed_path.contains("%3D"),
+        "= must be encoded: {signed_path}"
+    );
+    // No raw reserved bytes from the address value leak into the query.
+    assert!(!signed_path.contains("0xaa&amount=999"));
+    assert_eq!(
+        signed_path,
+        "/api/v5/dex/aggregator/quote?chainIndex=8453&fromTokenAddress=0xaa%26amount%3D999&toTokenAddress=0xbbbb&amount=1000"
+    );
+}
+
+#[tokio::test]
 async fn normalized_quote_drives_p80_benchmark_comparison() {
     let transport = ScriptedTransport::single(valid_response());
     let client = OkxClient::new(transport, credentials());

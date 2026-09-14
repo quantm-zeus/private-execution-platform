@@ -298,10 +298,25 @@ pub fn okx_chain_index(chain: &ChainId) -> Result<u64, OkxClientError> {
         ChainId::Base => Ok(OKX_CHAIN_BASE),
         ChainId::BnbChain => Ok(OKX_CHAIN_BNB),
         ChainId::RobinhoodAssociated => Err(OkxClientError::UnsupportedChain),
-        ChainId::Other(value) => value
-            .parse::<u64>()
-            .map_err(|_| OkxClientError::UnsupportedChain),
+        ChainId::Other(value) => canonical_chain_index(value),
     }
+}
+
+/// Parses a numeric [`ChainId::Other`] value canonically.
+///
+/// The value must be non-empty, all ASCII digits, and must not carry a leading
+/// zero unless it is exactly `"0"`. This rejects non-canonical spellings such as
+/// `"01"` or `"+1"` that would otherwise parse to an ambiguous index.
+fn canonical_chain_index(value: &str) -> Result<u64, OkxClientError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OkxClientError::UnsupportedChain);
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return Err(OkxClientError::UnsupportedChain);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| OkxClientError::UnsupportedChain)
 }
 
 /// Renders basis points as the OKX percentage string (for example `50` -> `0.5`).
@@ -382,11 +397,15 @@ pub(crate) fn normalize_quote(
     }
     let data = &envelope.data[0];
 
-    if let Some(chain_index) = data.chain_index.as_deref() {
-        let expected = okx_chain_index(request.chain())?;
-        if chain_index != expected.to_string() {
-            return Err(OkxClientError::QuoteMismatch);
-        }
+    // The response chain index is mandatory: an absent binding is malformed,
+    // never silently trusted as "probably the requested chain".
+    let chain_index = data
+        .chain_index
+        .as_deref()
+        .ok_or(OkxClientError::MalformedResponse)?;
+    let expected = okx_chain_index(request.chain())?;
+    if chain_index != expected.to_string() {
+        return Err(OkxClientError::QuoteMismatch);
     }
 
     let from_address =
@@ -424,19 +443,22 @@ fn resolve_address<'a>(
     top_level: Option<&'a str>,
     nested: Option<&'a OkxTokenWire>,
 ) -> Result<&'a str, OkxClientError> {
-    if let Some(address) = top_level {
-        if !address.is_empty() {
-            return Ok(address);
-        }
-    }
-    if let Some(token) = nested {
-        if let Some(address) = token.token_contract_address.as_deref() {
-            if !address.is_empty() {
-                return Ok(address);
+    let top_level = top_level.filter(|address| !address.is_empty());
+    let nested = nested
+        .and_then(|token| token.token_contract_address.as_deref())
+        .filter(|address| !address.is_empty());
+    match (top_level, nested) {
+        // Both spellings are present: they must agree, or the row is ambiguous.
+        (Some(top_level), Some(nested)) => {
+            if top_level == nested {
+                Ok(top_level)
+            } else {
+                Err(OkxClientError::MalformedResponse)
             }
         }
+        (Some(address), None) | (None, Some(address)) => Ok(address),
+        (None, None) => Err(OkxClientError::MalformedResponse),
     }
-    Err(OkxClientError::MalformedResponse)
 }
 
 /// Parses a strict non-negative decimal integer atomic amount.
@@ -451,6 +473,10 @@ fn parse_atomic_decimal(
         return Err(OkxClientError::MalformedResponse);
     }
     if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OkxClientError::MalformedResponse);
+    }
+    // Canonical decimal: only `"0"` may begin with `0`.
+    if value.len() > 1 && value.starts_with('0') {
         return Err(OkxClientError::MalformedResponse);
     }
     let parsed = value
@@ -498,6 +524,60 @@ mod tests {
             Err(OkxClientError::UnsupportedChain)
         );
         assert_eq!(okx_chain_index(&ChainId::Other("137".to_string())), Ok(137));
+    }
+
+    #[test]
+    fn chain_index_parsing_is_canonical() {
+        assert_eq!(okx_chain_index(&ChainId::Other("137".to_string())), Ok(137));
+        assert_eq!(okx_chain_index(&ChainId::Other("1".to_string())), Ok(1));
+        assert_eq!(okx_chain_index(&ChainId::Other("0".to_string())), Ok(0));
+        for non_canonical in ["01", "+1", "-1", " 1", "1 ", "00", "1_0", ""] {
+            assert_eq!(
+                okx_chain_index(&ChainId::Other(non_canonical.to_string())),
+                Err(OkxClientError::UnsupportedChain),
+                "non-canonical value {non_canonical:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_address_spellings_fail_closed() {
+        let nested = |address: &str| OkxTokenWire {
+            token_contract_address: Some(address.to_string()),
+        };
+
+        // (a) both present and equal -> accepted.
+        assert_eq!(
+            resolve_address(Some("0xaaaa"), Some(&nested("0xaaaa"))),
+            Ok("0xaaaa")
+        );
+        // (b) both present and different -> ambiguous.
+        assert_eq!(
+            resolve_address(Some("0xaaaa"), Some(&nested("0xdddd"))),
+            Err(OkxClientError::MalformedResponse)
+        );
+        // (c) only nested -> accepted.
+        assert_eq!(resolve_address(None, Some(&nested("0xaaaa"))), Ok("0xaaaa"));
+        // (d) only top-level -> accepted.
+        assert_eq!(resolve_address(Some("0xaaaa"), None), Ok("0xaaaa"));
+        // Empty spellings are treated as absent.
+        assert_eq!(
+            resolve_address(Some(""), Some(&nested("0xaaaa"))),
+            Ok("0xaaaa")
+        );
+        assert_eq!(
+            resolve_address(Some("0xaaaa"), Some(&nested(""))),
+            Ok("0xaaaa")
+        );
+        // Neither present -> malformed.
+        assert_eq!(
+            resolve_address(None, None),
+            Err(OkxClientError::MalformedResponse)
+        );
+        assert_eq!(
+            resolve_address(Some(""), Some(&nested(""))),
+            Err(OkxClientError::MalformedResponse)
+        );
     }
 
     #[test]
@@ -622,6 +702,97 @@ mod tests {
             parse_atomic_decimal(Some(&overflow), false),
             Err(OkxClientError::MalformedResponse)
         );
+        // Canonical decimal only: `"0"` is valid, leading zeros are not.
+        assert_eq!(parse_atomic_decimal(Some("0"), false), Ok(0));
+        assert_eq!(
+            parse_atomic_decimal(Some("0"), true),
+            Err(OkxClientError::QuoteMismatch)
+        );
+        for leading_zero in ["00", "01", "01000"] {
+            assert_eq!(
+                parse_atomic_decimal(Some(leading_zero), false),
+                Err(OkxClientError::MalformedResponse),
+                "leading-zero value {leading_zero:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn response_row_without_chain_index_is_rejected() {
+        let request = base_request();
+        // This row was accepted before chain binding became mandatory.
+        let payload = r#"{
+            "code":"0",
+            "msg":"",
+            "data":[{
+                "fromTokenAddress":"0xaaaa",
+                "toTokenAddress":"0xbbbb",
+                "fromTokenAmount":"1000",
+                "toTokenAmount":"2500"
+            }]
+        }"#;
+        let envelope: OkxQuoteEnvelope = serde_json::from_str(payload).expect("fixture");
+        assert_eq!(
+            normalize_quote(&request, envelope, 123),
+            Err(OkxClientError::MalformedResponse)
+        );
+    }
+
+    #[test]
+    fn response_row_with_mismatched_chain_index_is_rejected() {
+        let request = base_request();
+        let payload = r#"{
+            "code":"0",
+            "msg":"",
+            "data":[{
+                "chainIndex":"1",
+                "fromTokenAddress":"0xaaaa",
+                "toTokenAddress":"0xbbbb",
+                "fromTokenAmount":"1000",
+                "toTokenAmount":"2500"
+            }]
+        }"#;
+        let envelope: OkxQuoteEnvelope = serde_json::from_str(payload).expect("fixture");
+        assert_eq!(
+            normalize_quote(&request, envelope, 123),
+            Err(OkxClientError::QuoteMismatch)
+        );
+    }
+
+    #[test]
+    fn ambiguous_response_address_fields_are_rejected() {
+        let request = base_request();
+        let from_side = r#"{
+            "code":"0",
+            "msg":"",
+            "data":[{
+                "chainIndex":"8453",
+                "fromTokenAddress":"0xaaaa",
+                "fromToken":{"tokenContractAddress":"0xdddd"},
+                "toTokenAddress":"0xbbbb",
+                "fromTokenAmount":"1000",
+                "toTokenAmount":"2500"
+            }]
+        }"#;
+        let to_side = r#"{
+            "code":"0",
+            "msg":"",
+            "data":[{
+                "chainIndex":"8453",
+                "fromTokenAddress":"0xaaaa",
+                "toTokenAddress":"0xbbbb",
+                "toToken":{"tokenContractAddress":"0xdddd"},
+                "fromTokenAmount":"1000",
+                "toTokenAmount":"2500"
+            }]
+        }"#;
+        for payload in [from_side, to_side] {
+            let envelope: OkxQuoteEnvelope = serde_json::from_str(payload).expect("fixture");
+            assert_eq!(
+                normalize_quote(&request, envelope, 123),
+                Err(OkxClientError::MalformedResponse)
+            );
+        }
     }
 
     #[test]

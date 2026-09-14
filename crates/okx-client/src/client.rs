@@ -58,6 +58,11 @@ impl<T: OkxTransport> OkxClient<T> {
     /// the requested chain/pair/amount is rejected with a redacted
     /// [`OkxClientError`]. The response body is checked against the configured
     /// bound before parsing.
+    ///
+    /// That client-side bound is defense in depth only, because the body has
+    /// already been materialized by the injected transport. A production
+    /// [`OkxTransport`] implementation MUST bound or stream the provider
+    /// response before materializing it in memory.
     pub async fn quote(
         &self,
         request: &OkxQuoteRequest,
