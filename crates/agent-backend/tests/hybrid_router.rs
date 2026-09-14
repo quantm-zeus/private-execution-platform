@@ -662,6 +662,9 @@ async fn get_quote_okx_with_an_injected_source_serves_provider_economics() {
         ),
         OKX_NET_OUT
     );
+    // The real provider impact is reported on the get_quote path too.
+    assert_eq!(value["quote"]["score"]["price_impact"], Value::from(50));
+    assert_eq!(value["quote"]["quote"]["route_impact_bps"], Value::from(50));
     assert_eq!(
         port.calls(),
         0,
@@ -700,4 +703,26 @@ async fn mcp_preview_without_a_router_preference_defaults_to_okx() {
         OKX_GROSS_OUT
     );
     assert_eq!(port.calls(), 0);
+}
+
+#[tokio::test]
+async fn local_identity_is_pinned_and_unchanged_by_the_router_field() {
+    let snapshot = Arc::new(CountingSnapshot::new());
+    let port = Arc::new(RecordingExecution::submitted());
+    let backend = backend(snapshot.clone(), port);
+
+    assert!(matches!(
+        run(&backend, preview_command(RouterSource::Local)).await,
+        BackendOutcome::Value(_)
+    ));
+    let seen = snapshot.seen();
+    assert_eq!(seen.len(), 1);
+    // Golden pre-P84B Local identity: the router discriminant is appended only
+    // for OKX, so a Local intent id is unchanged when the router field is added.
+    // (Value captured from the conditional implementation; an unconditional
+    // append for Local would change it and fail this test.)
+    assert_eq!(
+        seen[0].id.as_str(),
+        "intent-b64831b8cbb800aab611784bb2db4c69b2dbdc99d8ca42e6877e5c5aec3365c2"
+    );
 }

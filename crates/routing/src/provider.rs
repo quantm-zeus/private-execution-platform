@@ -13,9 +13,11 @@
 //! The provider route is represented as a single synthetic leg with caller-
 //! supplied validated [`VenueLabel`]/[`PoolRefLabel`] text, so the locked
 //! `RoutePlan`/`NetDelta` shape and the `ExecutionPreview` validator are reused
-//! unchanged. `route_impact_bps` is `None` because no local pool model exists for
-//! a provider route; the exact on-chain slippage floor is bound to the provider
-//! proposal before signing in a later slice.
+//! unchanged. `route_impact_bps` is the provider-reported impact (rounded up to
+//! basis points), or `None` when the provider reported none; a non-zero intent
+//! `max_price_impact` fails closed on `None` exactly like the local planner. The
+//! exact on-chain slippage floor is bound to the provider proposal before
+//! signing in a later slice.
 
 use domain::{RouteLeg, RoutePlan, RouteScore, TradeIntent, TradeSide};
 use execution_preview::{validate_delta_preview_with_assessment, NetDelta};
