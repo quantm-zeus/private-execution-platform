@@ -1671,6 +1671,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "okx-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chain-types",
+ "hmac",
+ "market-types",
+ "routing",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
