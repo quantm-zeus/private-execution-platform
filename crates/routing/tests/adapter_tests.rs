@@ -7,18 +7,22 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use chain_types::AssetId;
 use common::*;
-use market_types::{AtomicAmount, PoolKindState};
+use market_types::{AtomicAmount, Bps, PoolKindState};
 use routing::{
-    AdapterRegistry, BinAdapter, ClmmAdapter, CpmmAdapter, DexAdapter, PoolRefLabel, RoutingError,
-    MAX_ADAPTERS,
+    AdapterQuote, AdapterRegistry, BinAdapter, ClmmAdapter, CpmmAdapter, DexAdapter, PoolRefLabel,
+    RoutingError, SwapInstruction, MAX_ADAPTERS,
 };
 use simulation::{
-    simulate_bin_exact_input, simulate_bin_exact_output, simulate_clmm_exact_input,
-    simulate_clmm_exact_output, simulate_cpmm_exact_input, simulate_cpmm_exact_output,
-    BinExactInputRequest, BinExactOutputRequest, BinSimulationError, ClmmExactInputRequest,
-    ClmmExactOutputRequest, ClmmSimulationError, CpmmExactInputRequest, CpmmExactOutputRequest,
-    CpmmSimulationErrorClass,
+    div_u256_by_u128_floor, mul_u128_wide, simulate_bin_exact_input, simulate_bin_exact_output,
+    simulate_clmm_exact_input, simulate_clmm_exact_output, simulate_cpmm_exact_input,
+    simulate_cpmm_exact_output, BinExactInputRequest, BinExactOutputRequest, BinSimulationError,
+    ClmmExactInputRequest, ClmmExactOutputRequest, ClmmSimulationError, CpmmExactInputRequest,
+    CpmmExactOutputRequest, CpmmSimulationErrorClass,
 };
 
 fn reference() -> PoolRefLabel {
@@ -40,6 +44,105 @@ fn clmm_state() -> PoolKindState {
 fn bin_state() -> PoolKindState {
     PoolKindState::Bin(bin(usdc(), weth()))
 }
+
+/// Independently recomputes the exact CPMM fee-excluded impact in basis points
+/// from raw kernel values, without calling the adapter or the `impact` module.
+///
+/// `floor(10_000 * effective_input / (reserve_in + effective_input))` where
+/// `reserve_in` is derived as `resulting_reserve_in - amount_in`. This mirrors
+/// the documented economics but is a separate implementation (wide multiply and
+/// 256-bit division driven by the hand-derived fixture numbers), so a mutated
+/// adapter formula cannot satisfy it.
+fn recompute_cpmm_impact_bps(
+    effective_input: u128,
+    resulting_reserve_in: u128,
+    amount_in: u128,
+) -> Bps {
+    let reserve_in = resulting_reserve_in
+        .checked_sub(amount_in)
+        .expect("pre-swap reserve_in");
+    let denominator = reserve_in
+        .checked_add(effective_input)
+        .expect("denominator fits in u128");
+    assert_ne!(denominator, 0, "impact denominator must be non-zero");
+    let (hi, lo) = mul_u128_wide(10_000, effective_input);
+    let value = div_u256_by_u128_floor(hi, lo, denominator).expect("division succeeds");
+    let value = u16::try_from(value).expect("impact fits in u16");
+    Bps::new(value).expect("valid bps")
+}
+
+/// Test-only dispatch probe.
+///
+/// `supports` is a caller-supplied predicate; whenever the registry dispatches a
+/// quote the corresponding method increments a counter and then panics, so an
+/// erroneous `if adapter.supports(state)` -> `if true` mutation is impossible to
+/// miss. The counters make the "not invoked" property explicit when dispatch is
+/// correct.
+struct ProbeAdapter {
+    venue: &'static str,
+    supports_fn: fn(&PoolKindState) -> bool,
+    exact_in_calls: Arc<AtomicUsize>,
+    exact_out_calls: Arc<AtomicUsize>,
+}
+
+impl ProbeAdapter {
+    fn new(venue: &'static str, supports_fn: fn(&PoolKindState) -> bool) -> Self {
+        Self {
+            venue,
+            supports_fn,
+            exact_in_calls: Arc::new(AtomicUsize::new(0)),
+            exact_out_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl DexAdapter for ProbeAdapter {
+    fn venue(&self) -> &'static str {
+        self.venue
+    }
+
+    fn supports(&self, state: &PoolKindState) -> bool {
+        (self.supports_fn)(state)
+    }
+
+    fn quote_exact_in(
+        &self,
+        _pool_ref: &PoolRefLabel,
+        _state: &PoolKindState,
+        _token_in: &AssetId,
+        _amount_in: AtomicAmount,
+    ) -> Result<AdapterQuote, RoutingError> {
+        self.exact_in_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("probe adapter quote_exact_in must not be dispatched");
+    }
+
+    fn quote_exact_out(
+        &self,
+        _pool_ref: &PoolRefLabel,
+        _state: &PoolKindState,
+        _token_in: &AssetId,
+        _amount_out: AtomicAmount,
+    ) -> Result<AdapterQuote, RoutingError> {
+        self.exact_out_calls.fetch_add(1, Ordering::SeqCst);
+        panic!("probe adapter quote_exact_out must not be dispatched");
+    }
+
+    fn swap_instruction(
+        &self,
+        _quote: &AdapterQuote,
+        _min_amount_out: AtomicAmount,
+    ) -> Result<SwapInstruction, RoutingError> {
+        panic!("probe adapter swap_instruction must not be dispatched");
+    }
+}
+
+/// Seventeen distinct venue labels so the `MAX_ADAPTERS` boundary can be probed
+/// with unique-label adapters on both sides of the bound.
+const DISTINCT_VENUES: [&str; 17] = [
+    "probe-00", "probe-01", "probe-02", "probe-03", "probe-04", "probe-05", "probe-06", "probe-07",
+    "probe-08", "probe-09", "probe-10", "probe-11", "probe-12", "probe-13", "probe-14", "probe-15",
+    "probe-16",
+];
 
 // --- Exact-in parity vs. the landed kernels -------------------------------
 
@@ -67,7 +170,16 @@ fn cpmm_exact_in_parity_matches_kernel() {
     assert_eq!(quote.amount_out, direct.output.amount);
     assert_eq!(quote.pool_fee, direct.pool_fee);
     assert_eq!(quote.effective_input, direct.effective_input.amount);
-    assert!(quote.impact_bps.is_some());
+
+    // Independently recompute the exact fixture impact (hand-derived value 98)
+    // from the kernel quote so a wrong adapter formula is caught.
+    let expected_impact = recompute_cpmm_impact_bps(
+        direct.effective_input.amount.get(),
+        direct.resulting_reserve_in.get(),
+        amount_in.get(),
+    );
+    assert_eq!(quote.impact_bps, Some(expected_impact));
+    assert_eq!(quote.impact_bps.map(Bps::get), Some(98));
 }
 
 #[test]
@@ -153,12 +265,25 @@ fn cpmm_exact_out_is_minimal_and_matches_kernel() {
     let direct = simulate_cpmm_exact_output(pool, &CpmmExactOutputRequest::new(usdc(), target))
         .expect("cpmm exact out kernel");
 
+    assert_eq!(quote.token_in, usdc());
+    assert_eq!(quote.token_out, weth());
+    assert_ne!(quote.token_in, quote.token_out);
+    assert_eq!(quote.token_out, direct.output.asset);
     assert_eq!(quote.amount_in, direct.input.amount);
     assert_eq!(quote.amount_out, direct.output.amount);
     assert_eq!(quote.pool_fee, direct.pool_fee);
     assert_eq!(quote.effective_input, direct.effective_input.amount);
     assert!(quote.amount_out.get() >= target.get());
-    assert!(quote.impact_bps.is_some());
+
+    // Exact-out impact uses the exact-output quote's gross `input` as the
+    // consumed amount in the reserve reconstruction.
+    let expected_impact = recompute_cpmm_impact_bps(
+        direct.effective_input.amount.get(),
+        direct.resulting_reserve_in.get(),
+        direct.input.amount.get(),
+    );
+    assert_eq!(quote.impact_bps, Some(expected_impact));
+    assert_eq!(quote.impact_bps.map(Bps::get), Some(98));
 
     let previous = simulate_cpmm_exact_input(
         pool,
@@ -195,6 +320,10 @@ fn clmm_exact_out_is_minimal_and_matches_kernel() {
     let direct = simulate_clmm_exact_output(pool, &ClmmExactOutputRequest::new(usdc(), target))
         .expect("clmm exact out kernel");
 
+    assert_eq!(quote.token_in, usdc());
+    assert_eq!(quote.token_out, weth());
+    assert_ne!(quote.token_in, quote.token_out);
+    assert_eq!(quote.token_out, direct.output.asset);
     assert_eq!(quote.amount_in, direct.input.amount);
     assert_eq!(quote.amount_out, direct.output.amount);
     assert_eq!(quote.pool_fee, direct.fee);
@@ -236,6 +365,10 @@ fn bin_exact_out_is_minimal_and_matches_kernel() {
     let direct = simulate_bin_exact_output(pool, &BinExactOutputRequest::new(usdc(), target))
         .expect("bin exact out kernel");
 
+    assert_eq!(quote.token_in, usdc());
+    assert_eq!(quote.token_out, weth());
+    assert_ne!(quote.token_in, quote.token_out);
+    assert_eq!(quote.token_out, direct.output.asset);
     assert_eq!(quote.amount_in, direct.input.amount);
     assert_eq!(quote.amount_out, direct.output.amount);
     assert_eq!(quote.pool_fee, direct.fee);
@@ -342,8 +475,20 @@ fn bin_binding_failures_are_typed_and_immutable() {
 
 #[test]
 fn registry_without_matching_adapter_denies_state() {
-    let registry = AdapterRegistry::new(vec![Box::new(CpmmAdapter)]).expect("registry");
     let pool_ref = reference();
+
+    // Dispatch must consult `supports`: a non-matching adapter's quote method
+    // must never run. `ProbeAdapter` records and panics if it is dispatched.
+    let probe = ProbeAdapter::new("probe-cpmm-only", |state| {
+        matches!(state, PoolKindState::Cpmm(_))
+    });
+    assert!(probe.supports(&cpmm_state()));
+    assert!(!probe.supports(&clmm_state()));
+    assert!(!probe.supports(&bin_state()));
+    let exact_in_calls = Arc::clone(&probe.exact_in_calls);
+    let exact_out_calls = Arc::clone(&probe.exact_out_calls);
+
+    let registry = AdapterRegistry::new(vec![Box::new(probe)]).expect("registry");
     assert_eq!(
         registry.quote_exact_in(&clmm_state(), &pool_ref, &usdc(), AtomicAmount::new(1_000)),
         Err(RoutingError::UnsupportedPoolKind)
@@ -351,6 +496,16 @@ fn registry_without_matching_adapter_denies_state() {
     assert_eq!(
         registry.quote_exact_out(&bin_state(), &pool_ref, &usdc(), AtomicAmount::new(1)),
         Err(RoutingError::UnsupportedPoolKind)
+    );
+    assert_eq!(
+        exact_in_calls.load(Ordering::SeqCst),
+        0,
+        "non-matching adapter quote_exact_in must not be invoked"
+    );
+    assert_eq!(
+        exact_out_calls.load(Ordering::SeqCst),
+        0,
+        "non-matching adapter quote_exact_out must not be invoked"
     );
 
     assert!(CpmmAdapter.supports(&cpmm_state()));
@@ -368,15 +523,34 @@ fn registry_construction_is_bounded() {
         Some(RoutingError::EmptyPoolSet)
     );
 
-    let over_bound: Vec<Box<dyn DexAdapter>> = (0..=MAX_ADAPTERS)
-        .map(|_| Box::new(CpmmAdapter) as Box<dyn DexAdapter>)
+    // Exactly `MAX_ADAPTERS` distinct-venue adapters must be accepted, and one
+    // more must be rejected. This catches an off-by-one `>` -> `>=` mutation.
+    let exact_bound: Vec<Box<dyn DexAdapter>> = DISTINCT_VENUES[..MAX_ADAPTERS]
+        .iter()
+        .copied()
+        .map(|venue| Box::new(ProbeAdapter::new(venue, |_| false)) as Box<dyn DexAdapter>)
         .collect();
+    assert_eq!(exact_bound.len(), MAX_ADAPTERS);
+    assert!(AdapterRegistry::new(exact_bound).is_ok());
+
+    let over_bound: Vec<Box<dyn DexAdapter>> = DISTINCT_VENUES
+        .iter()
+        .copied()
+        .map(|venue| Box::new(ProbeAdapter::new(venue, |_| false)) as Box<dyn DexAdapter>)
+        .collect();
+    assert_eq!(over_bound.len(), MAX_ADAPTERS + 1);
     assert_eq!(
         AdapterRegistry::new(over_bound).err(),
         Some(RoutingError::BudgetExceeded)
     );
 
-    let duplicates: Vec<Box<dyn DexAdapter>> = vec![Box::new(CpmmAdapter), Box::new(CpmmAdapter)];
+    // The repeated label is at index 2, not index 1: a check that only compares
+    // against the first adapter would wrongly accept this registry.
+    let duplicates: Vec<Box<dyn DexAdapter>> = vec![
+        Box::new(CpmmAdapter),
+        Box::new(ClmmAdapter),
+        Box::new(ClmmAdapter),
+    ];
     assert_eq!(
         AdapterRegistry::new(duplicates).err(),
         Some(RoutingError::InvalidVenueLabel)
