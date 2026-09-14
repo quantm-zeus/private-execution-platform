@@ -308,7 +308,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         max_price_impact: Bps,
         router: RouterSource,
     ) -> Vec<Vec<u8>> {
-        vec![
+        let mut parts = vec![
             self.config.owner.as_str().as_bytes().to_vec(),
             self.config.wallet_ref.as_str().as_bytes().to_vec(),
             chain_code(&self.config.chain).into_bytes(),
@@ -325,9 +325,14 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             max_price_impact.get().to_be_bytes().to_vec(),
             self.config.risk.max_buy_tax.get().to_be_bytes().to_vec(),
             self.config.risk.max_sell_tax.get().to_be_bytes().to_vec(),
-            // Source-bound identity: the wire discriminant differs by router.
-            router.as_str().as_bytes().to_vec(),
-        ]
+        ];
+        // Source-bound identity: OKX appends its discriminant so a Local quote
+        // can never be replayed as an OKX execution. Local appends nothing, so a
+        // pre-P84B Local intent/idempotency identity is preserved byte-for-byte.
+        if router == RouterSource::Okx {
+            parts.push(b"okx".to_vec());
+        }
+        parts
     }
 
     /// Builds the trusted intent for one market preview.
@@ -517,7 +522,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
                     venue: &venue,
                     pool_ref: &pool_ref,
                     scoring: &snapshot.scoring,
-                    price_impact_bps: Bps::new(0).map_err(|_| BackendError::Denied)?,
+                    price_impact_bps: normalized.price_impact_bps(),
                 };
                 let composed = quote_provider_route(&input).map_err(|_| BackendError::Denied)?;
                 Ok((

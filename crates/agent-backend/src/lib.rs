@@ -76,3 +76,6 @@ pub use trade::{
     FixedClock, OrderValuation, SystemClock, TradingAgentBackend, TradingBackendConfig,
     TrustedClock, UnavailableOrderValuation,
 };
+
+/// Routing-source preference re-exported for execution-seam implementors.
+pub use agent_commands::RouterSource;

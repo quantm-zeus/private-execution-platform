@@ -29,6 +29,27 @@ fn input<'a>(
     policy: &'a market_types::FreshnessPolicy,
     scoring: &'a routing::ScoringInputs,
 ) -> ProviderRouteInput<'a> {
+    input_with_impact(
+        intent,
+        amount_in,
+        provider_out,
+        assessment,
+        policy,
+        scoring,
+        Some(0),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn input_with_impact<'a>(
+    intent: &'a domain::TradeIntent,
+    amount_in: u128,
+    provider_out: u128,
+    assessment: &'a tax_engine::TaxAssessment,
+    policy: &'a market_types::FreshnessPolicy,
+    scoring: &'a routing::ScoringInputs,
+    impact_bps: Option<u16>,
+) -> ProviderRouteInput<'a> {
     ProviderRouteInput {
         intent,
         amount_in: AtomicAmount::new(amount_in),
@@ -39,7 +60,7 @@ fn input<'a>(
         venue: venue(),
         pool_ref: pool_ref(),
         scoring,
-        price_impact_bps: Bps::new(0).expect("bps"),
+        price_impact_bps: impact_bps.map(|bps| Bps::new(bps).expect("bps")),
     }
 }
 
@@ -70,7 +91,10 @@ fn buy_zero_tax_composes_exact_net_delta() {
     assert_eq!(composed.quote.plan.legs[0].expected_amount_out.get(), 2_500);
     assert_eq!(composed.quote.plan.expected_net_output.amount.get(), 2_500);
     assert_eq!(composed.score.simulated_net_output.amount.get(), 2_500);
-    assert_eq!(composed.quote.route_impact_bps, None);
+    assert_eq!(
+        composed.quote.route_impact_bps,
+        Some(Bps::new(0).expect("bps"))
+    );
 }
 
 #[test]
@@ -236,4 +260,84 @@ fn composition_is_deterministic_and_redacted() {
     let rendered = format!("{error} {error:?}");
     assert!(!rendered.contains("2500"));
     assert!(!rendered.contains("1000"));
+}
+
+#[test]
+fn price_impact_cap_is_enforced_like_the_local_planner() {
+    // `common::buy` uses `risk(500)`: a 500 bps max impact cap.
+    let intent = buy(usdc(), weth(), 1_000);
+    let assessment = assessment(weth(), 0, 0);
+    let scoring = scoring();
+    let policy = caller_policy();
+
+    // A non-zero cap with an unmodeled provider impact fails closed.
+    assert_eq!(
+        quote_provider_route(&input_with_impact(
+            &intent,
+            1_000,
+            2_500,
+            &assessment,
+            &policy,
+            &scoring,
+            None,
+        ))
+        .err(),
+        Some(RoutingError::ImpactUnavailable)
+    );
+
+    // An impact above the cap fails closed.
+    assert_eq!(
+        quote_provider_route(&input_with_impact(
+            &intent,
+            1_000,
+            2_500,
+            &assessment,
+            &policy,
+            &scoring,
+            Some(501),
+        ))
+        .err(),
+        Some(RoutingError::ImpactExceedsCap)
+    );
+
+    // An impact at the cap is admitted and reported (not fabricated as zero).
+    let composed = quote_provider_route(&input_with_impact(
+        &intent,
+        1_000,
+        2_500,
+        &assessment,
+        &policy,
+        &scoring,
+        Some(500),
+    ))
+    .expect("at cap");
+    assert_eq!(
+        composed.quote.route_impact_bps,
+        Some(Bps::new(500).expect("bps"))
+    );
+    assert_eq!(composed.score.price_impact, Bps::new(500).expect("bps"));
+
+    // With the caller's explicit unbounded sentinel (cap == 0), an unmodeled
+    // impact is admitted but the route still reports "not modeled".
+    let mut unbounded_risk = common::risk(0);
+    unbounded_risk.max_price_impact = Bps::new(0).expect("bps");
+    let unbounded_intent = common::intent_with_risk(
+        domain::TradeSide::Buy,
+        usdc(),
+        weth(),
+        1_000,
+        unbounded_risk,
+    );
+    let composed = quote_provider_route(&input_with_impact(
+        &unbounded_intent,
+        1_000,
+        2_500,
+        &assessment,
+        &policy,
+        &scoring,
+        None,
+    ))
+    .expect("unbounded");
+    assert_eq!(composed.quote.route_impact_bps, None);
+    assert_eq!(composed.score.price_impact, Bps::new(0).expect("bps"));
 }

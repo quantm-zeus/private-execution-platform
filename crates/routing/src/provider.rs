@@ -47,8 +47,10 @@ pub struct ProviderRouteInput<'a> {
     pub pool_ref: &'a PoolRefLabel,
     /// Caller-supplied router cost/risk scoring inputs.
     pub scoring: &'a ScoringInputs,
-    /// Provider-reported price impact in basis points (`0` when unavailable).
-    pub price_impact_bps: Bps,
+    /// Provider-reported absolute price impact in basis points, or `None` when
+    /// the provider did not report one. When the intent sets a non-zero
+    /// `max_price_impact`, `None` fails closed exactly like the local planner.
+    pub price_impact_bps: Option<Bps>,
 }
 
 /// A provider route composed into the locked contracts.
@@ -107,6 +109,25 @@ pub fn quote_provider_route(
     if gross_amount.is_zero() {
         return Err(RoutingError::ZeroHopOutput);
     }
+
+    // Price-impact gate: mirror the locked local planner. A non-zero intent cap
+    // requires a modeled impact at or below it; the router's `0` is the
+    // documented "unbounded" sentinel, so an unmodeled impact is admitted only
+    // when the caller has explicitly opted out of the cap. This prevents a
+    // provider route from silently bypassing the cap the local route enforces.
+    if intent.risk.max_price_impact.get() != 0 {
+        match input.price_impact_bps {
+            None => return Err(RoutingError::ImpactUnavailable),
+            Some(impact) if impact.get() > intent.risk.max_price_impact.get() => {
+                return Err(RoutingError::ImpactExceedsCap);
+            }
+            Some(_) => {}
+        }
+    }
+    let score_impact = match input.price_impact_bps {
+        Some(impact) => impact,
+        None => Bps::new(0).map_err(|_| RoutingError::Internal("zero bps invalid"))?,
+    };
 
     // Buy-side output tax is applied after the provider swap.
     let (net_amount, tax_cost) = match intent.side {
@@ -197,7 +218,7 @@ pub fn quote_provider_route(
         dex_fee: None,
         provider_fee: None,
         gas_cost: None,
-        price_impact: input.price_impact_bps,
+        price_impact: score_impact,
         expected_slippage: input.scoring.expected_slippage_bps,
         mev_risk: input.scoring.mev_risk_bps,
         failure_probability: input.scoring.failure_probability_bps,
@@ -214,7 +235,7 @@ pub fn quote_provider_route(
             gross_output,
             net_output,
             tax_cost,
-            route_impact_bps: None,
+            route_impact_bps: input.price_impact_bps,
         },
         score,
     })

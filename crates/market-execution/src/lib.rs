@@ -49,6 +49,7 @@ use std::fmt;
 
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
+    RouterSource,
 };
 use async_trait::async_trait;
 use domain::{
@@ -218,6 +219,15 @@ where
         &self,
         request: MarketExecutionRequest,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        // P84B source boundary: this port composes the *local* relay path only.
+        // An OKX-sourced quote must go through the P84C verified-proposal
+        // boundary before it can be signed, so a non-Local source is denied here
+        // rather than being signed as if it were a local route. This makes a
+        // source mismatch a final pre-sign denial (no sign/submit occurs).
+        if request.router_source != RouterSource::Local {
+            return Err(MarketExecutionError::Denied);
+        }
+
         let trust = self.trust.trust(&request)?;
 
         // Authority is checked on the *same* engine that gates the relay, so the

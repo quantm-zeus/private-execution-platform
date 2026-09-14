@@ -276,6 +276,38 @@ fn okx_quote_body() -> Vec<u8> {
             "toTokenAddress":"0xbbbb",
             "fromTokenAmount":"{AMOUNT}",
             "toTokenAmount":"{OKX_GROSS_OUT}",
+            "quoteId":"quote-1",
+            "priceImpactPercentage":"0.5"
+        }}]}}"#
+    )
+    .into_bytes()
+}
+
+/// A fixture whose reported impact (500 bps) exceeds the configured 300 bps cap.
+fn okx_high_impact_body() -> Vec<u8> {
+    format!(
+        r#"{{"code":"0","msg":"","data":[{{
+            "chainIndex":"8453",
+            "fromTokenAddress":"0xaaaa",
+            "toTokenAddress":"0xbbbb",
+            "fromTokenAmount":"{AMOUNT}",
+            "toTokenAmount":"{OKX_GROSS_OUT}",
+            "quoteId":"quote-1",
+            "priceImpactPercentage":"5"
+        }}]}}"#
+    )
+    .into_bytes()
+}
+
+/// A fixture with no reported impact at all.
+fn okx_unmodeled_impact_body() -> Vec<u8> {
+    format!(
+        r#"{{"code":"0","msg":"","data":[{{
+            "chainIndex":"8453",
+            "fromTokenAddress":"0xaaaa",
+            "toTokenAddress":"0xbbbb",
+            "fromTokenAmount":"{AMOUNT}",
+            "toTokenAmount":"{OKX_GROSS_OUT}",
             "quoteId":"quote-1"
         }}]}}"#
     )
@@ -283,7 +315,11 @@ fn okx_quote_body() -> Vec<u8> {
 }
 
 fn okx_client() -> OkxClient<FixtureTransport> {
-    let transport = FixtureTransport::single(OkxHttpResponse::new(200, okx_quote_body()));
+    okx_client_with(okx_quote_body())
+}
+
+fn okx_client_with(body: Vec<u8>) -> OkxClient<FixtureTransport> {
+    let transport = FixtureTransport::single(OkxHttpResponse::new(200, body));
     OkxClient::new(
         transport,
         OkxCredentials::new("api-key-value", "signing-secret-value", "passphrase-value")
@@ -463,7 +499,43 @@ async fn okx_preview_with_an_injected_source_composes_the_exact_net_economics() 
     );
     assert!(preview["score"]["gas_cost"].is_null());
     assert!(preview["score"]["provider_fee"].is_null());
-    assert_eq!(preview["score"]["price_impact"], Value::from(0));
+    // The provider impact is the parsed 0.5% (50 bps), never a fabricated zero.
+    assert_eq!(preview["score"]["price_impact"], Value::from(50));
+    assert_eq!(preview["quote"]["route_impact_bps"], Value::from(50));
+}
+
+#[tokio::test]
+async fn okx_route_enforces_the_price_impact_cap() {
+    // `config()` sets a 300 bps hard price-impact cap. Both an above-cap impact
+    // and an unmodeled impact must fail closed before the execution port. A fresh
+    // scripted client is used per call because each carries one fixture response.
+    for body in [okx_high_impact_body(), okx_unmodeled_impact_body()] {
+        let port = Arc::new(RecordingExecution::submitted());
+        let b = backend(Arc::new(CountingSnapshot::new()), port.clone())
+            .with_okx_quote_source(Arc::new(okx_client_with(body.clone())));
+        assert_eq!(
+            run(&b, preview_command(RouterSource::Okx)).await,
+            BackendOutcome::Denied
+        );
+        assert_eq!(
+            port.calls(),
+            0,
+            "a price-impact denial must never reach the execution port"
+        );
+
+        let port = Arc::new(RecordingExecution::submitted());
+        let b = backend(Arc::new(CountingSnapshot::new()), port.clone())
+            .with_okx_quote_source(Arc::new(okx_client_with(body)));
+        assert_eq!(
+            run(&b, execute_command(RouterSource::Okx)).await,
+            BackendOutcome::Denied
+        );
+        assert_eq!(
+            port.calls(),
+            0,
+            "a price-impact denial must never reach the execution port"
+        );
+    }
 }
 
 #[tokio::test]
@@ -566,4 +638,66 @@ async fn local_preview_reports_local_source_and_stable_shape() {
     );
     // The Local route exposes a pool fee (unlike the provider route).
     assert!(!preview["quote"]["net_delta"]["dex_fee"].is_null());
+}
+
+#[tokio::test]
+async fn get_quote_okx_with_an_injected_source_serves_provider_economics() {
+    let snapshot = Arc::new(CountingSnapshot::new());
+    let port = Arc::new(RecordingExecution::submitted());
+    let source: Arc<dyn OkxQuoteSource> = Arc::new(okx_client());
+    let backend = backend(snapshot, port.clone()).with_okx_quote_source(source);
+
+    let outcome = run_read(&backend, get_quote_command(RouterSource::Okx)).await;
+    let BackendOutcome::Value(value) = outcome else {
+        panic!("expected an OKX get_quote, got {outcome:?}");
+    };
+    assert_eq!(
+        value["quote"]["router_source"],
+        Value::String("okx".to_string())
+    );
+    assert_eq!(
+        amount_at(
+            &value,
+            &["quote", "quote", "net_delta", "net_output", "amount"]
+        ),
+        OKX_NET_OUT
+    );
+    assert_eq!(
+        port.calls(),
+        0,
+        "get_quote must never reach the execution port"
+    );
+}
+
+#[tokio::test]
+async fn mcp_preview_without_a_router_preference_defaults_to_okx() {
+    let snapshot = Arc::new(CountingSnapshot::new());
+    let port = Arc::new(RecordingExecution::submitted());
+    let source: Arc<dyn OkxQuoteSource> = Arc::new(okx_client());
+    let backend = backend(snapshot, port.clone()).with_okx_quote_source(source);
+
+    // A tool call that omits `router_preference` entirely (the MCP default).
+    let json = r#"{"tool":"preview_market_order",
+        "token_in":{"chain":{"kind":"base"},"address":"0xaaaa"},
+        "token_out":{"chain":{"kind":"base"},"address":"0xbbbb"},
+        "side":"buy",
+        "amount":{"unit":"token_atomic","value":1000000000}}"#;
+    let command = AgentCommand::parse(json).expect("parse");
+
+    let outcome = backend.execute(AgentChannel::Mcp, command).await;
+    let BackendOutcome::Value(value) = outcome else {
+        panic!("expected an OKX preview, got {outcome:?}");
+    };
+    assert_eq!(
+        value["preview"]["router_source"],
+        Value::String("okx".to_string())
+    );
+    assert_eq!(
+        amount_at(
+            &value,
+            &["preview", "quote", "net_delta", "gross_output", "amount"]
+        ),
+        OKX_GROSS_OUT
+    );
+    assert_eq!(port.calls(), 0);
 }

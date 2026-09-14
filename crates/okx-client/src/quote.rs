@@ -223,6 +223,7 @@ pub struct OkxNormalizedQuote {
     amount_out: u128,
     reference: String,
     observed_at_ms: i64,
+    price_impact_bps: Option<Bps>,
 }
 
 impl OkxNormalizedQuote {
@@ -259,6 +260,13 @@ impl OkxNormalizedQuote {
     /// The caller reference instant the quote was observed at, in milliseconds.
     pub fn observed_at_ms(&self) -> i64 {
         self.observed_at_ms
+    }
+
+    /// The provider-reported absolute price impact in basis points, or `None`
+    /// when the provider did not report one. A caller that enforces an impact cap
+    /// must fail closed on `None` rather than treat it as zero.
+    pub fn price_impact_bps(&self) -> Option<Bps> {
+        self.price_impact_bps
     }
 
     /// Projects this quote into the P80 provider-route benchmark model,
@@ -373,6 +381,8 @@ pub(crate) struct OkxQuoteDataWire {
     to_token: Option<OkxTokenWire>,
     #[serde(default)]
     quote_id: Option<String>,
+    #[serde(default)]
+    price_impact_percentage: Option<serde_json::Value>,
 }
 
 /// Untrusted nested token descriptor.
@@ -428,6 +438,8 @@ pub(crate) fn normalize_quote(
         .unwrap_or("okx")
         .to_string();
 
+    let price_impact_bps = parse_price_impact_bps(data.price_impact_percentage.as_ref())?;
+
     Ok(OkxNormalizedQuote {
         chain: request.chain().clone(),
         token_in: request.token_in().clone(),
@@ -436,7 +448,82 @@ pub(crate) fn normalize_quote(
         amount_out: to_amount,
         reference,
         observed_at_ms,
+        price_impact_bps,
     })
+}
+
+/// Parses the untrusted provider `priceImpactPercentage` value into absolute
+/// basis points. `None`/absent is unmodeled; a malformed present value fails
+/// closed rather than being silently dropped.
+fn parse_price_impact_bps(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<Bps>, OkxClientError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => return Err(OkxClientError::MalformedResponse),
+    };
+    percent_to_bps_ceil(&text).map(Some)
+}
+
+/// Converts a provider percentage string (for example `"-0.5"`) to an absolute
+/// basis-point value, rounding away from zero so a cap comparison is
+/// conservative. Rejects exponents, signs other than a leading `-`, and values
+/// that do not fit a `u16` basis-point count.
+fn percent_to_bps_ceil(value: &str) -> Result<Bps, OkxClientError> {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    if value.is_empty() {
+        return Err(OkxClientError::MalformedResponse);
+    }
+    let (integer, fraction) = match value.split_once('.') {
+        Some((integer, fraction)) => {
+            if fraction.is_empty() {
+                return Err(OkxClientError::MalformedResponse);
+            }
+            (integer, fraction)
+        }
+        None => (value, ""),
+    };
+    if integer.is_empty() || !integer.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OkxClientError::MalformedResponse);
+    }
+    if fraction.len() > 12 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(OkxClientError::MalformedResponse);
+    }
+    let integer: u128 = integer
+        .parse()
+        .map_err(|_| OkxClientError::MalformedResponse)?;
+    let whole_bps = integer
+        .checked_mul(100)
+        .ok_or(OkxClientError::MalformedResponse)?;
+    let fraction_bps = if fraction.is_empty() {
+        0
+    } else {
+        let digits = fraction.len() as u32;
+        let numerator: u128 = fraction
+            .parse()
+            .map_err(|_| OkxClientError::MalformedResponse)?;
+        let scale = 10u128
+            .checked_pow(digits)
+            .ok_or(OkxClientError::MalformedResponse)?;
+        let scaled = numerator
+            .checked_mul(100)
+            .ok_or(OkxClientError::MalformedResponse)?;
+        // ceil(numerator * 100 / scale): round away from zero.
+        scaled
+            .checked_add(scale - 1)
+            .ok_or(OkxClientError::MalformedResponse)?
+            / scale
+    };
+    let total = whole_bps
+        .checked_add(fraction_bps)
+        .ok_or(OkxClientError::MalformedResponse)?;
+    let total = u16::try_from(total).map_err(|_| OkxClientError::MalformedResponse)?;
+    Bps::new(total).map_err(|_| OkxClientError::MalformedResponse)
 }
 
 fn resolve_address<'a>(
@@ -807,7 +894,8 @@ mod tests {
                 "toTokenAddress":"0xbbbb",
                 "fromTokenAmount":"1000",
                 "toTokenAmount":"2500",
-                "quoteId":"q-1"
+                "quoteId":"q-1",
+                "priceImpactPercentage":"-0.5"
             }]
         }"#;
         let envelope: OkxQuoteEnvelope = serde_json::from_str(payload).expect("fixture");
@@ -816,6 +904,10 @@ mod tests {
         assert_eq!(normalized.amount_out(), 2_500);
         assert_eq!(normalized.reference(), "q-1");
         assert_eq!(normalized.observed_at_ms(), 123);
+        assert_eq!(
+            normalized.price_impact_bps(),
+            Some(Bps::new(50).expect("bps"))
+        );
 
         let debug = format!("{normalized:?}");
         assert!(!debug.contains("2500"));
@@ -829,5 +921,49 @@ mod tests {
         assert_eq!(provider.amount_out, 2_500);
         assert_eq!(provider.reference(), "q-1");
         assert_eq!(provider.observed_at_ms, 123);
+    }
+
+    #[test]
+    fn price_impact_percentage_parsing_is_exact_and_fail_closed() {
+        assert_eq!(percent_to_bps_ceil("0.5"), Ok(Bps::new(50).expect("bps")));
+        assert_eq!(percent_to_bps_ceil("-0.5"), Ok(Bps::new(50).expect("bps")));
+        assert_eq!(percent_to_bps_ceil("1"), Ok(Bps::new(100).expect("bps")));
+        assert_eq!(
+            percent_to_bps_ceil("100"),
+            Ok(Bps::new(10_000).expect("bps"))
+        );
+        // Round away from zero so a cap comparison is conservative.
+        assert_eq!(percent_to_bps_ceil("0.001"), Ok(Bps::new(1).expect("bps")));
+        assert_eq!(percent_to_bps_ceil("0.0001"), Ok(Bps::new(1).expect("bps")));
+        assert_eq!(percent_to_bps_ceil("0"), Ok(Bps::new(0).expect("bps")));
+        assert_eq!(percent_to_bps_ceil("0.0"), Ok(Bps::new(0).expect("bps")));
+
+        for malformed in ["", ".", "0.", ".5", "1e-3", "+1", "abc", "0.1234567890123"] {
+            assert_eq!(
+                percent_to_bps_ceil(malformed),
+                Err(OkxClientError::MalformedResponse),
+                "malformed impact {malformed:?} must fail closed"
+            );
+        }
+        // Above the u16 basis-point range.
+        assert_eq!(
+            percent_to_bps_ceil("656"),
+            Err(OkxClientError::MalformedResponse)
+        );
+
+        // Absent/null is unmodeled; a present non-scalar is malformed.
+        assert_eq!(parse_price_impact_bps(None), Ok(None));
+        assert_eq!(
+            parse_price_impact_bps(Some(&serde_json::Value::Null)),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_price_impact_bps(Some(&serde_json::json!(0.25))),
+            Ok(Some(Bps::new(25).expect("bps")))
+        );
+        assert_eq!(
+            parse_price_impact_bps(Some(&serde_json::json!(["x"]))),
+            Err(OkxClientError::MalformedResponse)
+        );
     }
 }

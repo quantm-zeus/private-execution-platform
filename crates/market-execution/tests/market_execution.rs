@@ -54,6 +54,30 @@ async fn trading_disabled_denies_before_signer_or_adapter() {
 }
 
 #[tokio::test]
+async fn non_local_router_source_denies_before_signer_or_adapter() {
+    // P84B: the local relay port must never sign an OKX-sourced quote; that
+    // path belongs to the P84C verified-proposal boundary.
+    let h = harness(true, Behavior::Accept, trust(), false);
+
+    let mut okx_request = request();
+    okx_request.router_source = agent_backend::RouterSource::Okx;
+
+    let outcome = h.port.execute(okx_request).await;
+
+    assert_eq!(outcome, Err(MarketExecutionError::Denied));
+    assert_eq!(
+        h.signer.calls.load(Ordering::SeqCst),
+        0,
+        "a non-Local source must be denied before signing"
+    );
+    assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 0);
+
+    // The same port still accepts the Local source, so the denial above is the
+    // source boundary and not an unrelated failure.
+    assert!(h.port.execute(request()).await.is_ok());
+}
+
+#[tokio::test]
 async fn policy_trade_size_exceeded_denies() {
     let mut trust_value = trust();
     trust_value.policy_context = PolicyContext::from_trusted_backend_state(
