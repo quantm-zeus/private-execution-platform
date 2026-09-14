@@ -475,6 +475,52 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         }
     }
 
+    /// Reconciles an already-submitted market order identified by the same
+    /// command parameters that produced it. Read-only: it never signs or submits.
+    ///
+    /// The deterministic preview identity is rebuilt from the same parameters
+    /// [`Self::execute_market_order`] uses (via `preview_intent`), so the
+    /// idempotency key handed to the port is byte-identical to the one the
+    /// execution used; a structural denial is returned without touching the port.
+    /// No quote is needed to derive the identity, so no [`MarketSnapshotSource`]
+    /// is consulted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_market_order(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+    ) -> BackendOutcome {
+        // Read the trusted clock once, exactly as `execute_market_order` does.
+        let now_ms = self.clock.now_ms();
+        let (intent, _amount_in) = match self.preview_intent(
+            channel,
+            token_in,
+            token_out,
+            side,
+            &amount,
+            max_slippage_bps,
+            max_price_impact_bps,
+        ) {
+            Ok(intent) => intent,
+            Err(BackendError::Denied) => return BackendOutcome::Denied,
+            Err(BackendError::Unavailable) => return BackendOutcome::Unavailable,
+        };
+        match self
+            .execution
+            .reconcile(&intent.idempotency_key, now_ms)
+            .await
+        {
+            Ok(outcome) => execution_outcome(outcome),
+            Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
+            Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
+        }
+    }
+
     /// Serves the read-only `get_quote` command from the exact local router.
     ///
     /// `get_quote` carries no side, so it quotes the exact-input direction:

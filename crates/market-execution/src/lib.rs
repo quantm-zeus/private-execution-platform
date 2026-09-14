@@ -51,7 +51,9 @@ use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
 };
 use async_trait::async_trait;
-use domain::{cmp_u128_products, mul_u128_wide, RoutePlan, TaxObservation, TradeIntent};
+use domain::{
+    cmp_u128_products, mul_u128_wide, IdempotencyKey, RoutePlan, TaxObservation, TradeIntent,
+};
 use execution_preview::{
     revalidate_pre_sign, AllowanceObservation, RevalidationInput, RevalidationOutcome,
     RouteBinding, WalletBalance,
@@ -275,6 +277,26 @@ where
             now_ms: request.now_ms,
         };
         map_outcome(self.relay.execute(input).await)
+    }
+
+    /// Reconciles a previously delegated attempt by its idempotency key.
+    ///
+    /// # Invariants
+    /// - **MR-1 (read-only).** This delegates to [`ExecutionRelay::reconcile`],
+    ///   which only queries/reconciles the process-local journal and the chain
+    ///   adapter. It never runs the policy/trust/revalidation gates, never signs,
+    ///   and never submits.
+    /// - **MR-2 (no fabricated fill).** The result goes through the same private
+    ///   [`map_outcome`]: a `Filled` is produced only from a relay
+    ///   `Confirmed { fill: Some }` observation carrying exact amounts; a
+    ///   confirmation without amounts, an ambiguous transport error, or a missing
+    ///   journal entry is `Unknown`, never a guessed fill.
+    async fn reconcile(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        map_outcome(self.relay.reconcile(idempotency_key, now_ms).await)
     }
 }
 

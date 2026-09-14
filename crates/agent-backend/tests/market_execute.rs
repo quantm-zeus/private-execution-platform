@@ -16,7 +16,7 @@ use agent_commands::{
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
-use domain::{OrderStatus, TradeIntent, TradeSide};
+use domain::{IdempotencyKey, OrderStatus, TradeIntent, TradeSide};
 use limit_engine::InMemoryLimitOrderStore;
 use market_types::{
     AtomicAmount, Bps, CpmmPoolState, FreshnessPolicy, FreshnessStatus, PoolId, PoolKindState,
@@ -172,39 +172,59 @@ impl MarketSnapshotSource for StaticSnapshot {
 /// Records the exact intent/quote handed to the port and returns a scripted result.
 struct RecordingExecution {
     result: Result<MarketExecutionOutcome, MarketExecutionError>,
+    reconcile_result: Result<MarketExecutionOutcome, MarketExecutionError>,
     seen: Mutex<Vec<(TradeIntent, RouteQuote, i64)>>,
+    reconcile_seen: Mutex<Vec<(IdempotencyKey, i64)>>,
 }
 
 impl RecordingExecution {
     fn filled(net_input: u128, net_output: u128) -> Self {
-        Self {
-            result: Ok(MarketExecutionOutcome::Filled {
+        Self::new(
+            Ok(MarketExecutionOutcome::Filled {
                 net_input,
                 net_output,
             }),
-            seen: Mutex::new(Vec::new()),
-        }
+            Ok(MarketExecutionOutcome::Unknown),
+        )
     }
 
     fn submitted() -> Self {
-        Self {
-            result: Ok(MarketExecutionOutcome::Submitted),
-            seen: Mutex::new(Vec::new()),
-        }
+        Self::new(
+            Ok(MarketExecutionOutcome::Submitted),
+            Ok(MarketExecutionOutcome::Unknown),
+        )
     }
 
     fn failed() -> Self {
-        Self {
-            result: Ok(MarketExecutionOutcome::Failed),
-            seen: Mutex::new(Vec::new()),
-        }
+        Self::new(
+            Ok(MarketExecutionOutcome::Failed),
+            Ok(MarketExecutionOutcome::Unknown),
+        )
     }
 
     fn failing(error: MarketExecutionError) -> Self {
+        Self::new(Err(error), Ok(MarketExecutionOutcome::Unknown))
+    }
+
+    fn new(
+        result: Result<MarketExecutionOutcome, MarketExecutionError>,
+        reconcile_result: Result<MarketExecutionOutcome, MarketExecutionError>,
+    ) -> Self {
         Self {
-            result: Err(error),
+            result,
+            reconcile_result,
             seen: Mutex::new(Vec::new()),
+            reconcile_seen: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Scripts the read-only reconcile result (execute is unchanged).
+    fn with_reconcile(
+        mut self,
+        reconcile_result: Result<MarketExecutionOutcome, MarketExecutionError>,
+    ) -> Self {
+        self.reconcile_result = reconcile_result;
+        self
     }
 
     fn calls(&self) -> usize {
@@ -217,6 +237,19 @@ impl RecordingExecution {
             .expect("lock")
             .last()
             .expect("call")
+            .clone()
+    }
+
+    fn reconcile_calls(&self) -> usize {
+        self.reconcile_seen.lock().expect("lock").len()
+    }
+
+    fn last_reconcile(&self) -> (IdempotencyKey, i64) {
+        self.reconcile_seen
+            .lock()
+            .expect("lock")
+            .last()
+            .expect("reconcile call")
             .clone()
     }
 }
@@ -232,6 +265,18 @@ impl MarketExecutionPort for RecordingExecution {
             .expect("lock")
             .push((request.intent, request.quote, request.now_ms));
         self.result
+    }
+
+    async fn reconcile(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        self.reconcile_seen
+            .lock()
+            .expect("lock")
+            .push((idempotency_key.clone(), now_ms));
+        self.reconcile_result
     }
 }
 
@@ -600,4 +645,201 @@ async fn execution_types_debug_is_payload_free() {
     assert!(!rendered.contains("1234"));
     assert!(!rendered.contains("5678"));
     assert!(!format!("{:?}", MarketExecutionError::Denied).contains("denied payload"));
+}
+
+/// Formats the exact parameters a `reconcile_market_order` call needs for the
+/// same command that `execute` used.
+fn reconcile_args(
+    amount: AmountSpec,
+) -> (
+    agent_commands::AssetRef,
+    agent_commands::AssetRef,
+    TradeSide,
+    AmountSpec,
+    Option<u16>,
+    Option<u16>,
+) {
+    (
+        AssetRef::new(ChainId::Base, "USDC").expect("in"),
+        AssetRef::new(ChainId::Base, "TOKEN").expect("out"),
+        TradeSide::Buy,
+        amount,
+        None,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn reconcile_market_order_uses_the_same_identity_as_execute() {
+    let port = Arc::new(RecordingExecution::submitted());
+    let backend = backend_with(
+        Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
+        port.clone(),
+    );
+    let outcome = run(
+        &backend,
+        execute("USDC", "TOKEN", AmountSpec::TokenAtomic(AMOUNT)),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "submitted" } }))
+    );
+
+    let (token_in, token_out, side, amount, slippage, impact) =
+        reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
+    let reconciled = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            token_in,
+            token_out,
+            side,
+            amount,
+            slippage,
+            impact,
+        )
+        .await;
+
+    assert_eq!(
+        reconciled,
+        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "unknown" } }))
+    );
+    assert_eq!(port.calls(), 1);
+    assert_eq!(port.reconcile_calls(), 1);
+    let (executed_intent, _, executed_now) = port.last();
+    let (reconcile_key, reconcile_now) = port.last_reconcile();
+    assert_eq!(
+        reconcile_key, executed_intent.idempotency_key,
+        "reconcile must re-derive the byte-identical deterministic identity"
+    );
+    assert_eq!(reconcile_now, executed_now);
+    assert_eq!(reconcile_now, NOW);
+}
+
+#[tokio::test]
+async fn reconcile_market_order_default_port_is_unknown() {
+    // No `.with_market_execution(...)`: the default `UnavailableMarketExecution`
+    // falls through to the trait's default `reconcile`, which fails closed to
+    // `Unknown` rather than claiming an observation.
+    let reads = AgentReadBackend::new(FakeOrders, UnavailablePortfolioReadModel::new());
+    let backend = TradingAgentBackend::new(
+        reads,
+        Arc::new(InMemoryLimitOrderStore::new()),
+        config(),
+        Arc::new(FixedClock(NOW)),
+        Arc::new(OneAssetValuation { asset: usdc() }),
+    );
+    let (token_in, token_out, side, amount, slippage, impact) =
+        reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
+    let outcome = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            token_in,
+            token_out,
+            side,
+            amount,
+            slippage,
+            impact,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "unknown" } }))
+    );
+}
+
+#[tokio::test]
+async fn reconcile_market_order_surfaces_a_filled_observation() {
+    let port = Arc::new(RecordingExecution::submitted().with_reconcile(Ok(
+        MarketExecutionOutcome::Filled {
+            net_input: 999,
+            net_output: 123,
+        },
+    )));
+    let backend = backend_with(
+        Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
+        port.clone(),
+    );
+    let (token_in, token_out, side, amount, slippage, impact) =
+        reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
+    let outcome = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            token_in,
+            token_out,
+            side,
+            amount,
+            slippage,
+            impact,
+        )
+        .await;
+    let BackendOutcome::Value(value) = outcome else {
+        panic!("expected an execution value, got {outcome:?}");
+    };
+    assert_eq!(
+        value["execution"]["state"],
+        Value::String("filled".to_string())
+    );
+    assert_eq!(amount_at(&value, &["execution", "net_input"]), 999);
+    assert_eq!(amount_at(&value, &["execution", "net_output"]), 123);
+    assert_eq!(port.calls(), 0, "reconcile must not require an execute");
+}
+
+#[tokio::test]
+async fn reconcile_market_order_denies_structural_mismatch_without_the_port() {
+    let port = Arc::new(RecordingExecution::submitted());
+    let backend = backend_with(
+        Arc::new(StaticSnapshot::new(assessment(token(), 0, 0))),
+        port.clone(),
+    );
+    let (token_in, token_out, side, amount, slippage, impact) =
+        reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
+
+    // Same asset.
+    let same_asset = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            token_in.clone(),
+            token_in.clone(),
+            side,
+            amount,
+            slippage,
+            impact,
+        )
+        .await;
+    assert_eq!(same_asset, BackendOutcome::Denied);
+
+    // A USD amount needs a trusted conversion this layer does not perform.
+    let usd = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            token_in.clone(),
+            token_out.clone(),
+            side,
+            AmountSpec::UsdMicros(1),
+            slippage,
+            impact,
+        )
+        .await;
+    assert_eq!(usd, BackendOutcome::Denied);
+
+    // A foreign-chain pair.
+    let foreign = backend
+        .reconcile_market_order(
+            AgentChannel::Mcp,
+            AssetRef::new(ChainId::Solana, "USDC").expect("in"),
+            token_out,
+            side,
+            amount,
+            slippage,
+            impact,
+        )
+        .await;
+    assert_eq!(foreign, BackendOutcome::Denied);
+
+    assert_eq!(
+        port.reconcile_calls(),
+        0,
+        "denied reconciles must never reach the port"
+    );
 }
