@@ -195,7 +195,7 @@ fn padded_tamper_and_length_change_fail_closed() {
         .seal_padded(1, &frame, bucket_for(real.len()))
         .unwrap();
 
-    // Flip a byte of the ciphertext (covers the encrypted length prefix region).
+    // Flip a byte of the ciphertext (covers the encrypted frame header/marker region).
     let mut tampered = envelope.clone();
     tampered.ciphertext[0] ^= 0x01;
     assert_eq!(
@@ -371,13 +371,18 @@ fn padded_frame_malformed_error_is_redacted() {
 
 /// The marker is a structural domain separator: an unpadded frame (which lacks
 /// the authenticated magic) is never silently reinterpreted as a shorter padded
-/// payload. This pins the P74 review MEDIUM.
+/// payload. This pins the P74 review MEDIUM; the payloads are deliberately at
+/// least `PADDED_LEN_PREFIX` bytes long so they pass the length gate and are
+/// rejected only by the magic check (a shorter payload would be length-gated).
 #[test]
 fn unpadded_payload_is_never_misread_as_padded() {
     let (mut client, mut server) = setup_test_sessions();
 
-    // Payload bytes that look like the old unmarked length-prefix format.
-    let tricky = vec![0u8, 0x00, 0x00, 0x02, 0xAA, 0xBB];
+    // Eight bytes that parse as the old unmarked format (`real_len = 2`,
+    // two payload bytes, two zero padding bytes): without the magic check this
+    // would be accepted as a shorter padded payload `[0xAA, 0xBB]`.
+    let tricky = vec![0u8, 0x00, 0x00, 0x02, 0xAA, 0xBB, 0x00, 0x00];
+    assert!(tricky.len() >= PADDED_LEN_PREFIX);
     let frame = StreamFrame::new(StreamFrameKind::Delta, 1, tricky).unwrap();
     let envelope = client.seal_frame(&frame).expect("seal unpadded");
     assert_eq!(
@@ -385,9 +390,10 @@ fn unpadded_payload_is_never_misread_as_padded() {
         Err(StreamFrameError::PaddedFrameMalformed)
     );
 
-    // An all-zero 4-byte payload likewise cannot be read as an empty padded frame.
+    // An all-zero payload of the same length would parse as an empty padded
+    // payload without the magic check.
     let (mut client2, mut server2) = setup_test_sessions();
-    let zero = StreamFrame::new(StreamFrameKind::Delta, 1, vec![0u8; 4]).unwrap();
+    let zero = StreamFrame::new(StreamFrameKind::Delta, 1, vec![0u8; PADDED_LEN_PREFIX]).unwrap();
     let envelope2 = client2.seal_frame(&zero).expect("seal unpadded");
     assert_eq!(
         server2.receive_padded(&envelope2),
@@ -428,4 +434,11 @@ fn padded_buckets_match_the_real_privacy_policy() {
         let received = server.receive_padded(&envelope).expect("receive at bucket");
         assert_eq!(received.payload(), payload.as_slice());
     }
+
+    // Above the largest bucket the policy reports `padded = false` and returns the
+    // real length; the producer must fall back to the unpadded `seal` path rather
+    // than forwarding the exact length (which would be valid but leak the length).
+    let oversize = policy.pad(4096 + 1);
+    assert!(!oversize.padded);
+    assert_eq!(oversize.padded_len, 4096 + 1);
 }
