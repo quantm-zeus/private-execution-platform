@@ -167,9 +167,13 @@ impl BinExactOutputQuote {
 /// Classifies a Bin exact-input failure for the minimal-input search.
 fn bin_probe_class(err: &BinSimulationError) -> ProbeClass {
     match err {
-        BinSimulationError::ZeroOutputAmount
-        | BinSimulationError::ZeroEffectiveInput
-        | BinSimulationError::InvariantViolated => ProbeClass::Low,
+        BinSimulationError::ZeroOutputAmount | BinSimulationError::ZeroEffectiveInput => {
+            ProbeClass::Low
+        }
+        // The Bin kernel does not currently emit `InvariantViolated`, but if it
+        // ever does it must be treated as a hole (fail closed once the feasible
+        // region has begun), never as a monotonically-low failure.
+        BinSimulationError::InvariantViolated => ProbeClass::Hole,
         BinSimulationError::BinCrossingExceeded | BinSimulationError::ArithmeticOverflow => {
             ProbeClass::High
         }

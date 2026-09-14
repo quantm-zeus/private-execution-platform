@@ -630,3 +630,74 @@ fn panic_fuzz_100k_never_panics_and_ok_quotes_are_sound() {
         "fuzz must exercise the unreachable path"
     );
 }
+
+/// Regression for the P73 review CRITICAL: a *valid* CLMM pool can make the
+/// exact-input kernel return `InvariantViolated` in the middle of an otherwise
+/// `Ok` input range (a rounding artifact when a swap crosses into a
+/// much-larger-liquidity range with a small residual). That hole breaks the
+/// feasibility-interval lemma the minimal-input search relies on. The inversion
+/// must fail closed rather than return a larger (non-minimal) input that still
+/// covers the target.
+#[test]
+fn mid_interval_invariant_hole_fails_closed_instead_of_a_non_minimal_quote() {
+    let (t0, t1) = sample_assets();
+    for (l2_shift, fee) in [(70u32, 0u16), (70, 30), (75, 30), (80, 3000)] {
+        let l1: u128 = 1_000_000;
+        let l2: u128 = 1u128 << l2_shift;
+        let pool = ClmmPoolState {
+            token_0: t0.clone(),
+            token_1: t1.clone(),
+            decimals_0: 9,
+            decimals_1: 6,
+            tick_spacing: 2,
+            current_tick: 1,
+            sqrt_price_x64: sqrt_price_from_tick_index(1).unwrap(),
+            liquidity: l1,
+            fee_bps: Bps::new(fee).unwrap(),
+            ticks: vec![
+                ClmmTick::new(-2, 0, 0),
+                ClmmTick::new(0, l2 - l1, l1 as i128 - l2 as i128),
+                ClmmTick::new(2, 0, 0),
+            ],
+        };
+        pool.validate().expect("valid pool");
+        let before = pool.clone();
+
+        // Independent scan: an Ok output below the hole, the hole, then an Ok
+        // input above it. `out_before` is a target whose true minimal input sits
+        // below the hole.
+        let mut out_before: Option<u128> = None;
+        let mut saw_hole = false;
+        let mut saw_ok_after_hole = false;
+        for g in 1..=200_000u128 {
+            match exact_input(&pool, &t0, g) {
+                Ok(out) => {
+                    if saw_hole {
+                        saw_ok_after_hole = true;
+                        break;
+                    }
+                    out_before = Some(out);
+                }
+                Err(ClmmSimulationError::InvariantViolated) => saw_hole = true,
+                Err(other) => panic!("unexpected error at g={g}: {other:?}"),
+            }
+        }
+        assert!(
+            saw_hole && saw_ok_after_hole,
+            "fixture must contain a mid-interval hole followed by Ok (l2=2^{l2_shift}, fee={fee})"
+        );
+        let target = out_before.expect("an Ok output below the hole");
+
+        let result = simulate_clmm_exact_output(
+            &pool,
+            &ClmmExactOutputRequest::new(t0.clone(), AtomicAmount::new(target)),
+        );
+        // Fail closed: never a non-minimal quote.
+        assert_eq!(
+            result,
+            Err(ClmmSimulationError::InvariantViolated),
+            "a mid-interval hole must fail closed (l2=2^{l2_shift}, fee={fee})"
+        );
+        assert_eq!(pool, before, "the pool must not be mutated");
+    }
+}

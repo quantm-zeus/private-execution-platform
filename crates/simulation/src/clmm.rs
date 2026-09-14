@@ -156,6 +156,13 @@ pub(crate) enum ProbeClass {
     Low,
     /// High-end failure: the input is above the feasible ceiling.
     High,
+    /// A non-terminal hole in the feasible region: the exact-input kernel
+    /// rejected an input that sits *between* `Ok` inputs (for example a
+    /// mid-interval `InvariantViolated` rounding artifact). A hole is tolerated
+    /// only before any `Ok` input has been observed; once the feasible region has
+    /// begun, a hole contradicts monotonicity and the search fails closed rather
+    /// than risk returning a non-minimal input.
+    Hole,
     /// Any other failure: abort the search fail-closed.
     Unexpected,
 }
@@ -193,11 +200,17 @@ pub(crate) fn find_min_gross_input<E>(
     classify: impl Fn(&E) -> ProbeClass,
 ) -> Result<MinimalInputSearch, E> {
     // --- 1. Locate a covering upper bound `hi`. ---
+    //
+    // `seen_ok` records whether any probe has succeeded. A `Hole` is only
+    // tolerated while `!seen_ok`; afterwards it is a monotonicity contradiction
+    // and the search fails closed.
+    let mut seen_ok = false;
     let mut prev: u128 = 0;
     let mut g: u128 = 1;
     let hi: u128 = loop {
         match f(g) {
             Ok(out) => {
+                seen_ok = true;
                 if out >= target {
                     break g;
                 }
@@ -205,6 +218,12 @@ pub(crate) fn find_min_gross_input<E>(
             }
             Err(err) => match classify(&err) {
                 ProbeClass::Low => prev = g,
+                ProbeClass::Hole => {
+                    if seen_ok {
+                        return Err(err);
+                    }
+                    prev = g;
+                }
                 ProbeClass::High => {
                     // `g` is above the ceiling while `prev` is not: binary-search
                     // the smallest high-error input `x` in `(prev, g]`.
@@ -214,10 +233,19 @@ pub(crate) fn find_min_gross_input<E>(
                         // `high >= lo + 2`, so `mid >= lo + 1 >= 1`: never zero.
                         let mid = lo + (high - lo) / 2;
                         match f(mid) {
-                            Ok(_) => lo = mid,
+                            Ok(_) => {
+                                seen_ok = true;
+                                lo = mid;
+                            }
                             Err(inner) => match classify(&inner) {
                                 ProbeClass::High => high = mid,
                                 ProbeClass::Low => lo = mid,
+                                ProbeClass::Hole => {
+                                    if seen_ok {
+                                        return Err(inner);
+                                    }
+                                    lo = mid;
+                                }
                                 ProbeClass::Unexpected => return Err(inner),
                             },
                         }
@@ -238,6 +266,12 @@ pub(crate) fn find_min_gross_input<E>(
                         }
                         Err(inner) => match classify(&inner) {
                             ProbeClass::Low => return Ok(MinimalInputSearch::Unreachable),
+                            ProbeClass::Hole => {
+                                if seen_ok {
+                                    return Err(inner);
+                                }
+                                return Ok(MinimalInputSearch::Unreachable);
+                            }
                             ProbeClass::High => return Ok(MinimalInputSearch::Invariant),
                             ProbeClass::Unexpected => return Err(inner),
                         },
@@ -265,7 +299,13 @@ pub(crate) fn find_min_gross_input<E>(
         let mid = lo + (bound - lo) / 2;
         let covers = match f(mid) {
             Ok(out) => out >= target,
-            Err(_) => false,
+            // A hole, ceiling, or unexpected failure inside `[1, hi]` means the
+            // predicate is no longer monotone, so fail closed instead of risking a
+            // non-minimal result. A genuine low-end failure is a legitimate "no".
+            Err(err) => match classify(&err) {
+                ProbeClass::Low => false,
+                ProbeClass::Hole | ProbeClass::High | ProbeClass::Unexpected => return Err(err),
+            },
         };
         if covers {
             bound = mid;
@@ -289,7 +329,7 @@ pub(crate) fn find_min_gross_input<E>(
             }
             Err(err) => match classify(&err) {
                 ProbeClass::Low => {}
-                ProbeClass::High | ProbeClass::Unexpected => return Err(err),
+                ProbeClass::Hole | ProbeClass::High | ProbeClass::Unexpected => return Err(err),
             },
         }
     }
@@ -300,9 +340,10 @@ pub(crate) fn find_min_gross_input<E>(
 /// Classifies a CLMM exact-input failure for the minimal-input search.
 fn clmm_probe_class(err: &ClmmSimulationError) -> ProbeClass {
     match err {
-        ClmmSimulationError::ZeroOutputAmount
-        | ClmmSimulationError::ZeroEffectiveInput
-        | ClmmSimulationError::InvariantViolated => ProbeClass::Low,
+        ClmmSimulationError::ZeroOutputAmount | ClmmSimulationError::ZeroEffectiveInput => {
+            ProbeClass::Low
+        }
+        ClmmSimulationError::InvariantViolated => ProbeClass::Hole,
         ClmmSimulationError::TickCrossingExceeded | ClmmSimulationError::ArithmeticOverflow => {
             ProbeClass::High
         }
