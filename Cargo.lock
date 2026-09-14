@@ -1444,11 +1444,14 @@ dependencies = [
  "execution-preview",
  "execution-relay",
  "market-types",
+ "okx-client",
  "policy",
  "privy",
+ "provider-verification",
  "routing",
  "simulation",
  "tax-engine",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -2152,6 +2155,20 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "provider-verification"
+version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "domain",
+ "execution-preview",
+ "market-types",
+ "serde_json",
+ "sha2 0.11.0",
+ "tax-engine",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

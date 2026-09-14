@@ -43,6 +43,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod okx;
+
+pub use okx::{
+    ApprovedProviderSink, OkxExecutionConfig, ProviderProposalError, ProviderProposalSource,
+    UnavailableApprovedProviderSink, UnavailableProviderProposalSource,
+    VerifiedProviderExecutionPort,
+};
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;

@@ -16,10 +16,13 @@ domain.workspace = true
 execution-preview.workspace = true
 execution-relay.workspace = true
 market-types.workspace = true
+okx-client.workspace = true
 policy.workspace = true
 privy.workspace = true
+provider-verification.workspace = true
 simulation.workspace = true
 tax-engine.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 agent-commands.workspace = true
