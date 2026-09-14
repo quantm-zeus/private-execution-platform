@@ -41,3 +41,8 @@ getrandom = "0.2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+# Interop tests drive the real padding policy; the library itself has no
+# `privacy` edge (producers pass the numeric bucket into `seal_padded`).
+privacy.workspace = true

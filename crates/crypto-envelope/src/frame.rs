@@ -46,12 +46,20 @@ pub const MIN_CIPHERTEXT_LEN: usize = MIN_FRAME_LEN + AEAD_TAG_LEN;
 /// Maximum valid ciphertext length: header + 1 MiB payload + AEAD tag (1,048,606 bytes).
 pub const MAX_CIPHERTEXT_LEN: usize = MAX_FRAME_LEN + AEAD_TAG_LEN;
 
-/// Bytes of the real-length prefix inside a padded payload.
+/// Authenticated magic marker at the start of a padded inner payload.
 ///
-/// A padded frame's inner plaintext is `[real_len: u32 BE][payload][0x00 ...]`,
-/// so the prefix accounts for the length field while the real payload remains
-/// recoverable (`real_len + PADDED_LEN_PREFIX <= padded_payload_len`).
-pub const PADDED_LEN_PREFIX: usize = 4;
+/// A padded frame's inner plaintext is
+/// `[PADDED_MAGIC][real_len: u32 BE][payload][0x00 ...]`. The marker structurally
+/// separates padded frames from arbitrary unpadded payloads: `receive_padded`
+/// rejects any frame lacking the marker, so an unpadded frame can never be
+/// silently reinterpreted as a shorter padded payload.
+pub const PADDED_MAGIC: [u8; 4] = *b"PAD1";
+
+/// Bytes of the padded-payload header (`PADDED_MAGIC` + the real length).
+///
+/// The header accounts for the marker and the length field while the real
+/// payload remains recoverable (`real_len + PADDED_LEN_PREFIX <= padded_payload_len`).
+pub const PADDED_LEN_PREFIX: usize = PADDED_MAGIC.len() + 4;
 
 // =========================================================================
 // Frame Kind
@@ -612,8 +620,8 @@ impl StreamFrameCodec {
 
     /// Seals `frame` with its inner payload expanded to exactly `padded_payload_len`.
     ///
-    /// The inner plaintext is `[real_len: u32 BE][payload][0x00 padding]`, total
-    /// `padded_payload_len`; the whole thing is AEAD-sealed, so the wire ciphertext
+    /// The inner plaintext is `[PADDED_MAGIC][real_len: u32 BE][payload][0x00 padding]`,
+    /// total `padded_payload_len`; the whole thing is AEAD-sealed, so the wire ciphertext
     /// length hides the real payload length. `padded_payload_len` must satisfy
     /// `real_len + PADDED_LEN_PREFIX <= padded_payload_len <= effective_max_payload_len()`;
     /// otherwise `PayloadTooLarge` and no envelope is produced (the session is unchanged).
@@ -658,6 +666,7 @@ impl StreamFrameCodec {
             u32::try_from(real_len).map_err(|_| StreamFrameError::PayloadTooLarge)?;
 
         let mut padded = Vec::with_capacity(padded_payload_len);
+        padded.extend_from_slice(&PADDED_MAGIC);
         padded.extend_from_slice(&real_len_u32.to_be_bytes());
         padded.extend_from_slice(frame.payload());
         padded.resize(padded_payload_len, 0);
@@ -674,7 +683,7 @@ impl StreamFrameCodec {
     ///
     /// Performs the same preflight/AEAD/decode/sequence-binding steps as
     /// [`StreamFrameCodec::receive`], then parses the authenticated padded payload:
-    /// the first `PADDED_LEN_PREFIX` bytes are `real_len` (u32 BE);
+    /// it must start with [`PADDED_MAGIC`], followed by `real_len` (u32 BE);
     /// `real_len + PADDED_LEN_PREFIX <= payload.len()` and every trailing byte must be
     /// zero, else `PaddedFrameMalformed` (fail closed; the replay window is not
     /// advanced). The returned frame has the real payload and the original
@@ -720,7 +729,13 @@ impl StreamFrameCodec {
         if payload.len() < PADDED_LEN_PREFIX {
             return Err(StreamFrameError::PaddedFrameMalformed);
         }
-        let len_bytes: [u8; PADDED_LEN_PREFIX] = payload[..PADDED_LEN_PREFIX]
+        // Structural domain separation: a padded payload must carry the
+        // authenticated marker, so an arbitrary unpadded payload is never
+        // silently reinterpreted as a shorter padded one.
+        if payload[..PADDED_MAGIC.len()] != PADDED_MAGIC {
+            return Err(StreamFrameError::PaddedFrameMalformed);
+        }
+        let len_bytes: [u8; 4] = payload[PADDED_MAGIC.len()..PADDED_LEN_PREFIX]
             .try_into()
             .map_err(|_| StreamFrameError::PaddedFrameMalformed)?;
         let real_len = u32::from_be_bytes(len_bytes) as usize;

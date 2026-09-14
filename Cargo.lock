@@ -536,6 +536,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "hpke",
+ "privacy",
  "rand_chacha 0.10.0",
  "sha2 0.11.0",
  "thiserror 2.0.20",

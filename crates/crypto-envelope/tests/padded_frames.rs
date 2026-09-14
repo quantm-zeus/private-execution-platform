@@ -4,9 +4,10 @@
 //! the padding lives inside the AEAD plaintext, so the wire ciphertext length
 //! reveals only the ladder bucket, never the real payload length.
 //!
-//! The `crypto-envelope` crate intentionally has no `privacy` dependency, so the
-//! bucket ladder is mirrored here as plain numbers; production callers compute
-//! `padded_payload_len` with `privacy::PaddingPolicy::pad(real_len + PADDED_LEN_PREFIX)`.
+//! The `crypto-envelope` crate intentionally has no `privacy` dependency (the
+//! producer passes the numeric bucket in), but the `privacy` dev-dependency lets
+//! one test drive the real `PaddingPolicy` to prove the bucket arithmetic lines
+//! up with `seal_padded`.
 
 use crypto_envelope::hpke::{
     initiator_establish, responder_establish, HpkeHandshakeOffer, HpkeInitiatorSession,
@@ -14,7 +15,7 @@ use crypto_envelope::hpke::{
 };
 use crypto_envelope::{
     Envelope, StreamFrame, StreamFrameError, StreamFrameKind, AEAD_TAG_LEN, FRAME_HEADER_LEN,
-    FRAME_VERSION, MAX_FRAME_PAYLOAD_LEN, MIN_CIPHERTEXT_LEN, PADDED_LEN_PREFIX,
+    FRAME_VERSION, MAX_FRAME_PAYLOAD_LEN, MIN_CIPHERTEXT_LEN, PADDED_LEN_PREFIX, PADDED_MAGIC,
 };
 
 const TEST_KID: [u8; 16] = [0x55u8; 16];
@@ -114,10 +115,14 @@ fn padded_ciphertext_length_is_bucket_not_real_length() {
     assert_ne!(real_a.len(), real_b.len());
 
     // The unpadded reader exposes the authenticated inner padded frame: its
-    // payload is exactly the bucket, with the length prefix and zero padding.
+    // payload is exactly the bucket, with the marker, length header, and zero padding.
     let inner = server.receive_frame(&env_a).expect("unpadded read");
     assert_eq!(inner.payload().len(), bucket);
-    assert_eq!(&inner.payload()[..PADDED_LEN_PREFIX], &10u32.to_be_bytes());
+    assert_eq!(&inner.payload()[..PADDED_MAGIC.len()], &PADDED_MAGIC);
+    assert_eq!(
+        &inner.payload()[PADDED_MAGIC.len()..PADDED_LEN_PREFIX],
+        &10u32.to_be_bytes()
+    );
     assert_eq!(
         &inner.payload()[PADDED_LEN_PREFIX..PADDED_LEN_PREFIX + real_a.len()],
         real_a.as_slice()
@@ -215,53 +220,63 @@ fn padded_tamper_and_length_change_fail_closed() {
 
 fn malformed_len_payload() -> Vec<u8> {
     // Claims a 32-byte real payload but only carries 10 trailing bytes.
-    let mut payload = 32u32.to_be_bytes().to_vec();
+    let mut payload = PADDED_MAGIC.to_vec();
+    payload.extend_from_slice(&32u32.to_be_bytes());
     payload.extend_from_slice(&[0u8; 10]);
     payload
 }
 
 fn malformed_nonzero_padding_payload() -> Vec<u8> {
     // real_len = 4, four real bytes, then a nonzero byte inside the padding region.
-    let mut payload = 4u32.to_be_bytes().to_vec();
+    let mut payload = PADDED_MAGIC.to_vec();
+    payload.extend_from_slice(&4u32.to_be_bytes());
     payload.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
     payload.extend_from_slice(&[0x00, 0x00, 0x01]);
     payload
 }
 
 /// Case 6: malformed padded payloads are rejected and advance no replay state.
+///
+/// The legitimate frame is sealed at a *lower* sequence (900/901/902) before the
+/// malformed one (1000/1001/1002), and the server sees the malformed frame first.
+/// If the rejected frame had advanced the replay window, the older legitimate
+/// frame would be `StaleSequence` instead of opening. (A fresh session pair per
+/// variant keeps the sender's monotonic sequence valid.)
 #[test]
 fn padded_malformed_payloads_rejected_without_replay_advance() {
-    let (mut client, mut server) = setup_test_sessions();
-
-    // Seal raw, authenticated plaintext carrying a malformed padded payload so
-    // that AEAD succeeds and only the padding parse can reject it.
-    let mut sequence = 0u64;
-    for malformed in [
+    let malformed_payloads = [
         malformed_len_payload(),
         malformed_nonzero_padding_payload(),
         vec![0u8; PADDED_LEN_PREFIX - 1],
-    ] {
-        sequence += 1;
-        let frame = StreamFrame::new(StreamFrameKind::Batch, sequence, malformed).unwrap();
-        let encoded = frame.encode().unwrap();
-        let envelope = client.seal(sequence, &encoded).unwrap();
+    ];
+
+    for (index, malformed) in malformed_payloads.into_iter().enumerate() {
+        let (mut client, mut server) = setup_test_sessions();
+        let lower = 900u64 + index as u64;
+        let higher = 1000u64 + index as u64;
+
+        let good_payload = payload_of_len(12);
+        let good = StreamFrame::new(StreamFrameKind::Batch, lower, good_payload.clone()).unwrap();
+        let good_env = client
+            .seal_padded(lower, &good, bucket_for(good_payload.len()))
+            .unwrap();
+
+        // Raw, authenticated plaintext carrying a malformed padded payload so that
+        // AEAD succeeds and only the padding parse can reject it.
+        let bad_frame = StreamFrame::new(StreamFrameKind::Batch, higher, malformed).unwrap();
+        let bad_encoded = bad_frame.encode().unwrap();
+        let bad_env = client.seal(higher, &bad_encoded).unwrap();
 
         assert_eq!(
-            server.receive_padded(&envelope),
+            server.receive_padded(&bad_env),
             Err(StreamFrameError::PaddedFrameMalformed)
         );
 
-        // A subsequent legitimate padded frame at the next sequence still works.
-        sequence += 1;
-        let good_payload = payload_of_len(12);
-        let good =
-            StreamFrame::new(StreamFrameKind::Batch, sequence, good_payload.clone()).unwrap();
-        let good_env = client
-            .seal_padded(sequence, &good, bucket_for(good_payload.len()))
-            .unwrap();
+        // The lower, never-seen legitimate frame still opens, proving the rejected
+        // frame did not advance the replay window.
         let received = server
             .receive_padded(&good_env)
-            .expect("legit after malformed");
+            .expect("lower sequence still opens");
         assert_eq!(received.payload(), good_payload.as_slice());
     }
 }
@@ -352,4 +367,65 @@ fn padded_frame_malformed_error_is_redacted() {
     let envelope: Envelope = client.seal_padded(1, &frame, PADDED_LEN_PREFIX).unwrap();
     let envelope_debug = format!("{envelope:?}");
     assert!(envelope_debug.contains("[REDACTED]"));
+}
+
+/// The marker is a structural domain separator: an unpadded frame (which lacks
+/// the authenticated magic) is never silently reinterpreted as a shorter padded
+/// payload. This pins the P74 review MEDIUM.
+#[test]
+fn unpadded_payload_is_never_misread_as_padded() {
+    let (mut client, mut server) = setup_test_sessions();
+
+    // Payload bytes that look like the old unmarked length-prefix format.
+    let tricky = vec![0u8, 0x00, 0x00, 0x02, 0xAA, 0xBB];
+    let frame = StreamFrame::new(StreamFrameKind::Delta, 1, tricky).unwrap();
+    let envelope = client.seal_frame(&frame).expect("seal unpadded");
+    assert_eq!(
+        server.receive_padded(&envelope),
+        Err(StreamFrameError::PaddedFrameMalformed)
+    );
+
+    // An all-zero 4-byte payload likewise cannot be read as an empty padded frame.
+    let (mut client2, mut server2) = setup_test_sessions();
+    let zero = StreamFrame::new(StreamFrameKind::Delta, 1, vec![0u8; 4]).unwrap();
+    let envelope2 = client2.seal_frame(&zero).expect("seal unpadded");
+    assert_eq!(
+        server2.receive_padded(&envelope2),
+        Err(StreamFrameError::PaddedFrameMalformed)
+    );
+}
+
+/// The real `privacy::PaddingPolicy` buckets are accepted end-to-end: the producer
+/// flow `pad(real_len + PADDED_LEN_PREFIX)` produces exactly the inner payload
+/// length the codec seals to.
+#[test]
+fn padded_buckets_match_the_real_privacy_policy() {
+    use privacy::PaddingPolicy;
+
+    let policy = PaddingPolicy::new(vec![64, 256, 1024, 4096]).expect("ladder");
+    let (mut client, mut server) = setup_test_sessions();
+    let mut sequence = 0u64;
+
+    for real_len in [0usize, 1, 10, 60, 61, 252, 1000, 4000] {
+        sequence += 1;
+        let payload = payload_of_len(real_len);
+        let frame = StreamFrame::new(StreamFrameKind::Snapshot, sequence, payload.clone()).unwrap();
+        let need = real_len + PADDED_LEN_PREFIX;
+        let decision = policy.pad(need);
+        assert!(
+            decision.padded && decision.padded_len >= need,
+            "test ladder must cover real_len={real_len}"
+        );
+
+        let envelope = client
+            .seal_padded(sequence, &frame, decision.padded_len)
+            .expect("seal at policy bucket");
+        assert_eq!(
+            envelope.ciphertext.len(),
+            FRAME_HEADER_LEN + decision.padded_len + AEAD_TAG_LEN
+        );
+
+        let received = server.receive_padded(&envelope).expect("receive at bucket");
+        assert_eq!(received.payload(), payload.as_slice());
+    }
 }
