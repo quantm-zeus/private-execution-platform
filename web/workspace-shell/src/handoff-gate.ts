@@ -54,7 +54,13 @@ export class HandoffGate {
     if (typeof token !== "string" || token.length === 0) return null;
     if (token !== this.token) return null;
     this.delivered = true;
-    return this.session;
+    // Hand off the only retained reference and drop the shell's plaintext copy:
+    // `delivered` enforces one-shot, but retaining the payload AEAD keys for the
+    // whole unlocked session would widen exposure for no benefit.
+    const session = this.session;
+    this.session = null;
+    this.token = null;
+    return session;
   }
 
   /** Drop every reference. A disarmed gate refuses every `take`. */

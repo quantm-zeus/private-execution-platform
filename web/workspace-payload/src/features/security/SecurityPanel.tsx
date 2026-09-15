@@ -1,4 +1,4 @@
-import { Show, createMemo, createSignal, type Component } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, on, type Component } from "solid-js";
 import { formatUsd } from "../../core/format";
 import { workspaceError } from "../../core/errors";
 import type { WithdrawalReview } from "../../contracts/execution";
@@ -31,6 +31,17 @@ export const SecurityPanel: Component = () => {
   const [amount, setAmount] = createSignal("");
   const [phrase, setPhrase] = createSignal("");
   const [review, setReview] = createSignal<WithdrawalReview | null>(null);
+  // Focus management for the withdrawal review: entering it moves focus into the
+  // alertdialog (announced), and Cancel returns focus to the review button
+  // instead of dropping it on <body>.
+  let reviewButtonRef: HTMLButtonElement | undefined;
+  let reviewDialogRef: HTMLDivElement | undefined;
+  createEffect(
+    on(review, (now, prev) => {
+      if (now && !prev) queueMicrotask(() => reviewDialogRef?.focus());
+      else if (!now && prev) queueMicrotask(() => reviewButtonRef?.focus());
+    }),
+  );
   // One key per reviewed withdrawal so a failed/retried submit is idempotent.
   // It survives a cancel/re-review of an *unconfirmed* (UNKNOWN) submission so
   // an already-accepted withdrawal cannot be duplicated; a determinate
@@ -254,7 +265,11 @@ export const SecurityPanel: Component = () => {
                   </span>
                 </label>
               </div>
-              <ActionButton type="submit" disabled={!formValid() || denial() !== null}>
+              <ActionButton
+                ref={(element) => (reviewButtonRef = element)}
+                type="submit"
+                disabled={!formValid() || denial() !== null}
+              >
                 Review withdrawal
               </ActionButton>
               <Show when={!chainAvailable()}>
@@ -271,7 +286,13 @@ export const SecurityPanel: Component = () => {
           }
         >
           {(current) => (
-            <div class="panel-stack">
+            <div
+              class="panel-stack"
+              role="alertdialog"
+              aria-label="Confirm withdrawal"
+              tabindex="-1"
+              ref={reviewDialogRef}
+            >
               <KeyValue
                 rows={[
                   { key: "dest", label: "Destination", value: current().destination },
@@ -280,7 +301,7 @@ export const SecurityPanel: Component = () => {
                   { key: "fee", label: "Network fee", value: formatUsd(current().feeUsd) },
                 ]}
               />
-              <ReasonNote tone="danger">
+              <ReasonNote tone="danger" live="assertive">
                 Confirm the destination carefully. On-chain transfers cannot be reversed.
               </ReasonNote>
               <label class="field">

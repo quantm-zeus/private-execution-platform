@@ -124,6 +124,7 @@ test("a WASM loader failure is classified as U1", async () => {
         throw new Error("wasm unavailable /secret-path");
       },
     });
+    assert.fail("expected the second unlock to fail");
   } catch (error) {
     assert.ok(isUnlockError(error));
     assert.ok(!error.message.includes("secret-path"));

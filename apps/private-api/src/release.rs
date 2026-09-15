@@ -311,17 +311,31 @@ pub struct ArtifactHeader {
     pub kid: [u8; auth::WORKSPACE_KID_BYTES],
 }
 
-/// Parse exactly the bounded artifact header (`version || kid`).
+/// Parse exactly the bounded artifact header (`version || kid || encapsulated`).
+///
+/// Mirrors the public-header validation of
+/// `crypto_envelope::ArtifactEnvelope::from_bytes` (version, non-zero KID,
+/// non-zero encapsulated key) so the readiness probe cannot report a truncated,
+/// wrong-version or all-zero file as a deliverable artifact. The caller is
+/// separately responsible for the minimum total length (`MIN_ARTIFACT_LEN`).
 pub fn parse_artifact_header(header: &[u8]) -> Result<ArtifactHeader, DescriptorError> {
     if header.len() < crypto_envelope::ARTIFACT_HEADER_LEN {
         return Err(DescriptorError::ArtifactUnavailable);
     }
+    let version = header[0];
+    if version != crypto_envelope::ARTIFACT_VERSION {
+        return Err(DescriptorError::ArtifactUnavailable);
+    }
     let mut kid = [0u8; auth::WORKSPACE_KID_BYTES];
     kid.copy_from_slice(&header[1..1 + auth::WORKSPACE_KID_BYTES]);
-    Ok(ArtifactHeader {
-        version: header[0],
-        kid,
-    })
+    if kid.iter().all(|&b| b == 0) {
+        return Err(DescriptorError::ArtifactUnavailable);
+    }
+    let encapsulated = &header[1 + auth::WORKSPACE_KID_BYTES..crypto_envelope::ARTIFACT_HEADER_LEN];
+    if encapsulated.iter().all(|&b| b == 0) {
+        return Err(DescriptorError::ArtifactUnavailable);
+    }
+    Ok(ArtifactHeader { version, kid })
 }
 
 impl ReleaseManifest {
@@ -498,6 +512,32 @@ mod tests {
         assert_eq!(descriptor.artifact_size, artifact.len() as u64);
         assert_eq!(descriptor.artifact_sha256_hex, sha256_hex(&artifact));
         assert!(!descriptor.enrolled);
+    }
+
+    #[test]
+    fn artifact_header_parser_rejects_undeliverable_headers() {
+        let (artifact, _) = sealed_artifact();
+        let header = &artifact[..crypto_envelope::ARTIFACT_HEADER_LEN];
+        let parsed = parse_artifact_header(header).expect("valid header");
+        assert_eq!(parsed.version, ARTIFACT_VERSION);
+        assert_eq!(parsed.kid, TEST_KID);
+
+        // Truncated header.
+        assert!(
+            parse_artifact_header(&header[..crypto_envelope::ARTIFACT_HEADER_LEN - 1]).is_err()
+        );
+        // Wrong version.
+        let mut wrong_version = header.to_vec();
+        wrong_version[0] = ARTIFACT_VERSION + 1;
+        assert!(parse_artifact_header(&wrong_version).is_err());
+        // All-zero KID.
+        let mut zero_kid = header.to_vec();
+        zero_kid[1..1 + auth::WORKSPACE_KID_BYTES].fill(0);
+        assert!(parse_artifact_header(&zero_kid).is_err());
+        // All-zero encapsulated key.
+        let mut zero_encap = header.to_vec();
+        zero_encap[1 + auth::WORKSPACE_KID_BYTES..].fill(0);
+        assert!(parse_artifact_header(&zero_encap).is_err());
     }
 
     #[test]

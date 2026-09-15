@@ -310,6 +310,11 @@ pub struct PrivateApiState {
     /// liveness so a process with a dead relay is not reported healthy.
     relay_required: bool,
     relay_ready: Arc<AtomicBool>,
+    /// Whether the opaque command dispatcher surface is available. The
+    /// production binary always injects a fail-closed dispatcher before serving
+    /// (a build without one refuses startup), so this defaults to ready; a
+    /// composition that can lose its dispatcher clears it to fail `/ready`.
+    dispatcher_ready: Arc<AtomicBool>,
 }
 
 impl PrivateApiState {
@@ -337,6 +342,7 @@ impl PrivateApiState {
             enrollment_lock: Arc::new(Mutex::new(())),
             relay_required: false,
             relay_ready: Arc::new(AtomicBool::new(false)),
+            dispatcher_ready: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -405,6 +411,14 @@ impl PrivateApiState {
         self
     }
 
+    /// Attach the opaque command dispatcher's readiness contract. The process
+    /// refuses to start without a dispatcher, so the default is ready; a future
+    /// composition that can lose its dispatcher clears this to fail `/ready`.
+    pub fn with_dispatcher_readiness(mut self, ready: Arc<AtomicBool>) -> Self {
+        self.dispatcher_ready = ready;
+        self
+    }
+
     #[cfg(test)]
     fn with_test_dependencies(
         config: PrivateApiConfig,
@@ -434,6 +448,7 @@ impl PrivateApiState {
             enrollment_lock: Arc::new(Mutex::new(())),
             relay_required: false,
             relay_ready: Arc::new(AtomicBool::new(false)),
+            dispatcher_ready: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -591,13 +606,19 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
         Some(store) => store.list().is_ok(),
         None => true,
     };
-    let ready = relay_ok && artifact_ok && manifest_ok && passkey_store_ok && recovery_ok;
+    // The opaque command dispatcher is a required dependency. The binary always
+    // wires one before serving (startup refuses otherwise); a composition that
+    // clears this flag must not be reported ready.
+    let dispatcher_ok = state.dispatcher_ready.load(Ordering::SeqCst);
+    let ready =
+        relay_ok && artifact_ok && manifest_ok && dispatcher_ok && passkey_store_ok && recovery_ok;
     let body = serde_json::json!({
         "ready": ready,
         "checks": {
             "relay": relay_ok,
             "artifact": artifact_ok,
             "release_manifest": manifest_ok,
+            "dispatcher": dispatcher_ok,
             "passkey_store": passkey_store_ok,
             "recovery_store": recovery_ok,
         }
@@ -1751,9 +1772,10 @@ fn load_workspace_artifact_header() -> Result<Vec<u8>, StatusCode> {
     }
     let metadata = std::fs::metadata(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let header_len = crypto_envelope::ARTIFACT_HEADER_LEN as u64;
-    if !metadata.is_file()
-        || metadata.len() < header_len
-        || metadata.len() > MAX_ARTIFACT_BYTES as u64
+    // A file too short to hold a header plus the AEAD tag can never be delivered,
+    // so it must not make readiness report a healthy artifact.
+    let min_len = crypto_envelope::MIN_ARTIFACT_LEN as u64;
+    if !metadata.is_file() || metadata.len() < min_len || metadata.len() > MAX_ARTIFACT_BYTES as u64
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -5199,6 +5221,50 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["artifact"], false);
+
+        // A header-length file whose public header is undeliverable (wrong
+        // version / all-zero KID / all-zero encapsulated key) must not be
+        // reported as a healthy artifact.
+        for bad_header in [
+            {
+                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                header[0] = auth::ARTIFACT_VERSION + 1;
+                header
+            },
+            {
+                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                header[0] = auth::ARTIFACT_VERSION;
+                header[1..1 + auth::WORKSPACE_KID_BYTES].fill(0);
+                header
+            },
+            {
+                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                header[0] = auth::ARTIFACT_VERSION;
+                header[1 + auth::WORKSPACE_KID_BYTES..].fill(0);
+                header
+            },
+        ] {
+            let bad = state
+                .clone()
+                .with_artifact_loader(Arc::new(move || Ok(bad_header.clone())));
+            let ready = get(router(bad), "/ready").await;
+            assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = ready.into_body().collect().await.unwrap().to_bytes();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["ready"], false);
+            assert_eq!(parsed["checks"]["artifact"], false);
+        }
+
+        // Dispatcher unavailable: the required command surface is not ready.
+        let no_dispatcher = state
+            .clone()
+            .with_dispatcher_readiness(Arc::new(AtomicBool::new(false)));
+        let ready = get(router(no_dispatcher), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["dispatcher"], false);
     }
 
     // ---- Passkey-bound recovery wrapper tests ----

@@ -95,6 +95,38 @@ test.describe("accessibility", () => {
     );
     expect(moderate, JSON.stringify(moderate, null, 2)).toEqual([]);
   });
+
+  test("withdrawal confirmation has no moderate-or-worse axe violations", async ({
+    page,
+    request,
+  }) => {
+    await bootLive(page, request);
+    await page.locator('button[data-view="security"]').click();
+    await page.getByLabel("Destination address").fill("0x1234567890abcdef");
+    await page.getByLabel("Withdrawal amount").fill("1.5");
+    await page.getByRole("button", { name: "Review withdrawal" }).click();
+    // The irreversible-action review is a security-critical confirmation surface.
+    await expect(page.getByRole("alertdialog", { name: "Confirm withdrawal" })).toBeVisible();
+    await page.addScriptTag({ url: "/__test__/axe.min.js" });
+    const violations = await page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (ctx: Document, opts: unknown) => Promise<{ violations: { id: string; impact: string; nodes: { target: string[]; failureSummary?: string; html: string }[] }[] }> } }).axe;
+      const result = await axe.run(document, { resultTypes: ["violations"] });
+      return result.violations.map((violation) => ({
+        id: violation.id,
+        impact: violation.impact,
+        nodes: violation.nodes.length,
+        samples: violation.nodes.slice(0, 3).map((node) => ({
+          target: node.target,
+          html: node.html,
+          summary: node.failureSummary,
+        })),
+      }));
+    });
+    const moderate = violations.filter((violation) =>
+      ["moderate", "serious", "critical"].includes(violation.impact),
+    );
+    expect(moderate, JSON.stringify(moderate, null, 2)).toEqual([]);
+  });
 });
 
 test.describe("performance budgets (local harness)", () => {

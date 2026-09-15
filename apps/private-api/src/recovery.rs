@@ -87,6 +87,9 @@ pub const RECOVERY_CHALLENGE_ID_BYTES: usize = 16;
 pub const RECOVERY_CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 /// Global bound on simultaneously pending challenges (mirrors the auth budget).
 pub const MAX_PENDING_RECOVERY_CHALLENGES: usize = 32;
+/// Per-session bound, so one authenticated session cannot consume the whole
+/// global challenge set and deny wrapper mutation to every other session.
+pub const MAX_PENDING_RECOVERY_CHALLENGES_PER_SESSION: usize = 4;
 
 /// A stored wrapper. Contains no plaintext key material.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +226,14 @@ impl RecoveryChallengeState {
     ) -> Result<(), RecoveryInputError> {
         self.prune(now_ms);
         if self.pending.len() >= MAX_PENDING_RECOVERY_CHALLENGES {
+            return Err(RecoveryInputError::Invalid);
+        }
+        let session_pending = self
+            .pending
+            .values()
+            .filter(|challenge| challenge.session_id == session_id)
+            .count();
+        if session_pending >= MAX_PENDING_RECOVERY_CHALLENGES_PER_SESSION {
             return Err(RecoveryInputError::Invalid);
         }
         self.pending.insert(
@@ -682,14 +693,30 @@ mod tests {
         // Unknown id.
         assert!(state.consume(0, "missing", &session).is_none());
 
-        // Global budget.
+        // Per-session budget: one session cannot exhaust the global set, so a
+        // single authenticated caller cannot deny wrapper mutation to others.
+        let mut per_session = RecoveryChallengeState::default();
+        for index in 0..MAX_PENDING_RECOVERY_CHALLENGES_PER_SESSION {
+            per_session
+                .issue(0, session.clone(), format!("s{index}"), vec![1; 32])
+                .unwrap();
+        }
+        assert!(per_session
+            .issue(0, session.clone(), "s-over".to_string(), vec![1; 32])
+            .is_err());
+        // A different session can still issue while the first is saturated.
+        assert!(per_session
+            .issue(0, other.clone(), "other".to_string(), vec![1; 32])
+            .is_ok());
+
+        // Global budget across distinct sessions.
         let mut full = RecoveryChallengeState::default();
         for index in 0..MAX_PENDING_RECOVERY_CHALLENGES {
-            full.issue(0, session.clone(), format!("c{index}"), vec![1; 32])
+            full.issue(0, session_id(), format!("c{index}"), vec![1; 32])
                 .unwrap();
         }
         assert!(full
-            .issue(0, session, "overflow".to_string(), vec![1; 32])
+            .issue(0, session_id(), "overflow".to_string(), vec![1; 32])
             .is_err());
     }
 

@@ -82,6 +82,16 @@ impl PrivateRelay {
             .identity
             .validate()
             .map_err(|_| EdgeError::InvalidConfiguration)?;
+        // Eagerly load and parse the certificate, private key and CA here, at
+        // startup, rather than only on the first dial. An unreadable or
+        // malformed identity file would otherwise start an edge that answers
+        // every /v1/* with a permanent 503 while /health stays 200, which
+        // contradicts this module's "invalid identity refuses to start" contract.
+        service_identity::configure_client_endpoint(
+            tonic::transport::Endpoint::from_static("https://localhost"),
+            &config.identity,
+        )
+        .map_err(|_| EdgeError::InvalidConfiguration)?;
         Ok(Arc::new(Self {
             config,
             channel: RwLock::new(None),

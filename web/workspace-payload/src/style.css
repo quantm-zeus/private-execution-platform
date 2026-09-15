@@ -190,8 +190,11 @@ code {
   padding: 16px;
   scroll-behavior: smooth;
 }
-.workspace__main:focus {
-  outline: none;
+/* The skip-link and programmatic view focus land on this scroll container, so
+   it must show a visible indicator instead of suppressing focus entirely. */
+.workspace__main:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
 }
 
 /* Retained (already-visited) views are hidden with a class, never the boolean
@@ -781,8 +784,10 @@ select.input {
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  /* Stop the rotation entirely rather than slowing it: a persistent spinner is
+     still motion. The adjacent loading copy carries the state without it. */
   .spinner {
-    animation-duration: 3s;
+    animation: none;
   }
   .workspace__main {
     scroll-behavior: auto;
@@ -952,8 +957,10 @@ select.input {
   .nav-item {
     min-height: 44px;
   }
-  .btn {
+  .btn,
+  .chip-button {
     min-width: 44px;
+    text-align: center;
   }
   .nav-rail {
     border-right: none;

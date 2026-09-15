@@ -81,6 +81,31 @@ describe("SecurityPanel", () => {
     expect(ops).toContain("request_withdrawal");
   });
 
+  it("moves focus into the withdrawal review and back to Review on cancel", async () => {
+    const store = storeWith(recordingClient([]), true);
+    await flush();
+    render(() => (
+      <WorkspaceProvider store={store}>
+        <SecurityPanel />
+      </WorkspaceProvider>
+    ));
+    fireEvent.input(screen.getByLabelText("Destination address"), {
+      target: { value: "0x1234567890abcdef" },
+    });
+    fireEvent.input(screen.getByLabelText("Withdrawal amount"), { target: { value: "1.5" } });
+    fireEvent.click(screen.getByRole("button", { name: /review withdrawal/i }));
+    await flush();
+
+    const dialog = screen.getByRole("alertdialog", { name: "Confirm withdrawal" });
+    // Entering the irreversible-action review moves focus into it, so keyboard
+    // and screen-reader users are not dropped onto <body>.
+    expect(document.activeElement).toBe(dialog);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await flush();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /review withdrawal/i }));
+  });
+
   it("refuses a second concurrent submit while the first withdrawal is in flight", async () => {
     const ops: string[] = [];
     let release!: (value: unknown) => void;

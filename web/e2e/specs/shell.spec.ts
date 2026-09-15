@@ -160,6 +160,23 @@ test.describe("shell artifact unlock", () => {
     ).toBeGreaterThanOrEqual(1);
   });
 
+  test("shows bootstrap enrollment only when the server reports it open", async ({ page }) => {
+    // Positive control for the closed-state assertion above: when the server
+    // actually reports first-run enrollment open, the control must appear.
+    await page.route("**/internal/auth/session", (route) =>
+      route.fulfill({ status: 401, body: "" }),
+    );
+    await page.route("**/internal/auth/enrollment-status", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ enrollment_open: true }),
+      }),
+    );
+    await page.goto(`${SHELL_ORIGIN}/`);
+    await expect(page.getByText("First-run passkey enrollment")).toBeVisible();
+  });
+
   test("security gateway has no moderate-or-worse axe violations", async ({ page }) => {
     await page.route("**/internal/auth/session", (route) =>
       route.fulfill({ status: 401, body: "" }),

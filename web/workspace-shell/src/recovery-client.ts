@@ -143,7 +143,19 @@ export function parseRecoveryWrappers(input: unknown): RecoveryWrapperRecord[] {
   if (input.wrappers.length > MAX_WRAPPERS) {
     throw new RecoveryClientError("recovery_malformed");
   }
-  return input.wrappers.map(parseWrapperRecord);
+  // Parse per record and drop only the offending entry. A single malformed or
+  // future-scheme record (corruption, a newer client, a bad write) must not
+  // disable passkey recovery through every remaining valid credential; the
+  // mandatory offline recovery code stays the fallback either way.
+  const records: RecoveryWrapperRecord[] = [];
+  for (const wrapper of input.wrappers) {
+    try {
+      records.push(parseWrapperRecord(wrapper));
+    } catch {
+      // Skip the invalid record; never surface its content.
+    }
+  }
+  return records;
 }
 
 async function classify(response: Response): Promise<never> {
@@ -368,7 +380,9 @@ export async function touchRecoveryWrapper(
  */
 export async function unwrapWithPrfOutput(
   prfOutput: Uint8Array,
-  record: WrappedRootKey,
+  record: WrappedRootKey & { credential_id_b64?: string },
 ): Promise<Uint8Array> {
-  return unwrapRootKey(prfOutput, record);
+  // Bind the owning credential id into the AAD so a rewritten record cannot be
+  // reassigned to another credential without failing authentication.
+  return unwrapRootKey(prfOutput, record, undefined, record.credential_id_b64 ?? "");
 }

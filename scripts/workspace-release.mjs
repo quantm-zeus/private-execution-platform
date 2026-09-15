@@ -21,10 +21,12 @@ import {
   copyFile,
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   readdir,
   readlink,
+  realpath,
   rename,
   rm,
   symlink,
@@ -107,6 +109,12 @@ function publicKeyFingerprintB64(publicKey) {
 /** Deterministic digest over a directory tree (paths + bytes), hex. */
 export async function digestDirectory(root) {
   const rootResolved = resolve(root);
+  // Reject a symlinked root as well as symlinks inside the tree, so a caller
+  // cannot be redirected to hash a directory outside the release.
+  const rootStat = await lstat(rootResolved);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("release tree root must be a real directory");
+  }
   const entries = [];
   async function walk(dir) {
     const names = (await readdir(dir)).sort();
@@ -314,9 +322,12 @@ async function linkTarget(linkPath) {
 }
 
 async function atomicSymlink(linkPath, target) {
-  const tmp = join(dirname(linkPath), `.${Date.now()}-${process.pid}.tmp`);
+  const parent = dirname(linkPath);
+  const tmp = join(parent, `.${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
   await symlink(target, tmp);
   await rename(tmp, linkPath);
+  // Make the rename durable before the caller proceeds to the paired symlink.
+  await syncDirectory(parent);
 }
 
 /** Atomically point `current` at an existing validated release. */
@@ -361,6 +372,22 @@ export async function rollbackCurrent(releasesRoot) {
 export async function readRelease(releasesRoot, releaseId) {
   const id = assertReleaseId(releaseId);
   const releaseDir = join(releasesRoot, id);
+  // A release directory and its shell tree must be real directories inside the
+  // releases root: a symlink planted at either path must never be followed,
+  // validated and served from outside the root.
+  const rootReal = await realpath(releasesRoot);
+  const dirStat = await lstat(releaseDir);
+  if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+    throw new Error("release directory must be a real directory");
+  }
+  if ((await realpath(releaseDir)) !== join(rootReal, id)) {
+    throw new Error("release directory escapes the releases root");
+  }
+  const shellPath = join(releaseDir, SHELL_DIR);
+  const shellStat = await lstat(shellPath);
+  if (shellStat.isSymbolicLink() || !shellStat.isDirectory()) {
+    throw new Error("release shell must be a real directory");
+  }
   const manifest = JSON.parse(await readFile(join(releaseDir, MANIFEST_FILE), "utf8"));
   const artifact = await readFile(join(releaseDir, ARTIFACT_FILE));
   validateReleaseManifest(manifest, artifact);
@@ -372,11 +399,40 @@ export async function readRelease(releasesRoot, releaseId) {
   if (releaseIdFor(manifest.source_sha, manifest.artifact.sha256_hex) !== id) {
     throw new Error("manifest does not derive its own release id");
   }
-  const shellDigest = await digestDirectory(join(releaseDir, SHELL_DIR));
+  const shellDigest = await digestDirectory(shellPath);
   if (shellDigest !== manifest.shell.asset_digest_hex) {
     throw new Error("shell asset digest mismatch");
   }
   return { releaseDir, manifest, artifact };
+}
+
+/**
+ * Remove stale staging directories left by a killed publish. Only directories
+ * older than one hour are swept, so a concurrent in-flight publish is never
+ * disturbed.
+ */
+export async function sweepStaleStaging(releasesRoot, nowMs = Date.now(), maxAgeMs = 60 * 60 * 1000) {
+  let names;
+  try {
+    names = await readdir(releasesRoot);
+  } catch {
+    return 0;
+  }
+  let swept = 0;
+  for (const name of names) {
+    if (!name.startsWith(".staging-")) continue;
+    const full = join(releasesRoot, name);
+    try {
+      const stat = await lstat(full);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) continue;
+      if (nowMs - stat.mtimeMs < maxAgeMs) continue;
+      await rm(full, { recursive: true, force: true });
+      swept += 1;
+    } catch {
+      // A concurrent publish may have consumed it; ignore.
+    }
+  }
+  return swept;
 }
 
 /**
@@ -395,6 +451,12 @@ export async function publishRelease({
   const artifactDigest = sha256Hex(artifact);
   const releaseId = releaseIdFor(sourceSha, artifactDigest);
   const releaseDir = join(releasesRoot, releaseId);
+  // The staging directory is created by `mkdtemp` below, which requires the
+  // releases root to exist.
+  await mkdir(releasesRoot, { recursive: true });
+  // Best-effort sweep of staging directories leaked by a previous killed
+  // publish; age-bounded so a concurrent publish is never disturbed.
+  await sweepStaleStaging(releasesRoot);
   const shellAssetDigest = await digestDirectory(shellDir);
   const manifest = computeReleaseManifest({
     releaseId,
@@ -404,8 +466,7 @@ export async function publishRelease({
     kidB64,
     shellAssetDigest,
   });
-  const staging = join(releasesRoot, `.staging-${Date.now()}-${process.pid}`);
-  await mkdir(staging, { recursive: true });
+  const staging = await mkdtemp(join(releasesRoot, ".staging-"));
   let shippedShellDigest;
   try {
     await writeFileDurable(join(staging, ARTIFACT_FILE), artifact, { mode: 0o600 });
@@ -450,7 +511,11 @@ export async function publishRelease({
       const existing = await readRelease(releasesRoot, releaseId);
       if (
         !existing.artifact.equals(artifact) ||
-        existing.manifest.shell.asset_digest_hex !== shippedShellDigest
+        existing.manifest.shell.asset_digest_hex !== shippedShellDigest ||
+        existing.manifest.source_sha !== manifest.source_sha ||
+        existing.manifest.artifact.kid_b64 !== manifest.artifact.kid_b64 ||
+        existing.manifest.recipient.public_key_fingerprint_b64 !==
+          manifest.recipient.public_key_fingerprint_b64
       ) {
         throw new Error("release already exists and is immutable");
       }
@@ -479,8 +544,9 @@ async function copyTree(source, destination) {
     if (stat.isSymbolicLink()) throw new Error("symlinks are not allowed in a shell build");
     if (stat.isDirectory()) {
       await mkdir(to, { recursive: true });
-      await syncDirectory(to);
       await copyTree(from, to);
+      // Sync *after* the directory is populated, so its entries are durable.
+      await syncDirectory(to);
     } else if (stat.isFile()) {
       await copyFile(from, to);
       await syncFile(to);

@@ -312,7 +312,12 @@ body {
 
 .button:focus-visible,
 .field__input:focus-visible,
-summary:focus-visible {
+summary:focus-visible,
+/* Programmatic focus targets (skip/unlock/lock return, failure notice) must
+   also show a visible indicator, not just interactive controls. */
+.panel__heading:focus-visible,
+.workspace:focus-visible,
+.notice:focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
 }

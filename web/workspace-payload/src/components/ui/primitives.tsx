@@ -126,10 +126,13 @@ export const ActionButton: Component<
     tone?: "primary" | "danger" | "ghost";
     title?: string;
     type?: "button" | "submit";
+    /** Optional element handle, so callers can move focus back to this control. */
+    ref?: (element: HTMLButtonElement) => void;
     children: JSX.Element;
   }
 > = (props) => (
   <button
+    ref={props.ref}
     type={props.type ?? "button"}
     class={`btn btn--${props.tone ?? "ghost"}`}
     onClick={props.onClick}

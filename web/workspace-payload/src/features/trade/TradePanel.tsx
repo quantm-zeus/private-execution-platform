@@ -1,4 +1,4 @@
-import { Show, createMemo, createSignal, type Component, type JSX } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, on, type Component, type JSX } from "solid-js";
 import { formatAmount, formatBps, formatPercent, formatUsd, truncateAddress } from "../../core/format";
 import { workspaceError } from "../../core/errors";
 import type {
@@ -173,6 +173,18 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
   const [impact, setImpact] = createSignal("150");
   const [maxCost, setMaxCost] = createSignal("");
   const [confirming, setConfirming] = createSignal(false);
+  // Focus management for the inline confirmation. Opening it moves focus into
+  // the alertdialog so keyboard and screen-reader users land on the
+  // irreversible-action evidence; Cancel returns focus to the Execute control
+  // instead of dropping it on <body>.
+  let executeButtonRef: HTMLButtonElement | undefined;
+  let confirmDialogRef: HTMLDivElement | undefined;
+  createEffect(
+    on(confirming, (now, prev) => {
+      if (now && !prev) queueMicrotask(() => confirmDialogRef?.focus());
+      else if (!now && prev) queueMicrotask(() => executeButtonRef?.focus());
+    }),
+  );
   const [execState, setExecState] = createSignal<ExecutionOutcome>({ kind: "idle" });
   /** Two-step acknowledgement before releasing an UNKNOWN guard (no reconcile op yet, BR-9). */
   const [discardArmed, setDiscardArmed] = createSignal(false);
@@ -1069,13 +1081,19 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
         <Show
           when={!confirming()}
           fallback={
-            <div class="panel-stack">
+            <div
+              class="panel-stack"
+              role="alertdialog"
+              aria-label="Confirm market execution"
+              tabindex="-1"
+              ref={confirmDialogRef}
+            >
               <Show
                 when={previewIntent()}
                 fallback={<ReasonNote tone="warning">Preview is no longer available — preview again.</ReasonNote>}
               >
                 {(intent) => (
-                  <ReasonNote tone="danger">
+                  <ReasonNote tone="danger" live="assertive">
                     Confirm market {intent().side} for {intent().amount} {intent().amountType} on{" "}
                     {intent().chain}
                     {intent().tokenIn || intent().tokenOut
@@ -1103,6 +1121,7 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
           }
         >
           <ActionButton
+            ref={(element) => (executeButtonRef = element)}
             tone="primary"
             disabled={!canExecute()}
             onClick={() => setConfirming(true)}

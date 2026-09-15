@@ -459,6 +459,35 @@ describe("TradePanel", () => {
     expect(submitted).toBeNull();
   });
 
+  it("moves focus into the execute confirmation and back to Execute on cancel", async () => {
+    const client: CommandClient = {
+      async send<T>(op: string): Promise<T> {
+        if (op === "preview_market_order") return quote as unknown as T;
+        throw new Error(`unexpected op ${op}`);
+      },
+    };
+    const store = makeStore(client, true, true);
+    store.reload();
+    await flush();
+    renderPanel(store);
+
+    fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await flush();
+
+    fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
+    await flush();
+
+    const dialog = screen.getByRole("alertdialog", { name: "Confirm market execution" });
+    // Focus lands inside the confirmation so keyboard/screen-reader users are
+    // not dropped onto <body> when the Execute button unmounts.
+    expect(document.activeElement).toBe(dialog);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await flush();
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /execute buy/i }));
+  });
+
   it("renders an unconfirmed submit as an explicit UNKNOWN outcome, never a plain failure", async () => {
     const keys: (string | undefined)[] = [];
     const client: CommandClient = {

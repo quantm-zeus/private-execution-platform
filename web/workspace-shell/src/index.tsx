@@ -535,7 +535,7 @@ function App() {
         );
         return;
       }
-      const wrapped = await wrapRootKey(prfOutput, secret, salt);
+      const wrapped = await wrapRootKey(prfOutput, secret, salt, undefined, assertion.credentialIdB64);
       // Drop the offline-code bytes before the proof-of-possession network
       // round trip so they are not retained across it.
       secret.fill(0);
@@ -1007,8 +1007,9 @@ function App() {
 
       <footer class="gateway__footer">
         <p>
-          The perimeter and your passkey prove identity. Only the local recovery
-          code decrypts the release; it never leaves this browser.
+          The perimeter and your passkey prove identity. The release is decrypted
+          locally, either by your offline recovery code or by a recovery passkey
+          on this device; neither leaves this browser.
         </p>
       </footer>
     </main>

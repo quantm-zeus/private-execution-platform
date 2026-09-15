@@ -39,29 +39,39 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-test("parseRecoveryWrappers accepts a valid list and rejects malformed input", () => {
+test("parseRecoveryWrappers rejects malformed containers and skips bad records", () => {
   const parsed = parseRecoveryWrappers({ wrappers: [VALID_RECORD] });
   assert.equal(parsed.length, 1);
   assert.equal(parsed[0].label, "Laptop");
   assert.equal(parsed[0].last_used_at_ms, null);
 
-  for (const bad of [
-    null,
-    {},
-    { wrappers: "x" },
-    { wrappers: [{ ...VALID_RECORD, version: 2 }] },
-    { wrappers: [{ ...VALID_RECORD, credential_id_b64: "" }] },
-    { wrappers: [{ ...VALID_RECORD, created_at_ms: "soon" }] },
-    // An unknown key source must be rejected, never reinterpreted as the
-    // unlock secret by a future migration.
-    { wrappers: [{ ...VALID_RECORD, key_source: "root_key_v2" }] },
-  ]) {
+  for (const bad of [null, {}, { wrappers: "x" }]) {
     assert.throws(
       () => parseRecoveryWrappers(bad),
       (error: unknown) =>
         error instanceof RecoveryClientError && error.code === "recovery_malformed",
     );
   }
+
+  // A single malformed or unknown-key_source record must not disable the valid
+  // credentials beside it (the offline recovery code remains the fallback).
+  const mixed = parseRecoveryWrappers({
+    wrappers: [
+      { ...VALID_RECORD, version: 2 },
+      VALID_RECORD,
+      { ...VALID_RECORD, key_source: "root_key_v2" },
+      { ...VALID_RECORD, credential_id_b64: "" },
+      { ...VALID_RECORD, created_at_ms: "soon" },
+    ],
+  });
+  assert.equal(mixed.length, 1);
+  assert.equal(mixed[0].label, "Laptop");
+
+  // An all-invalid list yields an empty list, never a thrown parse.
+  assert.deepEqual(
+    parseRecoveryWrappers({ wrappers: [{ ...VALID_RECORD, version: 2 }] }),
+    [],
+  );
 });
 
 test("fetchRecoveryWrappers classifies auth, conflict and network failures", async () => {
@@ -166,6 +176,7 @@ test("add/revoke/touch send the expected wire body", async () => {
       record: {
         version: 1,
         algorithm: "HKDF-SHA256/AES-256-GCM",
+        key_source: "unlock_secret_v1",
         salt_b64: "salt",
         iv_b64: "iv",
         wrapped_root_key_b64: "wrapped",
@@ -201,4 +212,28 @@ test("unwrapWithPrfOutput roundtrips a wrapped secret", async () => {
 
   const wrong = new Uint8Array(32).fill(0x5b);
   await assert.rejects(unwrapWithPrfOutput(wrong, wrapped));
+});
+
+test("a wrapper's credential id is bound into the AEAD tag", async () => {
+  const root = generateWorkspaceRootKey();
+  const prf = new Uint8Array(32).fill(0x5a);
+  const credentialId = toBase64(new Uint8Array(32).fill(7));
+  const wrapped = await wrapRootKey(prf, root, generateRecoverySalt(), undefined, credentialId);
+
+  // The same PRF and record still unwrap for the owning credential.
+  const recovered = await unwrapWithPrfOutput(prf, {
+    ...wrapped,
+    credential_id_b64: credentialId,
+  });
+  assert.deepEqual(recovered, root);
+
+  // Reassigning the record to a different credential (or omitting the id) must
+  // fail authentication, not silently unwrap.
+  await assert.rejects(
+    unwrapWithPrfOutput(prf, {
+      ...wrapped,
+      credential_id_b64: toBase64(new Uint8Array(32).fill(8)),
+    }),
+  );
+  await assert.rejects(unwrapWithPrfOutput(prf, wrapped));
 });

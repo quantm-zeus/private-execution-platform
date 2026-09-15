@@ -48,13 +48,16 @@ The record carries `version = 1`, `algorithm = "HKDF-SHA256/AES-256-GCM"` and
 protects; a future random-root-key migration must introduce a new value rather
 than reinterpret existing records. Integrity is provided by AES-GCM: the IV, the
 wrapped bytes and the salt are all authenticated (a tampered salt derives a
-different wrapping key and the tag check fails). The AAD is a constant domain
-string. `unwrapRootKey` additionally checks `version`/`algorithm` by explicit
-equality before any crypto, and `parseRecoveryWrappers` rejects any record whose
-`key_source` is not `unlock_secret_v1` (the server enforces the same value on
-write), so a record for another scheme fails closed instead of being handed to
-the unlock-secret unwrap. The offline secret is HKDF-extracted before use, so it
-is never used as a raw AES key.
+different wrapping key and the tag check fails). The AAD is a canonical domain
+tuple `version | algorithm | key_source | credential_id`, so a rewritten record
+cannot be reassigned to another credential, downgraded to a different
+algorithm/key source, or spliced into a future scheme without breaking the tag.
+`unwrapRootKey` additionally checks `version`/`algorithm`/`key_source` by explicit
+equality before any crypto, and `parseRecoveryWrappers` skips (never
+interprets) any record whose `key_source` is not `unlock_secret_v1` while
+keeping the remaining valid records, so one corrupt entry cannot disable passkey
+recovery. The offline secret is HKDF-extracted before use, so it is never used
+as a raw AES key.
 
 Adding a credential re-enters the offline recovery code. Before wrapping, the
 shell derives the workspace public-key fingerprint from that code with the

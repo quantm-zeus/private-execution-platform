@@ -27,6 +27,11 @@ export const RECOVERY_WRAPPER_VERSION = 1;
 export const RECOVERY_WRAP_ALGORITHM = "HKDF-SHA256/AES-256-GCM";
 export const RECOVERY_KDF_INFO = "evergreen/workspace-recovery/v1";
 export const RECOVERY_AAD = "evergreen/workspace-recovery/v1";
+/**
+ * The only wrapper key source this build can unwrap. A future random-root-key
+ * migration introduces a new value; existing records are never reinterpreted.
+ */
+export const RECOVERY_KEY_SOURCE = "unlock_secret_v1";
 export const RECOVERY_SALT_BYTES = 32;
 export const RECOVERY_IV_BYTES = 12;
 export const ROOT_KEY_BYTES = 32;
@@ -50,12 +55,30 @@ export class RecoveryWrappingError extends Error {
 export interface WrappedRootKey {
   version: number;
   algorithm: string;
+  key_source: string;
   salt_b64: string;
   iv_b64: string;
   wrapped_root_key_b64: string;
 }
 
 const encoder = new TextEncoder();
+
+/**
+ * Canonical AES-GCM additional authenticated data.
+ *
+ * Binds the record's scheme metadata and its owning credential id into the tag,
+ * so a party able to rewrite a stored record cannot reassign the ciphertext to a
+ * different credential, downgrade the algorithm/key source, or splice a
+ * version-1 record into a future scheme without breaking authentication.
+ */
+export function recoveryAadContext(
+  record: Pick<WrappedRootKey, "version" | "algorithm" | "key_source">,
+  credentialIdB64: string,
+): Uint8Array {
+  return encoder.encode(
+    `${RECOVERY_AAD}|v${record.version}|${record.algorithm}|${record.key_source}|${credentialIdB64}`,
+  );
+}
 
 function subtleCrypto(): SubtleCrypto {
   const subtle = globalThis.crypto?.subtle;
@@ -121,7 +144,7 @@ export async function deriveRecoveryWrappingKey(
   salt: Uint8Array,
   info: string = RECOVERY_KDF_INFO,
 ): Promise<CryptoKey> {
-  if (ikm.length < 32) throw new RecoveryWrappingError("invalid_root_key");
+  if (ikm.length !== ROOT_KEY_BYTES) throw new RecoveryWrappingError("invalid_root_key");
   const subtle = subtleCrypto();
   const base = await subtle.importKey("raw", ikm as unknown as BufferSource, "HKDF", false, [
     "deriveKey",
@@ -152,24 +175,29 @@ export async function wrapRootKey(
   rootKey: Uint8Array,
   salt: Uint8Array = generateRecoverySalt(),
   info: string = RECOVERY_KDF_INFO,
+  credentialIdB64: string = "",
 ): Promise<WrappedRootKey> {
   requireRootKey(rootKey);
   if (salt.length !== RECOVERY_SALT_BYTES) throw new RecoveryWrappingError("invalid_record");
   const wrappingKey = await deriveRecoveryWrappingKey(ikm, salt, info);
   const iv = new Uint8Array(RECOVERY_IV_BYTES);
   globalThis.crypto.getRandomValues(iv);
+  const recordBase = {
+    version: RECOVERY_WRAPPER_VERSION,
+    algorithm: RECOVERY_WRAP_ALGORITHM,
+    key_source: RECOVERY_KEY_SOURCE,
+  };
   const ciphertext = await subtleCrypto().encrypt(
     {
       name: "AES-GCM",
       iv: iv as unknown as BufferSource,
-      additionalData: encoder.encode(RECOVERY_AAD) as unknown as BufferSource,
+      additionalData: recoveryAadContext(recordBase, credentialIdB64) as unknown as BufferSource,
     },
     wrappingKey,
     rootKey as unknown as BufferSource,
   );
   return {
-    version: RECOVERY_WRAPPER_VERSION,
-    algorithm: RECOVERY_WRAP_ALGORITHM,
+    ...recordBase,
     salt_b64: toBase64(salt),
     iv_b64: toBase64(iv),
     wrapped_root_key_b64: toBase64(new Uint8Array(ciphertext)),
@@ -181,11 +209,13 @@ export async function unwrapRootKey(
   ikm: Uint8Array,
   record: WrappedRootKey,
   info: string = RECOVERY_KDF_INFO,
+  credentialIdB64: string = "",
 ): Promise<Uint8Array> {
   if (
     !record ||
     record.version !== RECOVERY_WRAPPER_VERSION ||
-    record.algorithm !== RECOVERY_WRAP_ALGORITHM
+    record.algorithm !== RECOVERY_WRAP_ALGORITHM ||
+    record.key_source !== RECOVERY_KEY_SOURCE
   ) {
     throw new RecoveryWrappingError("invalid_record");
   }
@@ -208,7 +238,7 @@ export async function unwrapRootKey(
       {
         name: "AES-GCM",
         iv: iv as unknown as BufferSource,
-        additionalData: encoder.encode(RECOVERY_AAD) as unknown as BufferSource,
+        additionalData: recoveryAadContext(record, credentialIdB64) as unknown as BufferSource,
       },
       wrappingKey,
       ciphertext as unknown as BufferSource,

@@ -174,30 +174,38 @@ pub fn resolve_config(
     }
 
     let identity = match (cert, key, ca, dns) {
-        (Some(cert), Some(key), Some(ca), Some(dns))
-            if !cert.is_empty() && !key.is_empty() && !ca.is_empty() && !dns.is_empty() =>
-        {
-            Some(service_identity::ServiceIdentityConfig {
-                cert_chain_path: cert.into(),
-                private_key_path: key.into(),
-                ca_path: ca.into(),
-                expected_peer_dns: dns,
-            })
+        (Some(cert), Some(key), Some(ca), Some(dns)) => {
+            // Whitespace-only values are not configuration: trim before the
+            // presence check so a blank path cannot start a permanently-503 edge.
+            let (cert, key, ca, dns) = (cert.trim(), key.trim(), ca.trim(), dns.trim());
+            if !cert.is_empty() && !key.is_empty() && !ca.is_empty() && !dns.is_empty() {
+                Some(service_identity::ServiceIdentityConfig {
+                    cert_chain_path: cert.into(),
+                    private_key_path: key.into(),
+                    ca_path: ca.into(),
+                    expected_peer_dns: dns.to_string(),
+                })
+            } else {
+                None
+            }
         }
         _ => None,
     };
 
     match (identity, origin, header) {
-        (Some(identity), Some(origin), Some(header))
-            if !origin.is_empty() && !header.is_empty() =>
-        {
-            Ok(Some(EdgeProductionConfig {
-                relay: PrivateRelayConfig {
-                    identity,
-                    endpoint_origin: origin,
-                },
-                access_assertion_header: header,
-            }))
+        (Some(identity), Some(origin), Some(header)) => {
+            let (origin, header) = (origin.trim(), header.trim());
+            if !origin.is_empty() && !header.is_empty() {
+                Ok(Some(EdgeProductionConfig {
+                    relay: PrivateRelayConfig {
+                        identity,
+                        endpoint_origin: origin.to_string(),
+                    },
+                    access_assertion_header: header.to_string(),
+                }))
+            } else {
+                Err(EdgeError::InvalidConfiguration)
+            }
         }
         // Any present-but-incomplete set is an operator error: refuse startup
         // rather than silently serving 503s.
@@ -394,6 +402,84 @@ mod tests {
             ),
             Err(EdgeError::InvalidConfiguration)
         );
+        // A whitespace-only value is not configuration either.
+        assert_eq!(
+            resolve_config(
+                s("   "),
+                s("key.pem"),
+                s("ca.pem"),
+                s("dns"),
+                s("https://private.internal"),
+                s("cf-access-jwt-assertion")
+            ),
+            Err(EdgeError::InvalidConfiguration)
+        );
+        assert_eq!(
+            resolve_config(
+                s("cert.pem"),
+                s("key.pem"),
+                s("ca.pem"),
+                s("dns"),
+                s("https://private.internal"),
+                s("\t")
+            ),
+            Err(EdgeError::InvalidConfiguration)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forged_or_absent_perimeter_assertion_is_gated_at_the_router() {
+        let authorization =
+            Arc::new(HeaderAssertionAuthorization::new("cf-access-jwt-assertion").expect("config"));
+        let state = crate::EdgeState::new(
+            authorization,
+            Arc::new(crate::UnavailableRelay),
+            DEFAULT_MAX_OPAQUE_BODY_BYTES,
+        )
+        .expect("state");
+        let app = crate::router(state);
+
+        let call = |headers: HeaderMap| {
+            let app = app.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap")
+                    .header("content-type", "application/octet-stream");
+                for (name, value) in headers.iter() {
+                    builder = builder.header(name.clone(), value.clone());
+                }
+                app.oneshot(builder.body(Body::from(vec![1u8, 2, 3])).expect("request"))
+                    .await
+                    .expect("response")
+            }
+        };
+
+        // No perimeter assertion: refused before any backend contact.
+        assert_eq!(
+            call(HeaderMap::new()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A different header (for example a forwarding header a client can set)
+        // is not the configured assertion.
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            "203.0.113.7".parse().expect("value"),
+        );
+        assert_eq!(call(wrong).await.status(), StatusCode::UNAUTHORIZED);
+
+        // The configured assertion alone authorizes; with no relay wired the
+        // backend stays unavailable. This is exactly why a non-loopback bind is
+        // refused until a cryptographic Access-JWT check exists: a direct-origin
+        // caller who can reach the listener could otherwise forge the header.
+        let mut forged = HeaderMap::new();
+        forged.insert(
+            HeaderName::from_static("cf-access-jwt-assertion"),
+            "forged-by-a-direct-origin-caller".parse().expect("value"),
+        );
+        assert_eq!(call(forged).await.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

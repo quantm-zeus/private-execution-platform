@@ -790,9 +790,13 @@ remains best-effort; the byte copy is zeroized in a `finally`.
 `PRIVATE_API_RELAY_BIND_ADDR` with an incomplete identity (or any identity value
 without a bind) refuses startup. The relay listener is bound before it is
 spawned, so a bad address is a startup error, and `/ready` reports dependency
-readiness (relay bound, artifact readable, manifest valid, passkey store
-readable) distinct from `/health` liveness. `apps/edge-gateway` refuses a
-non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
+readiness (relay bound, artifact and manifest header valid, dispatcher available,
+passkey store readable, optional recovery store readable) distinct from `/health`
+liveness. The artifact check requires a deliverable file (`MIN_ARTIFACT_LEN`,
+version 1, non-zero KID and encapsulated key), so a truncated or wrong-version
+file is never reported healthy; the `dispatcher` check reflects the opaque
+command surface, which a future composition can clear. `apps/edge-gateway`
+refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
 validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
 bypass that, so the loopback deployment mitigation cannot be widened silently.
 
@@ -833,3 +837,44 @@ the valid findings were fixed with regression tests:
 - **Readiness.** `/ready` bounds the artifact and manifest reads from metadata
   before reading, runs artifact I/O on the blocking pool, and clears the relay
   readiness flag on any task exit (not only `Err`).
+
+## Second adversarial review pass (UX/auth/unlock lane)
+
+Five fresh-context reviewers re-audited the whole slice against current code. No
+CRITICAL or HIGH confidentiality/integrity break was found in the browser path.
+The confirmed findings were fixed with regression tests:
+
+- **Unlock secret lifetime (MEDIUM).** `deriveWorkspaceFingerprint` now zeroizes
+  its owned copy of the recovery code after deriving the key. A WASM constructor
+  fault is classified `U1_WASM/wasm_unavailable` rather than blaming a valid
+  recovery code, and `HandoffGate.take` drops the shell's copy of the payload
+  AEAD keys after the one-shot handoff.
+- **Recovery wrapping (LOW hardening).** The AES-GCM AAD is now the canonical
+  `version | algorithm | key_source | credential_id` tuple, so a rewritten record
+  cannot be reassigned to another credential or downgraded without breaking the
+  tag; `key_source` is part of the primitive's validation. `parseRecoveryWrappers`
+  skips an invalid record instead of disabling every remaining valid passkey
+  wrapper, and the pending proof-of-possession challenge set now has a
+  per-session bound in addition to the global one.
+- **Readiness (MEDIUM).** `/ready` no longer reports a truncated or
+  wrong-version artifact as healthy: the header probe requires
+  `MIN_ARTIFACT_LEN` and mirrors the audited envelope's public-header validation
+  (version, non-zero KID, non-zero encapsulated key). The dispatcher is an
+  explicit readiness check. `apps/edge-gateway` eagerly loads and validates its
+  certificate/key/CA at startup (instead of failing later as a permanent 503),
+  trims whitespace-only identity values, and has a router-level forged/absent
+  assertion test.
+- **Release publication (LOW hardening).** Staging uses `mkdtemp` (no
+  collision) with an age-bounded stale sweep; directory fsync happens after the
+  directory is populated and after every symlink rename; `readRelease` rejects a
+  symlinked release or shell directory and one that resolves outside the
+  releases root; re-publishing refuses a changed recipient fingerprint even when
+  the artifact id collides.
+- **UI/accessibility.** The payload reduced-motion rule stops the spinner
+  instead of slowing it; the trade-execute and withdrawal-review confirmations
+  move focus into a named `alertdialog`, announce assertively, and return focus
+  on cancel; mobile `.chip-button` targets reach 44px wide; the workspace scroll
+  container and shell programmatic-focus targets keep a visible focus ring; the
+  withdrawal confirmation and shell security gateway are axe-gated at
+  moderate-or-worse; and the shell has a positive control that bootstrap
+  enrollment controls appear when the server reports enrollment open.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,6 +18,7 @@ import {
   releaseIdFor,
   rollbackCurrent,
   switchCurrent,
+  sweepStaleStaging,
   validateReleaseManifest,
   writeShellCacheHeaders,
 } from "./workspace-release.mjs";
@@ -424,4 +425,90 @@ test("validateReleaseManifest rejects missing manifest blocks without a TypeErro
     () => validateReleaseManifest({ ...manifest, workspace_protocol: undefined }, artifact),
     /protocol missing/,
   );
+});
+
+test("a symlinked release directory or shell is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-symlink-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-symlink-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+
+    // A symlink planted at the canonical release id must not be followed.
+    const realDir = join(root, `${releaseId}-real`);
+    await rename(join(root, releaseId), realDir);
+    await symlink(realDir, join(root, releaseId));
+    await assert.rejects(readRelease(root, releaseId), /real directory/);
+    await assert.rejects(switchCurrent(root, releaseId), /real directory/);
+
+    // A symlinked shell inside a real release directory is refused too.
+    await rm(join(root, releaseId), { force: true });
+    await rename(realDir, join(root, releaseId));
+    const realShell = join(root, releaseId, `${SHELL_DIR}-real`);
+    await rename(join(root, releaseId, SHELL_DIR), realShell);
+    await symlink(realShell, join(root, releaseId, SHELL_DIR));
+    await assert.rejects(readRelease(root, releaseId), /real directory/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
+test("stale staging directories are swept while fresh ones are kept", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-sweep-"));
+  try {
+    const stale = join(root, ".staging-old");
+    const fresh = join(root, ".staging-fresh");
+    await mkdir(stale);
+    await mkdir(fresh);
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(stale, twoHoursAgo, twoHoursAgo);
+
+    const swept = await sweepStaleStaging(root);
+    assert.equal(swept, 1);
+    const names = await readdir(root);
+    assert.ok(!names.includes(".staging-old"), "stale staging should be removed");
+    assert.ok(names.includes(".staging-fresh"), "fresh staging must be preserved");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("republishing the same artifact under a different recipient key is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-recipient-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-recipient-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    // Same artifact id but a different recipient fingerprint must not silently
+    // return the stale manifest.
+    await assert.rejects(
+      publishRelease({
+        releasesRoot: root,
+        artifact: fakeArtifact(),
+        publicKeyB64: Buffer.alloc(32, 8).toString("base64"),
+        kidB64: KID_B64,
+        sourceSha: "9a5a712",
+        shellDir,
+      }),
+      /immutable/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
 });

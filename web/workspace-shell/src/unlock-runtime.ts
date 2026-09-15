@@ -94,11 +94,10 @@ export function fromBase64(str: string): Uint8Array {
  * SHA-256 fingerprint of a workspace public key, standard base64.
  *
  * Matches the server's `public_key_fingerprint_b64`. Returns `null` when
- * WebCrypto is unavailable. A `null` result *skips* the optional local
- * preflight, so this is defence in depth only: the server independently
- * enforces the same fingerprint in its compatibility preflight, and artifact
- * decryption fails closed, so a missing digest API cannot by itself turn a
- * mismatch into a successful unlock.
+ * WebCrypto is unavailable or the input is rejected. A `null` result is a hard
+ * failure wherever a release or enrollment fingerprint is pinned: `unlock()`
+ * never treats a missing digest as a reason to skip the check, and the server
+ * independently enforces the same fingerprint in its compatibility preflight.
  */
 export async function publicKeyFingerprintB64(
   publicKey: Uint8Array,
@@ -145,10 +144,15 @@ export async function deriveWorkspaceFingerprint(
   if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) return null;
   if (secret.length !== 32 || secret.every((b) => b === 0)) return null;
   let key: WasmWorkspaceKey;
+  // Copy into an owned buffer so the caller's bytes are never mutated, and
+  // zeroize the copy once the key is derived (the WASM ctor does not retain it).
+  const secretCopy = new Uint8Array(secret);
   try {
-    key = new WasmWorkspaceKey(new Uint8Array(secret), 1, kidBytes);
+    key = new WasmWorkspaceKey(secretCopy, 1, kidBytes);
   } catch {
     return null;
+  } finally {
+    secretCopy.fill(0);
   }
   try {
     return await publicKeyFingerprintB64(new Uint8Array(key.public_key()));
@@ -440,7 +444,11 @@ export class WorkspaceUnlockRuntime {
       try {
         workspaceKey = new WasmWorkspaceKey(secretBytes, 1, kidBytes);
       } catch {
-        throw new UnlockError("U2_ENROLL", "invalid_secret");
+        // Length/zero/KID/version are all validated in JS above and mirrored by
+        // the audited WASM constructor, so a throw here is an internal WASM/alloc
+        // fault, not an invalid recovery code. Classify it as such instead of
+        // telling the person to re-enter a valid code.
+        throw new UnlockError("U1_WASM", "wasm_unavailable");
       }
       secretBytes.fill(0);
       let publicKeyBytes: Uint8Array;
