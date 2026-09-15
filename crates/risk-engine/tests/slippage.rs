@@ -157,8 +157,10 @@ fn bps_max_hard_max_is_respected() {
 
 #[test]
 fn latency_saturation_does_not_wrap() {
-    // u64::MAX + u64::MAX saturates to u64::MAX; the call must not wrap and the
-    // clamped result must stay at the hard maximum.
+    // The clamp makes the observable result equal whether the add saturates or
+    // wraps, so the wrap property itself is pinned by the `src` unit test
+    // `latency_sum_saturates_instead_of_wrapping`; this integration test only
+    // proves the extreme input still terminates at the hard maximum.
     let signals = signals(0, 0, u64::MAX, u64::MAX);
     let policy = policy(0, 1);
     let output = recommend(&signals, &policy, Bps::MAX).get();
@@ -250,6 +252,9 @@ fn source_has_no_forbidden_constructs() {
         ("src/lib.rs", include_str!("../src/lib.rs")),
         ("src/slippage.rs", include_str!("../src/slippage.rs")),
     ];
+    // The scan strips all whitespace first, so `.unwrap (` / `panic !` /
+    // `unsafe {` (and other spacing variants) cannot evade it. `f32`/`f64` are
+    // forbidden because the core must stay integer-only.
     let forbidden = [
         ".unwrap(",
         ".expect(",
@@ -257,14 +262,23 @@ fn source_has_no_forbidden_constructs() {
         "unreachable!",
         "todo!",
         "unimplemented!",
-        "unsafe {",
-        "unsafe fn",
-        "unsafe impl",
+        "unsafe{",
+        "unsafefn",
+        "unsafeimpl",
+        "f32",
+        "f64",
     ];
 
     for (name, source) in sources {
+        let compact: String = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
         for token in forbidden {
-            assert!(!source.contains(token), "{name} must not contain `{token}`");
+            assert!(
+                !compact.contains(token),
+                "{name} must not contain `{token}`"
+            );
         }
     }
     assert!(include_str!("../src/lib.rs").contains("#![forbid(unsafe_code)]"));

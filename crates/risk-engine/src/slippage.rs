@@ -161,7 +161,7 @@ mod tests {
         // The checked operations cannot fail with the current field widths:
         // u64::MAX * 10_000 still fits in u128. This pins the saturating path
         // as the one that is reached, not the fail-closed path.
-        let expected = ((u64::MAX as u128) * 10_000).div_ceil(1000);
+        let expected = ((u64::MAX as u128) * Bps::MAX as u128).div_ceil(1000);
         assert_eq!(ceil_latency_bps(u64::MAX, Bps::MAX), Ok(expected));
     }
 }
