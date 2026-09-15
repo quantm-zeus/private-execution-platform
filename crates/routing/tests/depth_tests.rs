@@ -10,7 +10,10 @@ use market_types::{
     AtomicAmount, BinPoolState, Bps, ClmmPoolState, ClmmTick, LiquidityBin, PoolKindState,
 };
 use routing::{depth_at_bps, depth_rank, plan_single_path, RoutingError, DEPTH_TARGETS_BPS};
-use simulation::{simulate_clmm_exact_input, ClmmExactInputRequest};
+use simulation::{
+    simulate_bin_exact_input, simulate_clmm_exact_input, BinExactInputRequest,
+    ClmmExactInputRequest,
+};
 
 fn bps(value: u16) -> Bps {
     Bps::new(value).expect("valid bps")
@@ -539,6 +542,75 @@ fn bin_depth_survives_an_unrepresentable_active_bin() {
         profile.levels[0].absorbed_in,
         Some(AtomicAmount::new(29_408_350))
     );
+}
+
+/// `bin_step = 1` with active bin 10: every per-bin price at/above bin 10 overflows
+/// `u128` (`10001^10`), so the depth fallback must compare the exact *ratio* rather
+/// than failing closed just because the individual powers overflow.
+fn one_sided_step1_pool() -> BinPoolState {
+    let mut bins: Vec<LiquidityBin> = (0..=9)
+        .map(|id| {
+            // Bins below the active bin hold only the quote asset (reserve_1).
+            LiquidityBin::new(id, AtomicAmount::new(0), AtomicAmount::new(1_000_000_000))
+        })
+        .collect();
+    bins.push(LiquidityBin::new(
+        10,
+        AtomicAmount::new(1_000_000_000),
+        AtomicAmount::new(0),
+    ));
+    BinPoolState {
+        token_0: weth(),
+        token_1: usdc(),
+        decimals_0: 0,
+        decimals_1: 0,
+        active_bin_id: 10,
+        bin_step: 1,
+        fee_bps: bps(0),
+        bins,
+    }
+}
+
+#[test]
+fn bin_depth_handles_a_near_one_ratio_whose_powers_overflow() {
+    let pool = one_sided_step1_pool();
+    let state = PoolKindState::Bin(pool.clone());
+
+    // Independently find the true maximum traversable input via the kernel.
+    let probe = |amount: u128| {
+        simulate_bin_exact_input(
+            &pool,
+            &BinExactInputRequest::new(weth(), AtomicAmount::new(amount)),
+        )
+        .is_ok()
+    };
+    let mut lo = 0u128;
+    let mut hi = u128::MAX >> 40;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if probe(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let cap = lo;
+    assert!(cap > 0, "fixture must be traversable");
+    let resulting = simulate_bin_exact_input(
+        &pool,
+        &BinExactInputRequest::new(weth(), AtomicAmount::new(cap)),
+    )
+    .expect("cap quotes")
+    .resulting_active_bin_id;
+    assert!(resulting < 10, "cap must traverse down from the active bin");
+
+    // The whole 0..=10 range is only ~10 bps wide, so a 250-bps band covers all of
+    // it: the absorbed input must be the exact cap, not an under-estimate.
+    let profile = depth_at_bps(&state, &weth(), AtomicAmount::new(cap), &targets(&[250]))
+        .expect("near-one-ratio depth profile");
+    assert_eq!(profile.levels[0].absorbed_in, Some(AtomicAmount::new(cap)));
+    // The exact move at the cap is `(10000/10001)^10 - 1 = 9.995 bps` -> ceiling 10.
+    assert_eq!(profile.trade_impact_bps, Some(bps(10)));
 }
 
 #[test]

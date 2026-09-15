@@ -261,9 +261,9 @@ fn clmm_within(pool_sqrt: u128, resulting_sqrt: u128, target_bps: u16) -> bool {
 /// Prefers the kernel's reduced per-bin prices (exact even when `|diff|` is large
 /// relative to `|bin_id|`). If an endpoint price is not representable — the kernel
 /// can still quote by skipping a zero-reserve active bin — it falls back to the
-/// signed-exponent ratio `base^|diff|`, which is exact whenever that power fits
-/// `u128`; a power that overflows implies an impact beyond any representable band,
-/// so `false` is the correct fail-closed answer.
+/// signed-exponent ratio `base^|diff|`, compared exactly with a small bignum so a
+/// near-one ratio never fails closed merely because its individual powers overflow
+/// `u128`.
 fn bin_within(
     bin_step: u16,
     decimals_0: u8,
@@ -286,6 +286,10 @@ fn bin_within(
 
 /// Fallback predicate for an unrepresentable endpoint price, using the signed
 /// exponent of the reduced bin base.
+///
+/// The ratio is compared exactly by a small bignum rather than by materialising
+/// `base^|diff|` in `u128`: for a near-one ratio (small `bin_step`) both powers can
+/// overflow while the exact move is still only a few basis points.
 fn bin_exponent_within(
     bin_step: u16,
     active_bin_id: i32,
@@ -298,18 +302,78 @@ fn bin_exponent_within(
     }
     let (base_num, base_den) = bin_base(bin_step);
     let exponent = diff.unsigned_abs() as u32;
-    let t = target_bps as u128;
-    let (Some(np), Some(dp)) = (
-        base_num.checked_pow(exponent),
-        base_den.checked_pow(exponent),
-    ) else {
-        return false;
-    };
+    let t = target_bps as u64;
     if diff > 0 {
-        cmp_u128_products(np, 10_000, 10_000 + t, dp) != Ordering::Greater
+        // `(base_num/base_den)^e <= (10_000 + t)/10_000`
+        //   <=>  `10_000 * base_num^e <= (10_000 + t) * base_den^e`.
+        bin_pow_cmp(base_num, base_den, exponent, 10_000, 10_000 + t) != Ordering::Greater
     } else {
-        cmp_u128_products(dp, 10_000, 10_000 - t, np) != Ordering::Less
+        // `(base_den/base_num)^e >= (10_000 - t)/10_000`
+        //   <=>  `(10_000 - t) * base_num^e <= 10_000 * base_den^e`.
+        bin_pow_cmp(base_num, base_den, exponent, 10_000 - t, 10_000) != Ordering::Greater
     }
+}
+
+/// Little-endian `u64` bignum limbs.
+type Big = Vec<u64>;
+
+/// Exact comparison of `lhs_scale * base_num^exponent` against
+/// `rhs_scale * base_den^exponent`.
+///
+/// `base_num`/`base_den` come from [`bin_base`] (at most `11_000`/`10_000`) and the
+/// exponent is bounded by the kernel's bin-crossing budget, so the exact powers fit
+/// comfortably in a small little-endian bignum. This is the only way to compare a
+/// near-one ratio whose individual powers overflow `u128`.
+fn bin_pow_cmp(
+    base_num: u128,
+    base_den: u128,
+    exponent: u32,
+    lhs_scale: u64,
+    rhs_scale: u64,
+) -> Ordering {
+    let lhs = mul_big_small(&pow_big(base_num as u64, exponent), lhs_scale);
+    let rhs = mul_big_small(&pow_big(base_den as u64, exponent), rhs_scale);
+    cmp_big(&lhs, &rhs)
+}
+
+/// `base^exponent` as a little-endian `u64` bignum (repeated small multiplication).
+fn pow_big(base: u64, exponent: u32) -> Big {
+    let mut result: Big = vec![1];
+    for _ in 0..exponent {
+        result = mul_big_small(&result, base);
+    }
+    result
+}
+
+/// `value * factor` as a bignum.
+fn mul_big_small(value: &[u64], factor: u64) -> Big {
+    let mut out = Vec::with_capacity(value.len() + 1);
+    let mut carry: u128 = 0;
+    for &limb in value {
+        let acc = limb as u128 * factor as u128 + carry;
+        out.push(acc as u64);
+        carry = acc >> 64;
+    }
+    if carry != 0 {
+        out.push(carry as u64);
+    }
+    trim_big(out)
+}
+
+/// Drops high-order zero limbs.
+fn trim_big(mut value: Big) -> Big {
+    while value.len() > 1 && value.last() == Some(&0) {
+        value.pop();
+    }
+    value
+}
+
+/// Compares two little-endian bignums.
+fn cmp_big(left: &[u64], right: &[u64]) -> Ordering {
+    if left.len() != right.len() {
+        return left.len().cmp(&right.len());
+    }
+    left.iter().rev().cmp(right.iter().rev())
 }
 
 /// Reduced bin price base `((10_000 + bin_step) / 10_000)`.
@@ -623,5 +687,34 @@ mod tests {
         // One bin below active is a 10/11 move: 909.09 bps -> within 910, not 909.
         assert!(bin_within(1_000, 0, 0, 38, 37, 910));
         assert!(!bin_within(1_000, 0, 0, 38, 37, 909));
+    }
+
+    #[test]
+    fn bin_exponent_within_is_exact_when_a_per_bin_price_overflows() {
+        // `bin_step = 1`: `10001^10` overflows `u128`, so `atomic_bin_price` fails
+        // for bin 10, yet the exact ratio over ten bins is only ~9.995 bps (fall)
+        // and ~10.005 bps (rise). The bignum fallback must decide exactly.
+        assert!(atomic_bin_price(1, 0, 0, 10).is_err());
+        assert!(bin_within(1, 0, 0, 10, 0, 10));
+        assert!(!bin_within(1, 0, 0, 10, 0, 9));
+        assert!(bin_within(1, 0, 0, 0, 10, 11));
+        assert!(!bin_within(1, 0, 0, 0, 10, 10));
+        // A far move is correctly rejected.
+        assert!(!bin_within(1, 0, 0, 10, 0, 1));
+    }
+
+    #[test]
+    fn bignum_pow_and_compare_are_exact() {
+        // `2^64` carries into a second limb.
+        assert_eq!(pow_big(2, 64), [0, 1]);
+        // `mul_big_small` carry propagation: 2 * (2^64 - 1) = 2^65 - 2.
+        assert_eq!(mul_big_small(&[u64::MAX], 2), [u64::MAX - 1, 1]);
+        // Exact comparison, including the `lhs_scale`/`rhs_scale` factors.
+        assert_eq!(bin_pow_cmp(3, 2, 5, 1, 1), Ordering::Greater);
+        assert_eq!(bin_pow_cmp(2, 3, 4, 100, 1), Ordering::Greater);
+        assert_eq!(bin_pow_cmp(2, 3, 4, 1, 100), Ordering::Less);
+        assert_eq!(bin_pow_cmp(7, 7, 3, 5, 5), Ordering::Equal);
+        assert_eq!(cmp_big(&[0], &[0]), Ordering::Equal);
+        assert_eq!(cmp_big(&[u64::MAX, 1], &[0, 2]), Ordering::Less);
     }
 }
