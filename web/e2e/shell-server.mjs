@@ -305,6 +305,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // The passkey-recovery surface is closed on this host (no wrapper store is
+    // configured), so the shell must not advertise it. A uniform 503 keeps the
+    // test host honest instead of letting a 404 be mistaken for a live surface.
+    if (path.startsWith("/internal/workspace/recovery")) {
+      return json(res, 503, { code: "recovery_unavailable" });
+    }
+
     if (path.startsWith("/internal/") || path.startsWith("/v1/")) {
       return json(res, 404, { error: "not found" });
     }

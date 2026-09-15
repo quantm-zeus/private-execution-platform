@@ -94,7 +94,23 @@ checks that the client could open a challenge the server itself produced. A
 challenge is issued only when the enrolled key matches the **immutable release
 manifest's recipient fingerprint**, so an attacker cannot enroll a key they
 control and then self-approve: mutating recovery requires an existing trusted
-recovery factor.
+recovery factor. The cheap public bindings (manifest shape, artifact
+version/KID, enrolled key, fingerprint) are checked before the full
+manifest-vs-artifact byte validation, so a rejected request never forces a full
+artifact hash. `add`, `revoke` and `touch` all require a proof; `list` is
+read-only.
+
+### Step-up verification
+
+Adding or editing credentials happens while the shell already holds an
+authenticated session. `/internal/auth/verify` therefore treats a ceremony that
+arrives with a live session cookie as a **step-up**: it verifies the assertion,
+consumes the single-use challenge, and keeps the existing session instead of
+minting a replacement. Minting a new session would silently drop the workspace
+enrollment bound to the old one (the enrollment ledger is keyed by session), so
+the immediately following proof-of-possession call would fail
+`enrollment_required`. A ceremony with no live session is an ordinary login and
+mints a new session as before.
 
 ## New-device flow
 
