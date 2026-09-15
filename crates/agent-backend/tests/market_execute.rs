@@ -689,10 +689,16 @@ async fn reconcile_market_order_uses_the_same_identity_as_execute() {
         execute("USDC", "TOKEN", AmountSpec::TokenAtomic(AMOUNT)),
     )
     .await;
-    assert_eq!(
-        outcome,
-        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "submitted" } }))
-    );
+    let BackendOutcome::Value(value) = &outcome else {
+        panic!("expected an execution value, got {outcome:?}");
+    };
+    assert_eq!(value["execution"]["state"], "submitted");
+    // BR-10: the result echoes the bound routing source and a stable execution
+    // id so the caller can attribute the submission honestly.
+    assert_eq!(value["router_source"], "local");
+    assert!(value["execution_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
 
     let (token_in, token_out, side, amount, slippage, impact, router) =
         reconcile_args(AmountSpec::TokenAtomic(AMOUNT));
@@ -711,7 +717,9 @@ async fn reconcile_market_order_uses_the_same_identity_as_execute() {
 
     assert_eq!(
         reconciled,
-        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "unknown" } }))
+        BackendOutcome::Value(
+            serde_json::json!({ "execution": { "state": "unknown" }, "router_source": "local" })
+        )
     );
     assert_eq!(port.calls(), 1);
     assert_eq!(port.reconcile_calls(), 1);
@@ -754,7 +762,9 @@ async fn reconcile_market_order_default_port_is_unknown() {
         .await;
     assert_eq!(
         outcome,
-        BackendOutcome::Value(serde_json::json!({ "execution": { "state": "unknown" } }))
+        BackendOutcome::Value(
+            serde_json::json!({ "execution": { "state": "unknown" }, "router_source": "local" })
+        )
     );
 }
 

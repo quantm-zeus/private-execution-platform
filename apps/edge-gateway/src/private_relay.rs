@@ -233,23 +233,18 @@ impl crate::OpaqueStreamRelay for PrivateStreamRelay {
         });
         // Backend -> browser: enforce the same size bound the unary path uses.
         tokio::spawn(async move {
-            loop {
-                match inbound.message().await {
-                    Ok(Some(frame)) => {
-                        if frame.ciphertext.is_empty()
-                            || frame.ciphertext.len() > crate::DEFAULT_MAX_OPAQUE_BODY_BYTES
-                        {
-                            break;
-                        }
-                        if from_backend_tx
-                            .send(Bytes::from(frame.ciphertext))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(frame)) = inbound.message().await {
+                if frame.ciphertext.is_empty()
+                    || frame.ciphertext.len() > crate::DEFAULT_MAX_OPAQUE_BODY_BYTES
+                {
+                    break;
+                }
+                if from_backend_tx
+                    .send(Bytes::from(frame.ciphertext))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         });

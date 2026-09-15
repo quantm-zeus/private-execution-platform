@@ -26,6 +26,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub mod opaque;
 pub mod stream;
+pub mod web_contract;
 
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -35,6 +36,9 @@ pub use opaque::{
 pub use stream::{
     EncryptedStreamService, FailClosedStreamSource, FrameSink, SourceFrame, StreamDriver,
     StreamHub, StreamSource,
+};
+pub use web_contract::{
+    FailClosedWebContract, WebContractBackend, WebContractDispatcher,
 };
 
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";
