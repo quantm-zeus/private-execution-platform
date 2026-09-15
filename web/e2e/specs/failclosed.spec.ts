@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { resetServer } from "./helpers";
+import { configureSession, handoffKey, randomKeyB64, resetServer, waitForWorkspace } from "./helpers";
 
 const ALL_TRUE_BOOTSTRAP = {
   protocol_version: 1,
@@ -30,6 +30,9 @@ test.describe("fail-closed private workspace", () => {
   test("renders an explicit unavailable state and enables no capability on 404", async ({ page }) => {
     await page.route("**/v1/bootstrap", (route) => route.fulfill({ status: 404, body: "not found" }));
     await page.goto("/");
+    // Bootstrap is opaque now: it needs a BR-5 key before the routed 404 can be
+    // observed (with no key it fails closed locally instead of probing).
+    await handoffKey(page, randomKeyB64(), randomKeyB64());
 
     await expect(page.locator(".workspace")).toBeVisible();
     await expect(page.getByText(/not available on this deployment/i).first()).toBeVisible();
@@ -40,6 +43,7 @@ test.describe("fail-closed private workspace", () => {
   test("maps an unauthorized bootstrap to an auth error, never a ready state", async ({ page }) => {
     await page.route("**/v1/bootstrap", (route) => route.fulfill({ status: 401, body: "no" }));
     await page.goto("/");
+    await handoffKey(page, randomKeyB64(), randomKeyB64());
 
     await expect(page.getByText(/not authorized/i).first()).toBeVisible();
     await expect(page.getByText("TRADING ENABLED")).toHaveCount(0);
@@ -47,6 +51,9 @@ test.describe("fail-closed private workspace", () => {
 
   test("disables every mutation with a reason while the kill switch is engaged", async ({ page, request }) => {
     await resetServer(request);
+    const s2c = randomKeyB64();
+    const c2s = randomKeyB64();
+    await configureSession(request, s2c, c2s);
     await request.post("/__test__/bootstrap", {
       data: {
         bootstrap: {
@@ -57,6 +64,8 @@ test.describe("fail-closed private workspace", () => {
       },
     });
     await page.goto("/");
+    await waitForWorkspace(page);
+    await handoffKey(page, s2c, c2s);
     await expect(page.locator(".workspace")).toBeVisible();
     await expect(page.getByText(/trading is disabled|foundation phase/i).first()).toBeVisible();
 
@@ -75,7 +84,14 @@ test.describe("fail-closed private workspace", () => {
 
   test("shows no fabricated market values before any authenticated frame arrives", async ({ page, request }) => {
     await resetServer(request);
+    const s2c = randomKeyB64();
+    const c2s = randomKeyB64();
+    await configureSession(request, s2c, c2s);
     await page.goto("/");
+    await waitForWorkspace(page);
+    // The stream key is handed over (so bootstrap succeeds), but no frame is
+    // ever sent: the view must stay on "awaiting feed", not fabricate depth.
+    await handoffKey(page, s2c, c2s);
     await expect(page.locator(".workspace")).toBeVisible();
     await page.locator('button[data-view="terminal"]').click();
 

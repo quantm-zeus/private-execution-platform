@@ -196,6 +196,13 @@ export interface UnlockResult {
   cleanup: () => void;
 }
 
+/** BR-5 session material handed to the payload over the same-document channel. */
+export interface ShellSessionKeys {
+  readonly kid: string;
+  readonly s2cKeyB64: string;
+  readonly c2sKeyB64: string;
+}
+
 export interface UnlockOptions {
   enrollUrl?: string;
   grantUrl?: string;
@@ -207,6 +214,13 @@ export class WorkspaceUnlockRuntime {
   private activeUrls: Set<string> = new Set();
   private currentKey: WasmWorkspaceKey | null = null;
   private currentPayloadFiles: Map<string, Uint8Array> | null = null;
+  /**
+   * BR-5 transport session keys, derived from the same authenticated HPKE
+   * exchange that decrypts the artifact. Held only while unlocked; `lock()`
+   * drops the reference so it can be garbage-collected, and the payload owns
+   * the only durable copy as non-extractable CryptoKeys.
+   */
+  private currentSession: ShellSessionKeys | null = null;
   private isUnlocked: boolean = false;
 
   constructor() {
@@ -222,6 +236,15 @@ export class WorkspaceUnlockRuntime {
 
   public getActiveUrlCount(): number {
     return this.activeUrls.size;
+  }
+
+  /**
+   * BR-5 session keys for the payload handoff, or `null` before unlock/after
+   * lock. The caller must only deliver these over the same-document channel to
+   * its own sandboxed frame.
+   */
+  public sessionKeys(): ShellSessionKeys | null {
+    return this.currentSession;
   }
 
   public async unlock(
@@ -342,10 +365,30 @@ export class WorkspaceUnlockRuntime {
 
       const sessionEnvelopeWire = new Uint8Array(await deliverResponse.arrayBuffer());
 
-      // 5. Decrypt transport envelope in WASM, then drop the transport session
+      // 5. Decrypt transport envelope in WASM, extract the BR-5 directional app
+      //    session keys, then drop the transport session. The keys are only
+      //    needed for the same-document handoff to the payload; they are never
+      //    persisted.
       let sealedArtifactBytes: Uint8Array;
+      let sessionMaterial: ShellSessionKeys | null = null;
       try {
         sealedArtifactBytes = new Uint8Array(initiator.decrypt(sessionEnvelopeWire));
+        const rawAppKeys = new Uint8Array(initiator.app_session_keys());
+        const rawKid = new Uint8Array(initiator.kid());
+        try {
+          if (rawAppKeys.length !== 64 || rawKid.length !== 16) {
+            throw new Error("Session key material was malformed");
+          }
+          sessionMaterial = {
+            kid: toBase64(rawKid),
+            // app_session_keys() returns c2s(32) || s2c(32).
+            c2sKeyB64: toBase64(rawAppKeys.subarray(0, 32)),
+            s2cKeyB64: toBase64(rawAppKeys.subarray(32, 64)),
+          };
+        } finally {
+          rawAppKeys.fill(0);
+          rawKid.fill(0);
+        }
       } finally {
         initiator.free();
         initiator = null;
@@ -368,7 +411,11 @@ export class WorkspaceUnlockRuntime {
       const htmlUrl = this.instantiatePayload(unpackedFiles);
       // Ownership transfers only after the payload is fully instantiated; any
       // earlier failure is reclaimed by the finally below.
+      if (!sessionMaterial) {
+        throw new Error("Session key handoff unavailable");
+      }
       this.currentKey = workspaceKey;
+      this.currentSession = sessionMaterial;
       workspaceKey = null;
       unlocked = true;
       this.isUnlocked = true;
@@ -448,6 +495,11 @@ export class WorkspaceUnlockRuntime {
       } catch {}
       this.currentKey = null;
     }
+
+    // Drop the BR-5 handoff material. Strings cannot be zeroized in JS; the
+    // durable copies live only as non-extractable CryptoKeys inside the payload,
+    // which is torn down with the iframe on lock.
+    this.currentSession = null;
 
     this.isUnlocked = false;
   }

@@ -1136,6 +1136,7 @@ fn channel_source(channel: AgentChannel) -> TradeSource {
     match channel {
         AgentChannel::Mcp => TradeSource::Mcp,
         AgentChannel::Telegram => TradeSource::Telegram,
+        AgentChannel::Web => TradeSource::Web,
     }
 }
 

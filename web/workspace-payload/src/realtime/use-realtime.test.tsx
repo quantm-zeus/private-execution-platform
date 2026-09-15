@@ -201,6 +201,8 @@ describe("useRealtimeFeed", () => {
     deliver({ type: "evergreen:session-key", kid: "kid-1", s2cKeyB64: S2C_KEY, c2sKeyB64: C2S_KEY });
     await flush();
     expect(setCommand).toHaveBeenCalledTimes(1);
+    // The c2s key is also handed to the worker so it can seal opaque syncs.
+    expect(started[0]).toMatchObject({ kid: "kid-1", keyB64: S2C_KEY, c2sKeyB64: C2S_KEY });
     // The stable proxy delegates to the encrypted client: a command now leaves
     // the process on the neutral path instead of failing with capability_missing.
     await expect(store.command.send("get_quote", { a: 1 })).rejects.toMatchObject({ code: "server" });

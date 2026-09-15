@@ -819,7 +819,7 @@ try {
   // differently. Regenerating the wasm is a reviewed change: update this digest
   // in the same commit.
   const EXPECTED_WASM_SHA256 =
-    "dbf0c80c5cc27a298b46febe67171c250e75a78f0d3f7eaddf46924b17fda7d3";
+    "60d2b137f2b8449c4ecb19a561726a047b1020344cf5dcac22871bd6a11744a8";
   const wasmSha256 = digest(wasmBytes);
   if (wasmSha256 !== EXPECTED_WASM_SHA256) {
     throw new Error(

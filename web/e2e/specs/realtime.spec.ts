@@ -117,8 +117,9 @@ test.describe("encrypted realtime workspace", () => {
     await resetServer(request);
     await page.goto("/");
     await waitForWorkspace(page);
-    // No key is delivered: the feed must fail closed, never fabricate "live".
-    await expect(page.getByText(/session key handoff unavailable/i)).toBeVisible({ timeout: 6_000 });
+    // No key is delivered: bootstrap itself fails closed (it can no longer fall
+    // back to a cleartext probe), so the feed must never fabricate "live".
+    await expect(page.getByText(/session key.*unavailable/i).first()).toBeVisible({ timeout: 6_000 });
     await expect(page.getByText("LOCAL DATA")).toHaveCount(0);
   });
 });
@@ -164,7 +165,10 @@ test.describe("encrypted command channel", () => {
     const cleartextBodies: string[] = [];
     page.on("request", (outgoing) => {
       if (outgoing.url().endsWith("/v1/command") && outgoing.method() === "POST") {
-        cleartextBodies.push(outgoing.postData() ?? "");
+        // The request is an octet-stream envelope; postData() only exposes text
+        // bodies, so read the raw buffer and decode it as UTF-8 JSON.
+        const buffer = outgoing.postDataBuffer();
+        if (buffer) cleartextBodies.push(buffer.toString("utf8"));
       }
     });
     await configureSession(request, s2c, c2s);

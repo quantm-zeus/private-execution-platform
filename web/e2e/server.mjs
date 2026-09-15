@@ -139,6 +139,57 @@ function json(res, status, body) {
   res.end(payload);
 }
 
+/** Opaque AEAD response: the bare envelope as UTF-8 JSON octet-stream bytes. */
+function octetStream(res, status, envelope) {
+  const payload = Buffer.from(JSON.stringify(envelope), "utf8");
+  res.writeHead(status, {
+    "Content-Type": "application/octet-stream",
+    "Cache-Control": "no-store",
+    "Content-Length": payload.length,
+  });
+  res.end(payload);
+}
+
+function readRawBody(req, limit = 2 * 1024 * 1024) {
+  return new Promise((resolvePromise, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error("body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolvePromise(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+/**
+ * Decode an octet-stream request: parse the generic envelope, validate the kid
+ * and open it with the seeded c2s key. Returns `null` (never throws) so a
+ * hostile body cannot take down the mock.
+ */
+async function readEnvelopeRequest(req) {
+  if (!state.kid || !state.c2sKey) return null;
+  let envelope;
+  try {
+    envelope = JSON.parse((await readRawBody(req)).toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!envelope || typeof envelope !== "object" || envelope.kid !== state.kid) return null;
+  try {
+    const plaintext = openEnvelope(state.kid, envelope.sequence, state.c2sKey, envelope);
+    return { envelope, plaintext };
+  } catch {
+    return null;
+  }
+}
+
 function readBody(req, limit = 2 * 1024 * 1024) {
   return new Promise((resolvePromise, reject) => {
     const chunks = [];
@@ -221,37 +272,51 @@ const server = createServer(async (req, res) => {
 
   try {
     if (path === "/v1/bootstrap" && req.method === "POST") {
-      json(res, 200, state.bootstrap);
+      const opened = await readEnvelopeRequest(req);
+      if (!opened) {
+        json(res, 400, { error: "unavailable" });
+        return;
+      }
+      // The bootstrap response is the flat workspace-session document the web
+      // parser accepts, plus the request-id echo (BR-3). `session.key_id` must
+      // equal the wire kid exactly as the real private API derives it.
+      const document = {
+        ...state.bootstrap,
+        session: { ...(state.bootstrap.session ?? {}), key_id: state.kid },
+        request_id: opened.plaintext.request_id,
+      };
+      const envelope = seal(state.kid, opened.envelope.sequence, state.s2cKey, document);
+      octetStream(res, 200, envelope);
       return;
     }
 
     if (path === "/v1/sync" && req.method === "POST") {
+      const opened = await readEnvelopeRequest(req);
+      if (!opened) {
+        json(res, 400, { error: "unavailable" });
+        return;
+      }
       state.resyncCount += 1;
-      json(res, 200, { ok: true });
+      const responseBody = {
+        request_id: opened.plaintext.request_id,
+        result: { accepted: true, from_seq: opened.plaintext.from_seq ?? null },
+      };
+      const envelope = seal(state.kid, opened.envelope.sequence, state.s2cKey, responseBody);
+      octetStream(res, 200, envelope);
       return;
     }
 
     if (path === "/v1/command" && req.method === "POST") {
-      if (!state.kid || !state.c2sKey || !state.s2cKey) {
+      const opened = await readEnvelopeRequest(req);
+      if (!opened) {
         json(res, 503, { error: "session unavailable" });
         return;
       }
-      const body = await readBody(req);
-      if (body.kid !== state.kid) {
-        json(res, 400, { error: "kid mismatch" });
-        return;
-      }
-      let oper;
-      try {
-        oper = openEnvelope(state.kid, body.sequence, state.c2sKey, body);
-      } catch {
-        json(res, 400, { error: "undecryptable" });
-        return;
-      }
+      const oper = opened.plaintext;
       state.commands.push({
         op: oper.op,
         payload: oper.payload,
-        sequence: body.sequence,
+        sequence: opened.envelope.sequence,
         requestId: oper.request_id,
       });
       // Echo the per-request challenge inside the AEAD: the client binds the
@@ -267,8 +332,8 @@ const server = createServer(async (req, res) => {
       } else {
         responseBody = { ...state.commandResponse, request_id: oper.request_id };
       }
-      const envelope = seal(state.kid, body.sequence, state.s2cKey, responseBody);
-      json(res, 200, { envelope });
+      const envelope = seal(state.kid, opened.envelope.sequence, state.s2cKey, responseBody);
+      octetStream(res, 200, envelope);
       return;
     }
 

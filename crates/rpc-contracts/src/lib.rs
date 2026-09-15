@@ -31,7 +31,7 @@ pub fn validate_stream_frame(frame: &StreamFrame) -> Result<(), PayloadError> {
 /// Validates a unary relay request, including route presence.
 pub fn validate_relay_request(request: &RelayRequest) -> Result<(), RequestError> {
     match Route::try_from(request.route) {
-        Ok(Route::Bootstrap | Route::Sync | Route::Blob) => {}
+        Ok(Route::Bootstrap | Route::Sync | Route::Blob | Route::Command) => {}
         Ok(Route::Unspecified) | Err(_) => return Err(RequestError::InvalidRoute),
     }
     validate_payload(&request.ciphertext).map_err(RequestError::Payload)
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn unary_route_validation_accepts_only_neutral_routes() {
-        for route in [Route::Bootstrap, Route::Sync, Route::Blob] {
+        for route in [Route::Bootstrap, Route::Sync, Route::Blob, Route::Command] {
             assert!(validate_relay_request(&request(route as i32, 1)).is_ok());
         }
     }
@@ -139,6 +139,7 @@ mod tests {
         assert_eq!(Route::try_from(1), Ok(Route::Bootstrap));
         assert_eq!(Route::try_from(2), Ok(Route::Sync));
         assert_eq!(Route::try_from(3), Ok(Route::Blob));
-        assert!(Route::try_from(4).is_err());
+        assert_eq!(Route::try_from(4), Ok(Route::Command));
+        assert!(Route::try_from(5).is_err());
     }
 }

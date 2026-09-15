@@ -125,6 +125,7 @@ fn proto_route(route: OpaqueRoute) -> i32 {
         OpaqueRoute::Bootstrap => Route::Bootstrap as i32,
         OpaqueRoute::Sync => Route::Sync as i32,
         OpaqueRoute::Blob => Route::Blob as i32,
+        OpaqueRoute::Command => Route::Command as i32,
     }
 }
 

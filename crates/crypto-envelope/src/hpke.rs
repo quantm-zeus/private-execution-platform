@@ -7,7 +7,7 @@
 
 use crate::{
     CryptoError, Envelope, ReceiveSession, SendSession, SessionKey, StreamFrame, StreamFrameCodec,
-    StreamFrameError, KID_LEN,
+    StreamFrameError, KID_LEN, SESSION_KEY_LEN,
 };
 use hpke::{
     aead::ChaCha20Poly1305, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::SeedableRng,
@@ -24,6 +24,16 @@ pub const HPKE_VERSION: u8 = 1;
 const HANDSHAKE_INFO: &[u8] = b"private-execution/hpke-session/v1";
 const EXPORTER_C2S: &[u8] = b"private-execution app session c2s v1";
 const EXPORTER_S2C: &[u8] = b"private-execution app session s2c v1";
+/// Additional exporter labels for the transport AEAD the *browser* consumes.
+///
+/// The browser app session uses WebCrypto AES-256-GCM (the only AEAD the
+/// platform exposes), while the artifact envelope above uses ChaCha20-Poly1305.
+/// Reusing one key across two AEADs is a cross-protocol hazard, so the app
+/// directions get their own HKDF exporter outputs. These labels are part of the
+/// wire protocol: changing them invalidates every outstanding session (a fresh
+/// BR-5 handoff would be required), so they are frozen.
+const APP_EXPORTER_C2S: &[u8] = b"private-execution app aead c2s v1";
+const APP_EXPORTER_S2C: &[u8] = b"private-execution app aead s2c v1";
 
 #[derive(Debug, Error)]
 pub enum HpkeSetupError {
@@ -132,11 +142,19 @@ pub struct HpkeInitiatorSession {
     kid: [u8; KID_LEN],
     send: SendSession,
     receive: ReceiveSession,
+    app: AppDirectionKeys,
 }
 
 impl HpkeInitiatorSession {
     pub fn kid(&self) -> [u8; KID_LEN] {
         self.kid
+    }
+
+    /// Raw browser-facing directional app keys. Only the trusted shell should
+    /// read these, and only to hand them to the payload over a same-document
+    /// channel (BR-5). Never persist, log or serialize them.
+    pub fn app_keys(&self) -> &AppDirectionKeys {
+        &self.app
     }
 
     pub fn seal(&mut self, sequence: u64, plaintext: &[u8]) -> Result<Envelope, CryptoError> {
@@ -205,11 +223,18 @@ pub struct HpkeResponderSession {
     kid: [u8; KID_LEN],
     send: SendSession,
     receive: ReceiveSession,
+    app: AppDirectionKeys,
 }
 
 impl HpkeResponderSession {
     pub fn kid(&self) -> [u8; KID_LEN] {
         self.kid
+    }
+
+    /// Raw browser-facing directional app keys for the server session store.
+    /// Mirrored by [`HpkeInitiatorSession::app_keys`]; never persist or log.
+    pub fn app_keys(&self) -> &AppDirectionKeys {
+        &self.app
     }
 
     pub fn seal(&mut self, sequence: u64, plaintext: &[u8]) -> Result<Envelope, CryptoError> {
@@ -276,6 +301,44 @@ impl std::fmt::Debug for HpkeResponderSession {
 struct ExportedMaterial {
     c2s: SessionKey,
     s2c: SessionKey,
+    app: AppDirectionKeys,
+}
+
+/// Raw direction-separated 32-byte keys for the browser-facing transport AEAD
+/// (AES-256-GCM in the private payload).
+///
+/// This is the only type that exports raw session key bytes. It exists solely
+/// so the trusted same-origin shell can hand the two directional keys to the
+/// sandboxed payload over a same-document `postMessage` channel (BR-5). The
+/// values zeroize on drop and never serialize or log.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct AppDirectionKeys {
+    c2s: [u8; SESSION_KEY_LEN],
+    s2c: [u8; SESSION_KEY_LEN],
+}
+
+impl AppDirectionKeys {
+    /// Client -> server key (the browser seals commands with this).
+    pub fn c2s(&self) -> &[u8; SESSION_KEY_LEN] {
+        &self.c2s
+    }
+
+    /// Server -> client key (the browser opens stream/response envelopes).
+    pub fn s2c(&self) -> &[u8; SESSION_KEY_LEN] {
+        &self.s2c
+    }
+
+    /// Construct from raw bytes. Intended for the private-api session store and
+    /// WASM handoff plumbing; callers must not log or persist the result.
+    pub fn from_bytes(c2s: [u8; SESSION_KEY_LEN], s2c: [u8; SESSION_KEY_LEN]) -> Self {
+        Self { c2s, s2c }
+    }
+}
+
+impl std::fmt::Debug for AppDirectionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AppDirectionKeys([REDACTED])")
+    }
 }
 
 impl ExportedMaterial {
@@ -284,16 +347,23 @@ impl ExportedMaterial {
     ) -> Result<Self, HpkeSetupError> {
         let mut c2s = Zeroizing::new([0u8; 32]);
         let mut s2c = Zeroizing::new([0u8; 32]);
+        let mut app_c2s = Zeroizing::new([0u8; SESSION_KEY_LEN]);
+        let mut app_s2c = Zeroizing::new([0u8; SESSION_KEY_LEN]);
         export(EXPORTER_C2S, &mut c2s[..]).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
         export(EXPORTER_S2C, &mut s2c[..]).map_err(|_| HpkeSetupError::EstablishmentFailed)?;
+        export(APP_EXPORTER_C2S, &mut app_c2s[..])
+            .map_err(|_| HpkeSetupError::EstablishmentFailed)?;
+        export(APP_EXPORTER_S2C, &mut app_s2c[..])
+            .map_err(|_| HpkeSetupError::EstablishmentFailed)?;
         Ok(Self {
             c2s: SessionKey::from_bytes(*c2s),
             s2c: SessionKey::from_bytes(*s2c),
+            app: AppDirectionKeys::from_bytes(*app_c2s, *app_s2c),
         })
     }
 }
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Initiator side: uses the recipient's public key, encapsulates, exports the
 /// two direction keys, and builds direction-correct sessions.
@@ -323,6 +393,7 @@ pub fn initiator_establish(
             send: SendSession::new(material.c2s)
                 .map_err(|_| HpkeSetupError::EstablishmentFailed)?,
             receive: ReceiveSession::new(material.s2c),
+            app: material.app,
         },
     ))
 }
@@ -355,6 +426,7 @@ pub fn responder_establish(
         kid: offer.kid,
         send: SendSession::new(material.s2c).map_err(|_| HpkeSetupError::EstablishmentFailed)?,
         receive: ReceiveSession::new(material.c2s),
+        app: material.app,
     })
 }
 
@@ -558,5 +630,31 @@ mod tests {
         assert!(!dbg.contains("[u8:"));
         let _ = SESSION_KEY_LEN;
         let _ = offer;
+    }
+
+    #[test]
+    fn app_direction_keys_match_both_sides_and_are_separated() {
+        let (offer, keypair) = HpkeHandshakeOffer::generate([7u8; KID_LEN]).expect("offer");
+        let (enc, init) = initiator_establish(&offer).expect("init");
+        let resp = responder_establish(&offer, &keypair, &enc).expect("resp");
+
+        // The two sides derive identical directional app keys...
+        assert_eq!(init.app_keys().c2s(), resp.app_keys().c2s());
+        assert_eq!(init.app_keys().s2c(), resp.app_keys().s2c());
+        // ...and the two directions are distinct (nonce-reuse safety).
+        assert_ne!(init.app_keys().c2s(), init.app_keys().s2c());
+        // A different handshake derives different app keys.
+        let (other_offer, _) = HpkeHandshakeOffer::generate([8u8; KID_LEN]).expect("other");
+        let (_, other_init) = initiator_establish(&other_offer).expect("other init");
+        assert_ne!(init.app_keys().c2s(), other_init.app_keys().c2s());
+    }
+
+    #[test]
+    fn app_direction_keys_debug_is_redacted() {
+        let (offer, keypair) = HpkeHandshakeOffer::generate([7u8; KID_LEN]).expect("offer");
+        let (enc, _init) = initiator_establish(&offer).expect("init");
+        let resp = responder_establish(&offer, &keypair, &enc).expect("resp");
+        let debug = format!("{:?}", resp.app_keys());
+        assert_eq!(debug, "AppDirectionKeys([REDACTED])");
     }
 }

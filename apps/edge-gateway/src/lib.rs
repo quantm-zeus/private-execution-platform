@@ -25,6 +25,9 @@ pub enum OpaqueRoute {
     Bootstrap,
     Sync,
     Blob,
+    /// Encrypted command channel. The edge cannot and must not distinguish the
+    /// operation type: the request/response bodies are opaque ciphertext.
+    Command,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -156,6 +159,7 @@ pub fn router(state: EdgeState) -> Router {
         .route("/v1/bootstrap", post(bootstrap))
         .route("/v1/sync", post(sync))
         .route("/v1/blob", post(blob))
+        .route("/v1/command", post(command))
         .route("/v1/stream", get(stream))
         .with_state(state)
 }
@@ -182,6 +186,10 @@ async fn sync(State(state): State<EdgeState>, headers: HeaderMap, request: Reque
 
 async fn blob(State(state): State<EdgeState>, headers: HeaderMap, request: Request) -> Response {
     protected(state, OpaqueRoute::Blob, headers, request).await
+}
+
+async fn command(State(state): State<EdgeState>, headers: HeaderMap, request: Request) -> Response {
+    protected(state, OpaqueRoute::Command, headers, request).await
 }
 
 async fn stream(
@@ -686,6 +694,60 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"\x00\x01opaque\xff");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn command_route_is_opaque_bounded_and_octet_stream_only() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: calls.clone(),
+            }),
+            1024,
+        )
+        .unwrap();
+
+        // A JSON-typed body is refused before the relay: the edge accepts only
+        // opaque octet-stream ciphertext on every /v1/* route.
+        let json_request = Request::builder()
+            .method("POST")
+            .uri("/v1/command")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = router(state.clone()).oneshot(json_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Unauthorized never reaches the relay.
+        let response = router(state.clone())
+            .oneshot(request("/v1/command", b"opaque", false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Authorized opaque command ciphertext is relayed byte-for-byte.
+        let response = router(state)
+            .oneshot(request("/v1/command", b"\x00cmd\xff", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            OPAQUE_CONTENT_TYPE
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"\x00cmd\xff");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

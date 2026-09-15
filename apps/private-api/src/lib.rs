@@ -24,6 +24,14 @@ use axum::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod opaque;
+
+pub use opaque::{
+    AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
+    CommandDispatcher, FailClosedBootstrap, FailClosedDispatcher, OpaqueClock, OpaqueRoute,
+    OpaqueServiceState, StaticBootstrap, SystemClock as OpaqueSystemClock,
+};
+
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";
 pub const SESSION_COOKIE_NAME: &str = "__Host-evergreen_session";
 pub const MAX_ASSERTION_BYTES: usize = 64 * 1024;
@@ -181,6 +189,9 @@ pub struct PrivateApiState {
     authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
     clock: Arc<dyn Clock>,
     artifact_loader: ArtifactLoader,
+    /// Established browser transport sessions (BR-5 key epoch). Shared with the
+    /// opaque command/bootstrap/sync service.
+    sessions: Arc<Mutex<session_transport::SessionRegistry>>,
 }
 
 impl PrivateApiState {
@@ -198,6 +209,7 @@ impl PrivateApiState {
             authenticator: None,
             clock: Arc::new(SystemClock),
             artifact_loader: Arc::new(load_workspace_artifact),
+            sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
         })
     }
 
@@ -206,6 +218,11 @@ impl PrivateApiState {
         let mut state = Self::production(config)?;
         state.authenticator = Some(Arc::new(authenticator));
         Ok(state)
+    }
+
+    /// Shared encrypted-session registry (BR-5 key epoch) for the opaque relay.
+    pub fn sessions(&self) -> Arc<Mutex<session_transport::SessionRegistry>> {
+        self.sessions.clone()
     }
 
     #[cfg(test)]
@@ -227,6 +244,7 @@ impl PrivateApiState {
             authenticator,
             clock,
             artifact_loader: Arc::new(load_workspace_artifact),
+            sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
         })
     }
 
@@ -831,6 +849,32 @@ async fn deliver_artifact(
         Ok(session) => session,
         Err(_) => return clear_grant(generic_error(StatusCode::UNAUTHORIZED)),
     };
+    // BR-5: the authenticated HPKE exchange that delivers the artifact also
+    // yields the browser transport session. Register the responder's
+    // directional app keys under the grant kid so the payload can immediately
+    // start encrypted bootstrap/command/sync once the shell hands the mirrored
+    // initiator keys over. Nothing is persisted; expiry is bounded here.
+    let session_expires_at_ms = now.saturating_add(state.config.session_ttl_ms);
+    let server_session = match session_transport::ServerSession::new(
+        session.kid(),
+        session.app_keys(),
+        session_expires_at_ms,
+    ) {
+        Ok(server_session) => server_session,
+        Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    {
+        let mut sessions = match state.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+        };
+        sessions.prune(now);
+        // Kids are fresh random values per grant, so a collision can only mean
+        // an internal fault; never replace a live session.
+        if sessions.insert(server_session).is_err() {
+            return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE));
+        }
+    }
     let envelope = match session.seal(1, &artifact) {
         Ok(envelope) => envelope,
         Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
@@ -1125,6 +1169,15 @@ mod tests {
     impl Clock for FixedClock {
         fn now_ms(&self) -> Result<i64, PrivateApiError> {
             Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Opaque-service clock sharing the `FixedClock` value so session expiry is
+    /// deterministic in tests.
+    struct TestOpaqueClock(i64);
+    impl OpaqueClock for TestOpaqueClock {
+        fn now_ms(&self) -> Option<i64> {
+            Some(self.0)
         }
     }
     fn config() -> PrivateApiConfig {
@@ -3137,6 +3190,58 @@ mod tests {
         };
         let delivered_artifact = initiator.receive(&envelope).unwrap();
         assert_eq!(delivered_artifact, sealed_artifact);
+
+        // 9b. BR-5/BR-7/BR-1/BR-3: the same authenticated HPKE exchange
+        //     registered the browser transport session. Drive the real opaque
+        //     bootstrap + command surface with the initiator's directional app
+        //     keys, exactly as the payload would after the shell handoff.
+        let mut session_client =
+            session_transport::ClientSession::new(initiator.kid(), initiator.app_keys()).unwrap();
+        let opaque = OpaqueServiceState::new(
+            state.sessions(),
+            Arc::new(FailClosedDispatcher),
+            Arc::new(FailClosedBootstrap),
+            Arc::new(TestOpaqueClock(1_000)),
+            state.config.session_ttl_ms,
+        )
+        .unwrap();
+
+        let bootstrap_request = session_client
+            .seal_next(br#"{"op":"bootstrap","protocol_version":1,"request_id":"e2e-bootstrap"}"#)
+            .unwrap();
+        let bootstrap_bytes = opaque
+            .relay_envelope(OpaqueRoute::Bootstrap, &bootstrap_request.to_wire_bytes())
+            .await
+            .unwrap();
+        let bootstrap_response = session_transport::parse_wire_envelope(&bootstrap_bytes).unwrap();
+        assert_eq!(bootstrap_response.sequence, bootstrap_request.sequence);
+        let bootstrap_plaintext = session_client.open(&bootstrap_response).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bootstrap_plaintext).unwrap();
+        assert_eq!(document["request_id"], "e2e-bootstrap");
+        assert_eq!(document["protocol_version"], 1);
+        assert_eq!(document["trading_enabled"], false);
+        assert_eq!(document["kill_switch"]["enabled"], true);
+        assert_eq!(document["capabilities"]["execute"], false);
+
+        // A command with no configured backend is an AEAD-authenticated typed
+        // denial that still echoes the request challenge (never a false
+        // success).
+        let command_request = session_client
+            .seal_next(
+                br#"{"op":"get_quote","payload":{},"request_id":"e2e-command","idempotency_key":null}"#,
+            )
+            .unwrap();
+        let command_bytes = opaque
+            .relay_envelope(OpaqueRoute::Command, &command_request.to_wire_bytes())
+            .await
+            .unwrap();
+        let command_response = session_transport::parse_wire_envelope(&command_bytes).unwrap();
+        assert_eq!(command_response.sequence, command_request.sequence);
+        let command_plaintext = session_client.open(&command_response).unwrap();
+        let command_body: serde_json::Value = serde_json::from_slice(&command_plaintext).unwrap();
+        assert_eq!(command_body["request_id"], "e2e-command");
+        assert_eq!(command_body["error"]["code"], "capability_missing");
+        assert!(command_body.get("result").is_none());
 
         // 10. Client decrypts inner workspace artifact in memory
         let decrypted_payload =

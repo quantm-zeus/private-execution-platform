@@ -216,6 +216,7 @@ impl OpaqueRelay for TestOverrideRelay {
             OpaqueRoute::Bootstrap => Route::Bootstrap as i32,
             OpaqueRoute::Sync => Route::Sync as i32,
             OpaqueRoute::Blob => Route::Blob as i32,
+            OpaqueRoute::Command => Route::Command as i32,
         };
         if payload.is_empty() || payload.len() > edge_gateway::DEFAULT_MAX_OPAQUE_BODY_BYTES {
             return Err(EdgeError::PayloadTooLarge);

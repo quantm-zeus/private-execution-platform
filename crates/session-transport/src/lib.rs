@@ -1,0 +1,916 @@
+//! Browser-interoperable opaque session transport.
+//!
+//! This crate implements the exact wire contract the private workspace payload
+//! uses over the neutral `/v1/*` paths:
+//!
+//! * Envelope (cleartext, `application/octet-stream` body as UTF-8 JSON):
+//!   `{"kid": b64, "nonce": b64, "sequence": u64, "ciphertext": b64}`.
+//! * AEAD: AES-256-GCM with a fresh 12-byte random nonce and associated data
+//!   exactly `kid=<kid>;seq=<sequence>` (UTF-8), matching WebCrypto
+//!   (`web/workspace-payload/src/realtime/{sealer,decryptor}.ts`).
+//! * Inner plaintext is UTF-8 JSON; the operation type never leaves the AEAD.
+//!
+//! Session keys are the HPKE-exporter app directions (see
+//! [`crypto_envelope::hpke::AppDirectionKeys`]); this crate never persists,
+//! logs or serializes them, and every error is value-free.
+//!
+//! The browser is authoritative for the framing, so this must not be "cleaned
+//! up" to the Rust-internal `Envelope`/`StreamFrame` types without a lockstep
+//! web change.
+
+use std::collections::HashMap;
+use std::fmt;
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crypto_envelope::hpke::AppDirectionKeys;
+use crypto_envelope::KID_LEN;
+
+/// Key identifier length in bytes (the wire `kid` is standard base64 of this).
+pub const KID_BYTES: usize = KID_LEN;
+/// AES-GCM nonce length.
+pub const WIRE_NONCE_LEN: usize = NONCE_LEN;
+/// Provider (GCM) tag length.
+pub const AEAD_TAG_LEN: usize = 16;
+/// Largest accepted ciphertext (base64-decoded) in bytes, matching the web
+/// `MAX_CIPHERTEXT_BYTES`.
+pub const MAX_CIPHERTEXT_BYTES: usize = 1024 * 1024;
+/// Largest accepted raw wire body in bytes, matching the web `MAX_WIRE_BYTES`.
+pub const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
+/// Largest accepted `request_id`.
+pub const MAX_REQUEST_ID_LEN: usize = 128;
+/// Largest accepted operation name.
+pub const MAX_OP_LEN: usize = 64;
+/// Replay window width in sequence numbers.
+const REPLAY_WINDOW: u64 = 64;
+
+/// Value-free transport/session errors. No key material, payload or decrypted
+/// content is ever included.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum SessionError {
+    #[error("session key is invalid")]
+    InvalidKey,
+    #[error("wire envelope is malformed")]
+    MalformedEnvelope,
+    #[error("wire envelope exceeded the size bound")]
+    TooLarge,
+    #[error("wire envelope key id did not match the session")]
+    KeyIdMismatch,
+    #[error("wire envelope nonce is invalid")]
+    InvalidNonce,
+    #[error("wire envelope ciphertext is invalid")]
+    InvalidCiphertext,
+    #[error("session envelope failed authentication")]
+    DecryptFailed,
+    #[error("session envelope could not be sealed")]
+    EncryptFailed,
+    #[error("sequence was already accepted (replay)")]
+    ReplayDetected,
+    #[error("sequence is older than the replay window")]
+    StaleSequence,
+    #[error("session has expired")]
+    Expired,
+    #[error("secure random number generator unavailable")]
+    RngUnavailable,
+    #[error("command plaintext is malformed")]
+    MalformedCommand,
+    #[error("request id is missing or malformed")]
+    MalformedRequestId,
+    #[error("operation name is missing or malformed")]
+    MalformedOperation,
+    #[error("operation is unknown")]
+    UnknownOperation,
+    #[error("session registry rejected a duplicate key id")]
+    DuplicateSession,
+}
+
+/// Direction-separated AES-256-GCM key. Redacted `Debug`, never `Clone`.
+struct AeadKey(LessSafeKey);
+
+impl AeadKey {
+    fn new(raw: &[u8; 32]) -> Result<Self, SessionError> {
+        let unbound = UnboundKey::new(&AES_256_GCM, raw).map_err(|_| SessionError::InvalidKey)?;
+        Ok(Self(LessSafeKey::new(unbound)))
+    }
+
+    fn seal(
+        &self,
+        nonce: &[u8; WIRE_NONCE_LEN],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SessionError> {
+        let mut in_out = plaintext.to_vec();
+        self.0
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                &mut in_out,
+            )
+            .map_err(|_| SessionError::EncryptFailed)?;
+        Ok(in_out)
+    }
+
+    fn open(
+        &self,
+        nonce: &[u8; WIRE_NONCE_LEN],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, SessionError> {
+        let mut in_out = ciphertext.to_vec();
+        let plaintext = self
+            .0
+            .open_in_place(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                &mut in_out,
+            )
+            .map_err(|_| SessionError::DecryptFailed)?;
+        Ok(plaintext.to_vec())
+    }
+}
+
+impl fmt::Debug for AeadKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AeadKey([REDACTED])")
+    }
+}
+
+fn random_nonce() -> Result<[u8; WIRE_NONCE_LEN], SessionError> {
+    let mut nonce = [0u8; WIRE_NONCE_LEN];
+    getrandom::getrandom(&mut nonce).map_err(|_| SessionError::RngUnavailable)?;
+    Ok(nonce)
+}
+
+/// Associated data bound by both sides: exactly `kid=<kid>;seq=<sequence>`.
+///
+/// This must byte-for-byte match the web `sealer`/`decryptor` and the e2e mock,
+/// so it is deliberately built from the *base64 string* kid, not raw bytes.
+pub fn envelope_aad(kid: &str, sequence: u64) -> Vec<u8> {
+    format!("kid={kid};seq={sequence}").into_bytes()
+}
+
+/// Cleartext wire envelope. `kid`/`nonce`/`ciphertext` are standard base64.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireEnvelope {
+    pub kid: String,
+    pub nonce: String,
+    pub sequence: u64,
+    pub ciphertext: String,
+}
+
+impl fmt::Debug for WireEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireEnvelope")
+            .field("kid", &"[REDACTED]")
+            .field("nonce", &"[REDACTED]")
+            .field("sequence", &self.sequence)
+            .field("ciphertext_len", &self.ciphertext.len())
+            .finish()
+    }
+}
+
+impl WireEnvelope {
+    /// Decode and validate the base64 `kid` as a 16-byte key id.
+    pub fn decode_kid(&self) -> Result<[u8; KID_BYTES], SessionError> {
+        let raw = B64
+            .decode(self.kid.as_bytes())
+            .map_err(|_| SessionError::MalformedEnvelope)?;
+        if raw.len() != KID_BYTES {
+            return Err(SessionError::MalformedEnvelope);
+        }
+        let mut out = [0u8; KID_BYTES];
+        out.copy_from_slice(&raw);
+        Ok(out)
+    }
+
+    fn decode_nonce(&self) -> Result<[u8; WIRE_NONCE_LEN], SessionError> {
+        let raw = B64
+            .decode(self.nonce.as_bytes())
+            .map_err(|_| SessionError::InvalidNonce)?;
+        if raw.len() != WIRE_NONCE_LEN {
+            return Err(SessionError::InvalidNonce);
+        }
+        let mut out = [0u8; WIRE_NONCE_LEN];
+        out.copy_from_slice(&raw);
+        Ok(out)
+    }
+
+    fn decode_ciphertext(&self) -> Result<Vec<u8>, SessionError> {
+        let raw = B64
+            .decode(self.ciphertext.as_bytes())
+            .map_err(|_| SessionError::InvalidCiphertext)?;
+        if raw.len() < AEAD_TAG_LEN || raw.len() > MAX_CIPHERTEXT_BYTES {
+            return Err(SessionError::InvalidCiphertext);
+        }
+        Ok(raw)
+    }
+
+    /// Serialize to the UTF-8 JSON bytes that cross the octet-stream boundary.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("wire envelope serialization is infallible")
+    }
+}
+
+/// Strict parse of an untrusted wire body (`application/octet-stream`, UTF-8
+/// JSON). Bounded before any decoding.
+pub fn parse_wire_envelope(bytes: &[u8]) -> Result<WireEnvelope, SessionError> {
+    if bytes.is_empty() || bytes.len() > MAX_WIRE_BYTES {
+        return Err(SessionError::TooLarge);
+    }
+    let envelope: WireEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| SessionError::MalformedEnvelope)?;
+    // Structural validation up-front so callers cannot observe malformed base64
+    // from a "valid" envelope; decoding is repeated by the session (cheap) and
+    // produces the same error class.
+    if envelope.kid.is_empty()
+        || envelope.kid.len() > 128
+        || !envelope.kid.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b':' | b'-')
+        })
+    {
+        return Err(SessionError::MalformedEnvelope);
+    }
+    envelope.decode_kid()?;
+    envelope.decode_nonce()?;
+    envelope.decode_ciphertext()?;
+    Ok(envelope)
+}
+
+/// Sliding-window replay tracker. Sequence `0` is a legal first sequence
+/// (the browser command client starts at 0), unlike the internal
+/// `crypto-envelope` window.
+#[derive(Debug, Default)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    fn accept(&mut self, sequence: u64) -> Result<(), SessionError> {
+        match self.highest {
+            None => {
+                self.highest = Some(sequence);
+                self.bitmap = 1;
+                Ok(())
+            }
+            Some(highest) if sequence > highest => {
+                let delta = sequence - highest;
+                self.bitmap = if delta >= REPLAY_WINDOW {
+                    1
+                } else {
+                    (self.bitmap << delta) | 1
+                };
+                self.highest = Some(sequence);
+                Ok(())
+            }
+            Some(highest) => {
+                let offset = highest - sequence;
+                if offset >= REPLAY_WINDOW {
+                    return Err(SessionError::StaleSequence);
+                }
+                let bit = 1u64 << offset;
+                if self.bitmap & bit != 0 {
+                    return Err(SessionError::ReplayDetected);
+                }
+                self.bitmap |= bit;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn kid_b64(kid: &[u8; KID_BYTES]) -> String {
+    B64.encode(kid)
+}
+
+/// Standard-base64 wire form of a 16-byte key id, exactly as the browser sends
+/// it in `kid` and as the artifact-grant flow advertises it.
+pub fn wire_kid(kid: &[u8; KID_BYTES]) -> String {
+    kid_b64(kid)
+}
+
+/// Logical channel a c2s envelope arrived on.
+///
+/// The browser seals bootstrap, sync and command requests with *independent*
+/// per-endpoint sequence counters (the sync worker and the main-thread command
+/// client each start at 0), so the server tracks a separate replay window per
+/// purpose. Nonces are independently random, so the same key may safely seal
+/// different purposes at the same sequence number; the purpose is fixed by the
+/// route and is never read from the request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Purpose {
+    Bootstrap,
+    Sync,
+    Command,
+}
+
+impl Purpose {
+    fn index(self) -> usize {
+        match self {
+            Purpose::Bootstrap => 0,
+            Purpose::Sync => 1,
+            Purpose::Command => 2,
+        }
+    }
+}
+
+/// Server-side view of one established browser session.
+///
+/// Opens c2s (command/sync/bootstrap request) envelopes and seals s2c
+/// (response/stream) envelopes under the same `kid`.
+pub struct ServerSession {
+    kid: String,
+    kid_bytes: [u8; KID_BYTES],
+    open_key: AeadKey,
+    seal_key: AeadKey,
+    replay: [ReplayWindow; 3],
+    expires_at_ms: i64,
+}
+
+impl fmt::Debug for ServerSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSession")
+            .field("kid", &"[REDACTED]")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerSession {
+    /// Build from the HPKE-exporter app keys. `kid` is the base64 wire form.
+    pub fn new(
+        kid: [u8; KID_BYTES],
+        keys: &AppDirectionKeys,
+        expires_at_ms: i64,
+    ) -> Result<Self, SessionError> {
+        Ok(Self {
+            kid: kid_b64(&kid),
+            kid_bytes: kid,
+            // Server receives under c2s and sends under s2c.
+            open_key: AeadKey::new(keys.c2s())?,
+            seal_key: AeadKey::new(keys.s2c())?,
+            replay: [
+                ReplayWindow::default(),
+                ReplayWindow::default(),
+                ReplayWindow::default(),
+            ],
+            expires_at_ms,
+        })
+    }
+
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    pub fn kid_bytes(&self) -> &[u8; KID_BYTES] {
+        &self.kid_bytes
+    }
+
+    pub fn is_expired(&self, now_ms: i64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+
+    /// Authenticate, decrypt and replay-check an inbound c2s envelope for the
+    /// given logical purpose.
+    pub fn open(
+        &mut self,
+        envelope: &WireEnvelope,
+        now_ms: i64,
+        purpose: Purpose,
+    ) -> Result<Vec<u8>, SessionError> {
+        if self.is_expired(now_ms) {
+            return Err(SessionError::Expired);
+        }
+        if envelope.kid != self.kid {
+            return Err(SessionError::KeyIdMismatch);
+        }
+        let decoded_kid = envelope.decode_kid()?;
+        if decoded_kid != self.kid_bytes {
+            return Err(SessionError::KeyIdMismatch);
+        }
+        let nonce = envelope.decode_nonce()?;
+        let ciphertext = envelope.decode_ciphertext()?;
+        let aad = envelope_aad(&self.kid, envelope.sequence);
+        let plaintext = self.open_key.open(&nonce, &aad, &ciphertext)?;
+        // Replay state advances only after successful authentication.
+        self.replay[purpose.index()].accept(envelope.sequence)?;
+        Ok(plaintext)
+    }
+
+    /// Seal an s2c envelope at an explicit sequence (command responses bind the
+    /// request sequence; stream frames use their own monotonic sequence).
+    pub fn seal(&self, sequence: u64, plaintext: &[u8]) -> Result<WireEnvelope, SessionError> {
+        let nonce = random_nonce()?;
+        let aad = envelope_aad(&self.kid, sequence);
+        let ciphertext = self.seal_key.seal(&nonce, &aad, plaintext)?;
+        Ok(WireEnvelope {
+            kid: self.kid.clone(),
+            nonce: B64.encode(nonce),
+            sequence,
+            ciphertext: B64.encode(ciphertext),
+        })
+    }
+}
+
+/// Client-side mirror used by tests and the in-process end-to-end harness. It
+/// reproduces the browser's exact framing and sequence behaviour.
+pub struct ClientSession {
+    kid: String,
+    kid_bytes: [u8; KID_BYTES],
+    seal_key: AeadKey,
+    open_key: AeadKey,
+    next_sequence: u64,
+    replay: ReplayWindow,
+}
+
+impl fmt::Debug for ClientSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ClientSession([REDACTED])")
+    }
+}
+
+impl ClientSession {
+    pub fn new(kid: [u8; KID_BYTES], keys: &AppDirectionKeys) -> Result<Self, SessionError> {
+        Ok(Self {
+            kid: kid_b64(&kid),
+            kid_bytes: kid,
+            // Client seals under c2s and opens under s2c.
+            seal_key: AeadKey::new(keys.c2s())?,
+            open_key: AeadKey::new(keys.s2c())?,
+            next_sequence: 0,
+            replay: ReplayWindow::default(),
+        })
+    }
+
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    /// Next sequence the browser-style client will use (0-based).
+    pub fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Seal the next c2s envelope, advancing the client sequence counter.
+    pub fn seal_next(&mut self, plaintext: &[u8]) -> Result<WireEnvelope, SessionError> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.seal_key.seal_at(&self.kid, sequence, plaintext)
+    }
+
+    /// Seal at an explicit sequence without consuming the counter (resync).
+    pub fn seal_at(&self, sequence: u64, plaintext: &[u8]) -> Result<WireEnvelope, SessionError> {
+        self.seal_key.seal_at(&self.kid, sequence, plaintext)
+    }
+
+    /// Open an s2c envelope with replay protection.
+    pub fn open(&mut self, envelope: &WireEnvelope) -> Result<Vec<u8>, SessionError> {
+        if envelope.kid != self.kid {
+            return Err(SessionError::KeyIdMismatch);
+        }
+        if envelope.decode_kid()? != self.kid_bytes {
+            return Err(SessionError::KeyIdMismatch);
+        }
+        let nonce = envelope.decode_nonce()?;
+        let ciphertext = envelope.decode_ciphertext()?;
+        let aad = envelope_aad(&self.kid, envelope.sequence);
+        let plaintext = self.open_key.open(&nonce, &aad, &ciphertext)?;
+        self.replay.accept(envelope.sequence)?;
+        Ok(plaintext)
+    }
+}
+
+impl AeadKey {
+    fn seal_at(
+        &self,
+        kid: &str,
+        sequence: u64,
+        plaintext: &[u8],
+    ) -> Result<WireEnvelope, SessionError> {
+        let nonce = random_nonce()?;
+        let aad = envelope_aad(kid, sequence);
+        let ciphertext = self.seal(&nonce, &aad, plaintext)?;
+        Ok(WireEnvelope {
+            kid: kid.to_string(),
+            nonce: B64.encode(nonce),
+            sequence,
+            ciphertext: B64.encode(ciphertext),
+        })
+    }
+}
+
+/// Server-side registry of established sessions, pruned on every access.
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: HashMap<[u8; KID_BYTES], ServerSession>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    pub fn insert(&mut self, session: ServerSession) -> Result<(), SessionError> {
+        let kid = *session.kid_bytes();
+        if self.sessions.contains_key(&kid) {
+            return Err(SessionError::DuplicateSession);
+        }
+        self.sessions.insert(kid, session);
+        Ok(())
+    }
+
+    pub fn get_mut(&mut self, kid: &[u8; KID_BYTES]) -> Option<&mut ServerSession> {
+        self.sessions.get_mut(kid)
+    }
+
+    pub fn remove(&mut self, kid: &[u8; KID_BYTES]) -> Option<ServerSession> {
+        self.sessions.remove(kid)
+    }
+
+    /// Drop expired sessions; returns how many were removed.
+    pub fn prune(&mut self, now_ms: i64) -> usize {
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|_, session| !session.is_expired(now_ms));
+        before - self.sessions.len()
+    }
+}
+
+impl fmt::Debug for SessionRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRegistry")
+            .field("len", &self.sessions.len())
+            .finish()
+    }
+}
+
+/// Closed set of denial codes the web client understands
+/// (`web/workspace-payload/src/transport/command.ts` allowed list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialCode {
+    Auth,
+    CapabilityMissing,
+    Freshness,
+    Protocol,
+    Server,
+    Cancelled,
+    Unknown,
+}
+
+impl DenialCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DenialCode::Auth => "auth",
+            DenialCode::CapabilityMissing => "capability_missing",
+            DenialCode::Freshness => "freshness",
+            DenialCode::Protocol => "protocol",
+            DenialCode::Server => "server",
+            DenialCode::Cancelled => "cancelled",
+            DenialCode::Unknown => "unknown",
+        }
+    }
+}
+
+/// Typed, AEAD-authenticated denial body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandDenial {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl CommandDenial {
+    pub fn new(code: DenialCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.as_str().to_string(),
+            message: message.into(),
+            retryable,
+        }
+    }
+
+    /// A denial the client classifies as not retryable.
+    pub fn determinate(code: DenialCode, message: impl Into<String>) -> Self {
+        Self::new(code, message, false)
+    }
+
+    /// A denial the client must treat as indeterminate (keeping its
+    /// idempotency key).
+    pub fn indeterminate(code: DenialCode, message: impl Into<String>) -> Self {
+        Self::new(code, message, true)
+    }
+}
+
+/// Inbound command plaintext: `{op, payload, request_id, idempotency_key}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRequest {
+    pub op: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl CommandRequest {
+    /// Strictly decode an authenticated command plaintext.
+    pub fn parse(bytes: &[u8]) -> Result<Self, SessionError> {
+        let request: CommandRequest =
+            serde_json::from_slice(bytes).map_err(|_| SessionError::MalformedCommand)?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), SessionError> {
+        if self.op.is_empty() || self.op.len() > MAX_OP_LEN || !self.op.is_ascii() {
+            return Err(SessionError::MalformedOperation);
+        }
+        if self.request_id.is_empty() || self.request_id.len() > MAX_REQUEST_ID_LEN {
+            return Err(SessionError::MalformedRequestId);
+        }
+        if let Some(key) = &self.idempotency_key {
+            if key.is_empty() || key.len() > 256 || !key.is_ascii() {
+                return Err(SessionError::MalformedCommand);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Outbound command response plaintext. `request_id` is always echoed so the
+/// client can bind the response to its request (BR-3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandResponse {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<CommandDenial>,
+}
+
+impl CommandResponse {
+    pub fn success(request_id: &str, result: serde_json::Value) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn denial(request_id: &str, denial: CommandDenial) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            result: None,
+            error: Some(denial),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("command response serialization is infallible")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> AppDirectionKeys {
+        AppDirectionKeys::from_bytes([0x11u8; 32], [0x22u8; 32])
+    }
+
+    fn established() -> (ServerSession, ClientSession) {
+        let kid = [0xABu8; KID_BYTES];
+        (
+            ServerSession::new(kid, &keys(), i64::MAX).expect("server"),
+            ClientSession::new(kid, &keys()).expect("client"),
+        )
+    }
+
+    #[test]
+    fn aad_matches_browser_shape() {
+        assert_eq!(envelope_aad("kid-e2e", 7), b"kid=kid-e2e;seq=7".to_vec());
+    }
+
+    #[test]
+    fn client_server_roundtrip_first_sequence_zero() {
+        let (mut server, mut client) = established();
+        assert_eq!(client.next_sequence(), 0);
+        let envelope = client.seal_next(b"{\"op\":\"get_quote\"}").expect("seal");
+        assert_eq!(envelope.sequence, 0);
+        let plaintext = server.open(&envelope, 0, Purpose::Command).expect("open");
+        assert_eq!(plaintext, b"{\"op\":\"get_quote\"}");
+        assert_eq!(client.next_sequence(), 1);
+    }
+
+    #[test]
+    fn response_binds_request_sequence() {
+        let (mut server, mut client) = established();
+        let request = client.seal_next(b"{}").expect("seal");
+        let _ = server.open(&request, 0, Purpose::Command).expect("open");
+        let response = server
+            .seal(request.sequence, b"{\"request_id\":\"r1\"}")
+            .expect("seal");
+        assert_eq!(response.sequence, request.sequence);
+        let opened = client.open(&response).expect("open");
+        assert_eq!(opened, b"{\"request_id\":\"r1\"}");
+    }
+
+    #[test]
+    fn replay_is_rejected_after_authentication() {
+        let (mut server, mut client) = established();
+        let envelope = client.seal_next(b"{}").expect("seal");
+        assert!(server.open(&envelope, 0, Purpose::Command).is_ok());
+        assert_eq!(
+            server.open(&envelope, 0, Purpose::Command),
+            Err(SessionError::ReplayDetected)
+        );
+    }
+
+    #[test]
+    fn independent_purpose_windows_allow_same_sequence_on_different_routes() {
+        let (mut server, client) = established();
+        // The bootstrap client and the command client each start their own
+        // counter at 0; both must be accepted because the purposes are tracked
+        // independently.
+        let bootstrap = client.seal_at(0, b"{\"op\":\"bootstrap\"}").expect("seal");
+        assert_eq!(
+            server
+                .open(&bootstrap, 0, Purpose::Bootstrap)
+                .expect("bootstrap"),
+            b"{\"op\":\"bootstrap\"}"
+        );
+        let command = client.seal_at(0, b"{\"op\":\"get_quote\"}").expect("seal");
+        assert_eq!(
+            server.open(&command, 0, Purpose::Command).expect("command"),
+            b"{\"op\":\"get_quote\"}"
+        );
+        // Replaying within one purpose is still refused.
+        assert_eq!(
+            server.open(&bootstrap, 0, Purpose::Bootstrap),
+            Err(SessionError::ReplayDetected)
+        );
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_and_does_not_poison() {
+        let (mut server, mut client) = established();
+        let mut envelope = client.seal_next(b"payload").expect("seal");
+        let mut raw = B64.decode(&envelope.ciphertext).unwrap();
+        raw[0] ^= 0xFF;
+        envelope.ciphertext = B64.encode(&raw);
+        assert_eq!(
+            server.open(&envelope, 0, Purpose::Command),
+            Err(SessionError::DecryptFailed)
+        );
+
+        // The genuine envelope (same sequence) is still fresh: authentication
+        // happened before the replay window advanced.
+        let genuine = client.seal_at(0, b"payload").expect("seal at 0");
+        assert_eq!(
+            server.open(&genuine, 0, Purpose::Command).expect("open"),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn kid_and_nonce_mismatch_rejected() {
+        let (mut server, mut client) = established();
+        let envelope = client.seal_next(b"x").expect("seal");
+        let mut other = envelope.clone();
+        other.kid = B64.encode([0x01u8; KID_BYTES]);
+        assert_eq!(
+            server.open(&other, 0, Purpose::Command),
+            Err(SessionError::KeyIdMismatch)
+        );
+
+        let mut bad_nonce = envelope.clone();
+        bad_nonce.nonce = B64.encode([0u8; 8]);
+        assert_eq!(
+            server.open(&bad_nonce, 0, Purpose::Command),
+            Err(SessionError::InvalidNonce)
+        );
+
+        // Session is still usable afterwards.
+        assert_eq!(
+            server.open(&envelope, 0, Purpose::Command).expect("open"),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn expiry_is_enforced_before_decrypt() {
+        let kid = [0xCDu8; KID_BYTES];
+        let mut server = ServerSession::new(kid, &keys(), 1_000).expect("server");
+        let mut client = ClientSession::new(kid, &keys()).expect("client");
+        let envelope = client.seal_next(b"x").expect("seal");
+        assert_eq!(
+            server.open(&envelope, 1_000, Purpose::Command),
+            Err(SessionError::Expired)
+        );
+        assert!(!server.is_expired(999));
+    }
+
+    #[test]
+    fn parse_rejects_oversize_and_malformed() {
+        assert_eq!(parse_wire_envelope(&[]), Err(SessionError::TooLarge));
+        assert_eq!(
+            parse_wire_envelope(&vec![b'x'; MAX_WIRE_BYTES + 1]),
+            Err(SessionError::TooLarge)
+        );
+        assert_eq!(
+            parse_wire_envelope(b"{}"),
+            Err(SessionError::MalformedEnvelope)
+        );
+    }
+
+    #[test]
+    fn parse_roundtrips_wire_bytes() {
+        let (_server, mut client) = established();
+        let envelope = client.seal_next(b"{}").expect("seal");
+        let bytes = envelope.to_wire_bytes();
+        let parsed = parse_wire_envelope(&bytes).expect("parse");
+        assert_eq!(parsed.sequence, 0);
+        assert_eq!(parsed.kid, envelope.kid);
+    }
+
+    #[test]
+    fn command_request_validation() {
+        let ok = CommandRequest::parse(
+            br#"{"op":"get_quote","payload":{},"request_id":"abc","idempotency_key":null}"#,
+        )
+        .expect("valid");
+        assert_eq!(ok.op, "get_quote");
+        assert!(ok.idempotency_key.is_none());
+
+        assert_eq!(
+            CommandRequest::parse(br#"{"op":"","request_id":"a"}"#).unwrap_err(),
+            SessionError::MalformedOperation
+        );
+        assert_eq!(
+            CommandRequest::parse(br#"{"op":"get_quote"}"#).unwrap_err(),
+            SessionError::MalformedRequestId
+        );
+        assert_eq!(
+            CommandRequest::parse(b"not json").unwrap_err(),
+            SessionError::MalformedCommand
+        );
+    }
+
+    #[test]
+    fn command_response_echoes_request_id() {
+        let ok = CommandResponse::success("r1", serde_json::json!({"ok": true}));
+        let value: serde_json::Value = serde_json::from_slice(&ok.to_bytes()).unwrap();
+        assert_eq!(value["request_id"], "r1");
+        assert_eq!(value["result"]["ok"], true);
+        assert!(value.get("error").is_none());
+
+        let denial = CommandResponse::denial(
+            "r2",
+            CommandDenial::indeterminate(DenialCode::Unknown, "outcome unknown"),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&denial.to_bytes()).unwrap();
+        assert_eq!(value["request_id"], "r2");
+        assert_eq!(value["error"]["code"], "unknown");
+        assert_eq!(value["error"]["retryable"], true);
+        assert!(value.get("result").is_none());
+    }
+
+    #[test]
+    fn registry_prunes_expired_and_rejects_duplicates() {
+        let kid = [0xEFu8; KID_BYTES];
+        let mut registry = SessionRegistry::new();
+        registry
+            .insert(ServerSession::new(kid, &keys(), 500).unwrap())
+            .expect("insert");
+        assert_eq!(
+            registry.insert(ServerSession::new(kid, &keys(), 500).unwrap()),
+            Err(SessionError::DuplicateSession)
+        );
+        assert_eq!(registry.prune(500), 1);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn debug_never_leaks_material() {
+        let (server, client) = established();
+        let text = format!("{server:?} {client:?}");
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains("171")); // 0xAB
+        assert!(!text.contains("17")); // 0x11
+    }
+}

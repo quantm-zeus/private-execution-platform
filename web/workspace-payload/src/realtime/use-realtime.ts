@@ -147,6 +147,9 @@ export function useRealtimeFeed(
       baseUrl: origin,
       kid: key.kid,
       keyB64: key.s2cKeyB64,
+      // The worker seals its own opaque `/v1/sync` envelopes with the c2s key.
+      // Absent the key the worker skips the best-effort sync POST.
+      ...(key.c2sKeyB64 ? { c2sKeyB64: key.c2sKeyB64 } : {}),
       // Server-minus-local clock offset from bootstrap, so the worker can reject
       // replayed frames by their authenticated `server_time_ms` (BR-15).
       serverSkewMs: ws.serverNowMs() - ws.clockMs(),

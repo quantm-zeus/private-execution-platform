@@ -7,6 +7,7 @@
 // DedicatedWorkerGlobalScope is not available under jsdom.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { WebCryptoDecryptor } from "./decryptor";
 
 interface WorkerContext {
   postMessage: ReturnType<typeof vi.fn>;
@@ -43,7 +44,7 @@ function keyB64(): string {
   return Buffer.from(bytes).toString("base64");
 }
 
-async function startWorker(): Promise<void> {
+async function startWorker(c2sKeyB64?: string): Promise<void> {
   context.onmessage?.({
     data: {
       type: "start",
@@ -51,6 +52,7 @@ async function startWorker(): Promise<void> {
       baseUrl: "http://localhost",
       kid: "kid-test",
       keyB64: keyB64(),
+      ...(c2sKeyB64 ? { c2sKeyB64 } : {}),
     },
   });
   await vi.waitFor(() => {
@@ -115,5 +117,69 @@ describe("realtime worker", () => {
     context.onmessage?.({ data: { type: "stop" } });
     expect(() => socket.onmessage?.({ data: frame.buffer })).not.toThrow();
     expect(socket.sent).toHaveLength(0);
+  });
+
+  it("seals the resync as an octet-stream envelope when a c2s key is present", async () => {
+    const c2sB64 = keyB64();
+    const calls: { url: string; init: RequestInit }[] = [];
+    const originalFetch = (globalThis as { fetch?: unknown }).fetch;
+    (globalThis as { fetch?: unknown }).fetch = async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return { ok: true, status: 200 } as Response;
+    };
+    try {
+      await startWorker(c2sB64);
+      const socket = latestSocket();
+      socket.onopen?.();
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      const call = calls[0]!;
+      expect(call.url).toContain("/v1/sync");
+      expect(call.init.headers).toMatchObject({ "Content-Type": "application/octet-stream" });
+      const bytes = call.init.body as Uint8Array;
+      expect(bytes).toBeDefined();
+      expect(ArrayBuffer.isView(bytes)).toBe(true);
+      const wire = new TextDecoder().decode(bytes);
+      // No cleartext control semantics on the wire.
+      expect(wire).not.toContain("sync");
+      expect(wire).not.toContain("from_seq");
+      const envelope = JSON.parse(wire) as {
+        kid: string;
+        nonce: string;
+        sequence: number;
+        ciphertext: string;
+      };
+      expect(Object.keys(envelope).sort()).toEqual(["ciphertext", "kid", "nonce", "sequence"]);
+      expect(envelope.sequence).toBe(0);
+      const decryptor = await WebCryptoDecryptor.fromRawKey(
+        Buffer.from(c2sB64, "base64"),
+        "kid-test",
+      );
+      const plain = await decryptor.decrypt(envelope);
+      try {
+        const request = JSON.parse(new TextDecoder().decode(plain)) as Record<string, unknown>;
+        expect(request.op).toBe("sync");
+      } finally {
+        plain.fill(0);
+      }
+    } finally {
+      (globalThis as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
+
+  it("skips the sync POST entirely when no c2s key is supplied", async () => {
+    const calls: unknown[] = [];
+    const originalFetch = (globalThis as { fetch?: unknown }).fetch;
+    (globalThis as { fetch?: unknown }).fetch = async (...args: unknown[]) => {
+      calls.push(args);
+      return { ok: true, status: 200 } as Response;
+    };
+    try {
+      await startWorker();
+      latestSocket().onopen?.();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(calls).toHaveLength(0);
+    } finally {
+      (globalThis as { fetch?: unknown }).fetch = originalFetch;
+    }
   });
 });

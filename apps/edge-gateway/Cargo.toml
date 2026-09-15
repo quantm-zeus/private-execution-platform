@@ -22,10 +22,13 @@ tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
+crypto-envelope.workspace = true
 futures-util = "0.3"
 http-body-util = "0.1"
 private-api = { path = "../private-api" }
 rcgen = { version = "=0.14.5", features = ["x509-parser"] }
+serde_json.workspace = true
+session-transport.workspace = true
 tempfile = "3"
 tokio-stream = "0.1"
 tokio-tungstenite = "0.29"

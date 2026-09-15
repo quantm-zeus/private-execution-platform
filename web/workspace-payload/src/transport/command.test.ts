@@ -15,6 +15,14 @@ interface EnvelopeBody {
   readonly ciphertext: string;
 }
 
+/** Decode the octet-stream request body into the generic envelope. */
+function decodeEnvelopeBody(init: RequestInit): EnvelopeBody {
+  expect(init.headers).toMatchObject({ "Content-Type": "application/octet-stream" });
+  expect(init.body).toBeDefined();
+  expect(ArrayBuffer.isView(init.body)).toBe(true);
+  return JSON.parse(new TextDecoder().decode(init.body as Uint8Array)) as EnvelopeBody;
+}
+
 /** Tests seal both directions with the same raw key, so the request is readable. */
 async function readRequest(body: EnvelopeBody): Promise<Record<string, unknown>> {
   const decryptor = await WebCryptoDecryptor.fromRawKey(rawKey, KID);
@@ -53,7 +61,7 @@ async function buildClient(fetchFn: typeof fetch) {
 /** A responder that echoes the request challenge and wraps `result`. */
 function responder(result: unknown, respondAt?: (body: EnvelopeBody) => number) {
   return (async (_url: string, init: RequestInit) => {
-    const body = JSON.parse(String(init.body)) as EnvelopeBody;
+    const body = decodeEnvelopeBody(init);
     const request = await readRequest(body);
     const sealer = await WebCryptoSealer.fromRawKey(rawKey);
     const envelope = await sealResponse(
@@ -71,11 +79,13 @@ describe("EncryptedCommandClient", () => {
     let captured: { url: string; init: RequestInit } | null = null;
     const fetchFn = (async (url: string, init: RequestInit) => {
       captured = { url, init };
-      const body = JSON.parse(String(init.body)) as EnvelopeBody;
+      const body = decodeEnvelopeBody(init);
       expect(body.kid).toBe(KID);
       // No operation type or payload may appear in cleartext.
-      expect(String(init.body)).not.toContain("get_quote");
-      expect(String(init.body)).not.toContain("secret-value");
+      const wire = new TextDecoder().decode(init.body as Uint8Array);
+      expect(wire).not.toContain("get_quote");
+      expect(wire).not.toContain("secret-value");
+      expect(Object.keys(body).sort()).toEqual(["ciphertext", "kid", "nonce", "sequence"]);
       const request = JSON.parse(
         new TextDecoder().decode(await requestDecryptor.decrypt(body as never)),
       ) as { request_id: string };
@@ -136,7 +146,7 @@ describe("EncryptedCommandClient", () => {
 
   it("classifies a rejection carried inside the authenticated envelope", async () => {
     const fetchFn = (async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as EnvelopeBody;
+      const body = decodeEnvelopeBody(init);
       const request = await readRequest(body);
       const sealer = await WebCryptoSealer.fromRawKey(rawKey);
       const envelope = await sealResponse(sealer, body.sequence, {
@@ -155,7 +165,7 @@ describe("EncryptedCommandClient", () => {
     // callers rotate their idempotency key on a determinate rejection, so the
     // absent flag would let a possibly-committed write be re-submitted.
     const writeFailure = (async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as EnvelopeBody;
+      const body = decodeEnvelopeBody(init);
       const request = await readRequest(body);
       const sealer = await WebCryptoSealer.fromRawKey(rawKey);
       const envelope = await sealResponse(sealer, body.sequence, {
@@ -182,7 +192,7 @@ describe("EncryptedCommandClient", () => {
     // rotate its idempotency key and double-submit a possibly-committed write.
     const respondWith = (echo: (requestId: string) => unknown) =>
       (async (_url: string, init: RequestInit) => {
-        const body = JSON.parse(String(init.body)) as EnvelopeBody;
+        const body = decodeEnvelopeBody(init);
         const request = await readRequest(body);
         const sealer = await WebCryptoSealer.fromRawKey(rawKey);
         const envelope = await sealResponse(sealer, body.sequence, {
@@ -206,7 +216,7 @@ describe("EncryptedCommandClient", () => {
     // A captured stream frame (or an older command response) at the right
     // cleartext sequence must not be accepted as the answer to this request.
     const fetchFn = (async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as EnvelopeBody;
+      const body = decodeEnvelopeBody(init);
       const sealer = await WebCryptoSealer.fromRawKey(rawKey);
       const envelope = await sealResponse(sealer, body.sequence, {
         op: "delta",
@@ -238,7 +248,7 @@ describe("EncryptedCommandClient", () => {
     const sequences: number[] = [];
     const nonces: string[] = [];
     const fetchFn = (async (_url: string, init: RequestInit) => {
-      const body = JSON.parse(String(init.body)) as EnvelopeBody;
+      const body = decodeEnvelopeBody(init);
       sequences.push(body.sequence);
       nonces.push(body.nonce);
       const request = await readRequest(body);

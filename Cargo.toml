@@ -6,6 +6,7 @@ members = [
     "crates/chain-types",
     "crates/crypto-envelope",
     "crates/crypto-envelope-wasm",
+    "crates/session-transport",
     "crates/storage",
     "crates/telemetry",
     "crates/auth",
@@ -54,6 +55,7 @@ rpc-mtls-proof = { path = "crates/rpc-mtls-proof" }
 market-types = { path = "crates/market-types" }
 chain-types = { path = "crates/chain-types" }
 crypto-envelope = { path = "crates/crypto-envelope" }
+session-transport = { path = "crates/session-transport" }
 storage = { path = "crates/storage" }
 telemetry = { path = "crates/telemetry" }
 auth = { path = "crates/auth" }

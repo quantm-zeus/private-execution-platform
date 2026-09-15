@@ -30,6 +30,33 @@ function App() {
       handleLock();
     } else if (data.type === "evergreen:workspace-ready") {
       setStatus("Workspace ready.");
+      deliverSessionKeys();
+    }
+  };
+
+  /**
+   * BR-5 handoff: deliver the directional session keys to the sandboxed payload
+   * over the same-document channel only. The payload imports them as
+   * non-extractable CryptoKeys; they are never persisted or placed in the DOM.
+   */
+  const deliverSessionKeys = () => {
+    const target = frame?.contentWindow;
+    if (!target) return;
+    const keys = defaultRuntime.sessionKeys();
+    if (!keys) return;
+    try {
+      target.postMessage(
+        {
+          type: "evergreen:session-key",
+          kid: keys.kid,
+          s2cKeyB64: keys.s2cKeyB64,
+          c2sKeyB64: keys.c2sKeyB64,
+        },
+        window.location.origin,
+      );
+    } catch {
+      // Best effort. Without the handoff the payload stays explicitly offline
+      // rather than falling back to any cleartext transport.
     }
   };
 

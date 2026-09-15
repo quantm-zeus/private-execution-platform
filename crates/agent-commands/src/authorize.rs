@@ -95,7 +95,7 @@ pub fn authorize(
     // Both channels deliberately share one rule set; the match documents that
     // there is no channel-specific privilege.
     match channel {
-        AgentChannel::Mcp | AgentChannel::Telegram => {
+        AgentChannel::Mcp | AgentChannel::Telegram | AgentChannel::Web => {
             authorize_shared(command, capabilities, valuation_usd_micros)
         }
     }

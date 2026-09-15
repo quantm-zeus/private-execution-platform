@@ -7,11 +7,17 @@
 //!   matters is same-origin enforcement + a strict own-origin CSP at the
 //!   browser layer (bootstrap/packaging, not this crate).
 //! - What this binding guarantees: NO secret/private/session key material
-//!   is exposed through the API surface. JS receives only the derived 32-byte
-//!   public key, the 32-byte encapsulated key (public wire material), and the
-//!   plaintext bytes returned by an authenticated decrypt. There are no
-//!   accessors for raw secrets or private keys, and this crate persists
-//!   nothing. Key-bearing types in `crypto-envelope` zeroize where practical.
+//!   is exposed through the API surface, **except** the deliberate BR-5
+//!   transport handoff: the initiator session exposes only the two
+//!   direction-separated 32-byte app keys (via `app_session_keys`) so the
+//!   trusted same-origin shell can hand them to the sandboxed payload over a
+//!   same-document `postMessage`. The artifact-session keys, the private key,
+//!   and the encapsulated secret are never exposed. JS receives only the
+//!   derived 32-byte public key, the 32-byte encapsulated key (public wire
+//!   material), the two app keys, and the plaintext bytes returned by an
+//!   authenticated decrypt. There are no accessors for raw secrets beyond the
+//!   app keys, and this crate persists nothing. Key-bearing types in
+//!   `crypto-envelope` zeroize where practical.
 //! - All failures surface as constant external errors ("invalid input" or
 //!   "crypto operation failed") so JS cannot differentiate internals.
 //!   Rust error text is never forwarded.
@@ -103,6 +109,29 @@ impl WasmInitiatorSession {
     #[wasm_bindgen]
     pub fn encapsulated_key(&self) -> Vec<u8> {
         self.encapsulated.0.to_vec()
+    }
+
+    /// The 16-byte session key id (public wire material).
+    #[wasm_bindgen]
+    pub fn kid(&self) -> Vec<u8> {
+        self.session.kid().to_vec()
+    }
+
+    /// Directional app session keys for the private payload (BR-5):
+    /// `c2s(32) || s2c(32)`.
+    ///
+    /// SECRET. This is the only key export on the boundary, and it exists so
+    /// the trusted same-origin shell can hand the keys to the sandboxed payload
+    /// over a same-document `postMessage`. The caller must import them as
+    /// non-extractable `CryptoKey`s, zeroize the returned buffer, and never
+    /// persist, log or serialize it. The artifact-session keys are not exposed.
+    #[wasm_bindgen]
+    pub fn app_session_keys(&self) -> Vec<u8> {
+        let keys = self.session.app_keys();
+        let mut out = Vec::with_capacity(2 * crypto_envelope::SESSION_KEY_LEN);
+        out.extend_from_slice(keys.c2s());
+        out.extend_from_slice(keys.s2c());
+        out
     }
 
     /// Authenticated decrypt of a server->client session envelope:

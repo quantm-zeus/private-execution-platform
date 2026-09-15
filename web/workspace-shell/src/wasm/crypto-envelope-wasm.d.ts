@@ -10,6 +10,17 @@ export class WasmInitiatorSession {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * Directional app session keys for the private payload (BR-5):
+     * `c2s(32) || s2c(32)`.
+     *
+     * SECRET. This is the only key export on the boundary, and it exists so
+     * the trusted same-origin shell can hand the keys to the sandboxed payload
+     * over a same-document `postMessage`. The caller must import them as
+     * non-extractable `CryptoKey`s, zeroize the returned buffer, and never
+     * persist, log or serialize it. The artifact-session keys are not exposed.
+     */
+    app_session_keys(): Uint8Array;
+    /**
      * Authenticated decrypt of a server->client session envelope:
      * `kid(16) || nonce(12) || sequence(u64 BE) || ciphertext`.
      */
@@ -23,6 +34,10 @@ export class WasmInitiatorSession {
      * Runs the audited `initiator_establish` against the validated offer.
      */
     static establish(offer: WasmOffer): WasmInitiatorSession;
+    /**
+     * The 16-byte session key id (public wire material).
+     */
+    kid(): Uint8Array;
 }
 
 /**
@@ -104,9 +119,11 @@ export interface InitOutput {
     readonly __wbg_wasmworkspacekey_free: (a: number, b: number) => void;
     readonly decrypt_workspace_artifact: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly derive_workspace_public_key: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly wasminitiatorsession_app_session_keys: (a: number) => [number, number];
     readonly wasminitiatorsession_decrypt: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasminitiatorsession_encapsulated_key: (a: number) => [number, number];
     readonly wasminitiatorsession_establish: (a: number) => [number, number, number];
+    readonly wasminitiatorsession_kid: (a: number) => [number, number];
     readonly wasmoffer_kid: (a: number) => [number, number];
     readonly wasmoffer_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly wasmworkspacekey_decrypt_artifact: (a: number, b: number, c: number) => [number, number, number, number];
