@@ -1,8 +1,10 @@
-import { Show, createMemo, createSignal, type Component } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, type Component } from "solid-js";
 import { formatAmount, formatBps, formatPercent } from "../../core/format";
+import { workspaceError } from "../../core/errors";
 import type { WorkspaceErrorShape } from "../../core/types";
 import type { ExecutionProgress, RfqLegView, RfqView, TwapRequest } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
+import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/idempotency";
 import { useWorkspace } from "../../state/session";
 import { ActionButton, Badge, Metric, MetricGrid, Panel, ReasonNote } from "../../components/ui/primitives";
 import { AsyncSurface, DenialNote, EmptyBlock, ErrorBlock } from "../../components/ui/states";
@@ -12,12 +14,20 @@ function num(raw: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+/**
+ * Treat a missing, empty or whitespace-only token reference as absent so it
+ * cannot slip past a `=== null` fail-closed gate and reach the backend.
+ */
+function nonBlank(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 function progressMetrics(progress: ExecutionProgress) {
   const done = progress.chunksDone;
   const total = progress.chunksTotal;
   return [
     { label: "State", value: progress.state.toUpperCase() },
-    { label: "Chunks", value: total === null ? "—" : `${done ?? 0}/${total}` },
+    { label: "Chunks", value: total === null ? "—" : `${done ?? "—"}/${total}` },
     { label: "Filled", value: progress.filledAmount ?? "—" },
     { label: "Remaining", value: progress.remainingAmount ?? "—" },
     { label: "Realized vs estimate", value: formatBps(progress.realizedVsEstimateBps) },
@@ -45,33 +55,195 @@ export const ExecutionPanel: Component = () => {
 
   const twapDenial = createMemo(() => ws.mutationDenial("twap"));
   const rfqDenial = createMemo(() => ws.mutationDenial("rfq"));
-  const twapValid = createMemo(
-    () => num(amount()) !== null && num(slippage()) !== null && num(impact()) !== null,
-  );
+  const progressDenial = createMemo(() => ws.capabilityDenial("twap"));
 
-  const startTwap = async () => {
-    if (!twapValid()) return;
-    const chainId = ws.session()?.chains.find((chain) => chain.enabled)?.id ?? "base";
-    const request: TwapRequest = {
+  // Load the current execution progress once the capability is authoritatively
+  // confirmed; otherwise the surface shows an unqueried "no execution running".
+  let progressRequested = false;
+  createEffect(() => {
+    if (progressDenial() === null && !progressRequested) {
+      progressRequested = true;
+      void progress.run();
+    }
+  });
+
+  const twapKeys = createSubmissionKeyTracker("twap");
+  const rfqKeys = createSubmissionKeyTracker("rfq");
+  const [twapUnknown, setTwapUnknown] = createSignal<{
+    reason: string;
+    signature: string;
+    request: TwapRequest;
+  } | null>(null);
+  /** Two-step acknowledgement before releasing a TWAP UNKNOWN guard (BR-9). */
+  const [discardArmed, setDiscardArmed] = createSignal(false);
+  /**
+   * In-flight guards. A double-click (or Enter resubmit) must not run two
+   * logical submissions; the second could clear/rotate the key of the first
+   * while it is still unresolved and start a duplicate execution.
+   */
+  const [twapSubmitting, setTwapSubmitting] = createSignal(false);
+  const [rfqSubmitting, setRfqSubmitting] = createSignal(false);
+  /**
+   * An RFQ whose outcome could not be confirmed. Kept (with its idempotency
+   * key and exact request) so a retry dedupes and a *different* request cannot
+   * start while the first may still have been accepted.
+   */
+  const [rfqUnknown, setRfqUnknown] = createSignal<{
+    reason: string;
+    signature: string;
+  } | null>(null);
+  /** Two-step acknowledgement before releasing an RFQ UNKNOWN guard (BR-9). */
+  const [rfqDiscardArmed, setRfqDiscardArmed] = createSignal(false);
+
+  const selected = () => ws.selectedInstrument();
+  const chain = (): string | null =>
+    selected()?.chain ?? ws.session()?.chains.find((c) => c.enabled)?.id ?? null;
+  const chainInfo = createMemo(() => {
+    const id = chain();
+    if (id === null) return undefined;
+    return ws.session()?.chains.find((c) => c.id === id && c.enabled);
+  });
+  /**
+   * Resolve the buy pair (this surface has no sell toggle): the chain's
+   * advertised quote/native token in (BR-11), the selected instrument out.
+   */
+  const resolvedTokens = createMemo(() => ({
+    tokenIn: nonBlank(chainInfo()?.nativeToken),
+    tokenOut: nonBlank(selected()?.address),
+  }));
+  const targetError = createMemo<string | null>(() => {
+    if (chain() === null) {
+      return "No enabled chain was advertised by the backend — execution is disabled.";
+    }
+    const tokens = resolvedTokens();
+    if (tokens.tokenIn === null || tokens.tokenOut === null) {
+      if (selected() === null) return "Select a token in Discover to set the execution target.";
+      return "The chain's quote token is not advertised by the backend — execution is disabled.";
+    }
+    return null;
+  });
+
+  /** The exact RFQ request the surface submits (extended with the target instrument). */
+  const rfqRequest = createMemo<Record<string, unknown>>(() => {
+    const tokens = resolvedTokens();
+    return { chain: chain(), token_in: tokens.tokenIn, token_out: tokens.tokenOut };
+  });
+
+  /** The exact TWAP request the form currently describes, or null if invalid. */
+  const twapRequest = createMemo<TwapRequest | null>(() => {
+    if (num(amount()) === null || num(slippage()) === null || num(impact()) === null) return null;
+    // Never silently substitute a default for an invalid scheduling value: a
+    // user who typed an unusable interval/max-chunks must see the form blocked.
+    const intervalMs = num(interval());
+    const chunks = num(maxChunks());
+    if (intervalMs === null || chunks === null) return null;
+    const chainId = chain();
+    const tokens = resolvedTokens();
+    if (chainId === null || tokens.tokenIn === null || tokens.tokenOut === null) return null;
+    return {
       chain: chainId,
-      tokenIn: "",
-      tokenOut: "",
+      tokenIn: tokens.tokenIn,
+      tokenOut: tokens.tokenOut,
       side: "buy",
       totalAmount: amount(),
       amountType: "usd",
       maxSlippageBps: Math.round(num(slippage())!),
       maxPriceImpactBps: Math.round(num(impact())!),
-      intervalMs: Math.round(num(interval()) ?? 30_000),
-      maxChunks: Math.round(num(maxChunks()) ?? 6),
+      intervalMs: Math.round(intervalMs),
+      maxChunks: Math.round(chunks),
     };
-    // Deterministic per logical submission so a manual retry is idempotent and
-    // can never create a duplicate TWAP; a changed input yields a new key.
-    const idempotencyKey = `twap-${chainId}-${amount()}-${slippage()}-${impact()}-${interval()}-${maxChunks()}`;
+  });
+  const twapValid = createMemo(() => twapRequest() !== null);
+  const twapSignature = createMemo(() => {
+    const request = twapRequest();
+    return request === null ? null : JSON.stringify(request);
+  });
+  const twapBlockedByUnknown = createMemo(() => {
+    const unknown = twapUnknown();
+    const signature = twapSignature();
+    return unknown !== null && signature !== null && unknown.signature !== signature;
+  });
+
+  const requestRfq = async (): Promise<void> => {
+    // Re-gate at action time: the retry affordance is not enough, a stale render
+    // or flipped kill switch must not let the write out.
+    const denial = rfqDenial();
+    if (denial !== null) return;
+    if (rfqSubmitting()) return;
+    // Fail closed on an incomplete target: never submit a chain-less/null-token RFQ.
+    if (targetError() !== null) return;
+    const request = rfqRequest();
+    const signature = JSON.stringify(request);
+    // While a previous RFQ is UNKNOWN, only the exact same request may be
+    // retried (same key -> backend dedupe). A different request is refused so an
+    // unresolved RFQ cannot be doubled by a changed form.
+    const unknown = rfqUnknown();
+    if (unknown !== null && unknown.signature !== signature) return;
+    const hadUnknown = unknown !== null;
+    const key = rfqKeys.keyFor(signature);
+    setRfqSubmitting(true);
+    try {
+      await rfq.run(request, { idempotencyKey: key });
+      const state = rfq.state();
+      if (state.kind === "ready" || state.kind === "stale") {
+        rfqKeys.clear();
+        setRfqUnknown(null);
+        setRfqDiscardArmed(false);
+      } else if (state.kind === "unavailable") {
+        // A retry of an existing UNKNOWN must not release the guard on a
+        // determinate rejection: a gateway can reject before the idempotency
+        // store is consulted.
+        if (hadUnknown) {
+          setRfqUnknown({ reason: state.reason, signature });
+        } else {
+          rfqKeys.clear();
+          setRfqUnknown(null);
+        }
+      } else if (state.kind === "error") {
+        if (hadUnknown || isIndeterminateOutcome(state.error.code, state.error.retryable)) {
+          setRfqUnknown({ reason: state.error.message, signature });
+        } else {
+          // A determinate rejection of a first attempt: a corrected retry is a
+          // genuinely new logical RFQ.
+          rfqKeys.clear();
+          setRfqUnknown(null);
+          setRfqDiscardArmed(false);
+        }
+      }
+    } finally {
+      setRfqSubmitting(false);
+    }
+  };
+
+  const discardRfqUnknown = (): void => {
+    // Explicit two-step acknowledgement before a *different* RFQ may run.
+    setRfqDiscardArmed(false);
+    rfqKeys.clear();
+    setRfqUnknown(null);
+  };
+
+  /** Submit one logical TWAP; the caller supplies the stable signature/key. */
+  const submitTwap = async (request: TwapRequest, signature: string): Promise<void> => {
+    // In-flight guard: a double-click must not clear the key of the first
+    // attempt while it is still unresolved.
+    if (twapSubmitting()) return;
+    const idempotencyKey = twapKeys.keyFor(signature);
+    // A retry of an already-UNKNOWN submission must never release the guard on a
+    // determinate rejection: a gateway can reject before the idempotency store is
+    // consulted, so it does not prove the first attempt did not start.
+    const hadUnknown = twapUnknown() !== null;
+    setTwapSubmitting(true);
     setTwapError(null);
     try {
       const result = await ws.command.send<ExecutionProgress>("start_twap", request, {
         idempotencyKey,
       });
+      if (!result || typeof result.state !== "string") {
+        throw workspaceError("protocol", "TWAP response was missing an execution state.");
+      }
+      twapKeys.clear();
+      setTwapUnknown(null);
+      setDiscardArmed(false);
       setTwapState(result);
     } catch (error) {
       const shape = (error as { toShape?: () => WorkspaceErrorShape }).toShape?.() ?? {
@@ -79,8 +251,74 @@ export const ExecutionPanel: Component = () => {
         message: "TWAP start failed.",
         retryable: false,
       };
-      setTwapError(shape);
+      if (hadUnknown || isIndeterminateOutcome(shape.code, shape.retryable)) {
+        // Never render an ambiguous outcome as a plain failure: the key is kept
+        // and the request is bound so a retry dedupes.
+        setTwapUnknown({ reason: shape.message, signature, request });
+        setTwapError(null);
+      } else {
+        // Determinate rejection of a first attempt rotates the key; the next
+        // attempt is new.
+        twapKeys.clear();
+        setTwapUnknown(null);
+        setTwapError(shape);
+      }
+    } finally {
+      setTwapSubmitting(false);
     }
+  };
+
+  const startTwap = async () => {
+    // Re-gate at action time (the ErrorBlock retry path bypasses the button).
+    const denial = twapDenial();
+    if (denial !== null) {
+      setTwapError({ code: "capability_missing", message: denial.reason, retryable: false });
+      return;
+    }
+    // Fail closed on an incomplete target before ever building the request.
+    const targetProblem = targetError();
+    if (targetProblem !== null) {
+      setTwapError({ code: "capability_missing", message: targetProblem, retryable: false });
+      return;
+    }
+    const request = twapRequest();
+    if (request === null) return;
+    const signature = JSON.stringify(request);
+    // While a previous submission is UNKNOWN, only the *same* request may be
+    // retried (same key -> backend dedupe). A changed request is refused so a
+    // still-in-flight TWAP cannot be doubled by an edited form.
+    const unknown = twapUnknown();
+    if (unknown !== null && unknown.signature !== signature) {
+      setTwapError({
+        code: "freshness",
+        message:
+          "An earlier TWAP submission is still UNKNOWN — retry the same request or reconcile it before starting a different one.",
+        retryable: true,
+      });
+      return;
+    }
+    await submitTwap(request, signature);
+  };
+
+  /** Idempotent retry of the exact UNKNOWN request (same key). */
+  const retryTwapUnknown = async () => {
+    const unknown = twapUnknown();
+    if (unknown === null) return;
+    const denial = twapDenial();
+    if (denial !== null) {
+      setTwapError({ code: "capability_missing", message: denial.reason, retryable: false });
+      return;
+    }
+    await submitTwap(unknown.request, unknown.signature);
+  };
+
+  const discardTwapUnknown = () => {
+    // The user attests they reconciled the unknown against Orders/history; the
+    // backend exposes no lookup op for it yet (see BR-9). This never claims the
+    // original did not happen. Two-step: the acknowledgement is required first.
+    setDiscardArmed(false);
+    twapKeys.clear();
+    setTwapUnknown(null);
   };
 
   const rankedLegs = createMemo(() => {
@@ -155,17 +393,68 @@ export const ExecutionPanel: Component = () => {
               />
             </label>
           </div>
-          <ActionButton type="submit" tone="primary" disabled={!twapValid() || twapDenial() !== null}>
+          <ActionButton
+            type="submit"
+            tone="primary"
+            disabled={!twapValid() || twapDenial() !== null || twapBlockedByUnknown() || twapSubmitting() || targetError() !== null}
+          >
             Start adaptive TWAP
           </ActionButton>
           <DenialNote denial={twapDenial()} />
+          <Show when={targetError()}>
+            {(message) => <ReasonNote tone="warning">{message()}</ReasonNote>}
+          </Show>
+          <Show when={!twapValid() && amount().trim() !== ""}>
+            <ReasonNote tone="warning">
+              Enter positive amount, slippage, price impact, interval and max chunks.
+            </ReasonNote>
+          </Show>
         </form>
+
+        <Show when={twapUnknown()}>
+          {(unknown) => (
+            <div class="panel-stack">
+              <ReasonNote tone="warning">
+                TWAP submission outcome UNKNOWN: {unknown().reason} The request may still have reached
+                the backend. Retrying the same request is idempotent; starting a different TWAP is
+                blocked until this is reconciled.
+              </ReasonNote>
+              <div class="actions">
+                <ActionButton onClick={() => void retryTwapUnknown()} disabled={twapDenial() !== null || twapSubmitting()}>
+                  Retry same request
+                </ActionButton>
+              </div>
+              <label class="field field--checkbox">
+                <input
+                  type="checkbox"
+                  aria-label="I verified the earlier TWAP out-of-band"
+                  checked={discardArmed()}
+                  onChange={(event) => setDiscardArmed(event.currentTarget.checked)}
+                />
+                <span class="field__label">
+                  I verified in the authoritative order/execution list that the earlier TWAP was not
+                  started.
+                </span>
+              </label>
+              <ActionButton tone="danger" disabled={!discardArmed()} onClick={discardTwapUnknown}>
+                Discard UNKNOWN and continue
+              </ActionButton>
+            </div>
+          )}
+        </Show>
+        <Show when={twapBlockedByUnknown()}>
+          <ReasonNote tone="danger">
+            The form no longer matches the UNKNOWN TWAP submission — restore it to retry idempotently,
+            or reconcile and discard the unknown first.
+          </ReasonNote>
+        </Show>
 
         <Show
           when={twapState()}
           fallback={
             <AsyncSurface<ExecutionProgress>
               state={progress.state()}
+              denial={progressDenial()}
               nowMs={ws.nowMs()}
               onRetry={() => void progress.run()}
               emptyTitle="No adaptive execution running"
@@ -189,6 +478,9 @@ export const ExecutionPanel: Component = () => {
             </div>
           )}
         </Show>
+        <Show when={twapError()}>
+          {(error) => <ErrorBlock error={error()} onRetry={() => void startTwap()} />}
+        </Show>
       </Panel>
 
       <Panel
@@ -196,14 +488,53 @@ export const ExecutionPanel: Component = () => {
         subtitle="Best-execution ranking across competing legs"
         badge={<Badge tone={rfqDenial() ? "warning" : "positive"}>{rfqDenial() ? "UNAVAILABLE" : "READY"}</Badge>}
       >
-        <ActionButton disabled={rfqDenial() !== null} onClick={() => void rfq.run({})}>
+        <ActionButton
+          disabled={rfqDenial() !== null || rfqSubmitting() || rfqUnknown() !== null || targetError() !== null}
+          onClick={() => void requestRfq()}
+        >
           Request quotes
         </ActionButton>
         <DenialNote denial={rfqDenial()} />
+        <Show when={targetError()}>
+          {(message) => <ReasonNote tone="warning">{message()}</ReasonNote>}
+        </Show>
+        <Show when={rfqUnknown()}>
+          {(unknown) => (
+            <div class="panel-stack">
+              <ReasonNote tone="warning">
+                RFQ outcome UNKNOWN: {unknown().reason} The request may still have reached the
+                backend. Retrying the same request is idempotent (same key); a different request is
+                blocked until this is reconciled.
+              </ReasonNote>
+              <div class="actions">
+                <ActionButton
+                  onClick={() => void requestRfq()}
+                  disabled={rfqDenial() !== null || rfqSubmitting()}
+                >
+                  Retry same request
+                </ActionButton>
+              </div>
+              <label class="field field--checkbox">
+                <input
+                  type="checkbox"
+                  aria-label="I verified the earlier RFQ out-of-band"
+                  checked={rfqDiscardArmed()}
+                  onChange={(event) => setRfqDiscardArmed(event.currentTarget.checked)}
+                />
+                <span class="field__label">
+                  I verified in the authoritative execution list that the earlier RFQ was not started.
+                </span>
+              </label>
+              <ActionButton tone="danger" disabled={!rfqDiscardArmed()} onClick={discardRfqUnknown}>
+                Discard UNKNOWN and continue
+              </ActionButton>
+            </div>
+          )}
+        </Show>
         <AsyncSurface<RfqView>
           state={rfq.state()}
           nowMs={ws.nowMs()}
-          onRetry={() => void rfq.run({})}
+          onRetry={() => void requestRfq()}
           emptyTitle="No RFQ in flight"
           emptyDetail="Submit a request to compare solver legs by simulated net output."
         >
@@ -218,7 +549,7 @@ export const ExecutionPanel: Component = () => {
                       {leg.solver === value.bestSolver ? "BEST" : leg.viable ? "VIABLE" : "REJECTED"}
                     </Badge>
                     <span class="route-list__venue">{leg.solver}</span>
-                    <span class="muted">out {formatAmount(leg.netOutput ?? Number(leg.amountOut))}</span>
+                    <span class="muted">net out {formatAmount(leg.netOutput)}</span>
                     <span class="route-list__share">{leg.latencyMs === null ? "—" : `${leg.latencyMs}ms`}</span>
                   </li>
                 ))}

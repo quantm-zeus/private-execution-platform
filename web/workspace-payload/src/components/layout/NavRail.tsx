@@ -9,16 +9,21 @@ function capabilityTone(available: boolean, active: boolean): Tone {
 
 export const NavRail: Component<{
   active: ViewId;
-  onSelect: (id: ViewId) => void;
+  /** `focusMain: false` keeps focus inside the rail (arrow-key traversal). */
+  onSelect: (id: ViewId, options?: { focusMain?: boolean }) => void;
   capabilityOf: (view: ViewDef) => boolean;
 }> = (props) => {
-  const move = (event: KeyboardEvent, index: number) => {
+  const move = (event: KeyboardEvent, _groupIndex: number) => {
     const buttons = Array.from(
       (event.currentTarget as HTMLElement)
         .closest("nav")
         ?.querySelectorAll<HTMLButtonElement>("button[data-view]") ?? [],
     );
     if (buttons.length === 0) return;
+    // Use the DOM position, not the group-local index, so arrow keys traverse
+    // the whole rail in visual order instead of jumping across groups.
+    const index = buttons.indexOf(event.currentTarget as HTMLButtonElement);
+    if (index < 0) return;
     let next = index;
     if (event.key === "ArrowDown" || event.key === "ArrowRight") next = (index + 1) % buttons.length;
     else if (event.key === "ArrowUp" || event.key === "ArrowLeft")
@@ -29,7 +34,9 @@ export const NavRail: Component<{
     event.preventDefault();
     const target = buttons[next];
     target.focus();
-    props.onSelect(target.dataset.view as ViewId);
+    // Keep focus in the rail: stealing it to the main region here made the next
+    // arrow key operate on `<main>` instead of continuing rail traversal.
+    props.onSelect(target.dataset.view as ViewId, { focusMain: false });
   };
 
   return (

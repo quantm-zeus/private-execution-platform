@@ -50,4 +50,18 @@ describe("FrameSequencer", () => {
     expect(sequencer.isResyncing).toBe(false);
     expect(sequencer.observe(101)).toEqual({ kind: "accept", expectedAfter: 102 });
   });
+
+  it("advances the rollback high-water mark only after authentication", () => {
+    const sequencer = new FrameSequencer();
+    // A cleartext observation (pre-AEAD) must never move the rollback mark: the
+    // sequence is attacker-controllable until the frame is authenticated.
+    expect(sequencer.observe(5)).toMatchObject({ kind: "accept" });
+    expect(sequencer.lastAppliedSeq).toBeNull();
+    sequencer.noteApplied(5);
+    expect(sequencer.lastAppliedSeq).toBe(5);
+    expect(sequencer.observe(6)).toMatchObject({ kind: "accept" });
+    expect(sequencer.lastAppliedSeq).toBe(5);
+    sequencer.onSnapshot(9);
+    expect(sequencer.lastAppliedSeq).toBe(9);
+  });
 });

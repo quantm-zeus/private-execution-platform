@@ -1,4 +1,5 @@
 import {
+  Show,
   createEffect,
   createSignal,
   onCleanup,
@@ -7,19 +8,34 @@ import {
 } from "solid-js";
 import { parseDepthSnapshot, applyMarketFrame, createMarketFrameStores } from "./frames";
 import { DEFAULT_CHART_THEME, renderChart } from "./renderer";
-import { formatAmount, formatBps } from "../core/format";
+import { formatAmount, formatBps, truncateAddress } from "../core/format";
+import type { InstrumentRef } from "../core/types";
 import { TIMEFRAMES, timeframeById } from "../market/ohlcv";
 import { computePriceRange, padRange, xToTime, zoomViewport, type Viewport } from "../market/scale";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
 import type { DecodedFrame } from "../realtime/types";
+import { useWorkspace } from "../state/session";
 import { Badge, Panel } from "../components/ui/primitives";
 import { EmptyBlock } from "../components/ui/states";
 
 export interface ChartPanelProps {
-  /** Entity key from the realtime feed, e.g. `ohlcv:BASE:SOL`. */
+  /** Explicit entity key from the realtime feed, e.g. `ohlcv:BASE:SOL`. */
   readonly entityKey?: string;
   readonly initialTimeframe?: string;
   readonly bars?: number;
+}
+
+/**
+ * Derive the chart entity key from the shared target selection. An explicit
+ * `override` (embedding) wins; otherwise a selected instrument targets
+ * `ohlcv:${chain}:${address}` and no selection keeps the neutral default.
+ */
+export function chartEntityKeyFor(
+  instrument: InstrumentRef | null,
+  override?: string,
+): string {
+  if (override !== undefined && override.length > 0) return override;
+  return instrument === null ? "ohlcv:default" : `ohlcv:${instrument.chain}:${instrument.address}`;
 }
 
 /**
@@ -27,12 +43,14 @@ export interface ChartPanelProps {
  * this component only applies them to bounded local buffers and paints.
  */
 export const ChartPanel: Component<ChartPanelProps> = (props) => {
-  const entityKey = () => props.entityKey ?? "ohlcv:default";
+  const ws = useWorkspace();
+  const entityKey = () => chartEntityKeyFor(ws.selectedInstrument(), props.entityKey);
   const [timeframeId, setTimeframeId] = createSignal(props.initialTimeframe ?? "1m");
   const [version, setVersion] = createSignal(0);
   const [size, setSize] = createSignal({ width: 640, height: 360 });
   const [endMs, setEndMs] = createSignal<number | null>(null);
   const [spanMs, setSpanMs] = createSignal<number | null>(null);
+  const [follow, setFollow] = createSignal(true);
   const stores = createMarketFrameStores();
   const [dragging, setDragging] = createSignal(false);
   const feed = useRealtimeFeedContext();
@@ -97,7 +115,9 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
       changed = changed || result.changed;
     }
     if (changed) {
-      setEndMs(null);
+      // Only auto-scroll while the user is following the right edge; a manual
+      // pan/zoom must not be overridden by the next frame.
+      if (follow()) setEndMs(null);
       setVersion((value) => value + 1);
     }
   };
@@ -123,6 +143,9 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   });
 
   createEffect(() => {
+    // Track the entity key so a shared-target change clears/redraws the canvas
+    // immediately instead of waiting for an unrelated frame or resize.
+    entityKey();
     version();
     size();
     timeframeId();
@@ -156,6 +179,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     );
     setSpanMs(next.endMs - next.startMs);
     setEndMs(next.endMs);
+    setFollow(false);
   };
 
   const onPointerDown = (event: PointerEvent) => {
@@ -163,6 +187,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     const all = series()?.toArray() ?? [];
     if (all.length === 0) return;
     setDragging(true);
+    setFollow(false);
     dragStartX = event.clientX;
     const tfMs = currentTimeframe().ms;
     const span = spanMs() ?? tfMs * (props.bars ?? 120);
@@ -189,6 +214,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   const reset = () => {
     setEndMs(null);
     setSpanMs(null);
+    setFollow(true);
     scheduleRender();
   };
 
@@ -202,6 +228,20 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
 
   return (
     <div class="chart-panel">
+      <div class="chart-target" data-testid="chart-target">
+        <Show
+          when={ws.selectedInstrument()}
+          fallback={<Badge tone="muted">No target selected</Badge>}
+        >
+          {(instrument) => (
+            <Badge tone="info">
+              {instrument().symbol} · {truncateAddress(instrument().address, 6, 6)} ·{" "}
+              {instrument().chain}
+            </Badge>
+          )}
+        </Show>
+        <span class="muted">entity {entityKey()}</span>
+      </div>
       <div class="timeframe-row" role="group" aria-label="Chart timeframe">
         {TIMEFRAMES.map((tf) => (
           <button

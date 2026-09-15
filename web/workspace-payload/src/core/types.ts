@@ -20,7 +20,8 @@ export type CapabilityKey =
   | "okx"
   | "twap"
   | "rfq"
-  | "withdraw";
+  | "withdraw"
+  | "wallet_limits";
 
 export const CAPABILITY_KEYS: readonly CapabilityKey[] = [
   "market",
@@ -37,6 +38,7 @@ export const CAPABILITY_KEYS: readonly CapabilityKey[] = [
   "twap",
   "rfq",
   "withdraw",
+  "wallet_limits",
 ] as const;
 
 export type CapabilitySet = Readonly<Record<CapabilityKey, boolean>>;
@@ -47,10 +49,28 @@ export interface CapabilityDenial {
   readonly reason: string;
 }
 
+/**
+ * A memory-only reference to the instrument selected in Discover. Shared across
+ * the header, chart, trade, limits and execution surfaces by the session store;
+ * never persisted to storage, URL, title or history.
+ */
+export interface InstrumentRef {
+  readonly chain: string;
+  readonly address: string;
+  readonly symbol: string;
+}
+
 export interface ChainInfo {
   readonly id: string;
   readonly display: string;
   readonly enabled: boolean;
+  /**
+   * The chain's canonical quote/native asset address (backend contract BR-11),
+   * used to resolve the counterparty leg of a pair without inventing one.
+   * `null` when the backend does not advertise it; consumers must then fail
+   * closed rather than guess.
+   */
+  readonly nativeToken: string | null;
 }
 
 export interface KillSwitchState {
@@ -196,6 +216,24 @@ export interface TtlPolicy {
 }
 
 export const DEFAULT_TTL_MS = 5_000;
+
+/**
+ * Maximum age of the last authenticated realtime frame before capital-committing
+ * mutations must fail closed (PRD circuit breaker: halt new execution when local
+ * state is stale). A half-open socket that never closes would otherwise leave the
+ * connection phase at `live` forever.
+ */
+export const FRAME_FRESHNESS_TTL_MS = 30_000;
+
+/** True when the connection is live AND the last authenticated frame is fresh. */
+export function isConnectionFresh(status: ConnectionStatus, nowMs: number): boolean {
+  if (status.phase !== "live") return false;
+  if (status.lastFrameAtMs === null) return false;
+  // A negative age means the decision clock lagged the frame clock (throttled
+  // tab): fail closed rather than treating stale state as fresh.
+  const frameAgeMs = nowMs - status.lastFrameAtMs;
+  return frameAgeMs >= 0 && frameAgeMs <= FRAME_FRESHNESS_TTL_MS;
+}
 
 export function ageMs(freshness: Freshness, nowMs: number): number {
   return Math.max(0, nowMs - freshness.receivedAtMs + freshness.sourceAgeMs);

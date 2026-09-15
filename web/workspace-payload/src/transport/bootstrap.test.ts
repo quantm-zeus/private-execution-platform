@@ -23,7 +23,27 @@ describe("parseWorkspaceSession", () => {
     expect(Object.keys(session.capabilities)).toContain("rfq");
     expect(session.tradingEnabled).toBe(false);
     expect(session.killSwitch).toEqual({ enabled: true, reason: "foundation" });
-    expect(session.chains).toEqual([{ id: "base", display: "Base", enabled: true }]);
+    expect(session.chains).toEqual([
+      { id: "base", display: "Base", enabled: true, nativeToken: null },
+    ]);
+  });
+
+  it("parses an advertised chain native/quote token and defaults it to null", () => {
+    const session = parseWorkspaceSession({
+      ...VALID,
+      chains: [
+        { id: "base", display: "Base", enabled: true, native_token: "0xusdc" },
+        { id: "eth", display: "Ethereum", enabled: false },
+        { id: "sol", display: "Solana", enabled: true, native_token: "" },
+        { id: "arb", display: "Arbitrum", enabled: true, native_token: 42 },
+      ],
+    });
+    expect(session.chains.map((chain) => chain.nativeToken)).toEqual([
+      "0xusdc",
+      null,
+      null,
+      null,
+    ]);
   });
 
   it("fails closed on a wrong protocol version", () => {
@@ -45,9 +65,25 @@ describe("parseWorkspaceSession", () => {
     expect(() => parseWorkspaceSession([1, 2, 3])).toThrowError();
   });
 
+  it("fails closed on an oversized chain list", () => {
+    const chains = Array.from({ length: 300 }, (_, index) => ({ id: `chain-${index}`, enabled: true }));
+    expect(() => parseWorkspaceSession({ ...VALID, chains })).toThrowError(/size limit/i);
+  });
+
   it("defaults the kill switch to engaged when malformed", () => {
     const session = parseWorkspaceSession({ ...VALID, kill_switch: "nope" });
     expect(session.killSwitch.enabled).toBe(true);
+  });
+
+  it("fails the kill switch closed on an object without a boolean enabled flag", () => {
+    for (const kill_switch of [{}, { reason: "halted" }, { enabled: "true" }, { enabled: 1 }]) {
+      const session = parseWorkspaceSession({ ...VALID, kill_switch });
+      expect(session.killSwitch.enabled).toBe(true);
+    }
+    // Only an explicit boolean may clear the halt.
+    expect(parseWorkspaceSession({ ...VALID, kill_switch: { enabled: false } }).killSwitch.enabled).toBe(
+      false,
+    );
   });
 
   it("does not enable a capability that is not explicitly true", () => {

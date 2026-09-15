@@ -13,8 +13,28 @@ function App() {
   const [isUnlocked, setIsUnlocked] = createSignal(false);
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [isProcessing, setIsProcessing] = createSignal(false);
+  let frame: HTMLIFrameElement | undefined;
+
+  // Same-document channel with the decrypted payload: the payload may request a
+  // lock (destroy session keys + revoke blob URLs) and announce readiness.
+  // Only messages originating from our own frame *and* our own origin are
+  // honoured: the sandbox permits self-navigation, so a navigated frame could
+  // still match `contentWindow` (BR-6 treats the payload as trusted code, but the
+  // origin check is cheap defense-in-depth).
+  const onPayloadMessage = (event: MessageEvent) => {
+    if (!frame || event.source !== frame.contentWindow) return;
+    if (event.origin !== window.location.origin) return;
+    const data = event.data as { type?: unknown } | null;
+    if (!data || typeof data !== "object") return;
+    if (data.type === "evergreen:lock-request") {
+      handleLock();
+    } else if (data.type === "evergreen:workspace-ready") {
+      setStatus("Workspace ready.");
+    }
+  };
 
   onMount(async () => {
+    window.addEventListener("message", onPayloadMessage);
     try {
       await loadWasm();
       setStatus("Workspace crypto boundary ready.");
@@ -24,6 +44,7 @@ function App() {
   });
 
   onCleanup(() => {
+    window.removeEventListener("message", onPayloadMessage);
     defaultRuntime.lock();
   });
 
@@ -108,10 +129,24 @@ function App() {
           </button>
           <iframe
             id="workspace-frame"
+            ref={(element) => {
+              frame = element;
+            }}
             src={payloadUrl()}
             title="Workspace Frame"
-            sandbox="allow-scripts"
-            style={{ width: "100%", height: "80vh", border: "1px solid #ccc" }}
+            // allow-same-origin is required: the decrypted payload document is
+            // instantiated from blob: URLs created by this document, and a
+            // sandboxed opaque origin cannot load blob: subresources (Chromium
+            // "Not allowed to load local resource"). Navigation, popups, modals,
+            // forms and downloads stay denied.
+            //
+            // CAVEAT (BR-6): with `allow-same-origin` this sandbox is an
+            // isolation WARNING, not a containment boundary — a same-origin
+            // document can remove its own sandbox. Do not treat it as a security
+            // control; the payload is trusted code. Real containment requires
+            // serving the payload from a distinct origin.
+            sandbox="allow-scripts allow-same-origin"
+            class="workspace-frame"
           />
         </div>
       </Show>

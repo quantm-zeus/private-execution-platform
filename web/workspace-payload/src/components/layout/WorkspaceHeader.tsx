@@ -1,6 +1,6 @@
 import { Show, type Component } from "solid-js";
-import { formatAge } from "../../core/format";
-import type { ConnectionStatus, KillSwitchState } from "../../core/types";
+import { formatAge, truncateAddress } from "../../core/format";
+import type { ConnectionStatus, InstrumentRef, KillSwitchState } from "../../core/types";
 import { ActionButton, Badge, type Tone } from "../ui/primitives";
 
 function connectionTone(phase: ConnectionStatus["phase"]): Tone {
@@ -24,6 +24,8 @@ export const WorkspaceHeader: Component<{
   killSwitch: KillSwitchState;
   tradingEnabled: boolean;
   nowMs: number;
+  /** Shared Discover target; `null` renders an explicit no-selection state. */
+  instrument: InstrumentRef | null;
   onLock: () => void;
 }> = (props) => {
   const lastFrameAge = () =>
@@ -39,6 +41,22 @@ export const WorkspaceHeader: Component<{
           <p class="ws-header__subtitle">Memory-only session · no persistent private state</p>
         </div>
       </div>
+      <span class="ws-header__target" data-testid="selected-instrument">
+        <Show
+          when={props.instrument}
+          fallback={<span class="muted">No target selected</span>}
+        >
+          {(instrument) => (
+            <>
+              <Badge tone="info">{instrument().symbol}</Badge>
+              <code title={instrument().address}>
+                {truncateAddress(instrument().address, 6, 6)}
+              </code>
+              <span class="muted">{instrument().chain}</span>
+            </>
+          )}
+        </Show>
+      </span>
       <div class="ws-header__status">
         <Badge tone={connectionTone(props.connection.phase)} title={props.connection.reason ?? undefined}>
           {props.connection.phase.toUpperCase()}

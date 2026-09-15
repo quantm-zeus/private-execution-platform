@@ -1,4 +1,4 @@
-import { For, Show, createMemo, onMount, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, type JSX } from "solid-js";
 import { formatAge, formatClock, formatUsd, truncateAddress } from "../../core/format";
 import type { AlertView, PortfolioView } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
@@ -57,9 +57,20 @@ export default function PortfolioPanel(): JSX.Element {
   const portfolioDenial = createMemo(() => ws.capabilityDenial("portfolio"));
   const alertsDenial = createMemo(() => ws.capabilityDenial("intelligence"));
 
-  onMount(() => {
-    if (!portfolioDenial()) void portfolio.run();
-    void alerts.run();
+  // Load each surface once its capability is authoritatively confirmed. A
+  // one-shot `onMount` check can observe the pre-bootstrap (all-false)
+  // capability set and then never load, rendering an unqueried empty state.
+  let portfolioRequested = false;
+  let alertsRequested = false;
+  createEffect(() => {
+    if (!portfolioRequested && portfolioDenial() === null) {
+      portfolioRequested = true;
+      void portfolio.run();
+    }
+    if (!alertsRequested && alertsDenial() === null) {
+      alertsRequested = true;
+      void alerts.run();
+    }
   });
 
   const portfolioFreshness = () => {
@@ -206,7 +217,9 @@ export default function PortfolioPanel(): JSX.Element {
             <section class="alerts" aria-label="Alerts">
               <header class="alerts__head">
                 <h3>Alerts</h3>
-                <ActionButton onClick={() => void alerts.run()}>Refresh</ActionButton>
+                <ActionButton disabled={alertsDenial() !== null} onClick={() => void alerts.run()}>
+                  Refresh
+                </ActionButton>
               </header>
               <AsyncSurface
                 state={alerts.state()}

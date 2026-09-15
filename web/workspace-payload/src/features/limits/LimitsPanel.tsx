@@ -1,12 +1,12 @@
 import {
   For,
   Show,
+  createEffect,
   createMemo,
   createSignal,
-  onMount,
   type JSX,
 } from "solid-js";
-import { toWorkspaceErrorShape } from "../../core/errors";
+import { toWorkspaceErrorShape, workspaceError } from "../../core/errors";
 import { formatAge, formatBps, formatClock, formatUsd, truncateAddress } from "../../core/format";
 import type {
   AmountType,
@@ -15,6 +15,7 @@ import type {
   TradeSide,
 } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
+import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/idempotency";
 import { useWorkspace } from "../../state/session";
 import {
   ActionButton,
@@ -59,6 +60,9 @@ interface OrdersResponse {
 }
 
 interface PlaceLimitPayload {
+  readonly chain: string | null;
+  readonly token_in: string | null;
+  readonly token_out: string | null;
   readonly side: TradeSide;
   readonly order_type: "limit";
   readonly limit_price: number | null;
@@ -87,6 +91,40 @@ function expiryToMs(raw: string): number | null {
 }
 
 /**
+ * Treat a missing, empty or whitespace-only token reference as absent so it
+ * cannot slip past a `=== null` fail-closed gate and reach the backend.
+ */
+function nonBlank(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** Client-side validation: never send a structurally invalid intent. */
+function validatePayload(payload: PlaceLimitPayload): string | null {
+  // Fail closed on an incomplete target: a limit order with no chain/tokens is
+  // not a tradeable intent and must never reach the backend.
+  if (payload.chain === null || payload.token_in === null || payload.token_out === null) {
+    return "Select a token in Discover to set the limit-order target.";
+  }
+  if (payload.amount === null || payload.amount <= 0) return "Enter a positive amount.";
+  if (payload.limit_price === null || payload.limit_price <= 0) {
+    return "Enter a positive limit net price.";
+  }
+  const caps: readonly (readonly [string, number | null])[] = [
+    ["max buy tax", payload.max_buy_tax_bps],
+    ["max sell tax", payload.max_sell_tax_bps],
+    ["max price impact", payload.max_price_impact_bps],
+    ["max slippage", payload.max_slippage_bps],
+    ["max total cost", payload.max_total_cost_usd],
+  ];
+  for (const [label, value] of caps) {
+    if (value !== null && (!Number.isFinite(value) || value < 0)) {
+      return `Enter a non-negative ${label}.`;
+    }
+  }
+  return null;
+}
+
+/**
  * Net-price limit order surface.
  *
  * The form only ever submits a structured intent; the durable order list is the
@@ -103,6 +141,7 @@ export default function LimitsPanel(): JSX.Element {
   });
   const readDenial = createMemo(() => ws.capabilityDenial("limits"));
   const mutationDenial = createMemo(() => ws.mutationDenial("limits"));
+  const submissionKeys = createSubmissionKeyTracker("limit");
 
   const [side, setSide] = createSignal<TradeSide>("buy");
   const [limitPrice, setLimitPrice] = createSignal("");
@@ -116,47 +155,231 @@ export default function LimitsPanel(): JSX.Element {
   const [expiry, setExpiry] = createSignal("");
   const [allowPartial, setAllowPartial] = createSignal(true);
 
+  const selected = () => ws.selectedInstrument();
+  const chain = (): string | null =>
+    selected()?.chain ?? ws.session()?.chains.find((c) => c.enabled)?.id ?? null;
+  const chainInfo = createMemo(() => {
+    const id = chain();
+    if (id === null) return undefined;
+    return ws.session()?.chains.find((c) => c.id === id && c.enabled);
+  });
+  /**
+   * Resolve the pair from the shared Discover selection and the chain's
+   * advertised quote/native token (BR-11), same as the market ticket. A missing
+   * leg stays `null` so placement fails closed.
+   */
+  const resolvedTokens = createMemo(() =>
+    side() === "buy"
+      ? { tokenIn: nonBlank(chainInfo()?.nativeToken), tokenOut: nonBlank(selected()?.address) }
+      : { tokenIn: nonBlank(selected()?.address), tokenOut: nonBlank(chainInfo()?.nativeToken) },
+  );
+  const targetError = createMemo<string | null>(() => {
+    const tokens = resolvedTokens();
+    if (tokens.tokenIn !== null && tokens.tokenOut !== null) return null;
+    if (selected() === null) {
+      return "Select a token in Discover to set the limit-order target.";
+    }
+    if (chainInfo() === undefined || chainInfo()?.nativeToken === null) {
+      return "The chain's quote token is not advertised by the backend — placing is disabled.";
+    }
+    return "Select a token in Discover before placing a limit order.";
+  });
+
   const [placing, setPlacing] = createSignal(false);
   const [actionError, setActionError] = createSignal<string | null>(null);
   const [reconcilingId, setReconcilingId] = createSignal<string | null>(null);
+  /** Two-step acknowledgement before releasing an UNKNOWN guard (BR-9). */
+  const [discardArmed, setDiscardArmed] = createSignal(false);
+  /**
+   * An ambiguous `place_limit_order` outcome. Kept (with its idempotency key and
+   * exact payload) so a retry dedupes and a *changed* form cannot create a second
+   * order while the first may still be open.
+   */
+  const [placeUnknown, setPlaceUnknown] = createSignal<{
+    reason: string;
+    signature: string;
+    payload: PlaceLimitPayload;
+  } | null>(null);
 
-  onMount(() => {
-    if (!readDenial()) void orders.run();
+  // Load once the authoritative session confirms the capability. A one-shot
+  // `onMount` check can observe the pre-bootstrap (all-false) capability set if
+  // the user navigates here before `/v1/bootstrap` settles, and then never load
+  // — presenting an unqueried "no orders" as if it were authoritative.
+  let requested = false;
+  createEffect(() => {
+    if (readDenial() === null && !requested) {
+      requested = true;
+      void orders.run();
+    }
   });
 
-  const buildPayload = (): PlaceLimitPayload => ({
-    side: side(),
-    order_type: "limit",
-    limit_price: numberOrNull(limitPrice()),
-    amount: numberOrNull(amount()),
-    amount_type: amountType(),
-    max_buy_tax_bps: numberOrNull(maxBuyTaxBps()),
-    max_sell_tax_bps: numberOrNull(maxSellTaxBps()),
-    max_price_impact_bps: numberOrNull(maxPriceImpactBps()),
-    max_slippage_bps: numberOrNull(maxSlippageBps()),
-    max_total_cost_usd: numberOrNull(maxTotalCostUsd()),
-    allow_partial_fill: allowPartial(),
-    expiry_ms: expiryToMs(expiry()),
+  const buildPayload = (): PlaceLimitPayload => {
+    const tokens = resolvedTokens();
+    return {
+      chain: chain(),
+      token_in: tokens.tokenIn,
+      token_out: tokens.tokenOut,
+      side: side(),
+      order_type: "limit",
+      limit_price: numberOrNull(limitPrice()),
+      amount: numberOrNull(amount()),
+      amount_type: amountType(),
+      max_buy_tax_bps: numberOrNull(maxBuyTaxBps()),
+      max_sell_tax_bps: numberOrNull(maxSellTaxBps()),
+      max_price_impact_bps: numberOrNull(maxPriceImpactBps()),
+      max_slippage_bps: numberOrNull(maxSlippageBps()),
+      max_total_cost_usd: numberOrNull(maxTotalCostUsd()),
+      allow_partial_fill: allowPartial(),
+      expiry_ms: expiryToMs(expiry()),
+    };
+  };
+
+  /**
+   * A non-empty cap that does not parse must never be silently dropped to `null`
+   * ("no cap"): that turns a typo into a fail-open user constraint. Empty stays
+   * null (explicitly no cap); anything else must be a finite non-negative number.
+   */
+  const capError = createMemo<string | null>(() => {
+    const caps: readonly (readonly [string, string])[] = [
+      ["max buy tax", maxBuyTaxBps()],
+      ["max sell tax", maxSellTaxBps()],
+      ["max price impact", maxPriceImpactBps()],
+      ["max slippage", maxSlippageBps()],
+      ["max total cost", maxTotalCostUsd()],
+    ];
+    for (const [label, raw] of caps) {
+      const trimmed = raw.trim();
+      if (trimmed === "") continue;
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return `Enter a non-negative ${label}, or leave it empty for no cap.`;
+      }
+    }
+    return null;
   });
 
   const place = async (): Promise<void> => {
     if (mutationDenial()) return;
+    // In-flight guard: a fast backend plus an implicit form submit must not race
+    // a second logical submission (the disabled button is not enough on its own).
+    if (placing()) return;
+    const capInvalid = capError();
+    if (capInvalid !== null) {
+      // `capError` is rendered reactively next to the form; do not duplicate it
+      // in `actionError` (the action must still fail closed here).
+      return;
+    }
+    const targetInvalid = targetError();
+    if (targetInvalid !== null) {
+      // `targetError` is rendered reactively; fail closed without duplicating it.
+      return;
+    }
+    const payload = buildPayload();
+    const invalid = validatePayload(payload);
+    if (invalid !== null) {
+      setActionError(invalid);
+      return;
+    }
+    const expiryRaw = expiry().trim();
+    if (expiryRaw !== "") {
+      const expiryMs = expiryToMs(expiry());
+      if (expiryMs === null) {
+        setActionError("Enter a valid expiry, or leave it empty for an open expiry.");
+        return;
+      }
+      if (expiryMs <= ws.nowMs()) {
+        setActionError("Expiry must be in the future.");
+        return;
+      }
+    }
+    const signature = JSON.stringify(payload);
+    const unknown = placeUnknown();
+    if (unknown !== null && unknown.signature !== signature) {
+      setActionError(
+        "An earlier limit order is still UNKNOWN — retry the same order or reconcile it before placing a different one.",
+      );
+      return;
+    }
+    await submitPlace(payload, signature);
+  };
+
+  /** Submit one logical limit order; the caller supplies the stable signature. */
+  const submitPlace = async (payload: PlaceLimitPayload, signature: string): Promise<void> => {
     setPlacing(true);
     setActionError(null);
     try {
-      await command.send("place_limit_order", buildPayload());
+      const idempotencyKey = submissionKeys.keyFor(signature);
+      const result = await command.send<{ order_id?: unknown }>("place_limit_order", payload, {
+        idempotencyKey,
+      });
+      // A 2xx is not proof of a placed order: the response must identify the
+      // created order. A malformed/empty success (e.g. `result: null`) means the
+      // write may still have committed, so it must keep the UNKNOWN guard and the
+      // idempotency key rather than release them as a success.
+      const orderId = result?.order_id;
+      if (typeof orderId !== "string" || orderId.length === 0) {
+        throw workspaceError("protocol", "Limit order response was missing an order id.");
+      }
+      // A repeat of the same parameters after success is a new logical order.
+      submissionKeys.clear();
+      setPlaceUnknown(null);
+      setDiscardArmed(false);
       await orders.run();
     } catch (error) {
-      setActionError(toWorkspaceErrorShape(error).message);
+      const shape = toWorkspaceErrorShape(error);
+      // If an UNKNOWN from an earlier attempt of THIS logical order already
+      // exists, a failure on the retry must not release the guard or rotate the
+      // key: a gateway can reject (401/400) before the idempotency store is
+      // consulted, so it proves nothing about whether the first attempt committed.
+      if (placeUnknown() !== null || isIndeterminateOutcome(shape.code, shape.retryable)) {
+        // Ambiguous: never render as a plain failure. Keep the key and bind the
+        // exact payload so a retry dedupes and a changed form is refused.
+        setPlaceUnknown({ reason: shape.message, signature, payload });
+        setActionError(null);
+      } else {
+        // A determinate rejection on a first attempt definitely did not commit;
+        // rotate the key so a corrected retry is a genuinely new order rather
+        // than a replay of the backend's cached rejection.
+        submissionKeys.clear();
+        setPlaceUnknown(null);
+        setActionError(shape.message);
+      }
     } finally {
       setPlacing(false);
     }
   };
 
+  const retryPlaceUnknown = async (): Promise<void> => {
+    const unknown = placeUnknown();
+    if (unknown === null) return;
+    if (mutationDenial() || placing()) return;
+    await submitPlace(unknown.payload, unknown.signature);
+  };
+
+  const discardPlaceUnknown = (): void => {
+    // Honest: the user attests they reconciled against the order list; the
+    // backend exposes no create-lookup op yet (see BR-9).
+    setDiscardArmed(false);
+    submissionKeys.clear();
+    setPlaceUnknown(null);
+  };
+
   const cancel = async (order: LimitOrderView): Promise<void> => {
+    // Re-gate at action time: a stale render or a flipped kill switch must not
+    // let a write through.
+    const denial = mutationDenial();
+    if (denial !== null) {
+      setActionError(denial.reason);
+      return;
+    }
     setActionError(null);
     try {
-      await command.send("cancel_order", { order_id: order.orderId });
+      // Cancellation is naturally idempotent per order id.
+      await command.send(
+        "cancel_order",
+        { order_id: order.orderId },
+        { idempotencyKey: `cancel-${order.orderId}` },
+      );
       await orders.run();
     } catch (error) {
       setActionError(toWorkspaceErrorShape(error).message);
@@ -318,6 +541,20 @@ export default function LimitsPanel(): JSX.Element {
                 </button>
               </div>
 
+              <p class="muted" data-testid="limit-target">
+                Target:{" "}
+                <Show when={selected()} fallback="No target selected">
+                  {(instrument) => (
+                    <>
+                      <strong>{instrument().symbol}</strong>{" "}
+                      <code>{truncateAddress(instrument().address, 6, 6)}</code> on{" "}
+                      {instrument().chain}
+                    </>
+                  )}
+                </Show>{" "}
+                · pair {resolvedTokens().tokenIn ?? "—"} → {resolvedTokens().tokenOut ?? "—"}
+              </p>
+
               <div class="ticket__grid">
                 <Field label="Limit net price" forId="limit-net-price">
                   <input
@@ -436,15 +673,60 @@ export default function LimitsPanel(): JSX.Element {
                 <ActionButton
                   type="submit"
                   tone="primary"
-                  disabled={mutationDenial() !== null || placing()}
+                  disabled={mutationDenial() !== null || placing() || capError() !== null || targetError() !== null}
                 >
                   Place limit order
                 </ActionButton>
               </div>
 
               <DenialNote denial={mutationDenial()} />
+              <Show when={targetError()}>
+                {(message) => <ReasonNote tone="warning">{message()}</ReasonNote>}
+              </Show>
+              <Show when={capError()}>
+                {(message) => <ReasonNote tone="danger">{message()}</ReasonNote>}
+              </Show>
               <Show when={actionError()}>
                 {(message) => <ReasonNote tone="danger">{message()}</ReasonNote>}
+              </Show>
+              <Show when={placeUnknown()}>
+                {(unknown) => (
+                  <div class="state-block state-block--error" role="alert" data-testid="limit-unknown">
+                    <p class="state-block__title">Limit order outcome unknown</p>
+                    <p class="state-block__detail">
+                      {unknown().reason} The request may still have reached the backend, so this
+                      order may already be open. Placing a different order now could create a
+                      second one. Retrying the same order is idempotent and cannot duplicate it.
+                    </p>
+                    <div class="ticket__actions">
+                      <ActionButton
+                        disabled={mutationDenial() !== null || placing()}
+                        onClick={() => void retryPlaceUnknown()}
+                      >
+                        Retry same order (idempotent)
+                      </ActionButton>
+                    </div>
+                    <label class="field field--checkbox">
+                      <input
+                        type="checkbox"
+                        aria-label="I verified the earlier limit order out-of-band"
+                        checked={discardArmed()}
+                        onChange={(event) => setDiscardArmed(event.currentTarget.checked)}
+                      />
+                      <span class="field__label">
+                        I verified in the authoritative order list that the earlier order was not
+                        created.
+                      </span>
+                    </label>
+                    <ActionButton
+                      tone="ghost"
+                      disabled={!discardArmed()}
+                      onClick={discardPlaceUnknown}
+                    >
+                      Discard UNKNOWN and continue
+                    </ActionButton>
+                  </div>
+                )}
               </Show>
             </form>
 

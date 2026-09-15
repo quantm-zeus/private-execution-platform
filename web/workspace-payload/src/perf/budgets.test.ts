@@ -16,6 +16,7 @@ function frame(index: number): DecodedFrame {
     entityKey: `market:${index % 500}`,
     slot: null,
     sourceAgeMs: 0,
+    serverTimeMs: null,
     payload: {},
   };
 }
@@ -65,6 +66,7 @@ describe("performance budgets", () => {
       entityKey: "ohlcv:BASE:SOL",
       slot: null,
       sourceAgeMs: 0,
+      serverTimeMs: null,
       payload: { timeframe: "1m", candle: { time_ms: 0, open: 1, high: 2, low: 0.5, close: 1.5, volume: 1 } },
     };
     const duration = elapsed(() => {

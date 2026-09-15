@@ -56,6 +56,10 @@ export class FrameBatcher {
     // intermediate SUBMITTED → FILLED must stay observable.
     const key = frame.priority === 0 ? `${frame.entityKey}#${this.p0Sequence++}` : frame.entityKey;
     if (frame.priority !== 0 && bucket.has(key)) {
+      // Re-insert so the refreshed frame moves to the end of the insertion
+      // order; otherwise eviction could drop the fresh value and retain a stale
+      // one under the same coalescing key.
+      bucket.delete(key);
       bucket.set(key, frame);
       return { replaced: true, forcedResync: false };
     }
@@ -70,14 +74,16 @@ export class FrameBatcher {
 
   private evictOne(): boolean {
     // Drop lowest-priority (metadata first) before visual, never deliberately
-    // drop P0; if only P0 remains, force a resync for the dropped frame.
+    // drop P0. ANY eviction loses state (a P1/P2/P3 delta is not necessarily
+    // superseded by a later frame), so it forces a resync rather than leaving
+    // balances/charts silently stale with no recovery signal.
     for (let priority = 3 as Priority; priority >= 1; priority = (priority - 1) as Priority) {
       const bucket = this.buckets[priority];
       if (bucket.size > 0) {
         const oldestKey = bucket.keys().next().value as string;
         bucket.delete(oldestKey);
         this.total -= 1;
-        return false;
+        return true;
       }
     }
     const p0 = this.buckets[0];

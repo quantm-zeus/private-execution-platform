@@ -111,6 +111,9 @@ export function applyMarketFrame(stores: MarketFrameStores, frame: DecodedFrame)
   }
 
   if (frame.channel === "depth") {
+    // Depth is a snapshot-only contract (BR-2). A delta is ignored rather than
+    // replacing the book, so a future partial delta cannot wipe local state.
+    if (frame.op !== "snapshot") return { changed: false, kind: null, seriesKey: null };
     const snapshot = parseDepthSnapshot(frame.payload);
     if (!snapshot) return { changed: false, kind: null, seriesKey: null };
     stores.depth.applySnapshot(snapshot);

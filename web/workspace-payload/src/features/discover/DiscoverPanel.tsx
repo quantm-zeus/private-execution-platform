@@ -28,7 +28,7 @@ import {
   Panel,
   type Tone,
 } from "../../components/ui/primitives";
-import { AsyncSurface, EmptyBlock, UnavailableBlock } from "../../components/ui/states";
+import { AsyncSurface, EmptyBlock, StaleRibbon, UnavailableBlock } from "../../components/ui/states";
 
 /** Evidence older than this (or explicitly flagged) is rendered as STALE. */
 const EVIDENCE_TTL_MS = 30_000;
@@ -85,6 +85,13 @@ const TokenDetailView: Component<{ detail: TokenDetail }> = (props) => {
           {truncateAddress(props.detail.token.address, 6, 6)}
         </code>
       </div>
+
+      <Show when={props.detail.sourceAgeMs > DETAIL_TTL_MS}>
+        <StaleRibbon
+          ageMs={props.detail.sourceAgeMs}
+          reason="Token detail is older than its freshness TTL — stats and risk are stale, not authoritative."
+        />
+      </Show>
 
       <KeyValue
         rows={[
@@ -274,6 +281,13 @@ export default function DiscoverPanel(): JSX.Element {
 
   const selectToken = (token: TokenRef): void => {
     setSelected(token);
+    // Publish the target to the shared, memory-only selection so the header,
+    // chart, trade, limits and execution surfaces can target it.
+    ws.setSelectedInstrument({
+      chain: token.chain,
+      address: token.address,
+      symbol: tokenLabel(token),
+    });
     void detail.run({ chain: token.chain, address: token.address });
   };
 
@@ -367,6 +381,8 @@ export default function DiscoverPanel(): JSX.Element {
             state={search.state()}
             nowMs={ws.nowMs()}
             onRetry={() => runSearch(query())}
+            idleTitle="Search for a token"
+            idleDetail="Enter a symbol, name or address, then run a search. No query has been made yet."
             emptyTitle="No matches"
             emptyDetail="No token matched the current query."
             isEmpty={(payload) => payload.results.length === 0}

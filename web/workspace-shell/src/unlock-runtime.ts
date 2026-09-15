@@ -247,151 +247,157 @@ export class WorkspaceUnlockRuntime {
       throw new Error("Invalid unlock secret: must be 32 non-zero bytes");
     }
 
-    const kidBytes =
-      typeof kidInput === "string"
-        ? fromBase64(kidInput)
-        : new Uint8Array(kidInput);
+    // Parse the kid inside a guard that zeroizes the already-derived secret if
+    // the kid encoding is malformed, so a throw cannot leave it resident.
+    let kidBytes: Uint8Array;
+    try {
+      kidBytes =
+        typeof kidInput === "string"
+          ? fromBase64(kidInput)
+          : new Uint8Array(kidInput);
+    } catch (error) {
+      secretBytes.fill(0);
+      throw error;
+    }
     if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) {
       secretBytes.fill(0);
       throw new Error("Invalid key ID: must be 16 non-zero bytes");
     }
 
     let workspaceKey: WasmWorkspaceKey | null = null;
-    let publicKeyBytes: Uint8Array | null = null;
+    let initiator: WasmInitiatorSession | null = null;
+    let unlocked = false;
 
     try {
       const version = 1;
       workspaceKey = new WasmWorkspaceKey(secretBytes, version, kidBytes);
-      publicKeyBytes = new Uint8Array(workspaceKey.public_key());
-    } finally {
+      // The raw secret is only needed to derive the workspace key in WASM;
+      // zero it immediately rather than leaving it in the JS heap across the
+      // network fetches, HPKE decrypt and payload instantiation below.
       secretBytes.fill(0);
-    }
+      const publicKeyBytes = new Uint8Array(workspaceKey.public_key());
 
-    // 1. Authenticated workspace public key enrollment
-    const enrollResponse = await fetchImpl(enrollEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify({
-        version: 1,
-        kid: toBase64(kidBytes),
-        public_key: toBase64(publicKeyBytes),
-      }),
-    });
+      // 1. Authenticated workspace public key enrollment
+      const enrollResponse = await fetchImpl(enrollEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          version: 1,
+          kid: toBase64(kidBytes),
+          public_key: toBase64(publicKeyBytes),
+        }),
+      });
+      if (!enrollResponse.ok) {
+        throw new Error("Workspace enrollment rejected");
+      }
 
-    if (!enrollResponse.ok) {
-      workspaceKey.free();
-      throw new Error("Workspace enrollment rejected");
-    }
+      // 2. Artifact grant request (P0-4a HPKE offer)
+      const grantResponse = await fetchImpl(grantEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: "",
+      });
+      if (!grantResponse.ok) {
+        throw new Error("Artifact grant request failed");
+      }
+      const grantData = await grantResponse.json();
+      if (
+        !grantData ||
+        !grantData.grant_id ||
+        !grantData.kid ||
+        !grantData.recipient_public_key
+      ) {
+        throw new Error("Malformed artifact grant response");
+      }
 
-    // 2. Artifact grant request (P0-4a HPKE offer)
-    const grantResponse = await fetchImpl(grantEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: "",
-    });
+      // 3. Establish session with server offer
+      const grantKid = fromBase64(grantData.kid);
+      const grantPk = fromBase64(grantData.recipient_public_key);
+      let offer: WasmOffer | null = null;
+      try {
+        offer = new WasmOffer(grantKid, grantPk);
+        initiator = WasmInitiatorSession.establish(offer);
+      } finally {
+        if (offer) offer.free();
+      }
 
-    if (!grantResponse.ok) {
-      workspaceKey.free();
-      throw new Error("Artifact grant request failed");
-    }
+      const encapsulatedKey = initiator.encapsulated_key();
 
-    const grantData = await grantResponse.json();
-    if (
-      !grantData ||
-      !grantData.grant_id ||
-      !grantData.kid ||
-      !grantData.recipient_public_key
-    ) {
-      workspaceKey.free();
-      throw new Error("Malformed artifact grant response");
-    }
+      // 4. Retrieve artifact ciphertext
+      const deliverResponse = await fetchImpl(deliverEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          grant_id: grantData.grant_id,
+          kid: grantData.kid,
+          encapsulated_key: toBase64(new Uint8Array(encapsulatedKey)),
+        }),
+      });
+      if (!deliverResponse.ok) {
+        throw new Error("Artifact ciphertext delivery failed");
+      }
 
-    // 3. Establish session with server offer
-    const grantKid = fromBase64(grantData.kid);
-    const grantPk = fromBase64(grantData.recipient_public_key);
-    let offer: WasmOffer | null = null;
-    let initiator: WasmInitiatorSession | null = null;
-    try {
-      offer = new WasmOffer(grantKid, grantPk);
-      initiator = WasmInitiatorSession.establish(offer);
-    } catch {
-      if (offer) offer.free();
-      workspaceKey.free();
-      throw new Error("HPKE handshake failed");
-    } finally {
-      if (offer) offer.free();
-    }
+      const sessionEnvelopeWire = new Uint8Array(await deliverResponse.arrayBuffer());
 
-    const encapsulatedKey = initiator.encapsulated_key();
+      // 5. Decrypt transport envelope in WASM, then drop the transport session
+      let sealedArtifactBytes: Uint8Array;
+      try {
+        sealedArtifactBytes = new Uint8Array(initiator.decrypt(sessionEnvelopeWire));
+      } finally {
+        initiator.free();
+        initiator = null;
+      }
 
-    // 4. Retrieve artifact ciphertext
-    const deliverResponse = await fetchImpl(deliverEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",
-      body: JSON.stringify({
-        grant_id: grantData.grant_id,
-        kid: grantData.kid,
-        encapsulated_key: toBase64(new Uint8Array(encapsulatedKey)),
-      }),
-    });
-
-    if (!deliverResponse.ok) {
-      initiator.free();
-      workspaceKey.free();
-      throw new Error("Artifact ciphertext delivery failed");
-    }
-
-    const sessionEnvelopeWire = new Uint8Array(
-      await deliverResponse.arrayBuffer(),
-    );
-
-    // 5. Decrypt transport envelope in WASM
-    let sealedArtifactBytes: Uint8Array;
-    try {
-      sealedArtifactBytes = new Uint8Array(
-        initiator.decrypt(sessionEnvelopeWire),
-      );
-    } catch {
-      initiator.free();
-      workspaceKey.free();
-      throw new Error("Session envelope decrypt failed");
-    } finally {
-      initiator.free();
-    }
-
-    // 6. Decrypt workspace artifact with WasmWorkspaceKey in memory
-    let decryptedPayloadBytes: Uint8Array;
-    try {
-      decryptedPayloadBytes = new Uint8Array(
+      // 6. Decrypt workspace artifact with WasmWorkspaceKey in memory
+      const decryptedPayloadBytes = new Uint8Array(
         workspaceKey.decrypt_artifact(sealedArtifactBytes),
       );
-    } catch {
-      workspaceKey.free();
-      throw new Error("Workspace artifact decrypt failed");
-    }
 
-    this.currentKey = workspaceKey;
+      // 7. Unpack in memory and zero decrypted payload
+      let unpackedFiles: Map<string, Uint8Array>;
+      try {
+        unpackedFiles = unpackPackageFromMemory(decryptedPayloadBytes);
+      } finally {
+        decryptedPayloadBytes.fill(0);
+      }
+      this.currentPayloadFiles = unpackedFiles;
 
-    // 7. Unpack in memory and zero decrypted payload
-    let unpackedFiles: Map<string, Uint8Array>;
-    try {
-      unpackedFiles = unpackPackageFromMemory(decryptedPayloadBytes);
+      const htmlUrl = this.instantiatePayload(unpackedFiles);
+      // Ownership transfers only after the payload is fully instantiated; any
+      // earlier failure is reclaimed by the finally below.
+      this.currentKey = workspaceKey;
+      workspaceKey = null;
+      unlocked = true;
+      this.isUnlocked = true;
+
+      return {
+        htmlUrl,
+        files: unpackedFiles,
+        cleanup: () => this.lock(),
+      };
     } finally {
-      decryptedPayloadBytes.fill(0);
+      secretBytes.fill(0);
+      kidBytes.fill(0);
+      if (initiator) {
+        try {
+          initiator.free();
+        } catch {}
+      }
+      if (!unlocked) {
+        // A thrown fetch/decrypt/instantiate must never leave the WASM key or the
+        // decrypted payload resident: lock() revokes blob URLs and zeroizes the
+        // unpacked files, then free the workspace key exactly once.
+        this.lock();
+        if (workspaceKey) {
+          try {
+            workspaceKey.free();
+          } catch {}
+        }
+      }
     }
-    this.currentPayloadFiles = unpackedFiles;
-
-    const htmlUrl = this.instantiatePayload(unpackedFiles);
-    this.isUnlocked = true;
-
-    return {
-      htmlUrl,
-      files: unpackedFiles,
-      cleanup: () => this.lock(),
-    };
   }
 
   private instantiatePayload(files: Map<string, Uint8Array>): string {
@@ -403,13 +409,17 @@ export class WorkspaceUnlockRuntime {
       indexHtml = "<!doctype html><html><body><div id=\"root\"></div></body></html>";
     }
 
-    for (const [name, data] of files.entries()) {
-      if (name === "index.html") continue;
+    const assetNames = [...files.keys()].filter((name) => name !== "index.html");
+    // Longest paths first, and only at token boundaries, so a short asset name
+    // can never match inside a longer reference and corrupt the HTML.
+    assetNames.sort((a, b) => b.length - a.length);
+    for (const name of assetNames) {
+      const data = files.get(name)!;
       const mime = getMimeType(name);
       const url = createSafeBlobUrl(data, mime, this.activeUrls);
 
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`(?:/|\\./)?${escaped}`, "g");
+      const pattern = new RegExp(`(?<![\\w./-])(?:\\./|/)?${escaped}(?![\\w.-])`, "g");
       indexHtml = indexHtml.replace(pattern, url);
     }
 

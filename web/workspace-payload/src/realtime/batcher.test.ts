@@ -11,6 +11,7 @@ function frame(priority: Priority, entityKey: string, seq = 1): DecodedFrame {
     entityKey,
     slot: null,
     sourceAgeMs: 0,
+    serverTimeMs: null,
     payload: { value: seq },
   };
 }
@@ -55,12 +56,14 @@ describe("FrameBatcher", () => {
     expect(batcher.drainDue(5)).toHaveLength(1);
   });
 
-  it("evicts lowest-priority frames first under bounded capacity", () => {
+  it("evicts lowest-priority frames first and forces a resync for the lost state", () => {
     const batcher = new FrameBatcher({ capacity: 2, flushMs: zeroFlush });
     batcher.enqueue(frame(3, "meta:a"));
     batcher.enqueue(frame(1, "visual:a"));
     const result = batcher.enqueue(frame(1, "visual:b"));
-    expect(result.forcedResync).toBe(false);
+    // Any eviction loses state, so a resync is forced rather than leaving the
+    // surface silently stale.
+    expect(result.forcedResync).toBe(true);
     const remaining = batcher.drainAll().map((f) => f.entityKey);
     expect(remaining).toEqual(["visual:a", "visual:b"]);
   });

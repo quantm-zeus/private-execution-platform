@@ -130,6 +130,33 @@ describe("PortfolioPanel", () => {
 
     const alerts = screen.getAllByRole("alert");
     expect(alerts.length).toBeGreaterThan(0);
-    expect(alerts[0].textContent).toMatch(/unavailable/i);
+    expect(alerts[0].textContent).toMatch(/temporary failure|request failed|unavailable/i);
+  });
+
+  it("renders unavailable, not an unqueried 'No alerts', when intelligence is missing", async () => {
+    const client = new FakeCommandClient({ get_portfolio: () => makePortfolio({}) });
+    const store = createWorkspaceStore({
+      manualClock: true,
+      clock: () => 1000,
+      command: client,
+      session: parseWorkspaceSession({
+        protocol_version: 1,
+        capabilities: { portfolio: true }, // no intelligence
+        trading_enabled: true,
+        kill_switch: { enabled: false, reason: null },
+        chains: [],
+        session: { key_id: "kid-1", expires_at_ms: 1_700_000_000_000 },
+        server_time_ms: 1_699_999_000_000,
+      }),
+    });
+    store.reload();
+    await flush();
+    renderPanel(store);
+    await flush();
+
+    // The alerts resource was never queried, so it must not claim "No alerts".
+    expect(screen.queryByText("No alerts")).toBeNull();
+    expect(screen.getByText(/Backend capability missing/i)).toBeTruthy();
+    expect(client.calls.some((call) => call.op === "get_alerts")).toBe(false);
   });
 });

@@ -9,6 +9,7 @@ export interface RealtimeStartConfig {
   readonly baseUrl: string;
   readonly kid: string;
   readonly keyB64: string;
+  readonly serverSkewMs?: number;
   readonly flushMs?: Record<Priority, number>;
   readonly capacity?: number;
 }

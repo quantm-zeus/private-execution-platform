@@ -16,4 +16,6 @@ web/workspace/dist/
 web/workspace-shell/dist/
 web/workspace-payload/dist/
 web/workspace-artifact/
+web/e2e/test-results/
+web/e2e/playwright-report/
 

@@ -26,6 +26,13 @@ const LOOKUP: Record<string, number> = (() => {
 
 export function base64ToBytes(input: string): Uint8Array<ArrayBuffer> {
   const clean = input.replace(/[\r\n\s]/g, "");
+  // Strict-enough validation: reject non-canonical alphabets, misplaced
+  // padding, and impossible lengths (`length % 4 === 1`) instead of silently
+  // decoding garbage. Both padded and unpadded standard base64 are accepted.
+  if (clean.length === 0) throw new Error("empty base64 input");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) throw new Error("invalid base64 character");
+  if (clean.length % 4 === 1) throw new Error("invalid base64 length");
+  if (clean.includes("=") && clean.length % 4 !== 0) throw new Error("invalid base64 padding");
   let body = clean;
   if (body.endsWith("==")) body = body.slice(0, -2);
   else if (body.endsWith("=")) body = body.slice(0, -1);

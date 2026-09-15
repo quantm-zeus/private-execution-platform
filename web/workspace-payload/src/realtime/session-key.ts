@@ -38,33 +38,53 @@ function parseHostKey(data: unknown): HostSessionKey | null {
 }
 
 /**
- * Wait for the shell to deliver session keys. Resolves `null` on timeout so the
- * caller can surface an explicit offline state instead of hanging. The listener
- * only accepts same-document messages from this window or its parent frame;
- * a synthetic event with a null source (tests) is also accepted because only
- * code already running in this document can dispatch one.
+ * Wait for the shell to deliver session keys. Resolves `null` on timeout or
+ * abort so the caller can surface an explicit offline state instead of hanging.
+ *
+ * Only same-document messages, or messages whose source is exactly this
+ * document's parent frame, are accepted. `event.source === null` is refused:
+ * it can be synthesized by other code in the page and must never be able to
+ * install attacker-chosen session keys.
  */
 export function awaitHostSessionKey(
   timeoutMs: number,
   target: Window = window,
+  signal?: AbortSignal,
 ): Promise<HostSessionKey | null> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (value: HostSessionKey | null) => {
-      if (settled) return;
-      settled = true;
-      target.removeEventListener("message", onMessage);
-      clearTimeout(timer);
-      resolve(value);
-    };
     const onMessage = (event: MessageEvent) => {
-      const sourceOk =
-        event.source === null || event.source === target || event.source === target.parent;
+      const sourceOk = event.source === target || event.source === target.parent;
       if (!sourceOk) return;
+      // Same-origin only: the shell and the payload share an origin (the payload
+      // is framed with `allow-same-origin`). A cross-origin frame must never be
+      // able to install attacker-chosen session keys, even if it somehow obtains
+      // a handle to this window.
+      const expectedOrigin = target.location ? target.location.origin : "";
+      if (event.origin !== expectedOrigin) return;
       const key = parseHostKey(event.data);
       if (key) finish(key);
     };
+    const onAbort = () => finish(null);
+    const cleanup = () => {
+      if (typeof target.removeEventListener === "function") {
+        target.removeEventListener("message", onMessage);
+      }
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (value: HostSessionKey | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
     const timer = setTimeout(() => finish(null), timeoutMs);
+    if (signal?.aborted) {
+      finish(null);
+      return;
+    }
     target.addEventListener("message", onMessage);
+    signal?.addEventListener("abort", onAbort);
   });
 }

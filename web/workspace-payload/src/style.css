@@ -8,9 +8,9 @@
   --border-strong: #35455a;
   --text: #dce5ef;
   --muted: #8b98a9;
-  --faint: #5f6c7d;
+  --faint: #828fa1;
   --accent: #3ad1d9;
-  --accent-dim: #1d7f86;
+  --accent-dim: #218f97;
   --positive: #3ddc97;
   --warning: #f2b544;
   --danger: #ff5d6c;
@@ -138,6 +138,17 @@ code {
   color: var(--muted);
   font-family: var(--mono);
 }
+.ws-header__target {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.ws-header__target code {
+  font-family: var(--mono);
+}
 
 .offline-banner {
   display: flex;
@@ -164,6 +175,12 @@ code {
 }
 .workspace__main:focus {
   outline: none;
+}
+
+/* Retained (already-visited) views are hidden with a class, never the boolean
+   `hidden` attribute, so the active view is never accidentally hidden. */
+.view-slot--hidden {
+  display: none;
 }
 
 /* ------------------------------------------------------------------ nav --- */
@@ -551,6 +568,8 @@ code {
 }
 .ticket__side {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
 }
 .ticket__grid {
@@ -621,6 +640,16 @@ select.input {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.chart-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.chart-target code {
+  font-family: var(--mono);
 }
 .chart-frame--interactive {
   position: relative;
@@ -935,4 +964,66 @@ select.input {
   .ws-header__status {
     justify-content: flex-start;
   }
+}
+
+/* W14 — trading wallet limits configuration */
+.limits-config {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.limits-config__group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.limits-config__group > legend {
+  padding: 0 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--faint);
+}
+.checkbox-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.field--checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.input--area {
+  min-height: 72px;
+  font-family: var(--mono);
+  resize: vertical;
+}
+.change-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.change-list__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev-2);
+  font-size: 12px;
+}
+.change-list__label {
+  flex: 1;
+}
+.change-list__value {
+  font-family: var(--mono);
 }

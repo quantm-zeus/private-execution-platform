@@ -72,6 +72,9 @@ export function assertNeutralStreamUrl(input: string, base: string): URL {
       detail: url.host,
     });
   }
+  if (url.username || url.password) {
+    throw workspaceError("protocol", "Blocked credentialed workspace stream URL.");
+  }
   if (url.pathname !== "/v1/stream") {
     throw workspaceError("protocol", "Blocked non-neutral workspace stream path.");
   }

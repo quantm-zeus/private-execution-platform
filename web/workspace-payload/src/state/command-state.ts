@@ -22,8 +22,13 @@ export interface CommandResourceOptions {
 
 export interface CommandResource<T> {
   readonly state: Accessor<DataState<T>>;
-  run(payload?: unknown): Promise<void>;
+  run(payload?: unknown, options?: CommandRunOptions): Promise<void>;
   reset(): void;
+}
+
+export interface CommandRunOptions {
+  /** Stable key so a transport retry cannot duplicate a write (INVARIANTS #9). */
+  readonly idempotencyKey?: string;
 }
 
 /**
@@ -41,7 +46,7 @@ export function createCommandResource<T>(
   let controller: AbortController | null = null;
   let generation = 0;
 
-  const run = async (payload?: unknown): Promise<void> => {
+  const run = async (payload?: unknown, runOptions?: CommandRunOptions): Promise<void> => {
     controller?.abort();
     controller = new AbortController();
     const token = ++generation;
@@ -53,7 +58,10 @@ export function createCommandResource<T>(
     })();
     setState(loadingState(clock(), prior));
     try {
-      const result = await command.send<T>(op, payload, { signal: controller.signal });
+      const result = await command.send<T>(op, payload, {
+        signal: controller.signal,
+        idempotencyKey: runOptions?.idempotencyKey,
+      });
       if (token !== generation) return;
       setState(
         readyState(result, {

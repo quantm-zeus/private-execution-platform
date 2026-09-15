@@ -39,6 +39,12 @@ export interface DecodedFrame {
   readonly entityKey: string;
   readonly slot: number | null;
   readonly sourceAgeMs: number;
+  /**
+   * AEAD-authenticated server wall clock for this frame, when the backend
+   * provides one (`server_time_ms`). The client uses it to refuse a replayed
+   * frame that is older than the freshness window. `null` when absent.
+   */
+  readonly serverTimeMs: number | null;
   /** Channel-specific payload; validated by the consumer, never trusted blindly. */
   readonly payload: unknown;
 }
@@ -49,7 +55,8 @@ export type ResyncReason =
   | "protocol"
   | "reconnect"
   | "explicit"
-  | "backpressure";
+  | "backpressure"
+  | "freshness";
 
 export interface RealtimeErrorEvent {
   readonly error: WorkspaceErrorShape;

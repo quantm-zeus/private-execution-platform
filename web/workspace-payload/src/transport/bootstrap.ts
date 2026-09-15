@@ -14,6 +14,7 @@ import {
   type KillSwitchState,
 } from "../core/types";
 import { assertNeutralUrl } from "./paths";
+import { readBoundedJson } from "./http-body";
 
 export interface WorkspaceSession {
   readonly protocolVersion: number;
@@ -58,6 +59,8 @@ function parseCapabilities(raw: unknown): CapabilitySet {
 function parseChains(raw: unknown): readonly ChainInfo[] {
   if (raw === undefined) return [];
   if (!Array.isArray(raw)) throw workspaceError("protocol", "Malformed chain list.");
+  // Bound the list before iterating: an unbounded array is a cheap relay-side OOM.
+  if (raw.length > 256) throw workspaceError("protocol", "Chain list exceeded the size limit.");
   const chains: ChainInfo[] = [];
   for (const entry of raw) {
     if (!isRecord(entry)) throw workspaceError("protocol", "Malformed chain entry.");
@@ -68,6 +71,13 @@ function parseChains(raw: unknown): readonly ChainInfo[] {
       id: entry.id,
       display: typeof entry.display === "string" ? entry.display : entry.id,
       enabled: entry.enabled === true,
+      // BR-11: optional canonical quote/native asset for the chain. A missing or
+      // non-string value stays `null` so consumers fail closed rather than
+      // fabricating a counterparty token.
+      nativeToken:
+        typeof entry.native_token === "string" && entry.native_token.length > 0
+          ? entry.native_token
+          : null,
     });
   }
   return chains;
@@ -75,9 +85,14 @@ function parseChains(raw: unknown): readonly ChainInfo[] {
 
 function parseKillSwitch(raw: unknown): KillSwitchState {
   if (!isRecord(raw)) return { enabled: true, reason: "Kill-switch state unavailable." };
-  const enabled = raw.enabled === true;
+  // Fail closed on a malformed-but-object block: a stripped/renamed `enabled`
+  // field must not silently disengage the safety control. Only an explicit
+  // boolean may clear the halt.
+  if (typeof raw.enabled !== "boolean") {
+    return { enabled: true, reason: "Kill-switch state unavailable." };
+  }
   const reason = typeof raw.reason === "string" ? raw.reason : null;
-  return { enabled, reason };
+  return { enabled: raw.enabled, reason };
 }
 
 /** Strictly validate an untrusted bootstrap payload. Fails closed on any gap. */
@@ -167,11 +182,8 @@ export async function bootstrapWorkspaceSession(
 
   if (!response.ok) mapBootstrapFailure(response.status);
 
-  let raw: unknown;
-  try {
-    raw = await response.json();
-  } catch {
-    throw workspaceError("protocol", "Bootstrap response was not valid JSON.");
-  }
-  return parseWorkspaceSession(raw);
+  // The response is bounded before parsing: a compromised relay must not be able
+  // to OOM the main thread with a multi-gigabyte body (the command path already
+  // enforces the same ceiling).
+  return parseWorkspaceSession(await readBoundedJson(response));
 }

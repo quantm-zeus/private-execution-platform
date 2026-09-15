@@ -1,4 +1,4 @@
-import { Show, createMemo, createSignal, onMount, type Component } from "solid-js";
+import { For, Show, createMemo, createSignal, onMount, type Component } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import type { ViewId } from "./views";
 import { surfaceFor, viewMeta } from "../features/surfaces";
@@ -15,8 +15,21 @@ export const AppShell: Component = () => {
   const ws = useWorkspace();
   const feed = useRealtimeFeed(ws);
   const [active, setActive] = createSignal<ViewId>("overview");
+  // Views are lazily mounted on first visit and then RETAINED (hidden, not
+  // unmounted). Submission/UNKNOWN/idempotency state is deliberately
+  // session-scoped: unmounting on navigation would erase an UNKNOWN outcome and
+  // its idempotency key, so a later retry would look like a brand-new order and
+  // could double-fill. Retaining the mounted panel keeps that guard alive.
+  const [visited, setVisited] = createSignal<readonly ViewId[]>(["overview"]);
+  const selectView = (id: ViewId, options?: { focusMain?: boolean }): void => {
+    setVisited((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setActive(id);
+    // Arrow-key rail traversal keeps focus in the rail; pointer/activation moves
+    // it to the work area so screen-reader users land on the new view.
+    if (options?.focusMain === false) return;
+    queueMicrotask(() => document.getElementById("workspace-main")?.focus());
+  };
   const meta = createMemo(() => viewMeta(active()));
-  const panel = createMemo(() => surfaceFor(active()));
   const sessionFreshness = createMemo(() => {
     const state = ws.state();
     return state.kind === "ready" || state.kind === "stale" ? state.freshness : null;
@@ -38,6 +51,7 @@ export const AppShell: Component = () => {
         killSwitch={ws.killSwitch()}
         tradingEnabled={ws.tradingEnabled()}
         nowMs={ws.nowMs()}
+        instrument={ws.selectedInstrument()}
         onLock={() => {
           requestHostLock();
         }}
@@ -53,10 +67,7 @@ export const AppShell: Component = () => {
       <div class="workspace__body">
         <NavRail
           active={active()}
-          onSelect={(id) => {
-            setActive(id);
-            queueMicrotask(() => document.getElementById("workspace-main")?.focus());
-          }}
+          onSelect={selectView}
           capabilityOf={(view) => ws.capabilities()[view.capability] === true}
         />
         <main id="workspace-main" class="workspace__main" tabindex="-1" aria-labelledby="view-title">
@@ -71,7 +82,16 @@ export const AppShell: Component = () => {
               {meta().capability}
             </Badge>
           </header>
-          <Dynamic component={panel()} />
+          <For each={visited()}>
+            {(id) => (
+              <section
+                class={`view-slot${id === active() ? "" : " view-slot--hidden"}`}
+                aria-hidden={id !== active()}
+              >
+                <Dynamic component={surfaceFor(id)} />
+              </section>
+            )}
+          </For>
         </main>
       </div>
       <StatusBar

@@ -11,6 +11,7 @@ function frame(partial: Partial<DecodedFrame> = {}): DecodedFrame {
     entityKey: "ohlcv:BASE:SOL",
     slot: null,
     sourceAgeMs: 0,
+    serverTimeMs: null,
     payload: {},
     ...partial,
   };
@@ -77,13 +78,26 @@ describe("applyMarketFrame", () => {
     expect(applyMarketFrame(stores, frame({ channel: "depth", payload: { bids: "no" } })).changed).toBe(false);
   });
 
-  it("applies depth snapshots", () => {
+  it("applies depth snapshots and ignores depth deltas", () => {
     const stores = createMarketFrameStores();
     const result = applyMarketFrame(
       stores,
-      frame({ channel: "depth", entityKey: "depth:BASE:SOL", payload: { bids: [{ price: 10, size: 1 }], asks: [{ price: 11, size: 1 }] } }),
+      frame({
+        op: "snapshot",
+        channel: "depth",
+        entityKey: "depth:BASE:SOL",
+        payload: { bids: [{ price: 10, size: 1 }], asks: [{ price: 11, size: 1 }] },
+      }),
     );
     expect(result.kind).toBe("depth");
+    expect(stores.depth.mid()).toBe(10.5);
+
+    // A delta must never wipe the snapshot book.
+    const delta = applyMarketFrame(
+      stores,
+      frame({ op: "delta", channel: "depth", entityKey: "depth:BASE:SOL", payload: { bids: [], asks: [] } }),
+    );
+    expect(delta.changed).toBe(false);
     expect(stores.depth.mid()).toBe(10.5);
   });
 

@@ -10,6 +10,11 @@ export interface WorkerStartMessage {
   readonly kid: string;
   /** Base64 raw 32-byte AES-256-GCM session key. Cleared from memory on stop. */
   readonly keyB64: string;
+  /**
+   * Server-clock offset (server minus local) captured from bootstrap, used to
+   * reject replayed frames by their authenticated `server_time_ms` (BR-15).
+   */
+  readonly serverSkewMs?: number;
   readonly flushMs?: Record<Priority, number>;
   readonly capacity?: number;
 }

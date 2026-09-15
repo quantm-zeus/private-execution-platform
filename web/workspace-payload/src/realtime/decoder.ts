@@ -97,6 +97,22 @@ export function decodeInnerFrame(bytes: Uint8Array, seq: number): DecodedFrame {
     typeof sourceAgeRaw === "number" && Number.isFinite(sourceAgeRaw) && sourceAgeRaw >= 0
       ? sourceAgeRaw
       : 0;
+  // Optional AEAD-authenticated server wall clock. Absent/null is allowed (the
+  // client then cannot detect delayed replay); a present non-finite/negative
+  // value is a protocol error rather than a silent zero.
+  const serverTimeRaw = raw.server_time_ms;
+  let serverTimeMs: number | null;
+  if (serverTimeRaw === null || serverTimeRaw === undefined) {
+    serverTimeMs = null;
+  } else if (
+    typeof serverTimeRaw === "number" &&
+    Number.isFinite(serverTimeRaw) &&
+    serverTimeRaw >= 0
+  ) {
+    serverTimeMs = serverTimeRaw;
+  } else {
+    throw workspaceError("protocol", "Decrypted frame had an invalid server time.");
+  }
 
   if ((op === "snapshot" || op === "delta") && raw.payload === undefined) {
     throw workspaceError("protocol", "Decrypted state frame carried no payload.");
@@ -110,6 +126,7 @@ export function decodeInnerFrame(bytes: Uint8Array, seq: number): DecodedFrame {
     entityKey,
     slot,
     sourceAgeMs,
+    serverTimeMs,
     payload: raw.payload,
   };
 }

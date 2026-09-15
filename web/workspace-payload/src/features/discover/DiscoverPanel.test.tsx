@@ -177,6 +177,24 @@ describe("DiscoverPanel", () => {
     expect(screen.getByText("Mentions spiking")).toBeTruthy();
   });
 
+  it("publishes the selected token to the shared instrument selection", async () => {
+    const client = detailClient();
+    const store = await readyStore(client);
+    // Nothing is selected until the user picks a result.
+    expect(store.selectedInstrument()).toBeNull();
+    renderPanel(store);
+
+    await searchAndSelect(client);
+
+    // The detail load must be unaffected and the shared target set.
+    expect(client.calls.some((call) => call.op === "get_token")).toBe(true);
+    expect(store.selectedInstrument()).toEqual({
+      chain: TOKEN_REF.chain,
+      address: TOKEN_REF.address,
+      symbol: "PEPE",
+    });
+  });
+
   it("marks evidence stale when flagged or when it exceeds its TTL", async () => {
     const client = detailClient();
     const store = await readyStore(client);

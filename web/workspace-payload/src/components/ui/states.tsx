@@ -20,18 +20,27 @@ export const EmptyBlock: Component<{ title: string; detail?: string; action?: JS
   </div>
 );
 
-export const ErrorBlock: Component<{ error: WorkspaceErrorShape; onRetry?: () => void }> = (props) => (
-  <div class="state-block state-block--error" role="alert">
-    <p class="state-block__title">Unavailable</p>
-    <p class="state-block__detail">{props.error.message}</p>
-    <Show when={props.error.detail}>
-      <p class="state-block__meta">{props.error.detail}</p>
-    </Show>
-    <Show when={props.onRetry && props.error.retryable}>
-      <ActionButton onClick={props.onRetry}>Retry</ActionButton>
-    </Show>
-  </div>
-);
+export const ErrorBlock: Component<{ error: WorkspaceErrorShape; onRetry?: () => void }> = (props) => {
+  const title = () => {
+    if (props.error.code === "capability_missing") return "Unavailable";
+    if (props.error.code === "auth") return "Not authorized";
+    if (props.error.code === "freshness") return "State changed";
+    if (props.error.retryable) return "Temporary failure";
+    return "Request failed";
+  };
+  return (
+    <div class="state-block state-block--error" role="alert">
+      <p class="state-block__title">{title()}</p>
+      <p class="state-block__detail">{props.error.message}</p>
+      <Show when={props.error.detail}>
+        <p class="state-block__meta">{props.error.detail}</p>
+      </Show>
+      <Show when={props.onRetry && props.error.retryable}>
+        <ActionButton onClick={props.onRetry}>Retry</ActionButton>
+      </Show>
+    </div>
+  );
+};
 
 export const UnavailableBlock: Component<{ denial: CapabilityDenial | null; detail?: string }> = (props) => (
   <div class="state-block state-block--unavailable">
@@ -87,6 +96,9 @@ interface SurfaceProps<T> {
   onRetry?: () => void;
   emptyTitle?: string;
   emptyDetail?: string;
+  /** Distinct pre-query copy for `idle`; avoids presenting an unqueried empty. */
+  idleTitle?: string;
+  idleDetail?: string;
   unavailableDetail?: string;
   isEmpty?: (value: T) => boolean;
   children: (value: T, stale: boolean) => JSX.Element;
@@ -101,6 +113,14 @@ export function AsyncSurface<T>(props: SurfaceProps<T>): JSX.Element {
     const state = props.state;
     switch (state.kind) {
       case "idle":
+        // A surface whose capability is missing must never present an
+        // unqueried empty ("no alerts"/"no orders") as if it had been loaded.
+        if (props.denial) {
+          return <UnavailableBlock denial={props.denial} detail={props.unavailableDetail} />;
+        }
+        if (props.idleTitle || props.idleDetail) {
+          return <EmptyBlock title={props.idleTitle ?? "Not started."} detail={props.idleDetail} />;
+        }
         return <EmptyBlock title={props.emptyTitle ?? "Nothing loaded yet."} detail={props.emptyDetail} />;
       case "unavailable":
         return <UnavailableBlock denial={props.denial ?? null} detail={props.unavailableDetail} />;
@@ -108,7 +128,9 @@ export function AsyncSurface<T>(props: SurfaceProps<T>): JSX.Element {
         return <ErrorBlock error={state.error} onRetry={props.onRetry} />;
       case "loading":
         if (state.prior === undefined) return <LoadingBlock />;
-        return renderValue(state.prior, false, undefined);
+        // Prior data is shown while a refresh is in flight: mark it stale so a
+        // slow refresh never paints old balances/orders as if they were current.
+        return renderValue(state.prior, true, undefined);
       case "ready": {
         const freshness = { ...state.freshness, slot: null };
         return renderValue(

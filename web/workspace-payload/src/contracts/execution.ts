@@ -6,6 +6,62 @@ export type TradeSide = "buy" | "sell";
 export type AmountType = "usd" | "stablecoin" | "token";
 export type OrderType = "market" | "limit" | "twap" | "rfq";
 
+/**
+ * Routing source preference for a swap. `okx` asks the explicit PEP hybrid
+ * router/benchmark; `local` asks our own exact local router. The browser sends
+ * this only to the neutral first-party quote/preview/execute contract and never
+ * talks to a provider directly (architecture lock L2). The preference is
+ * memory-only session state — never persisted.
+ */
+export type RouterPreference = "okx" | "local";
+
+/**
+ * The routing source the backend actually used for a quote. `okx` is never
+ * silently substituted for `local` (or vice versa): a mismatched or missing
+ * source is a protocol violation the UI refuses to execute.
+ */
+export interface RouterSourceView {
+  readonly id: RouterPreference;
+  /** Optional neutral note (no URLs, credentials or provider internals). */
+  readonly detail: string | null;
+}
+
+/**
+ * Canonical wire form of the routing discriminant.
+ *
+ * The landed `agent-backend` P84B/P84C contract (`MarketPreview::router_source`)
+ * serialises the discriminant as the bare string `"okx"` / `"local"` — see
+ * `crates/agent-backend/src/market.rs` and `tests/hybrid_router.rs`
+ * (`assert_eq!(preview["router_source"], Value::String("okx".to_string()))`).
+ * The private web contract's `QuotePreview` requested the same value wrapped in
+ * an object `{ id, detail }` (BR-10), so the client accepts either exact form and
+ * normalises to {@link RouterSourceView}. Both must carry an exact `okx`/`local`
+ * discriminant; anything else is refused rather than guessed (no silent
+ * fallback).
+ */
+export type RouterSourceWire = RouterSourceView | RouterPreference;
+
+export function routerSourceLabel(id: RouterPreference): string {
+  return id === "okx" ? "OKX" : "Local Router";
+}
+
+/**
+ * Strictly normalise an untrusted `router_source` value to a
+ * {@link RouterSourceView}, accepting both the canonical string discriminant and
+ * the object form. Returns `null` for anything that does not name exactly `okx`
+ * or `local` (case/whitespace sensitive); a missing or malformed source is never
+ * treated as a default.
+ */
+export function parseRouterSource(value: unknown): RouterSourceView | null {
+  // Canonical P84B/P84C form: the bare wire label.
+  if (value === "okx" || value === "local") return { id: value, detail: null };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = (value as { id?: unknown }).id;
+  if (id !== "okx" && id !== "local") return null;
+  const detail = (value as { detail?: unknown }).detail;
+  return { id, detail: typeof detail === "string" ? detail : null };
+}
+
 export interface TradeIntentView {
   readonly id: string;
   readonly chain: string;
@@ -58,6 +114,14 @@ export interface QuotePreview {
   readonly expiresAtMs: number | null;
   /** Authoritative signal that a fresh revalidation is required before submit. */
   readonly revalidationRequired: boolean;
+  /** The routing source the backend was asked to use (echo of the request). */
+  readonly routerPreference: RouterPreference;
+  /**
+   * The routing source actually used. Must equal `routerPreference`. Accepts the
+   * canonical string discriminant (`RouterSourceWire`) or the object form; parse
+   * it with {@link parseRouterSource} before use.
+   */
+  readonly routerSource: RouterSourceWire;
 }
 
 export type OrderState =

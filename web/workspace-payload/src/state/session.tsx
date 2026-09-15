@@ -9,6 +9,7 @@ import {
   type JSX,
 } from "solid-js";
 import { toWorkspaceErrorShape } from "../core/errors";
+import type { RouterPreference } from "../contracts/execution";
 import {
   CAPABILITY_KEYS,
   type CapabilityDenial,
@@ -16,8 +17,10 @@ import {
   type CapabilitySet,
   type ConnectionStatus,
   type DataState,
+  type InstrumentRef,
   type KillSwitchState,
   idleState,
+  isConnectionFresh,
   loadingState,
   unavailableState,
   errorState,
@@ -38,6 +41,32 @@ export interface WorkspaceStore {
   readonly killSwitch: Accessor<KillSwitchState>;
   readonly connection: Accessor<ConnectionStatus>;
   readonly nowMs: Accessor<number>;
+  /**
+   * Raw local wall clock, read at decision time (not the throttled `nowMs`
+   * ticker). Freshness/deadline gates must use this so a background tab whose
+   * interval has not fired cannot read stale state as fresh.
+   */
+  readonly clockMs: Accessor<number>;
+  /**
+   * Server-anchored clock (raw local clock + the bootstrap `server_time_ms`
+   * offset). Server-issued absolute deadlines (session/quote expiry) are
+   * compared against this, not a possibly-skewed local clock.
+   */
+  readonly serverNowMs: Accessor<number>;
+  /**
+   * Memory-only swap routing preference (W13). Defaults to `okx` for every new
+   * private session; never written to localStorage/cookies/URL. Changing it must
+   * invalidate any source-bound preview/confirmation in the caller.
+   */
+  readonly routerPreference: Accessor<RouterPreference>;
+  setRouterPreference(preference: RouterPreference): void;
+  /**
+   * Memory-only target instrument shared Discover → header/chart/trade/limits/
+   * execution. Reset to `null` by `reload()` (a new private session); never
+   * persisted.
+   */
+  readonly selectedInstrument: Accessor<InstrumentRef | null>;
+  setSelectedInstrument(ref: InstrumentRef | null): void;
   /** Current encrypted command channel (swapped in after the key handoff). */
   readonly command: CommandClient;
   setConnection(status: ConnectionStatus): void;
@@ -70,6 +99,40 @@ const DISCONNECTED: ConnectionStatus = {
   reason: null,
 };
 
+/**
+ * Bootstrap timestamps come from an unauthenticated response, so a hostile relay
+ * could otherwise move the server-anchored clock arbitrarily. Never let the
+ * anchor move backwards (which would extend every server-issued deadline), and
+ * cap a forward correction so a lie can shift deadlines by at most this much.
+ */
+const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * Hard ceiling on an advertised session lifetime. `expires_at_ms` and
+ * `server_time_ms` are both relay-controlled, so the *duration* is only trusted
+ * up to this bound; a relay cannot mint an effectively non-expiring session.
+ */
+const MAX_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+function boundedServerSkew(serverTimeMs: number, localNowMs: number): number {
+  const skew = serverTimeMs - localNowMs;
+  if (!Number.isFinite(skew) || skew <= 0) return 0;
+  return Math.min(skew, MAX_CLOCK_SKEW_MS);
+}
+
+function boundedSessionTtlMs(expiresAtMs: number, serverTimeMs: number): number {
+  const ttl = expiresAtMs - serverTimeMs;
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
+  return Math.min(ttl, MAX_SESSION_TTL_MS);
+}
+
+/**
+ * Mutations that commit capital and therefore must fail closed when the
+ * authoritative realtime state is not live (PRD circuit breaker). Read-only
+ * previews and web-only withdrawal are intentionally excluded.
+ */
+const STATE_FRESH_MUTATIONS: readonly CapabilityKey[] = ["execute", "limits", "twap", "rfq"];
+
 export interface CreateWorkspaceStoreOptions extends SessionBootstrapOptions {
   /** Clock tick used to recompute freshness ages. Defaults to 1000ms. */
   readonly tickMs?: number;
@@ -86,8 +149,33 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
   const [state, setState] = createSignal<DataState<WorkspaceSession>>(idleState());
   const [connection, setConnection] = createSignal<ConnectionStatus>(DISCONNECTED);
   const [nowMs, setNowMs] = createSignal(clock());
+  // W13: OKX is the default routing preference for each new private session.
+  // This is in-memory only and is reset by `reload()` (a fresh session).
+  const [routerPreference, setRouterPreference] = createSignal<RouterPreference>("okx");
+  // Memory-only Discover selection. Reset by `reload()` alongside the router
+  // preference so a new private session never inherits a prior target.
+  const [selectedInstrument, setSelectedInstrument] = createSignal<InstrumentRef | null>(null);
+  /**
+   * Offset between the backend clock and the local clock, captured from the
+   * bootstrap `server_time_ms` anchor. Server-issued absolute timestamps (session
+   * expiry) must be compared against server time, not a possibly-skewed local
+   * clock, or a client clock running behind would make an expired session look
+   * valid.
+   */
+  const [serverSkewMs, setServerSkewMs] = createSignal(0);
+  /**
+   * Locally derived session deadline. Computed from the advertised *duration*
+   * (`expires_at_ms - server_time_ms`) rather than the absolute timestamp, so a
+   * relay cannot extend a session by lying about either field.
+   */
+  const [sessionDeadlineMs, setSessionDeadlineMs] = createSignal(0);
   let generation = 0;
   let commandClient: CommandClient = options.command ?? new UnavailableCommandClient();
+  // Stable proxy so panels that capture `ws.command` at setup still reach the
+  // encrypted client once the host key handoff installs it.
+  const commandProxy: CommandClient = {
+    send: (op, payload, sendOptions) => commandClient.send(op, payload, sendOptions),
+  };
   let ticker: number | undefined;
 
   const session = (): WorkspaceSession | undefined => {
@@ -102,11 +190,17 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
 
   const reload = (): void => {
     const token = ++generation;
+    // A reload bootstraps a (possibly new) private session: reset the memory-only
+    // routing preference to the OKX default and clear the selected instrument.
+    setRouterPreference("okx");
+    setSelectedInstrument(null);
     setState(loadingState<WorkspaceSession>(clock()));
     setConnection({ ...DISCONNECTED, phase: "connecting" });
     bootstrapWorkspaceSession(options).then(
       (value) => {
         if (token !== generation) return;
+        setServerSkewMs(boundedServerSkew(value.serverTimeMs, clock()));
+        setSessionDeadlineMs(clock() + boundedSessionTtlMs(value.expiresAtMs, value.serverTimeMs));
         if (value.capabilities.realtime) {
           setConnection({ ...DISCONNECTED, phase: "connecting" });
         } else {
@@ -164,9 +258,13 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     killSwitch: () => session()?.killSwitch ?? { enabled: true, reason: "Session unavailable." },
     connection,
     nowMs,
-    get command() {
-      return commandClient;
-    },
+    clockMs: () => clock(),
+    serverNowMs: () => clock() + serverSkewMs(),
+    routerPreference,
+    setRouterPreference,
+    selectedInstrument,
+    setSelectedInstrument,
+    command: commandProxy,
     setConnection,
     setCommand(client: CommandClient) {
       commandClient = client;
@@ -185,12 +283,58 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
       if (!cap) {
         return { capability: key, reason: `Backend capability "${key}" is not available.` };
       }
-      if (!session()?.tradingEnabled) {
+      const current = session();
+      if (!current) {
+        return { capability: key, reason: "Workspace session is not available." };
+      }
+      if (!current.tradingEnabled) {
         return { capability: key, reason: "Trading is disabled by the global kill switch." };
       }
-      const kill = session()?.killSwitch;
+      const kill = current.killSwitch;
       if (kill?.enabled) {
         return { capability: key, reason: kill.reason ?? "Trading is halted." };
+      }
+      // Fresh authorization is required for every mutation: an expired session
+      // must fail closed even while the capability flags still read true. The
+      // deadline is derived from the advertised session duration on the local
+      // clock, so neither a skewed local clock nor a relay-controlled absolute
+      // timestamp can keep an expired session usable.
+      if (clock() >= sessionDeadlineMs()) {
+        return {
+          capability: key,
+          reason: "Session authorization has expired — re-authenticate before trading.",
+        };
+      }
+      // Circuit breaker (PRD): a capital-committing mutation requires
+      // authoritative realtime state. `phase` alone latches — a half-open socket
+      // that stops delivering frames never flips off `live` — so the frame age is
+      // the real freshness signal (see `isConnectionFresh`).
+      //
+      // The `realtime` bit comes from the *unauthenticated* bootstrap body, so a
+      // relay that clears only that bit (while keeping execute/limits/twap/rfq)
+      // must not be able to switch the breaker off by making us skip it. With no
+      // advertised feed there is nothing to prove the local view is current, so
+      // capital-committing mutations halt rather than pass unverified.
+      if (STATE_FRESH_MUTATIONS.includes(key)) {
+        if (!capabilities().realtime) {
+          return {
+            capability: key,
+            reason:
+              "Realtime state feed is not available on this deployment — trading is halted (fail closed).",
+          };
+        }
+        // Evaluate against the current clock, not the throttled ticker signal,
+        // so a tab whose interval has not fired cannot read stale state fresh.
+        if (!isConnectionFresh(connection(), clock())) {
+          const status = connection();
+          return {
+            capability: key,
+            reason:
+              status.phase === "live"
+                ? "Realtime state is stale (no authenticated frame within the freshness window) — trading is halted until the stream resyncs."
+                : `Realtime state is ${status.phase} — trading is halted until the stream resyncs.`,
+          };
+        }
       }
       return null;
     },

@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # verify:web-boundary shells out to the crypto-envelope CLI/wasm proofs,
+      # so the boundary gate must have a pinned Rust toolchain available.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with:
           version: 11.22.0
@@ -26,4 +29,24 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test:web
       - run: pnpm verify:web-boundary
+  web-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:workspace-payload
+      - run: pnpm build:workspace-shell
+      # Audited HPKE responder + artifact tooling used by the shell-unlock spec.
+      - run: cargo build -p crypto-envelope --bins --example test-session-host
+      - run: pnpm --filter @evergreen/e2e exec playwright install --with-deps chromium
+      - run: pnpm --filter @evergreen/e2e exec playwright test
