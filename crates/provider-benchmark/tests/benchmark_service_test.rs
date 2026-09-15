@@ -102,6 +102,7 @@ struct ScriptedSource {
     fail: bool,
     fail_basis: Option<u128>,
     fail_from_call: Option<usize>,
+    hang_on_call: Option<usize>,
     mismatch_amount: bool,
     future: bool,
     calls: AtomicUsize,
@@ -115,6 +116,7 @@ impl ScriptedSource {
             fail: false,
             fail_basis: None,
             fail_from_call: None,
+            hang_on_call: None,
             mismatch_amount: false,
             future: false,
             calls: AtomicUsize::new(0),
@@ -134,6 +136,18 @@ impl ScriptedSource {
         Self {
             fail_from_call: Some(fail_from_call),
             ..Self::quoting(label, amount_out)
+        }
+    }
+
+    /// Fails on `fail_basis` and hangs forever on the `hang_on_call`-th call.
+    fn failing_then_hanging(
+        label: BenchmarkSource,
+        fail_basis: Option<u128>,
+        hang_on_call: usize,
+    ) -> Self {
+        Self {
+            hang_on_call: Some(hang_on_call),
+            ..Self::failing(label, fail_basis)
         }
     }
 
@@ -170,6 +184,11 @@ impl ProviderQuoteSource for ScriptedSource {
         let call_fail = self.fail_from_call.is_some_and(|from| call >= from);
         if basis_fail || call_fail {
             return Err(ProviderQuoteSourceError::Unavailable);
+        }
+        if self.hang_on_call == Some(call) {
+            // Cancellation bait: never yields, so the caller can drop the
+            // future (time out) while the probe is in flight.
+            std::future::pending::<()>().await;
         }
         let amount_in = if self.mismatch_amount {
             request.amount_in.saturating_add(1)
@@ -587,6 +606,253 @@ async fn future_quotes_are_unbound() {
         BenchmarkSkipReason::Degraded(DegradedReason::ProviderUnavailable)
     );
     assert_eq!(source.calls(), 1);
+}
+
+#[tokio::test]
+async fn budget_denied_before_probe_does_not_strand_the_circuit() {
+    // request_cost=1, capacity=1, refill=1/s, threshold=1, cooldown=10ms.
+    let source = Arc::new(ScriptedSource::failing(label("okx"), Some(1)));
+    let mut service = ProviderBenchmarkService::new(
+        source.clone(),
+        policy_with(label("okx"), 1, 1, 1, 2_000, 30_000, 5_000, 1, 10, 1),
+        BASE_MS as u64,
+    )
+    .expect("service builds");
+
+    // t=1000: the basis-1 fetch fails, tripping the circuit and consuming the
+    // single budget unit.
+    let first = service
+        .benchmark(&request_at(1, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert_eq!(
+        skip_reason(&first),
+        BenchmarkSkipReason::Degraded(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 1);
+
+    // t=1010: the cooldown has elapsed (health is Degraded) but the budget has
+    // not refilled. Budget must be denied BEFORE the half-open probe is taken.
+    let denied = service
+        .benchmark(&request_at(2, 10_000, BASE_MS + 10), BASE_MS + 10)
+        .await;
+    assert_eq!(
+        denied,
+        BenchmarkOutcome::Skipped {
+            reason: BenchmarkSkipReason::Degraded(DegradedReason::BudgetExhausted),
+            meta: BenchmarkMeta {
+                cache_state: CacheState::Miss,
+                degraded_reason: Some(DegradedReason::BudgetExhausted),
+                request_cost: 0,
+            },
+        }
+    );
+    assert_eq!(
+        source.calls(),
+        1,
+        "a budget-denied request must not reach the provider"
+    );
+
+    // t=2500: the budget has refilled; if the probe had been stranded at t=1010
+    // this would be CooldownActive instead of a real comparison.
+    let recovered = service
+        .benchmark(&request_at(3, 10_000, BASE_MS + 1_500), BASE_MS + 1_500)
+        .await;
+    assert!(
+        matches!(recovered, BenchmarkOutcome::Compared { .. }),
+        "budget-denied probe was stranded; outcome = {recovered:?}"
+    );
+    assert_eq!(source.calls(), 2);
+}
+
+#[tokio::test]
+async fn bound_but_comparator_rejected_quote_is_negatively_cached() {
+    // The quote binds the basis exactly but has zero output, which the
+    // comparator structurally rejects.
+    let source = Arc::new(ScriptedSource::quoting(label("okx"), 0));
+    let mut service = ProviderBenchmarkService::new(
+        source.clone(),
+        policy_with(label("okx"), 1, 10, 0, 2_000, 30_000, 5_000, 3, 15_000, 1),
+        BASE_MS as u64,
+    )
+    .expect("service builds");
+
+    let first = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert_eq!(
+        skip_reason(&first),
+        BenchmarkSkipReason::Degraded(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 1);
+
+    // A malformed quote cached positively would be a fresh hit here; it must be
+    // a negative-cache hit with no refetch.
+    let second = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert_eq!(
+        skip_reason(&second),
+        BenchmarkSkipReason::Degraded(DegradedReason::NegativeCached)
+    );
+    assert_eq!(source.calls(), 1);
+}
+
+#[tokio::test]
+async fn negative_reference_time_skips_without_calling_the_source() {
+    let source = Arc::new(ScriptedSource::quoting(label("okx"), 10_000));
+    let outcome = run(
+        source.clone(),
+        policy(label("okx")),
+        &request_at(1_000, 10_000, BASE_MS),
+        -1,
+    )
+    .await;
+    assert_eq!(
+        skip_reason(&outcome),
+        BenchmarkSkipReason::InvalidReferenceTime
+    );
+    assert_eq!(source.calls(), 0);
+}
+
+#[tokio::test]
+async fn negative_entry_prefers_a_stale_fallback() {
+    // Call 1 succeeds; call 2 (a stale-age refresh) fails and negative-caches
+    // the key while the positive data entry is still present.
+    let source = Arc::new(ScriptedSource::failing_after(label("okx"), 10_000, 2));
+    let mut service = ProviderBenchmarkService::new(
+        source.clone(),
+        policy_with(label("okx"), 1, 10, 0, 2_000, 30_000, 5_000, 3, 15_000, 1),
+        BASE_MS as u64,
+    )
+    .expect("service builds");
+
+    let first = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert!(matches!(first, BenchmarkOutcome::Compared { .. }));
+
+    let refresh_failed = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS + 2_001), BASE_MS + 2_001)
+        .await;
+    let (_, meta) = compared(&refresh_failed);
+    assert_eq!(meta.cache_state, CacheState::StaleServed);
+    assert_eq!(
+        meta.degraded_reason,
+        Some(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 2);
+
+    // The key now has an active negative entry alongside the positive data: the
+    // negative hit must still serve the present stale fallback without a fetch.
+    let stale_served = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS + 2_500), BASE_MS + 2_500)
+        .await;
+    let (_, meta) = compared(&stale_served);
+    assert_eq!(meta.cache_state, CacheState::StaleServed);
+    assert_eq!(meta.degraded_reason, Some(DegradedReason::NegativeCached));
+    assert_eq!(meta.request_cost, 0);
+    assert_eq!(source.calls(), 2);
+}
+
+#[tokio::test]
+async fn expired_entry_refreshes_with_fallback() {
+    // fresh_ttl=2s, stale_grace=3s: an age beyond 5s is Expired, not a hit.
+    let source = Arc::new(ScriptedSource::failing_after(label("okx"), 10_000, 2));
+    let mut service = ProviderBenchmarkService::new(
+        source.clone(),
+        policy_with(label("okx"), 1, 10, 0, 2_000, 3_000, 5_000, 3, 15_000, 1),
+        BASE_MS as u64,
+    )
+    .expect("service builds");
+
+    let first = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert!(matches!(first, BenchmarkOutcome::Compared { .. }));
+
+    // Age 5_001ms > fresh_ttl + stale_grace (5_000): Expired -> refresh, and the
+    // failed refresh serves the expired entry as a degraded fallback.
+    let expired = service
+        .benchmark(&request_at(1_000, 10_000, BASE_MS + 5_001), BASE_MS + 5_001)
+        .await;
+    let (verdict, meta) = compared(&expired);
+    assert_eq!(
+        *verdict,
+        BenchmarkVerdict::Skipped(routing::BenchmarkSkip::ProviderStale)
+    );
+    assert_eq!(meta.cache_state, CacheState::StaleServed);
+    assert_eq!(
+        meta.degraded_reason,
+        Some(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 2);
+}
+
+#[tokio::test]
+async fn quote_with_a_different_source_label_is_unbound() {
+    // The quote binds chain/pair/amount but reports another source label, so it
+    // must be rejected rather than compared against the configured source.
+    let source = Arc::new(ScriptedSource::quoting(label("other"), 10_000));
+    let outcome = run(
+        source.clone(),
+        policy(label("okx")),
+        &request_at(1_000, 10_000, BASE_MS),
+        BASE_MS,
+    )
+    .await;
+    assert_eq!(
+        skip_reason(&outcome),
+        BenchmarkSkipReason::Degraded(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 1);
+}
+
+#[tokio::test]
+async fn cancelled_fetch_releases_the_half_open_probe() {
+    use std::time::Duration;
+
+    // Fails basis 1 on call 1, hangs on call 2, then quotes normally.
+    let source = Arc::new(ScriptedSource::failing_then_hanging(
+        label("okx"),
+        Some(1),
+        2,
+    ));
+    let mut service = ProviderBenchmarkService::new(
+        source.clone(),
+        policy_with(label("okx"), 1, 10, 0, 2_000, 30_000, 5_000, 1, 10, 1),
+        BASE_MS as u64,
+    )
+    .expect("service builds");
+
+    // t=1000: basis 1 fails, tripping the circuit open until t=1010.
+    let first = service
+        .benchmark(&request_at(1, 10_000, BASE_MS), BASE_MS)
+        .await;
+    assert_eq!(
+        skip_reason(&first),
+        BenchmarkSkipReason::Degraded(DegradedReason::ProviderUnavailable)
+    );
+    assert_eq!(source.calls(), 1);
+
+    // t=1010: the half-open probe hangs; the caller times out, dropping (and
+    // thus cancelling) the benchmark future mid-fetch.
+    let timed_out = tokio::time::timeout(
+        Duration::from_millis(20),
+        service.benchmark(&request_at(2, 10_000, BASE_MS + 10), BASE_MS + 10),
+    )
+    .await;
+    assert!(timed_out.is_err(), "the hanging fetch should time out");
+
+    // t=1030: the cancelled probe must have been recorded as a failure, so a
+    // fresh basis can take the next probe and recover.
+    let recovered = service
+        .benchmark(&request_at(3, 10_000, BASE_MS + 30), BASE_MS + 30)
+        .await;
+    assert!(
+        matches!(recovered, BenchmarkOutcome::Compared { .. }),
+        "cancelled probe was stranded; outcome = {recovered:?}"
+    );
+    assert_eq!(source.calls(), 3);
 }
 
 #[tokio::test]
