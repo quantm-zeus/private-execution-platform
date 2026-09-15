@@ -327,16 +327,47 @@ impl ProviderBenchmarkService {
             observed_at_ms: now_ms,
         };
         let source = Arc::clone(&self.source);
-        match source.fetch_quote(&quote_request).await {
-            Ok(quote) if binds(&self.policy, &request.local, &quote, now_ms) => {
-                self.circuit.record_success();
+
+        // The half-open probe is wrapped in an RAII guard and the fetch runs in
+        // its own block, so the guard is dropped (and the probe resolved) before
+        // any cache/comparison work. If this future is cancelled or times out
+        // mid-`await`, the guard's `Drop` records a failure instead of leaving
+        // `probe_in_flight` set forever.
+        let fetch_result = {
+            let mut guard = ProbeGuard::new(&mut self.circuit, now);
+            match source.fetch_quote(&quote_request).await {
+                Ok(quote) if binds(&self.policy, &request.local, &quote, now_ms) => {
+                    // A quote the comparator structurally rejects (for example a
+                    // zero provider output) is a malformed response, not a
+                    // provider success: fail the probe and negatively cache it.
+                    if compare_route(&request.local, &quote, &self.policy.benchmark, now_ms).is_ok()
+                    {
+                        guard.succeed();
+                        Ok(quote)
+                    } else {
+                        guard.fail();
+                        Err(FetchFailure::Unbound)
+                    }
+                }
+                Ok(_) => {
+                    // A quote that does not bind the requested basis is a
+                    // provider contract violation: fail closed.
+                    guard.fail();
+                    Err(FetchFailure::Unbound)
+                }
+                Err(_) => {
+                    guard.fail();
+                    Err(FetchFailure::Unavailable)
+                }
+            }
+        };
+
+        match fetch_result {
+            Ok(quote) => {
                 self.cache.insert_success(key, Arc::new(quote.clone()), now);
                 self.compare_outcome(&request.local, &quote, now_ms, CacheState::Miss, None, cost)
             }
-            Ok(_) => {
-                // A quote that does not bind the requested basis is a provider
-                // contract violation: fail closed and negatively cache it.
-                self.circuit.record_failure(now);
+            Err(FetchFailure::Unbound) => {
                 let until = now.saturating_add(self.policy.negative_ttl_ms);
                 self.cache
                     .insert_negative(key, OpaqueFailureKind::MalformedResponse, until);
@@ -348,8 +379,7 @@ impl ProviderBenchmarkService {
                     cost,
                 )
             }
-            Err(_) => {
-                self.circuit.record_failure(now);
+            Err(FetchFailure::Unavailable) => {
                 let until = now.saturating_add(self.policy.negative_ttl_ms);
                 self.cache
                     .insert_negative(key, OpaqueFailureKind::ServiceUnavailable, until);
@@ -417,6 +447,56 @@ impl ProviderBenchmarkService {
                 Some(reason),
                 request_cost,
             ),
+        }
+    }
+}
+
+/// Why the probe's fetch did not yield a comparable quote.
+///
+/// Fieldless so no provider payload, endpoint, or credential can be carried.
+enum FetchFailure {
+    /// The response did not bind the requested basis, or the comparator
+    /// structurally rejected the bound quote.
+    Unbound,
+    /// The source returned an error (transport or structural rejection).
+    Unavailable,
+}
+
+/// RAII owner of the circuit's single half-open probe.
+///
+/// `succeed`/`fail` resolve the probe explicitly; if neither runs because the
+/// owning future is dropped mid-fetch, `Drop` records a failure so
+/// `probe_in_flight` can never stay set forever.
+struct ProbeGuard<'a> {
+    circuit: &'a mut CircuitBreaker,
+    now_ms: u64,
+    armed: bool,
+}
+
+impl<'a> ProbeGuard<'a> {
+    fn new(circuit: &'a mut CircuitBreaker, now_ms: u64) -> Self {
+        Self {
+            circuit,
+            now_ms,
+            armed: true,
+        }
+    }
+
+    fn succeed(&mut self) {
+        self.circuit.record_success();
+        self.armed = false;
+    }
+
+    fn fail(&mut self) {
+        self.circuit.record_failure(self.now_ms);
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.circuit.record_failure(self.now_ms);
         }
     }
 }
