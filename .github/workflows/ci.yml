@@ -30,6 +30,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test:web
+      - run: pnpm test:shell
       - run: pnpm verify:web-boundary
   web-e2e:
     runs-on: ubuntu-latest

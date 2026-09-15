@@ -34,11 +34,9 @@ use std::sync::Mutex;
 use webauthn_authenticator_rs::prelude::WebauthnAuthenticator;
 #[cfg(any(test, feature = "private-test-support"))]
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-#[cfg(any(test, feature = "private-test-support"))]
-use webauthn_rs::prelude::Uuid;
 use webauthn_rs::prelude::{
-    PasskeyAuthentication, PublicKeyCredential, RequestChallengeResponse, Url, Webauthn,
-    WebauthnBuilder,
+    CreationChallengeResponse, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder,
 };
 
 use crate::{AuthError, AuthenticationResult, Passkey};
@@ -46,6 +44,19 @@ use crate::{AuthError, AuthenticationResult, Passkey};
 pub trait PasskeyCredentialStore: Send + Sync {
     fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError>;
     fn apply_authentication_result(&self, result: &AuthenticationResult) -> Result<(), AuthError>;
+
+    /// Persist a freshly registered passkey.
+    ///
+    /// Only the public credential record (credential id, COSE public key,
+    /// signature counter, transports) is ever handed to a store; a store must
+    /// never persist private key material because none is produced by WebAuthn
+    /// registration. The default is intentionally fail-closed: a store that has
+    /// not implemented enrollment refuses rather than silently dropping the
+    /// credential (which would make the next authentication fail with no
+    /// diagnostic).
+    fn register_passkey(&self, _passkey: Passkey) -> Result<(), AuthError> {
+        Err(AuthError::VerifierUnavailable)
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +97,21 @@ impl PasskeyCredentialStore for InMemoryPasskeyCredentialStore {
             .ok_or(AuthError::VerificationFailed)?;
         Ok(())
     }
+
+    fn register_passkey(&self, passkey: Passkey) -> Result<(), AuthError> {
+        let mut passkeys = self
+            .passkeys
+            .lock()
+            .map_err(|_| AuthError::VerifierUnavailable)?;
+        if passkeys
+            .iter()
+            .any(|existing| existing.cred_id() == passkey.cred_id())
+        {
+            return Err(AuthError::CredentialConflict);
+        }
+        passkeys.push(passkey);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +137,21 @@ pub struct AuthenticationAttempt {
 impl fmt::Debug for AuthenticationAttempt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("AuthenticationAttempt([REDACTED])")
+    }
+}
+
+/// Pending WebAuthn registration ceremony state.
+///
+/// Holds the single-use server challenge between the begin and finish steps.
+/// It is never serialized, persisted or logged; `Debug` is redacted so an
+/// accidental formatting cannot disclose the ceremony challenge.
+pub struct PasskeyRegistrationAttempt {
+    state: PasskeyRegistration,
+}
+
+impl fmt::Debug for PasskeyRegistrationAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasskeyRegistrationAttempt([REDACTED])")
     }
 }
 
@@ -167,6 +208,49 @@ impl WebAuthnPasskeyAuthenticator {
             .start_passkey_authentication(&passkeys)
             .map_err(|_| AuthError::VerificationFailed)?;
         Ok((options, AuthenticationAttempt { state }))
+    }
+
+    /// Begin an operator-driven passkey enrollment ceremony.
+    ///
+    /// The caller is responsible for authenticating the enrollment request
+    /// out-of-band (private-api gates this on an operator bootstrap secret);
+    /// this method only performs the WebAuthn ceremony.
+    pub fn start_registration(
+        &self,
+        user_unique_id: Uuid,
+        user_name: &str,
+        user_display_name: &str,
+    ) -> Result<(CreationChallengeResponse, PasskeyRegistrationAttempt), AuthError> {
+        let (options, state) = self
+            .webauthn
+            .start_passkey_registration(user_unique_id, user_name, user_display_name, None)
+            .map_err(|_| AuthError::VerificationFailed)?;
+        Ok((options, PasskeyRegistrationAttempt { state }))
+    }
+
+    /// Finish an enrollment ceremony and durably register the credential.
+    ///
+    /// The credential is only considered enrolled after the store has
+    /// persisted it; a store failure returns [`AuthError::VerifierUnavailable`]
+    /// and no credential is registered.
+    pub fn finish_registration(
+        &self,
+        attempt: PasskeyRegistrationAttempt,
+        credential: &RegisterPublicKeyCredential,
+    ) -> Result<Passkey, AuthError> {
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(credential, &attempt.state)
+            .map_err(|_| AuthError::VerificationFailed)?;
+        self.store.register_passkey(passkey.clone())?;
+        Ok(passkey)
+    }
+
+    /// Whether any credential is registered. Used to fail the enrollment
+    /// surface closed before the WebAuthn ceremony when there is nothing to
+    /// authenticate against.
+    pub fn has_credentials(&self) -> Result<bool, AuthError> {
+        Ok(!self.store.list_passkeys()?.is_empty())
     }
 
     pub fn finish_authentication(
@@ -330,6 +414,88 @@ mod tests {
         assert!(matches!(
             authenticator.finish_authentication(attempt, &credential),
             Err(AuthError::VerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn registration_round_trip_enrolls_then_authenticates() {
+        let origin = Url::parse("https://example.com").unwrap();
+        let store: Arc<dyn PasskeyCredentialStore> =
+            Arc::new(InMemoryPasskeyCredentialStore::new(Vec::new()));
+        let authenticator =
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap();
+
+        // No credential yet: the store is empty and authentication fails closed.
+        assert!(!authenticator.has_credentials().unwrap());
+        assert!(matches!(
+            authenticator.start_authentication(),
+            Err(AuthError::VerifierUnavailable)
+        ));
+
+        let mut client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let (creation, attempt) = authenticator
+            .start_registration(Uuid::new_v4(), "owner", "Owner")
+            .unwrap();
+        assert_eq!(
+            format!("{attempt:?}"),
+            "PasskeyRegistrationAttempt([REDACTED])"
+        );
+        let registration = client.do_registration(origin.clone(), creation).unwrap();
+        let passkey = authenticator
+            .finish_registration(attempt, &registration)
+            .unwrap();
+        assert!(authenticator.has_credentials().unwrap());
+
+        // The just-enrolled credential authenticates with no restart.
+        let (request, auth_attempt) = authenticator.start_authentication().unwrap();
+        let credential = client.do_authentication(origin, request).unwrap();
+        let verified = authenticator
+            .finish_authentication(auth_attempt, &credential)
+            .unwrap();
+        assert_eq!(
+            format!("{verified:?}"),
+            "VerifiedPasskeyAuthentication([REDACTED])"
+        );
+
+        // Re-registering the same credential is refused, never silently replaced.
+        let concrete = InMemoryPasskeyCredentialStore::new(vec![passkey.clone()]);
+        assert!(matches!(
+            concrete.register_passkey(passkey),
+            Err(AuthError::CredentialConflict)
+        ));
+    }
+
+    #[test]
+    fn store_without_enrollment_support_refuses_registration() {
+        // `FailingResultStore` only overrides the two auth methods; the default
+        // `register_passkey` must refuse rather than silently drop the credential.
+        let origin = Url::parse("https://example.com").unwrap();
+        let registration_server = WebauthnBuilder::new("example.com", &origin)
+            .and_then(WebauthnBuilder::build)
+            .unwrap();
+        let (creation, registration_state) = registration_server
+            .start_passkey_registration(Uuid::new_v4(), "owner", "Owner", None)
+            .unwrap();
+        let mut client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let registration = client.do_registration(origin, creation).unwrap();
+        let existing = registration_server
+            .finish_passkey_registration(&registration, &registration_state)
+            .unwrap();
+        let store: Arc<dyn PasskeyCredentialStore> =
+            Arc::new(FailingResultStore { passkey: existing });
+
+        let authenticator =
+            WebAuthnPasskeyAuthenticator::new("example.com", "https://example.com", store).unwrap();
+        let (creation, attempt) = authenticator
+            .start_registration(Uuid::new_v4(), "owner", "Owner")
+            .unwrap();
+        let mut fresh_client = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let registration = fresh_client
+            .do_registration(Url::parse("https://example.com").unwrap(), creation)
+            .unwrap();
+        assert!(matches!(
+            authenticator.finish_registration(attempt, &registration),
+            Err(AuthError::VerifierUnavailable)
         ));
     }
 }

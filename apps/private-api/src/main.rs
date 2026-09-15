@@ -1,10 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use auth::passkey::PasskeyCredentialStore;
 use private_api::opaque::{self};
 use private_api::relay;
-use private_api::{router, OpaqueSystemClock, PrivateApiConfig, PrivateApiState};
+use private_api::{
+    router, FilePasskeyCredentialStore, OpaqueSystemClock, PrivateApiConfig, PrivateApiState,
+};
 use service_identity::ServiceIdentityConfig;
+use zeroize::Zeroizing;
 
 fn parse_bind_addr(value: &str) -> Result<SocketAddr, std::io::Error> {
     let address: SocketAddr = value
@@ -16,6 +20,19 @@ fn parse_bind_addr(value: &str) -> Result<SocketAddr, std::io::Error> {
         ));
     }
     Ok(address)
+}
+
+/// Strict boolean environment parse (`true`/`false`; unset uses `default`).
+/// Anything else refuses startup so a typo cannot flip a security default.
+fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
+    match std::env::var(name) {
+        Ok(value) if value == "true" => Ok(true),
+        Ok(value) if value == "false" => Ok(false),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "{name} must be true or false"
+        ))),
+        Err(_) => Ok(default),
+    }
 }
 
 /// Optional internal mTLS relay identity. All four values must be present to
@@ -41,6 +58,20 @@ fn optional_relay_identity() -> Option<ServiceIdentityConfig> {
     })
 }
 
+/// Optional durable passkey credential store. When `PRIVATE_PASSKEY_STORE_PATH`
+/// is configured, production passkey authentication is enabled against that
+/// file; without it the private API keeps its fail-closed
+/// `authenticator: None` default (every auth route answers `503`).
+fn optional_passkey_store() -> Result<Option<Arc<dyn PasskeyCredentialStore>>, std::io::Error> {
+    let path = match std::env::var("PRIVATE_PASSKEY_STORE_PATH") {
+        Ok(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let store = FilePasskeyCredentialStore::open(path)
+        .map_err(|_| std::io::Error::other("passkey credential store invalid"))?;
+    Ok(Some(Arc::new(store)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rp_id = std::env::var("PRIVATE_RP_ID")?;
@@ -53,8 +84,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         artifact_grant_ttl_ms: 60_000,
     };
     let session_ttl_ms = config.session_ttl_ms;
-    let state = PrivateApiState::production(config)
-        .map_err(|_| std::io::Error::other("private api configuration invalid"))?;
+
+    // Production passkey composition. The operator bootstrap secret is only
+    // meaningful together with a durable store (otherwise an enrolled credential
+    // could not survive a restart), so a secret without a store refuses startup
+    // rather than silently presenting a dead enrollment surface.
+    let passkey_store = optional_passkey_store()?;
+    let enrollment_secret = std::env::var("PRIVATE_PASSKEY_ENROLL_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Zeroizing::new);
+    let allow_additional_credentials = strict_bool_env("PRIVATE_PASSKEY_ALLOW_ADDITIONAL", false)?;
+    if passkey_store.is_none() && (enrollment_secret.is_some() || allow_additional_credentials) {
+        return Err(std::io::Error::other(
+            "passkey enrollment configuration requires PRIVATE_PASSKEY_STORE_PATH",
+        )
+        .into());
+    }
+    let state = match passkey_store {
+        Some(store) => PrivateApiState::production_with_passkeys(
+            config,
+            store,
+            enrollment_secret,
+            allow_additional_credentials,
+        )
+        .map_err(|_| std::io::Error::other("private api passkey configuration invalid"))?,
+        None => PrivateApiState::production(config)
+            .map_err(|_| std::io::Error::other("private api configuration invalid"))?,
+    };
 
     // TRADING_ENABLED is parsed strictly (`"true"`/`"false"`; unset disables) so
     // a typo can never silently enable execution. The authoritative Trading Core
@@ -113,5 +170,19 @@ mod tests {
         assert!(parse_bind_addr("[::1]:8081").is_ok());
         assert!(parse_bind_addr("0.0.0.0:8081").is_err());
         assert!(parse_bind_addr("192.0.2.1:8081").is_err());
+    }
+
+    #[test]
+    fn strict_bool_env_defaults_and_rejects_typos() {
+        let name = "PRIVATE_PASSKEY_TEST_BOOL";
+        std::env::remove_var(name);
+        assert!(!strict_bool_env(name, false).unwrap());
+        std::env::set_var(name, "true");
+        assert!(strict_bool_env(name, false).unwrap());
+        std::env::set_var(name, "false");
+        assert!(!strict_bool_env(name, true).unwrap());
+        std::env::set_var(name, "1");
+        assert!(strict_bool_env(name, false).is_err());
+        std::env::remove_var(name);
     }
 }

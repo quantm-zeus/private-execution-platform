@@ -563,3 +563,131 @@ being worked around:
   against a Node AEAD mock. A single cross-process test that wires the real mTLS
   relay to the injected core (and a `wasm-pack test --node` assertion of the WASM
   `app_session_keys()` orientation) is still missing.
+
+## Sixth slice — production passkey composition + clear-shell authentication
+
+The operator reported a release-blocking defect: `PrivateApiState::production`
+built `authenticator: None`, and the only production `PasskeyCredentialStore`
+returned `VerifierUnavailable`, so `/internal/auth/challenge` answered `503` on
+the real deployment even with a valid RP id/origin. Production passkey auth was
+impossible. This slice closes it without weakening any fail-closed default.
+
+### Durable, operator-owned credential store
+
+`apps/private-api/src/passkey_store.rs` adds `FilePasskeyCredentialStore`, the
+first real `PasskeyCredentialStore`:
+
+- Persists a versioned JSON document of WebAuthn `Passkey` records. A `Passkey`
+  is **public** material only (credential id, COSE public key, signature counter,
+  transports); no private key material exists in WebAuthn registration and none
+  is written. This is consistent with the PRD's "no infrastructure-held key
+  material" rule.
+- Writes atomically: a per-write **random** same-directory temp file created
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, written `0600`, fsynced, then `rename`d over the
+  store, then the parent directory is fsynced. A crash cannot leave a truncated
+  store and a local user cannot pre-create or follow the temp path.
+- Refuses to load a store it does not own, that has any group/other access bit,
+  or that sits in a world-writable directory; it opens the path `O_NOFOLLOW`,
+  re-checks that the opened inode is the one it inspected (TOCTOU), and bounds
+  the document at 1 MiB. A missing file is the documented empty store; every
+  other failure refuses startup.
+- `apply_authentication_result` persists the updated signature counter **before**
+  publishing it in memory; a store that cannot persist returns
+  `VerifierUnavailable` (HTTP 503) rather than accepting an authentication it
+  cannot durably record.
+- Implements `Debug` as `FilePasskeyCredentialStore([REDACTED])` and logs
+  nothing.
+
+### Operator bootstrap enrollment
+
+`crates/auth` gains an additive, fail-closed registration contract:
+
+- `PasskeyCredentialStore::register_passkey` has a default that returns
+  `VerifierUnavailable`, so a store without enrollment support refuses instead
+  of silently dropping the credential.
+- `WebAuthnPasskeyAuthenticator::start_registration`/`finish_registration`
+  perform the ceremony and only return success after the store persisted the
+  record. `has_credentials` exposes the fail-closed empty check.
+
+`apps/private-api` exposes two operator-gated routes:
+
+| Route | Gate | Behavior |
+|-------|------|----------|
+| `POST /internal/auth/register/challenge` | `x-evergreen-enroll-secret` (constant-time compare against `PRIVATE_PASSKEY_ENROLL_SECRET`) | Begins a WebAuthn registration; `503` when enrollment is unconfigured, `401` on a wrong secret, `409` once a credential exists unless additions are allowed. |
+| `POST /internal/auth/register/verify` | same header | Finishes the ceremony and durably registers the credential; returns no credential id. |
+
+The secret must be at least 32 bytes (`MIN_ENROLLMENT_SECRET_LEN`); a shorter one
+refuses startup. Additions after the first credential are refused unless
+`PRIVATE_PASSKEY_ALLOW_ADDITIONAL=true`, so the secret is a one-time bootstrap
+capability by default. The pending ceremony is single-use, TTL-bounded and
+budgeted (`MAX_PENDING_REGISTRATIONS`). The secret is held in a `Zeroizing`
+buffer, compared in constant time, and never logged or echoed. The "is another
+credential allowed?" decision and the durable registration are serialized under
+one enrollment mutex with no `.await` between them, so N concurrent verifies of
+challenges minted while the store was empty cannot enroll N credentials. A store
+read failure during the policy check is a `503` backend condition, not a `409`
+policy conflict.
+
+### Production composition
+
+`PrivateApiState::production_with_passkeys(config, store, secret, allow_add)` is
+the real production constructor. `main.rs` wires it when
+`PRIVATE_PASSKEY_STORE_PATH` is set (and refuses startup if an enrollment secret
+or the allow-additional flag is set without a store). With no store configured
+the binary keeps the fail-closed `authenticator: None` behavior — every auth
+route answers `503` — so the default is unchanged and only an explicit operator
+configuration enables auth.
+
+Operator configuration on the deployment
+(`PRIVATE_RP_ID=evergreen.foresift.tech`,
+`PRIVATE_ORIGIN=https://evergreen.foresift.tech`):
+
+```
+PRIVATE_PASSKEY_STORE_PATH=/var/lib/evergreen/passkeys.json
+PRIVATE_PASSKEY_ENROLL_SECRET=<>=32 bytes, high entropy>
+# optional, only to enroll a second device later
+PRIVATE_PASSKEY_ALLOW_ADDITIONAL=false
+```
+
+Bootstrap once with a browser that can reach the perimeter: the clear shell's
+"Enroll passkey" form calls the registration routes with the typed secret, then
+the ordinary "Authenticate with passkey" path establishes the `__Host-` session
+cookie. Remove/rotate the secret afterwards.
+
+### Clear-shell passkey client and `/internal/*` reachability
+
+`web/workspace-shell/src/passkey-auth.ts` is the shell's only authentication
+client. It converts the server's `RequestChallengeResponse` /
+`CreationChallengeResponse` JSON to DOM options, runs
+`navigator.credentials.get`/`create`, and posts the serialized credential back to
+the same-origin `/internal/auth/verify` / `/internal/auth/register/verify`
+routes. It uses `credentials: "same-origin"` (the perimeter session and the
+`__Host-` cookies depend on it), persists nothing, and never logs or interpolates
+credential material or the enrollment secret. `index.tsx` runs the
+authentication on mount and offers the operator enrollment form; the session is
+an HttpOnly cookie the shell cannot read.
+
+Because every request is same-origin, the operator's single-origin gateway
+(`127.0.0.1:8090`: `/internal/*` → private-api, `/v1/*` → edge, requiring
+`Cf-Access-Jwt-Assertion`) is reachable from the shell with no CORS exception:
+Cloudflare Access injects the assertion on the authenticated same-origin
+navigation, and `connect-src 'self'` already permits it.
+
+### Tests added
+
+- `crates/auth`: registration round-trip (enroll then authenticate), duplicate
+  refusal, and the default-deny registration contract (3 new tests).
+- `apps/private-api/src/passkey_store.rs`: owner-only persistence + reload,
+  counter persistence, corrupt/symlink/wrong-version refusal, redacted `Debug`,
+  and a full register-then-authenticate over the file store (5 tests).
+- `apps/private-api` HTTP production path: real enrollment ceremony →
+  `/internal/auth/challenge` unavailable while empty → enroll with the operator
+  secret → authenticate → session → `/internal/auth/enroll` and
+  `/internal/artifact/grant` reachable → one-time bootstrap refusal; enrollment
+  disabled without a secret; short-secret refusal; restart durability (4 tests).
+- `web/workspace-shell`: `node --test` unit suite for the JSON↔DOM conversion,
+  same-origin request shape, fail-closed behavior and secret-header scoping
+  (7 tests), wired into CI as `pnpm test:shell`.
+- `scripts/verify-web-boundary.mjs`: the shell first-party path allowlist now
+  includes the audited `/internal/auth/{challenge,verify}` and
+  `/internal/auth/register/{challenge,verify}` routes.
