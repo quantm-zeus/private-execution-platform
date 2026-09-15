@@ -12,6 +12,7 @@ use chain_types::ChainId;
 use crate::{AgentChannel, AgentCommand, ReadCommand, TradeCommand};
 
 /// Trusted capability context; built by the backend, never from the request body.
+#[derive(Clone)]
 pub struct AgentCapabilities {
     pub trading_enabled: bool,
     /// Chains this wallet may trade.

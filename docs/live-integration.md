@@ -124,9 +124,14 @@ shipped UI needs that the canonical vocabulary does not carry, over an injected
 `WebContractBackend` (default `FailClosedWebContract`):
 
 - BR-9 reconciliation reads: `get_order`, `get_order_by_client_id`,
-  `get_withdrawal_by_request_id`, `get_execution_progress`.
+  `get_withdrawal_by_request_id`, `get_execution_progress` (a missing
+  `client_request_id` reads the current execution via
+  `WebContractBackend::current_execution_progress`).
 - BR-14 `get_wallet_limits` / `set_wallet_limits` (the write requires an
-  idempotency key; the backend is the authorization boundary).
+  idempotency key; the backend is the authorization boundary). Because this
+  web-only write never travels through `agent_commands::authorize`, the
+  dispatcher enforces the **same `TRADING_ENABLED` kill switch** itself
+  (`ensure_trading_enabled`) before contacting the backend (fresh-review F1).
 - BR-12 `place_limit_order` results are projected to a top-level `order_id` from
   the backend's own `order.order_id`; a success without one is indeterminate.
 - BR-10 `execute_market_order` requires an `execution.state` of
@@ -136,40 +141,130 @@ shipped UI needs that the canonical vocabulary does not carry, over an injected
   `execution_outcome` now emits `router_source` and the intent-id
   `execution_id`, so a real Trading Core satisfies this honestly.
 
+## BR-11 canonical instrument + amount translation, preview projection, quote binding
+
+The browser speaks a human-shaped, neutral contract; `apps/private-api/src/web_integration.rs`
+is the only place that bridges it to the canonical `agent-commands` vocabulary.
+It derives nothing on its own:
+
+- **`InstrumentRegistry`** is an injected, authoritative seam (chain slug + token
+  address → canonical `ChainId` + token decimals). The default
+  `FailClosedInstrumentRegistry` resolves nothing, so a token/stablecoin amount
+  fails closed with a determinate `capability_missing` instead of trading on a
+  client-asserted scale factor. `StaticInstrumentRegistry` serves tests and fixed
+  deployments.
+- `preview_market_order` (browser payload `{intent:{…}, router_preference}`) and
+  `place_limit_order` (flat payload) are translated into lossless canonical
+  `AssetRef`s and `AmountSpec`s. `usd` → `usd_micros` (6 dp) needs no registry;
+  `stablecoin`/`token` use the token_in decimals. A decimal with more precision
+  than the asset supports, exponent notation, a non-positive amount, or an
+  over-range value is a **protocol rejection**, never a silent rounding of a
+  trade size.
+- `place_limit_order`'s human quote-per-base `limit_price` becomes an exact atomic
+  `LimitPriceSpec` (`numerator_atomic`/`denominator_atomic`) using the canonical
+  orientation: buy → `(token_in, token_out)`, sell → `(token_out, token_in)`.
+  The web-only risk caps and `order_type` fields are dropped (the canonical
+  command owns only the eight accepted keys; wallet limits come from backend
+  config), and the canonical parser rejects any leaked field.
+- `preview_market_order` stores the **translated canonical execute intent** under
+  a 128-bit random, memory-only `quote_id`, scoped to the authenticated session
+  `kid` (`CommandDispatcher::dispatch_for_session`) with a bounded TTL.
+  `execute_market_order {quote_id, router_preference}` resolves that id and
+  executes the exact intent the user reviewed. An unknown/expired quote, a
+  session mismatch, or a `router_preference` different from the quoted source is
+  a determinate rejection — never a silent re-route.
+- The canonical `MarketPreview` (`RouteQuote` + `RouteScore`) is projected into
+  the web `QuotePreview` (`quoteId`/`intent`/`route`/`economics`/`routerSource`/
+  `sourceAgeMs`/`expiresAtMs`). Gross/net output, per-hop route legs, impact/
+  slippage/MEV/failure bps and state age come from the authenticated preview; a
+  value the backend did not supply is `null`, never fabricated. `minReceived` is
+  a **conservative slippage floor** (`net_output × (1 − max_slippage_bps)`), not
+  the current net output, and is `null` without an explicit cap. A bps is only
+  derived when the cost is denominated in the gross-output asset; a cross-asset
+  ratio is `null`, not a wrong number. `expiresAtMs` is the store's absolute
+  deadline. `revalidationRequired` is `false` because the server revalidates
+  state at execute, so the ticket stays executable; `routerSource` is passed
+  through unchanged so a silent source substitution is visible and blocked by the
+  client.
+
+`web_command_dispatcher(...)` composes the whole chain
+(`AgentCommandDispatcher` → `WebContractDispatcher` → `WebIntegrationDispatcher`)
+over the injected `AgentBackend`, `AgentCapabilities`, `WebContractBackend`,
+`InstrumentRegistry` and `OpaqueClock`. The production binary still builds the
+fail-closed state and never enables trading by itself.
+
 ## Tests
 
 - `crates/session-transport`: envelope/AEAD/replay/expiry/sequence-binding plus
   stream-frame schema, monotonic stream sequence, stale-server-time refusal and
   subscribe purpose-window tests (20).
-- `apps/private-api`: 67 lib tests, including the real gRPC bidi
+- `apps/private-api`: 95 lib tests, including the real gRPC bidi
   `RelayStreamService` subscribe + snapshot round-trip, driver fail-closed /
-  resync tests, and the `WebContractDispatcher` no-false-success tests.
+  resync tests, the `WebContractDispatcher` no-false-success + kill-switch tests,
+  and the BR-11 translation / preview projection / quote-binding tests.
 - `apps/edge-gateway/tests/opaque_command_e2e.rs`: browser-shaped opaque envelope
   -> edge `/v1/command` + `/v1/bootstrap` -> private-api session service, plus
   replay rejection, JSON-body rejection, and BR-10/BR-12 no-false-success
   assertions through the web-contract layer (7).
-- `web/workspace-payload`: 356 unit tests including the worker subscribe-frame
+- `apps/edge-gateway/tests/opaque_web_integration_e2e.rs`: true end-to-end through
+  the **real composed chain** (`web_command_dispatcher` -> `AgentCommandDispatcher`
+  -> `WebContractDispatcher` -> `WebIntegrationDispatcher`) to an injected
+  Trading Core seam: the browser payload is translated to the exact canonical
+  `AssetRef`/`AmountSpec`, preview projects a `quoteId`, execute binds the quote
+  and source, `TRADING_ENABLED=false` denies the write, an unknown instrument
+  never reaches the backend, and an unattributable execute is indeterminate (5).
+- `web/workspace-payload`: 357 unit tests including the worker subscribe-frame
   test (`realtime/worker.test.ts`).
 
 ## Residuals (explicit)
 
-- **BR-11 command payload translation (main blocker to live trades)**: the web
-  sends `{chain, token_in, token_out, amount, amount_type}` (human amount plus a
-  separate chain id), while the canonical `agent-commands` vocabulary expects
-  `token_in`/`token_out` as `{chain, address}` objects and `amount` as atomic
-  units (`{unit, value}`). Token amounts require token decimals the web contract
-  does not carry, so the private layer does not guess. Until either the web sends
-  atomic amounts or the private layer resolves token decimals server-side,
-  `get_quote`/`preview_market_order`/`execute_market_order`/`place_limit_order`
-  over `/v1/command` fail closed at the canonical parser (`protocol`/`malformed`)
-  rather than trading on a guessed amount. The bootstrap `native_token` half of
-  BR-11 is implemented.
+- **USD-notional amounts (Trading Core capability, not a private-layer bug)**: the
+  shipped ticket defaults to `amount_type:"usd"`. The canonical
+  `agent-backend` deliberately refuses `usd_micros` (it will not value a
+  request-body USD amount as trusted) and accepts only input-asset atomics, so
+  the private layer rejects `usd` with a determinate `protocol` refusal instead of
+  inventing a price. `token`/`stablecoin` amounts work with authoritative
+  decimals. Closing USD-notional requires Trading Core support (an authoritative
+  USD price / live market-data seam), not a private-layer workaround.
+- **Open-expiry limit orders**: the private layer requires `expiry_ms` (mapped to
+  the canonical required `expires_at_ms`); the web allows an empty expiry, which
+  becomes a determinate protocol denial. A default policy belongs to the Trading
+  Core, not the translator.
+- **User risk caps on `place_limit_order`**: the canonical command carries no
+  `max_*_bps`/`max_total_cost_usd` fields, so those web inputs are dropped and the
+  backend-configured wallet policy governs. A per-order cap contract is a
+  canonical-vocabulary change.
+- **Web-only ops with no canonical tool**: `start_twap`, `submit_rfq`,
+  `request_withdrawal` (submit), `get_alerts` and `get_provider_health` fall
+  through to `capability_missing`. They belong on the injected
+  `WebContractBackend` (their typed-denial default is already fail-closed).
+- **Response-shape projection for `get_orders`/`get_portfolio`**: the canonical
+  `agent-backend` returns snake_case domain documents nested under `orders` /
+  `portfolio`, while the web views expect camelCase/top-level fields. The
+  projection is not implemented yet; the surfaces stay non-fabricating but
+  partially blank.
 - **Operator wiring**: the Trading Core composition (real `AgentBackend`,
   authoritative capabilities, dynamic kill switch, real `StreamSource`,
-  `WebContractBackend` for wallet limits and reconciliation stores) is not wired;
-  `FailClosed*` remain the defaults. The production edge binary still serves
-  `default_router()` (unavailable relays, no authorization backend); the operator
-  composes `PrivateRelay`/`PrivateStreamRelay` plus an `AuthorizationBackend`.
+  `InstrumentRegistry` backed by market metadata, `WebContractBackend` for wallet
+  limits and reconciliation stores) is injected through `web_command_dispatcher`
+  but not wired by the binary; `FailClosed*` remain the defaults. The production
+  edge binary still serves `default_router()` (unavailable relays, no
+  authorization backend).
+- **Accepted LOW hardening residuals (fresh-context adversarial review)**: the
+  s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
+  substitution today); a captured c2s `subscribe` replayed on `/v1/command` is a
+  fail-closed DoS; a shared `Notify` can waste one resync wake-up across stream
+  generations; the s2c stream can emit frames after session expiry (the client
+  deadline still blocks mutations); and the payload keeps the BR-5 base64 key
+  strings until the iframe is torn down (the imported `CryptoKey`s are
+  non-extractable and the raw bytes are zeroized).
+- **Input-denominated fee projection**: `dex_fee` (always in `token_in`) and a
+  sell-side `tax_cost` (also in `token_in`) cannot be expressed as bps of the
+  gross output, so they project as `null` (unknown, never wrong). The second
+  adversarial review's quote-store starvation (per-session eviction now), the
+  misleading `minReceived` (now the slippage floor), the `proportional_bps`
+  saturation, the malformed `client_request_id` fallback, and the JSON-float
+  precision hole are fixed.
 - **BR-16 naming**: enrollment/artifact paths remain `/internal/*` and are
   asserted by `verify:web-boundary`; neutral-family renaming is a platform
   decision.

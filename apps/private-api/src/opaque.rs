@@ -184,6 +184,17 @@ impl BootstrapProvider for StaticBootstrap {
 #[async_trait]
 pub trait CommandDispatcher: Send + Sync {
     async fn dispatch(&self, request: &CommandRequest) -> Result<Value, CommandDenial>;
+
+    /// Session-scoped dispatch. The default ignores the session identity; the
+    /// web integration layer uses it to bind preview quotes to the
+    /// authenticated `kid` so one session cannot execute another's quote.
+    async fn dispatch_for_session(
+        &self,
+        _kid: &[u8],
+        request: &CommandRequest,
+    ) -> Result<Value, CommandDenial> {
+        self.dispatch(request).await
+    }
 }
 
 /// Fail-closed dispatcher: every command is a determinate capability denial
@@ -595,7 +606,8 @@ impl OpaqueServiceState {
             OpaqueRoute::Command => {
                 let request =
                     CommandRequest::parse(plaintext).map_err(|_| RelayFailure::Protocol)?;
-                let response = match self.dispatcher.dispatch(&request).await {
+                let kid = envelope.decode_kid().map_err(|_| RelayFailure::Malformed)?;
+                let response = match self.dispatcher.dispatch_for_session(&kid, &request).await {
                     Ok(result) => CommandResponse::success(&request.request_id, result),
                     Err(denial) => CommandResponse::denial(&request.request_id, denial),
                 };

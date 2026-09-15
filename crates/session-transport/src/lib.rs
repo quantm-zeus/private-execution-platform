@@ -1232,7 +1232,10 @@ mod tests {
 
         let mut missing_payload = snapshot(1);
         missing_payload.payload = None;
-        assert_eq!(missing_payload.validate(), Err(SessionError::MalformedFrame));
+        assert_eq!(
+            missing_payload.validate(),
+            Err(SessionError::MalformedFrame)
+        );
 
         let mut bad_time = snapshot(1);
         bad_time.server_time_ms = -1;
@@ -1252,7 +1255,10 @@ mod tests {
         let command = client.seal_at(0, b"{}").unwrap();
         assert!(server.open(&command, 0, Purpose::Command).is_ok());
         let subscribe = client
-            .seal_at(0, br#"{"op":"subscribe","from_seq":null,"request_id":"s1"}"#)
+            .seal_at(
+                0,
+                br#"{"op":"subscribe","from_seq":null,"request_id":"s1"}"#,
+            )
             .unwrap();
         let plaintext = server.open(&subscribe, 0, Purpose::Stream).unwrap();
         let parsed = StreamControlRequest::parse(&plaintext).unwrap();

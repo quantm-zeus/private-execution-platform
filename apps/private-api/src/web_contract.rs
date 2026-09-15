@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use agent_commands::AgentCapabilities;
 use async_trait::async_trait;
 use serde_json::Value;
 use session_transport::{CommandDenial, CommandRequest, DenialCode};
@@ -50,8 +51,17 @@ pub trait WebContractBackend: Send + Sync {
         client_request_id: &str,
     ) -> Result<Value, CommandDenial>;
     /// BR-9 correlated progress read for a submitted request.
-    async fn execution_progress(&self, client_request_id: &str)
-        -> Result<Value, CommandDenial>;
+    async fn execution_progress(&self, client_request_id: &str) -> Result<Value, CommandDenial>;
+
+    /// BR-9 progress of the current/active execution when the shipped client has
+    /// no correlation id yet (the panel issues this read with no payload).
+    /// Defaults to fail closed.
+    async fn current_execution_progress(&self) -> Result<Value, CommandDenial> {
+        Err(CommandDenial::determinate(
+            DenialCode::CapabilityMissing,
+            "Web command backend is not configured.",
+        ))
+    }
 }
 
 /// Fail-closed default: every web-only operation is a determinate capability
@@ -92,10 +102,7 @@ impl WebContractBackend for FailClosedWebContract {
     ) -> Result<Value, CommandDenial> {
         Err(Self::denial())
     }
-    async fn execution_progress(
-        &self,
-        _client_request_id: &str,
-    ) -> Result<Value, CommandDenial> {
+    async fn execution_progress(&self, _client_request_id: &str) -> Result<Value, CommandDenial> {
         Err(Self::denial())
     }
 }
@@ -105,17 +112,52 @@ impl WebContractBackend for FailClosedWebContract {
 pub struct WebContractDispatcher {
     canonical: Arc<dyn CommandDispatcher>,
     web: Arc<dyn WebContractBackend>,
+    /// Trusted capabilities. Web-only mutations (which never reach the canonical
+    /// `authorize` core) are gated on the same `TRADING_ENABLED`/kill switch.
+    capabilities: AgentCapabilities,
 }
 
 impl WebContractDispatcher {
+    /// Fail-closed default: trading is disabled, so every web-only mutation is
+    /// denied by the kill switch in addition to the fail-closed backend.
     pub fn new(canonical: Arc<dyn CommandDispatcher>, web: Arc<dyn WebContractBackend>) -> Self {
-        Self { canonical, web }
+        Self::with_capabilities(
+            canonical,
+            web,
+            AgentCapabilities::new(false, std::collections::HashSet::new(), 0),
+        )
+    }
+
+    /// Compose with the caller's authoritative capabilities so the web-only
+    /// mutations honour the shared trading gate.
+    pub fn with_capabilities(
+        canonical: Arc<dyn CommandDispatcher>,
+        web: Arc<dyn WebContractBackend>,
+        capabilities: AgentCapabilities,
+    ) -> Self {
+        Self {
+            canonical,
+            web,
+            capabilities,
+        }
     }
 
     /// Production default: canonical commands work but every web-only read/write
     /// fails closed.
     pub fn with_fail_closed_web(canonical: Arc<dyn CommandDispatcher>) -> Self {
         Self::new(canonical, Arc::new(FailClosedWebContract))
+    }
+
+    /// The `TRADING_ENABLED`/kill-switch gate shared with the canonical core.
+    fn ensure_trading_enabled(&self) -> Result<(), CommandDenial> {
+        if self.capabilities.trading_enabled {
+            Ok(())
+        } else {
+            Err(CommandDenial::determinate(
+                DenialCode::CapabilityMissing,
+                "Trading is disabled by the global kill switch.",
+            ))
+        }
     }
 }
 
@@ -132,6 +174,9 @@ impl CommandDispatcher for WebContractDispatcher {
                     .ok_or_else(|| {
                         protocol("idempotency_key is required for set_wallet_limits.")
                     })?;
+                // Web-only mutations do not travel through the canonical
+                // `authorize` core, so the kill switch must be enforced here.
+                self.ensure_trading_enabled()?;
                 self.web.set_wallet_limits(&request.payload, key).await
             }
             "get_order" => {
@@ -146,10 +191,15 @@ impl CommandDispatcher for WebContractDispatcher {
                 let client_request_id = required_string(request, "client_request_id")?;
                 self.web.withdrawal_by_request_id(&client_request_id).await
             }
-            "get_execution_progress" => {
-                let client_request_id = required_string(request, "client_request_id")?;
-                self.web.execution_progress(&client_request_id).await
-            }
+            "get_execution_progress" => match request.payload.get("client_request_id") {
+                None | Some(Value::Null) => self.web.current_execution_progress().await,
+                Some(Value::String(client_request_id)) if !client_request_id.trim().is_empty() => {
+                    self.web.execution_progress(client_request_id).await
+                }
+                // A present but malformed id is a protocol error, never silently
+                // served as a different (current) read.
+                Some(_) => Err(protocol("client_request_id must be a non-empty string.")),
+            },
             "place_limit_order" => {
                 let value = self.canonical.dispatch(request).await?;
                 normalize_limit_order_result(value)
@@ -192,7 +242,9 @@ fn requested_router(request: &CommandRequest) -> Result<String, CommandDenial> {
     {
         Some("okx") => Ok("okx".to_string()),
         Some("local") => Ok("local".to_string()),
-        _ => Err(protocol("router_preference is required and must be okx or local.")),
+        _ => Err(protocol(
+            "router_preference is required and must be okx or local.",
+        )),
     }
 }
 
@@ -277,7 +329,10 @@ mod tests {
             calls: calls.clone(),
             value: Ok(value),
         });
-        (WebContractDispatcher::with_fail_closed_web(canonical), calls)
+        (
+            WebContractDispatcher::with_fail_closed_web(canonical),
+            calls,
+        )
     }
 
     #[tokio::test]
@@ -311,6 +366,137 @@ mod tests {
         assert_eq!(denial.code, "protocol");
     }
 
+    /// Records whether the web-only backend was reached.
+    #[derive(Default)]
+    struct RecordingWebBackend {
+        set_calls: Arc<AtomicUsize>,
+        current_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl WebContractBackend for RecordingWebBackend {
+        async fn wallet_limits(&self) -> Result<Value, CommandDenial> {
+            Ok(json!({}))
+        }
+        async fn set_wallet_limits(
+            &self,
+            _limits: &Value,
+            _idempotency_key: &str,
+        ) -> Result<Value, CommandDenial> {
+            self.set_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "applied": true }))
+        }
+        async fn order_by_id(&self, _order_id: &str) -> Result<Value, CommandDenial> {
+            Ok(json!({}))
+        }
+        async fn order_by_client_id(&self, _client_order_id: &str) -> Result<Value, CommandDenial> {
+            Ok(json!({}))
+        }
+        async fn withdrawal_by_request_id(
+            &self,
+            _client_request_id: &str,
+        ) -> Result<Value, CommandDenial> {
+            Ok(json!({}))
+        }
+        async fn execution_progress(
+            &self,
+            _client_request_id: &str,
+        ) -> Result<Value, CommandDenial> {
+            Ok(json!({}))
+        }
+        async fn current_execution_progress(&self) -> Result<Value, CommandDenial> {
+            self.current_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "state": "ACTIVE" }))
+        }
+    }
+
+    fn capabilities(trading_enabled: bool) -> AgentCapabilities {
+        AgentCapabilities::new(trading_enabled, std::collections::HashSet::new(), u64::MAX)
+    }
+
+    /// F1: a web-only write must honour the same kill switch as the canonical
+    /// core even though it never travels through `agent_commands::authorize`.
+    #[tokio::test]
+    async fn set_wallet_limits_is_denied_while_trading_is_disabled() {
+        let web = Arc::new(RecordingWebBackend::default());
+        let canonical = Arc::new(CanonicalDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+            value: Ok(json!({})),
+        });
+        let dispatcher =
+            WebContractDispatcher::with_capabilities(canonical, web.clone(), capabilities(false));
+        let denial = dispatcher
+            .dispatch(&request(
+                br#"{"op":"set_wallet_limits","payload":{},"request_id":"r","idempotency_key":"k"}"#,
+            ))
+            .await
+            .expect_err("kill switch");
+        assert_eq!(denial.code, "capability_missing");
+        assert!(!denial.retryable);
+        assert_eq!(web.set_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn set_wallet_limits_reaches_the_backend_when_trading_is_enabled() {
+        let web = Arc::new(RecordingWebBackend::default());
+        let canonical = Arc::new(CanonicalDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+            value: Ok(json!({})),
+        });
+        let dispatcher =
+            WebContractDispatcher::with_capabilities(canonical, web.clone(), capabilities(true));
+        let value = dispatcher
+            .dispatch(&request(
+                br#"{"op":"set_wallet_limits","payload":{},"request_id":"r","idempotency_key":"k"}"#,
+            ))
+            .await
+            .expect("enabled");
+        assert_eq!(value["applied"], true);
+        assert_eq!(web.set_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The shipped `get_execution_progress` read sends no payload; it must reach
+    /// the current-progress read rather than a protocol denial.
+    #[tokio::test]
+    async fn get_execution_progress_without_a_correlation_id_reads_the_current_one() {
+        let web = Arc::new(RecordingWebBackend::default());
+        let canonical = Arc::new(CanonicalDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+            value: Ok(json!({})),
+        });
+        let dispatcher =
+            WebContractDispatcher::with_capabilities(canonical, web.clone(), capabilities(true));
+        let value = dispatcher
+            .dispatch(&request(
+                br#"{"op":"get_execution_progress","payload":null,"request_id":"r"}"#,
+            ))
+            .await
+            .expect("current progress");
+        assert_eq!(value["state"], "ACTIVE");
+        assert_eq!(web.current_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A present-but-malformed correlation id is a protocol error, never served
+    /// silently as the current-progress read.
+    #[tokio::test]
+    async fn malformed_execution_progress_id_is_a_protocol_denial() {
+        let web = Arc::new(RecordingWebBackend::default());
+        let canonical = Arc::new(CanonicalDispatcher {
+            calls: Arc::new(AtomicUsize::new(0)),
+            value: Ok(json!({})),
+        });
+        let dispatcher =
+            WebContractDispatcher::with_capabilities(canonical, web.clone(), capabilities(true));
+        let denial = dispatcher
+            .dispatch(&request(
+                br#"{"op":"get_execution_progress","payload":{"client_request_id":123},"request_id":"r"}"#,
+            ))
+            .await
+            .expect_err("malformed id");
+        assert_eq!(denial.code, "protocol");
+        assert_eq!(web.current_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn missing_lookup_field_is_a_protocol_denial() {
         let (dispatcher, _) = harness(json!({}));
@@ -325,7 +511,8 @@ mod tests {
 
     #[tokio::test]
     async fn place_limit_projects_the_backend_order_id() {
-        let (dispatcher, _) = harness(json!({ "order": { "order_id": "ord-7", "status": "ACTIVE" } }));
+        let (dispatcher, _) =
+            harness(json!({ "order": { "order_id": "ord-7", "status": "ACTIVE" } }));
         let value = dispatcher
             .dispatch(&request(
                 br#"{"op":"place_limit_order","payload":{},"request_id":"r","idempotency_key":"k"}"#,

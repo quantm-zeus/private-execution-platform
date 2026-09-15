@@ -28,7 +28,7 @@ use rpc_contracts::relay_stream_service::RelayStreamService;
 use rpc_contracts::{validate_stream_frame, StreamFrame as WireStreamFrame};
 use serde_json::{json, Value};
 use session_transport::{
-    parse_wire_envelope, StreamControlRequest, StreamFrame, StreamOp, Purpose, SessionRegistry,
+    parse_wire_envelope, Purpose, SessionRegistry, StreamControlRequest, StreamFrame, StreamOp,
 };
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
@@ -486,7 +486,8 @@ impl RelayStreamService for EncryptedStreamService {
         // WebSocket upgrade, so the first inbound frame is read *after* the
         // response headers are returned (reading before would deadlock).
         let mut inbound = request.into_inner();
-        let (sender, receiver) = mpsc::channel::<Result<WireStreamFrame, Status>>(OUTBOUND_CAPACITY);
+        let (sender, receiver) =
+            mpsc::channel::<Result<WireStreamFrame, Status>>(OUTBOUND_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let state = self.state.clone();
         let sink_pending = pending.clone();
@@ -685,7 +686,12 @@ mod tests {
         let sessions = registry(0);
         let hub = Arc::new(StreamHub::new());
         let (generation, notify) = hub.register(KID);
-        let driver = driver_with(source, sessions, hub, Arc::new(TickClock(AtomicUsize::new(0))));
+        let driver = driver_with(
+            source,
+            sessions,
+            hub,
+            Arc::new(TickClock(AtomicUsize::new(0))),
+        );
 
         let mut sink = VecSink(Vec::new());
         driver.run(KID, None, generation, notify, &mut sink).await;
@@ -735,8 +741,7 @@ mod tests {
         let first = parse_wire_envelope(&sink.0[0]).unwrap();
         let second = parse_wire_envelope(&sink.0[1]).unwrap();
         assert!(second.sequence > first.sequence);
-        let body: Value =
-            serde_json::from_slice(&client.open(&second).unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&client.open(&second).unwrap()).unwrap();
         assert_eq!(body["payload"]["v"], 2);
     }
 
@@ -768,8 +773,7 @@ mod tests {
 
         let mut client = ClientSession::new(KID, &keys()).unwrap();
         let envelope = parse_wire_envelope(&sink.0[0]).unwrap();
-        let frame: StreamFrame =
-            serde_json::from_slice(&client.open(&envelope).unwrap()).unwrap();
+        let frame: StreamFrame = serde_json::from_slice(&client.open(&envelope).unwrap()).unwrap();
         assert_eq!(frame.op, StreamOp::Error);
         assert_eq!(frame.server_time_ms, 5_000);
         assert!(matches!(

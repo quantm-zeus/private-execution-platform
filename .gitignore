@@ -4,9 +4,9 @@
 !.env.example
 *.log
 .DS_Store
-edge-gateway
-private-api
-trading-core
+/edge-gateway
+/private-api
+/trading-core
 node_modules/
 .pnpm-store/
 web/public/.output/

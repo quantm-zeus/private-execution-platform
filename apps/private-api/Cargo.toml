@@ -15,6 +15,7 @@ agent-commands.workspace = true
 async-trait.workspace = true
 auth.workspace = true
 axum.workspace = true
+chain-types.workspace = true
 crypto-envelope.workspace = true
 getrandom = "0.2"
 mcp-server.workspace = true

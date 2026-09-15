@@ -116,7 +116,10 @@ struct ScriptedDispatcher {
 
 #[async_trait]
 impl CommandDispatcher for ScriptedDispatcher {
-    async fn dispatch(&self, _request: &CommandRequest) -> Result<serde_json::Value, CommandDenial> {
+    async fn dispatch(
+        &self,
+        _request: &CommandRequest,
+    ) -> Result<serde_json::Value, CommandDenial> {
         Ok(self.value.clone())
     }
 }

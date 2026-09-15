@@ -27,6 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub mod opaque;
 pub mod stream;
 pub mod web_contract;
+pub mod web_integration;
 
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -37,9 +38,45 @@ pub use stream::{
     EncryptedStreamService, FailClosedStreamSource, FrameSink, SourceFrame, StreamDriver,
     StreamHub, StreamSource,
 };
-pub use web_contract::{
-    FailClosedWebContract, WebContractBackend, WebContractDispatcher,
+pub use web_contract::{FailClosedWebContract, WebContractBackend, WebContractDispatcher};
+pub use web_integration::{
+    FailClosedInstrumentRegistry, Instrument, InstrumentRegistry, QuoteStore,
+    StaticInstrumentRegistry, WebIntegrationDispatcher, DEFAULT_QUOTE_TTL_MS,
 };
+
+// Re-exported so an embedding application can compose the private command
+// surface without taking a direct dependency on the canonical vocabularies.
+pub use agent_commands::{
+    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
+};
+pub use chain_types::ChainId;
+pub use mcp_server::{AgentBackend, BackendOutcome};
+
+/// Compose the full private web command surface for an injected Trading Core.
+///
+/// The canonical `agent-commands` core is wrapped by the web response contract
+/// (BR-9/BR-10/BR-12/BR-14) and then by the web intent translation + preview
+/// projection + quote binding (BR-10/BR-11). The caller injects the
+/// authoritative [`InstrumentRegistry`], the [`WebContractBackend`] (wallet
+/// limits and reconciliation) and the [`OpaqueClock`].
+///
+/// This derives no capability: `capabilities` and the backend are supplied by
+/// the caller, and `TRADING_ENABLED=false` still denies every mutation through
+/// the shared `agent-commands` authorization core.
+pub fn web_command_dispatcher(
+    backend: std::sync::Arc<dyn mcp_server::AgentBackend>,
+    capabilities: agent_commands::AgentCapabilities,
+    web: std::sync::Arc<dyn WebContractBackend>,
+    registry: std::sync::Arc<dyn InstrumentRegistry>,
+    clock: std::sync::Arc<dyn OpaqueClock>,
+) -> std::sync::Arc<dyn CommandDispatcher> {
+    let gate = capabilities.clone();
+    let canonical = std::sync::Arc::new(AgentCommandDispatcher::for_web(backend, capabilities));
+    let contract = std::sync::Arc::new(WebContractDispatcher::with_capabilities(
+        canonical, web, gate,
+    ));
+    std::sync::Arc::new(WebIntegrationDispatcher::new(contract, registry, clock))
+}
 
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";
 pub const SESSION_COOKIE_NAME: &str = "__Host-evergreen_session";
