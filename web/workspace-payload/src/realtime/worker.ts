@@ -298,6 +298,13 @@ function requestResync(reason: ResyncReason, fromSeq: number | null): void {
 
 async function start(message: Extract<MainToWorker, { type: "start" }>): Promise<void> {
   const generation = ++startGeneration;
+  // A restart for the SAME session key must not rewind the per-purpose c2s
+  // counters: the server's per-kid replay windows never reset, so replaying
+  // sequence 0 would be refused and the stream/commands would wedge. Only a
+  // genuinely new kid (a fresh BR-5 handoff) starts a new epoch at 0.
+  const previousKid = sessionKid;
+  const previousSyncSequence = syncSequence;
+  const previousStreamSequence = streamSequence;
   stop("restarting");
   stopped = false;
   attempt = 0;
@@ -337,10 +344,11 @@ async function start(message: Extract<MainToWorker, { type: "start" }>): Promise
   // A stop/restart may have arrived while the key was being imported; never
   // install the client, decryptor or flush timer after a stop or a newer start.
   if (stopped || generation !== startGeneration) return;
+  const sameEpoch = previousKid.length > 0 && previousKid === message.kid;
   sessionKid = message.kid;
   syncSealer = sealer;
-  syncSequence = 0;
-  streamSequence = 0;
+  syncSequence = sameEpoch ? previousSyncSequence : 0;
+  streamSequence = sameEpoch ? previousStreamSequence : 0;
 
   client = new RealtimeClient({
     decryptor,

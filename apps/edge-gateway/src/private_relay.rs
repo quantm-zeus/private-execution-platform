@@ -116,6 +116,13 @@ impl PrivateRelay {
     async fn client(&self) -> Result<RelayServiceClient<tonic::transport::Channel>, EdgeError> {
         Ok(RelayServiceClient::new(self.channel().await?))
     }
+
+    /// Drop the cached channel so the next call re-dials. Used when a stream
+    /// handshake fails and the channel may be poisoned.
+    async fn reset_channel(&self) {
+        let mut guard = self.channel.write().await;
+        *guard = None;
+    }
 }
 
 fn endpoint_host(origin: &str) -> Result<&str, EdgeError> {
@@ -208,13 +215,21 @@ impl crate::OpaqueStreamRelay for PrivateStreamRelay {
         let mut client = RelayStreamServiceClient::new(self.relay.channel().await?);
         let (to_backend_tx, mut to_backend_rx) = mpsc::channel::<Bytes>(STREAM_QUEUE);
         let (grpc_tx, grpc_rx) = mpsc::channel::<WireStreamFrame>(STREAM_QUEUE);
-        let response = tokio::time::timeout(
+        let response = match tokio::time::timeout(
             STREAM_OPEN_TIMEOUT,
             client.stream(tonic::Request::new(ReceiverStream::new(grpc_rx))),
         )
         .await
-        .map_err(|_| EdgeError::BackendUnavailable)?
-        .map_err(|_| EdgeError::BackendUnavailable)?;
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) | Err(_) => {
+                // A timed-out/failed handshake may leave a poisoned channel; drop
+                // it so the next upgrade re-dials instead of re-waiting the full
+                // timeout.
+                self.relay.reset_channel().await;
+                return Err(EdgeError::BackendUnavailable);
+            }
+        };
         let mut inbound = response.into_inner();
         let (from_backend_tx, from_backend_rx) = mpsc::channel::<Bytes>(STREAM_QUEUE);
         // Browser -> backend: never buffer a cleared channel indefinitely.

@@ -225,4 +225,43 @@ describe("realtime worker", () => {
       (globalThis as { fetch?: unknown }).fetch = originalFetch;
     }
   });
+
+  it("preserves the stream subscribe sequence across a same-kid restart (BR-2)", async () => {
+    const c2sB64 = keyB64();
+    const originalFetch = (globalThis as { fetch?: unknown }).fetch;
+    (globalThis as { fetch?: unknown }).fetch = async () =>
+      ({ ok: true, status: 200 }) as Response;
+    try {
+      await startWorker(c2sB64);
+      latestSocket().onopen?.();
+      await vi.waitFor(() => expect(latestSocket().sent.length).toBeGreaterThan(0));
+      const first = JSON.parse(
+        new TextDecoder().decode(latestSocket().sent[0] as Uint8Array),
+      ) as { sequence: number };
+      expect(first.sequence).toBe(0);
+
+      // Restart for the SAME kid: the server's per-kid replay window never
+      // resets, so the counter must continue, not replay 0.
+      context.onmessage?.({
+        data: {
+          type: "start",
+          url: "ws://localhost/v1/stream",
+          baseUrl: "http://localhost",
+          kid: "kid-test",
+          keyB64: keyB64(),
+          c2sKeyB64: c2sB64,
+        },
+      });
+      await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(1));
+      const restarted = latestSocket();
+      restarted.onopen?.();
+      await vi.waitFor(() => expect(restarted.sent.length).toBeGreaterThan(0));
+      const second = JSON.parse(
+        new TextDecoder().decode(restarted.sent[0] as Uint8Array),
+      ) as { sequence: number };
+      expect(second.sequence).toBe(1);
+    } finally {
+      (globalThis as { fetch?: unknown }).fetch = originalFetch;
+    }
+  });
 });

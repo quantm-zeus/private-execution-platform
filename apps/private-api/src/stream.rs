@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -31,13 +32,17 @@ use session_transport::{
 };
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::opaque::{OpaqueClock, OpaqueServiceState};
 
-/// Outbound frame buffer per stream connection. A full buffer stops the driver
-/// (leaving the client to resync) instead of unbounded memory growth.
-const OUTBOUND_CAPACITY: usize = 256;
+/// Outbound frame-count cap per stream connection (a secondary bound; the byte
+/// budget below is the primary one).
+const OUTBOUND_CAPACITY: usize = 64;
+/// Maximum sealed bytes buffered for one connection before the driver stops and
+/// lets the client resync. Bounds memory even if a subscriber stops reading.
+const OUTBOUND_BYTES_BUDGET: usize = 4 * 1024 * 1024;
 /// Frames the fail-closed source emits before ending the stream.
 const FAIL_CLOSED_FRAMES: usize = 1;
 
@@ -183,23 +188,47 @@ pub trait FrameSink: Send {
     async fn send(&mut self, bytes: Vec<u8>) -> bool;
 }
 
-/// Sink that forwards frames into the gRPC outbound channel.
-struct ChannelSink(mpsc::Sender<Result<WireStreamFrame, Status>>);
+/// Sink that forwards frames into the gRPC outbound channel under a byte budget.
+struct ChannelSink {
+    sender: mpsc::Sender<Result<WireStreamFrame, Status>>,
+    /// Sealed bytes currently buffered for this connection (released by the
+    /// outbound stream as frames are consumed).
+    pending: Arc<AtomicUsize>,
+}
 
 impl ChannelSink {
+    fn new(
+        sender: mpsc::Sender<Result<WireStreamFrame, Status>>,
+        pending: Arc<AtomicUsize>,
+    ) -> Self {
+        Self { sender, pending }
+    }
+
     /// Terminate the outbound stream with an opaque status.
     async fn fail(&mut self, status: Status) -> bool {
-        self.0.send(Err(status)).await.is_ok()
+        self.sender.send(Err(status)).await.is_ok()
     }
 }
 
 #[async_trait]
 impl FrameSink for ChannelSink {
     async fn send(&mut self, bytes: Vec<u8>) -> bool {
-        self.0
-            .send(Ok(WireStreamFrame { ciphertext: bytes }))
-            .await
-            .is_ok()
+        // Byte-budgeted backpressure: stop the driver rather than queue without
+        // bound when the peer stops reading. A single oversized frame (bounded
+        // upstream by the frame validation) also stops.
+        let len = bytes.len();
+        if len > OUTBOUND_BYTES_BUDGET
+            || self.pending.load(Ordering::Acquire).saturating_add(len) > OUTBOUND_BYTES_BUDGET
+        {
+            return false;
+        }
+        self.pending.fetch_add(len, Ordering::AcqRel);
+        let frame = WireStreamFrame { ciphertext: bytes };
+        if self.sender.send(Ok(frame)).await.is_err() {
+            self.pending.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 }
 
@@ -253,7 +282,11 @@ impl StreamHub {
         let mut map = self.lock();
         if let Some(slot) = map.get_mut(&kid) {
             slot.resync = Some(from_seq.unwrap_or(0));
-            slot.notify.notify_waiters();
+            // `notify_one` (not `notify_waiters`) stores a permit when no waiter
+            // is registered, so a resync that lands in the window between the
+            // driver's `take_resync` check and its `notified()` await is not
+            // lost (which would wedge recovery on an idle source).
+            slot.notify.notify_one();
         }
     }
 
@@ -265,6 +298,35 @@ impl StreamHub {
             return None;
         }
         slot.resync.take()
+    }
+
+    /// True while `generation` is the live connection for `kid`. A superseded
+    /// connection must stop emitting: it would otherwise advance the shared
+    /// monotonic stream sequence with frames the client never sees, forcing a
+    /// spurious gap/resync.
+    fn is_current(&self, kid: Kid, generation: u64) -> bool {
+        let map = self.lock();
+        map.get(&kid)
+            .is_some_and(|slot| slot.generation == generation)
+    }
+
+    /// Drop the slot when its connection ends. Only the current generation may
+    /// release, so a superseded connection cannot evict a newer one. This keeps
+    /// the map bounded by live connections rather than by historical unlocks.
+    fn release(&self, kid: Kid, generation: u64) {
+        let mut map = self.lock();
+        if map
+            .get(&kid)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            map.remove(&kid);
+        }
+    }
+
+    /// Test/diagnostic accessor: number of live stream slots.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
@@ -314,12 +376,12 @@ impl StreamDriver {
         notify: Arc<Notify>,
         sink: &mut dyn FrameSink,
     ) {
-        if !self.emit_snapshot(kid, from_seq, sink).await {
+        if !self.emit_snapshot(kid, from_seq, generation, sink).await {
             return;
         }
         loop {
             if let Some(from) = self.hub.take_resync(kid, generation) {
-                if !self.emit_snapshot(kid, Some(from), sink).await {
+                if !self.emit_snapshot(kid, Some(from), generation, sink).await {
                     return;
                 }
                 continue;
@@ -328,7 +390,7 @@ impl StreamDriver {
                 _ = notify.notified() => continue,
                 delta = self.source.next_delta() => match delta {
                     Some(frame) => {
-                        if !self.emit(kid, frame, sink).await {
+                        if !self.emit(kid, frame, generation, sink).await {
                             return;
                         }
                     }
@@ -338,9 +400,15 @@ impl StreamDriver {
         }
     }
 
-    async fn emit_snapshot(&self, kid: Kid, from_seq: Option<u64>, sink: &mut dyn FrameSink) -> bool {
+    async fn emit_snapshot(
+        &self,
+        kid: Kid,
+        from_seq: Option<u64>,
+        generation: u64,
+        sink: &mut dyn FrameSink,
+    ) -> bool {
         match self.source.snapshot(from_seq).await {
-            Some(frame) => self.emit(kid, frame, sink).await,
+            Some(frame) => self.emit(kid, frame, generation, sink).await,
             None => {
                 // Fail closed: surface the unavailability to the client as an
                 // authenticated frame, then end the stream; never fabricate state.
@@ -351,7 +419,7 @@ impl StreamDriver {
                     .into_iter()
                     .take(FAIL_CLOSED_FRAMES)
                 {
-                    if !self.emit(kid, frame, sink).await {
+                    if !self.emit(kid, frame, generation, sink).await {
                         return false;
                     }
                 }
@@ -360,7 +428,17 @@ impl StreamDriver {
         }
     }
 
-    async fn emit(&self, kid: Kid, frame: SourceFrame, sink: &mut dyn FrameSink) -> bool {
+    async fn emit(
+        &self,
+        kid: Kid,
+        frame: SourceFrame,
+        generation: u64,
+        sink: &mut dyn FrameSink,
+    ) -> bool {
+        // A superseded connection must not advance the shared stream sequence.
+        if !self.hub.is_current(kid, generation) {
+            return false;
+        }
         let Some(now) = self.clock.now_ms() else {
             return false;
         };
@@ -409,14 +487,23 @@ impl RelayStreamService for EncryptedStreamService {
         // response headers are returned (reading before would deadlock).
         let mut inbound = request.into_inner();
         let (sender, receiver) = mpsc::channel::<Result<WireStreamFrame, Status>>(OUTBOUND_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
         let state = self.state.clone();
+        let sink_pending = pending.clone();
         tokio::spawn(async move {
-            let mut sink = ChannelSink(sender);
+            let mut sink = ChannelSink::new(sender, sink_pending);
             if let Err(status) = run_subscription(&state, &mut inbound, &mut sink).await {
                 let _ = sink.fail(status).await;
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        // Release the byte budget as the transport drains frames.
+        let outbound = ReceiverStream::new(receiver).map(move |item| {
+            if let Ok(frame) = &item {
+                pending.fetch_sub(frame.ciphertext.len(), Ordering::AcqRel);
+            }
+            item
+        });
+        Ok(Response::new(Box::pin(outbound)))
     }
 }
 
@@ -464,6 +551,9 @@ async fn run_subscription(
     driver
         .run(kid, subscribe.from_seq, generation, notify, sink)
         .await;
+    // The connection ended: release the hub slot so repeated reconnects cannot
+    // grow the map for the process lifetime. `release` is generation-guarded.
+    state.stream_hub().release(kid, generation);
     Ok(())
 }
 
@@ -798,5 +888,99 @@ mod tests {
             serde_json::from_slice(&session_client.open(&envelope).unwrap()).unwrap();
         assert_eq!(inner.op, StreamOp::Snapshot);
         assert_eq!(inner.payload.unwrap()["pools"], json!([]));
+    }
+
+    /// Source whose delta stream never resolves, so the driver blocks in
+    /// `select!` and only the resync notification can wake it.
+    struct IdleSource {
+        snapshots: Mutex<Vec<SourceFrame>>,
+    }
+
+    #[async_trait]
+    impl StreamSource for IdleSource {
+        async fn snapshot(&self, _from_seq: Option<u64>) -> Option<SourceFrame> {
+            let mut snapshots = self.snapshots.lock().unwrap();
+            if snapshots.is_empty() {
+                None
+            } else {
+                Some(snapshots.remove(0))
+            }
+        }
+
+        async fn next_delta(&self) -> Option<SourceFrame> {
+            std::future::pending::<()>().await;
+            None
+        }
+    }
+
+    struct ArcSink(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    #[async_trait]
+    impl FrameSink for ArcSink {
+        async fn send(&mut self, bytes: Vec<u8>) -> bool {
+            self.0.lock().unwrap().push(bytes);
+            true
+        }
+    }
+
+    /// Regression: a `/v1/sync` arriving while the driver is between its
+    /// `take_resync` check and `notified()` must not be lost.
+    #[tokio::test]
+    async fn resync_wakes_an_idle_driver() {
+        let source = Arc::new(IdleSource {
+            snapshots: Mutex::new(vec![
+                SourceFrame::snapshot("market", json!({ "v": 1 }), None),
+                SourceFrame::snapshot("market", json!({ "v": 2 }), None),
+            ]),
+        });
+        let sessions = registry(0);
+        let hub = Arc::new(StreamHub::new());
+        let (generation, notify) = hub.register(KID);
+        let driver = StreamDriver::new(
+            sessions,
+            hub.clone(),
+            Arc::new(TickClock(AtomicUsize::new(0))),
+            source,
+        );
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let frames_clone = frames.clone();
+        let handle = tokio::spawn(async move {
+            let mut sink = ArcSink(frames_clone);
+            driver.run(KID, None, generation, notify, &mut sink).await;
+        });
+
+        for _ in 0..200 {
+            if frames.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(frames.lock().unwrap().len(), 1, "initial snapshot");
+        hub.request_resync(KID, Some(0));
+        for _ in 0..200 {
+            if frames.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            2,
+            "resync must wake an idle driver"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn hub_release_removes_the_slot_and_is_generation_guarded() {
+        let hub = StreamHub::new();
+        let (first, _notify) = hub.register(KID);
+        assert_eq!(hub.len(), 1);
+        let (second, _notify) = hub.register(KID);
+        // A superseded connection cannot evict the newer slot.
+        hub.release(KID, first);
+        assert_eq!(hub.len(), 1);
+        hub.release(KID, second);
+        assert_eq!(hub.len(), 0);
     }
 }

@@ -44,8 +44,18 @@ the browser transport session:
 5. The payload imports the raw keys as **non-extractable** `CryptoKey`s
    (AES-GCM encrypt/decrypt) and zeroizes the base64/byte copies.
 
-No key is persisted. `ServerSession`/`SessionRegistry` zeroize on drop and their
-`Debug` output is redacted.
+No key is persisted. The payload keeps the browser-side byte copies in
+zeroizable buffers and drops them after import. On the Rust side
+`WireEnvelope`/`AeadKey`/`ServerSession`/`ClientSession` redact their `Debug`
+output; the key itself lives in a ring `LessSafeKey` (ring does not expose a
+zeroization hook), so "zeroize on drop" is a best-effort property of the
+surrounding buffers, not a guarantee of this crate.
+
+**Effective wire size cap:** the browser accepts up to 1 MiB of ciphertext, but
+the internal relay contract (`rpc_contracts::MAX_PAYLOAD_BYTES`) bounds the whole
+envelope JSON at 1 MiB, so the largest practical ciphertext is ~768 KiB. An
+over-limit envelope is rejected `out_of_range`/413 before dispatch; a write stays
+indeterminate (idempotency key kept), never a false success.
 
 ## Request/response plaintexts
 
