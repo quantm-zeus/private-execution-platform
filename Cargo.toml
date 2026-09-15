@@ -37,6 +37,7 @@ members = [
     "crates/privacy",
     "crates/okx-client",
     "crates/provider-verification",
+    "crates/provider-benchmark",
 ]
 
 [workspace.package]
@@ -80,6 +81,7 @@ adaptive-exec = { path = "crates/adaptive-exec" }
 privacy = { path = "crates/privacy" }
 okx-client = { path = "crates/okx-client" }
 provider-verification = { path = "crates/provider-verification" }
+provider-benchmark = { path = "crates/provider-benchmark" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

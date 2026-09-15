@@ -178,6 +178,7 @@ pub fn plan_market_preview(
         scoring: &snapshot.scoring,
         gas,
         gas_price_in_output: snapshot.gas_price_in_output,
+        depth_targets: &[],
     };
     let decision = plan_single_path(&request).map_err(classify)?;
     let Some(best) = decision.candidates.first() else {

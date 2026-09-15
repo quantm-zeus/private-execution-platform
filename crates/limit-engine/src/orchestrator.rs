@@ -68,6 +68,7 @@ use market_types::AtomicAmount;
 use policy::PolicyEngine;
 use storage::{EventBus, OpaqueStore};
 
+use crate::analytics::{fill_analytics, ExecutionAnalyticsSink};
 use crate::attempt::{
     ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, RealizedFill,
 };
@@ -336,6 +337,7 @@ pub struct Orchestrator<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> {
     policy: PolicyEngine,
     limits: AttemptLimits,
     bus: Option<Arc<dyn EventBus>>,
+    analytics: Option<Arc<dyn ExecutionAnalyticsSink>>,
 }
 
 impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E> {
@@ -359,6 +361,32 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
             policy,
             limits,
             bus: None,
+            analytics: None,
+        }
+    }
+
+    /// Attaches (or clears) the observational analytics sink used by
+    /// `tick`/`recover`.
+    ///
+    /// The sink is best-effort and never affects the applied resolution: a
+    /// record is emitted at most once per compliant fill, and a missing sink or
+    /// an undefined comparison (for example a zero expected output) is a silent
+    /// no-op.
+    pub fn with_analytics_sink(mut self, sink: Option<Arc<dyn ExecutionAnalyticsSink>>) -> Self {
+        self.analytics = sink;
+        self
+    }
+
+    /// Best-effort emission of one derived analytics record for a compliant fill.
+    ///
+    /// No-op when no sink is attached or the comparison is undefined. Never
+    /// fails, logs, or alters the applied resolution.
+    fn emit_analytics(&self, bound: &BoundAttempt, fill: &RealizedFill) {
+        let Some(sink) = &self.analytics else {
+            return;
+        };
+        if let Some(analytics) = fill_analytics(bound, fill) {
+            sink.record(&analytics);
         }
     }
 
@@ -630,6 +658,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
         let applied = self
             .apply_resolution(
                 &order,
+                &bound,
                 prepared.intent.amount,
                 prepared.min_out.amount.get(),
                 attempt_seq,
@@ -781,6 +810,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 let applied = self
                     .apply_resolution(
                         order,
+                        &bound,
                         bound.intent.amount,
                         min_out,
                         latest.attempt_seq,
@@ -841,6 +871,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 let applied = self
                     .apply_resolution(
                         order,
+                        &bound,
                         bound.intent.amount,
                         min_out,
                         latest.attempt_seq,
@@ -856,6 +887,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 let applied = self
                     .apply_resolution(
                         order,
+                        &bound,
                         bound.intent.amount,
                         bound.intent.amount.get(),
                         latest.attempt_seq,
@@ -871,6 +903,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                 let applied = self
                     .apply_resolution(
                         order,
+                        &bound,
                         bound.intent.amount,
                         bound.intent.amount.get(),
                         latest.attempt_seq,
@@ -922,6 +955,7 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
     async fn apply_resolution(
         &self,
         order: &StoredLimitOrder,
+        bound: &BoundAttempt,
         expected_input: AtomicAmount,
         min_out: u128,
         attempt_seq: u64,
@@ -936,8 +970,16 @@ impl<S: OpaqueStore, Q: QuoteProvider, E: AttemptExecutor> Orchestrator<S, Q, E>
                     self.append_confirmed(&order.order.id, attempt_seq, attempt_key, &fill, at_ms)
                         .await?;
                 }
-                self.resolve_fill(order, expected_input, min_out, &fill, at_ms)
-                    .await
+                let applied = self
+                    .resolve_fill(order, expected_input, min_out, &fill, at_ms)
+                    .await?;
+                // Observational only: a compliant fill (never a `Violation`)
+                // emits at most one derived, redacted record. The emit is
+                // best-effort and cannot alter the applied resolution.
+                if matches!(applied, AppliedResolution::Filled { .. }) {
+                    self.emit_analytics(bound, &fill);
+                }
+                Ok(applied)
             }
             AttemptResolution::Unknown => {
                 if prior_phase != Some(AttemptPhase::Unknown) {

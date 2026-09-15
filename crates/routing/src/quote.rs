@@ -23,6 +23,7 @@ use simulation::{
 };
 use tax_engine::{assessed_asset_for_intent, TaxAssessment, TaxSafetyError};
 
+use crate::depth;
 use crate::error::RoutingError;
 use crate::graph::{CandidatePath, PoolDescriptor};
 use crate::impact::{combine_impacts, cpmm_impact_bps};
@@ -247,7 +248,13 @@ pub(crate) fn quote_path(
             .ok_or(RoutingError::Internal(
                 "candidate descriptor index out of range",
             ))?;
-        let hop = simulate_hop(descriptor, &leg.token_in, &leg.token_out, current)?;
+        let hop = simulate_hop(
+            descriptor,
+            &leg.token_in,
+            &leg.token_out,
+            current,
+            !req.depth_targets.is_empty(),
+        )?;
         if hop.amount_out.is_zero() {
             return Err(RoutingError::ZeroHopOutput);
         }
@@ -380,6 +387,7 @@ fn simulate_hop(
     token_in: &AssetId,
     token_out: &AssetId,
     amount_in: AtomicAmount,
+    depth_enabled: bool,
 ) -> Result<SimulatedHop, RoutingError> {
     match &descriptor.envelope.state {
         PoolKindState::Cpmm(pool) => {
@@ -407,11 +415,19 @@ fn simulate_hop(
             };
             let quote = simulate_clmm_exact_input(pool, &request)
                 .map_err(|_| RoutingError::HopSimulationFailed(PoolKindClass::Clmm))?;
+            let impact_bps = if depth_enabled {
+                // Depth enabled: model the impact exactly from the kernel result.
+                // An unrepresentable move (> `Bps::MAX`) stays `None` so the cap
+                // fails closed instead of trusting the caller override.
+                depth::clmm_impact_bps(pool.sqrt_price_x64, quote.resulting_sqrt_price_x64)
+            } else {
+                descriptor.impact_override_bps
+            };
             Ok(SimulatedHop {
                 amount_out: quote.output.amount,
                 fee: nonzero(quote.fee.clone()),
                 kind: PoolKindClass::Clmm,
-                impact_bps: descriptor.impact_override_bps,
+                impact_bps,
             })
         }
         PoolKindState::Bin(pool) => {
@@ -419,11 +435,25 @@ fn simulate_hop(
                 BinExactInputRequest::new_directed(token_in.clone(), amount_in, token_out.clone());
             let quote = simulate_bin_exact_input(pool, &request)
                 .map_err(|_| RoutingError::HopSimulationFailed(PoolKindClass::Bin))?;
+            let impact_bps = if depth_enabled {
+                // Depth enabled: model the impact exactly from the kernel result.
+                // An unrepresentable move (> `Bps::MAX`) stays `None` so the cap
+                // fails closed instead of trusting the caller override.
+                depth::bin_impact_bps(
+                    pool.bin_step,
+                    pool.decimals_0,
+                    pool.decimals_1,
+                    pool.active_bin_id,
+                    quote.resulting_active_bin_id,
+                )
+            } else {
+                descriptor.impact_override_bps
+            };
             Ok(SimulatedHop {
                 amount_out: quote.output.amount,
                 fee: nonzero(quote.fee.clone()),
                 kind: PoolKindClass::Bin,
-                impact_bps: descriptor.impact_override_bps,
+                impact_bps,
             })
         }
     }
