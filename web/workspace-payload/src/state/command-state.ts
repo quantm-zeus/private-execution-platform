@@ -11,13 +11,20 @@ import {
 } from "../core/types";
 import type { CommandClient } from "../transport/command";
 
-export interface CommandResourceOptions {
+export interface CommandResourceOptions<T = unknown> {
   /** Capability this command depends on, used for the `unavailable` state. */
   readonly capability?: CapabilityKey;
   /** Freshness TTL applied to a successful result. */
   readonly ttlMs?: number;
   /** Local clock, injectable for tests. */
   readonly clock?: () => number;
+  /**
+   * Validate/parse an untrusted success result. The private API is
+   * authoritative for the wire shape, so a document the client cannot consume
+   * must be rejected here: a thrown error becomes the resource's `error` state
+   * (never a `ready` value that later throws inside a renderer).
+   */
+  readonly validate?: (value: unknown) => T;
 }
 
 export interface CommandResource<T> {
@@ -39,7 +46,7 @@ export interface CommandRunOptions {
 export function createCommandResource<T>(
   command: CommandClient,
   op: string,
-  options: CommandResourceOptions = {},
+  options: CommandResourceOptions<T> = {},
 ): CommandResource<T> {
   const clock = options.clock ?? (() => Date.now());
   const [state, setState] = createSignal<DataState<T>>(idleState());
@@ -58,13 +65,16 @@ export function createCommandResource<T>(
     })();
     setState(loadingState(clock(), prior));
     try {
-      const result = await command.send<T>(op, payload, {
+      const result = await command.send<unknown>(op, payload, {
         signal: controller.signal,
         idempotencyKey: runOptions?.idempotencyKey,
       });
       if (token !== generation) return;
+      // A validator throw is caught below and surfaced as an error state, so a
+      // malformed success can never be marked `ready`.
+      const value = options.validate ? options.validate(result) : (result as T);
       setState(
-        readyState(result, {
+        readyState(value, {
           receivedAtMs: clock(),
           slot: null,
           sourceAgeMs: 0,

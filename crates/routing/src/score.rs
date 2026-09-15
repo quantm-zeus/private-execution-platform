@@ -9,10 +9,11 @@ use std::cmp::Ordering;
 
 use chain_types::{AssetId, ChainId};
 use domain::{RouteScore, TradeIntent};
-use market_types::{AssetAmount, Bps, PriceRatio};
+use market_types::{AssetAmount, AtomicAmount, Bps, PriceRatio};
 use serde::{Deserialize, Serialize};
 use simulation::{div_u256_by_u128_floor, mul_u128_wide};
 
+use crate::depth::DepthRank;
 use crate::error::RoutingError;
 use crate::quote::RouteQuote;
 use crate::{RouteRequest, ScoredRoute};
@@ -243,13 +244,23 @@ fn canonical_key(route: &ScoredRoute) -> Vec<(String, String, String, String)> {
 ///
 /// Keys, in order: gas-adjusted net output descending (or net output when no gas
 /// view), simulated net output descending, gas cost ascending when both costs
-/// share an asset, failure probability ascending, hop count ascending, canonical
+/// share an asset, exact CLMM/Bin depth descending when **both** candidates carry
+/// a depth key, failure probability ascending, hop count ascending, canonical
 /// leg key ascending.
+///
+/// Depth is strictly a tie-break below net output **and** below gas cost (gas is
+/// part of the exact route economics, invariant #4). It is a no-op when depth is
+/// disabled (`None` on both sides); when only one candidate has a computed depth
+/// profile the known-depth candidate is preferred, which keeps the comparator a
+/// valid total order. An empty target list therefore reproduces the pre-depth
+/// ordering exactly.
 pub(crate) fn compare_scored(
     left: &ScoredRoute,
     left_net_after_gas: Option<u128>,
+    left_depth: Option<&DepthRank>,
     right: &ScoredRoute,
     right_net_after_gas: Option<u128>,
+    right_depth: Option<&DepthRank>,
 ) -> Ordering {
     let left_primary = primary_net(left_net_after_gas, &left.quote);
     let right_primary = primary_net(right_net_after_gas, &right.quote);
@@ -265,6 +276,7 @@ pub(crate) fn compare_scored(
                 .cmp(&left.score.simulated_net_output.amount.get())
         })
         .then_with(|| gas_ascending(&left.score.gas_cost, &right.score.gas_cost))
+        .then_with(|| depth_ascending(left_depth, right_depth))
         .then_with(|| {
             left.score
                 .failure_probability
@@ -273,4 +285,46 @@ pub(crate) fn compare_scored(
         })
         .then_with(|| left.quote.plan.legs.len().cmp(&right.quote.plan.legs.len()))
         .then_with(|| canonical_key(left).cmp(&canonical_key(right)))
+}
+
+/// Orders depth keys as a lower-priority tie-break: compare absorbed capacity
+/// from the widest band down, then lower exact impact.
+///
+/// A candidate with a computed profile sorts ahead of one without. Treating the
+/// missing profile as the weakest value (rather than "neutral") keeps this key a
+/// total preorder, so the composed comparator stays a valid total order; with
+/// depth disabled every candidate is `None`, which is `Equal`.
+fn depth_ascending(left: Option<&DepthRank>, right: Option<&DepthRank>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            for (left_level, right_level) in left.levels.iter().zip(right.levels.iter()) {
+                let ordering = compare_absorbed(left_level.absorbed_in, right_level.absorbed_in);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            depth_impact_key(left.impact_bps).cmp(&depth_impact_key(right.impact_bps))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Orders absorbed amounts so that a deeper pool sorts [`Ordering::Less`].
+fn compare_absorbed(left: Option<AtomicAmount>, right: Option<AtomicAmount>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.get().cmp(&left.get()),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// Maps an optional impact to a comparable key where `None` is the weakest.
+fn depth_impact_key(impact: Option<Bps>) -> (u8, u16) {
+    match impact {
+        Some(bps) => (0, bps.get()),
+        None => (1, 0),
+    }
 }

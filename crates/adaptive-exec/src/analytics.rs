@@ -131,6 +131,24 @@ impl fmt::Debug for ExecutionAnalytics {
     }
 }
 
+/// Observational sink for a derived, redacted execution-analytics record.
+///
+/// Implementations must be cheap, non-blocking, and must never panic: the sink
+/// is called on the execution path after a compliant fill has been applied, and
+/// nothing it does may fail or alter that result.
+pub trait ExecutionAnalyticsSink: Send + Sync {
+    /// Records one derived analytics record.
+    fn record(&self, analytics: &ExecutionAnalytics);
+}
+
+/// A sink that drops every record.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopExecutionAnalyticsSink;
+
+impl ExecutionAnalyticsSink for NoopExecutionAnalyticsSink {
+    fn record(&self, _analytics: &ExecutionAnalytics) {}
+}
+
 /// A redacted analytics failure.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AnalyticsError {

@@ -23,6 +23,25 @@ describe("isIndeterminateOutcome", () => {
   it("treats explicit backend rejections as determinate (retry is a new write)", () => {
     for (const code of ["auth", "capability_missing", "freshness"] as const) {
       expect(isIndeterminateOutcome(code)).toBe(false);
+      // An explicit non-retryable rejection is determinate too.
+      expect(isIndeterminateOutcome(code, false)).toBe(false);
+    }
+  });
+
+  it("honours an explicit retryable flag on any code (no duplicate write)", () => {
+    // A transient backend failure can be surfaced under a capability code while
+    // the write may still have committed, so `retryable:true` must keep the key.
+    for (const code of ["auth", "capability_missing", "freshness", "protocol", "server"] as const) {
+      expect(isIndeterminateOutcome(code, true)).toBe(true);
+    }
+  });
+
+  it("keeps transport/protocol codes indeterminate even when explicitly marked non-retryable", () => {
+    // The inverse asymmetry is deliberate and safe: for a code that can never
+    // prove the write did not commit, the key is kept regardless of an explicit
+    // `retryable:false`, because rotating it risks a duplicate order.
+    for (const code of ["network", "protocol", "unknown", "cancelled"] as const) {
+      expect(isIndeterminateOutcome(code, false)).toBe(true);
     }
   });
 });

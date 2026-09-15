@@ -579,8 +579,12 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             now_ms,
             router_source: router,
         };
+        // BR-10: the stable execution reference is the intent id. Capture it
+        // before the port consumes the request so the authenticated result can
+        // bind the client to the attempt it submitted.
+        let execution_id = request.intent.id.as_str().to_string();
         match self.execution.execute(request).await {
-            Ok(outcome) => execution_outcome(outcome),
+            Ok(outcome) => execution_outcome(outcome, router, Some(&execution_id)),
             Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
             Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
         }
@@ -662,7 +666,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             )
             .await
         {
-            Ok(outcome) => execution_outcome(outcome),
+            Ok(outcome) => execution_outcome(outcome, router, None),
             Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
             Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
         }
@@ -1136,6 +1140,7 @@ fn channel_source(channel: AgentChannel) -> TradeSource {
     match channel {
         AgentChannel::Mcp => TradeSource::Mcp,
         AgentChannel::Telegram => TradeSource::Telegram,
+        AgentChannel::Web => TradeSource::Web,
     }
 }
 
@@ -1153,24 +1158,33 @@ fn outcome_for(result: Result<StoredLimitOrder, BackendError>) -> BackendOutcome
 /// amounts are included only when the chain observed them. A definitively
 /// failed execution is surfaced as [`BackendOutcome::Failed`] so the MCP layer
 /// renders it as an error rather than a successful `"failed"` value.
-fn execution_outcome(outcome: MarketExecutionOutcome) -> BackendOutcome {
-    match outcome {
-        MarketExecutionOutcome::Submitted => {
-            BackendOutcome::Value(json!({ "execution": { "state": "submitted" } }))
-        }
+///
+/// BR-10: `router_source` is the routing discriminant the execution was bound
+/// to (the same value carried on [`MarketExecutionRequest`]), and
+/// `execution_id` is the stable intent reference when known. The private web
+/// command surface requires both to attribute a submission honestly; a caller
+/// that cannot supply them must not claim a source it cannot substantiate.
+fn execution_outcome(
+    outcome: MarketExecutionOutcome,
+    router_source: RouterSource,
+    execution_id: Option<&str>,
+) -> BackendOutcome {
+    let execution = match outcome {
+        MarketExecutionOutcome::Submitted => json!({ "state": "submitted" }),
         MarketExecutionOutcome::Filled {
             net_input,
             net_output,
-        } => BackendOutcome::Value(json!({
-            "execution": {
-                "state": "filled",
-                "net_input": net_input,
-                "net_output": net_output,
-            }
-        })),
-        MarketExecutionOutcome::Unknown => {
-            BackendOutcome::Value(json!({ "execution": { "state": "unknown" } }))
-        }
-        MarketExecutionOutcome::Failed => BackendOutcome::Failed,
+        } => json!({
+            "state": "filled",
+            "net_input": net_input,
+            "net_output": net_output,
+        }),
+        MarketExecutionOutcome::Unknown => json!({ "state": "unknown" }),
+        MarketExecutionOutcome::Failed => return BackendOutcome::Failed,
+    };
+    let mut value = json!({ "execution": execution, "router_source": router_source });
+    if let Some(execution_id) = execution_id {
+        value["execution_id"] = json!(execution_id);
     }
+    BackendOutcome::Value(value)
 }

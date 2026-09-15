@@ -4,13 +4,15 @@
 // batching and normalization. The main thread never touches the socket or the
 // session key. Keys live only in this worker's memory and are dropped on stop.
 
-import { base64ToBytes } from "../core/base64";
+import { base64ToBytes, utf8Encode } from "../core/base64";
 import { toWorkspaceErrorShape } from "../core/errors";
+import { randomRequestId } from "../core/request-id";
 import { assertNeutralUrl, assertNeutralStreamUrl } from "../transport/paths";
 import { FrameBatcher, DEFAULT_FLUSH_MS } from "./batcher";
 import { RealtimeClient } from "./client";
 import { WebCryptoDecryptor, UnavailableDecryptor, type SessionDecryptor } from "./decryptor";
 import { backoffDelay } from "./reconnect";
+import { WebCryptoSealer, type SessionSealer } from "./sealer";
 import type { MainToWorker, WorkerToMain } from "./worker-protocol";
 import type { ResyncReason } from "./types";
 
@@ -33,6 +35,16 @@ let attempt = 0;
 let streamUrl = "";
 let baseUrl = "";
 let syncUrl = "";
+let sessionKid = "";
+let syncSealer: SessionSealer | null = null;
+// The sync channel owns its own 0-based sequence window (the server tracks a
+// per-purpose replay window, so it must not share the command counter).
+let syncSequence = 0;
+// The realtime subscribe channel owns a third, independent 0-based window
+// (`Purpose::Stream` server-side). It persists across reconnects for the
+// lifetime of the session key: the server rejects a reused sequence as a
+// replay, so only start()/stop() (a new key epoch) may reset it.
+let streamSequence = 0;
 let hasSessionKey = false;
 let startGeneration = 0;
 
@@ -71,6 +83,12 @@ function stop(reason: string): void {
   clearTimers();
   teardownSocket();
   hasSessionKey = false;
+  // Drop the seal key and reset the per-purpose counter so a restart never
+  // reuses a sequence under a dropped key.
+  syncSealer = null;
+  syncSequence = 0;
+  streamSequence = 0;
+  sessionKid = "";
   if (client) {
     client.stop();
     // Do NOT flush buffered frames on stop/lock: private frames must not reach
@@ -105,6 +123,57 @@ function scheduleReconnect(): void {
   retryTimer = setTimeout(openSocket, delay);
 }
 
+/**
+ * BR-2: the browser WebSocket itself carries no browser -> server frame, so the
+ * private backend cannot know which BR-5 session key to encrypt for. On every
+ * (re)connect the worker sends one opaque, AEAD-sealed `subscribe` frame whose
+ * cleartext envelope `kid` identifies the session and whose encrypted body
+ * carries the client's applied-sequence high-water mark. The edge relays the
+ * binary ciphertext unchanged.
+ *
+ * Skipped without a c2s key (the "stream key only" mode); the server then never
+ * receives a subscription and the stream stays fail-closed.
+ */
+async function sendStreamSubscribe(): Promise<void> {
+  const sealer = syncSealer;
+  const socketRef = socket;
+  // Capture the key id once: `stop()`/`start()` may run while the seal is
+  // pending, and the cleartext envelope must identify the same kid the tag was
+  // bound to.
+  const kid = sessionKid;
+  if (sealer === null || socketRef === null || kid.length === 0) return;
+  const sequence = streamSequence++;
+  const plaintext = utf8Encode(
+    JSON.stringify({
+      op: "subscribe",
+      from_seq: client?.expectedSeq ?? null,
+      request_id: randomRequestId(),
+    }),
+  );
+  let sealed;
+  try {
+    sealed = await sealer.seal({ kid, sequence }, plaintext);
+  } catch {
+    return;
+  } finally {
+    plaintext.fill(0);
+  }
+  const envelopeBody = utf8Encode(
+    JSON.stringify({
+      kid,
+      sequence,
+      nonce: sealed.nonce,
+      ciphertext: sealed.ciphertext,
+    }),
+  );
+  try {
+    socketRef.send(envelopeBody);
+  } catch {
+    // The socket closed between the seal and the send; the reconnect path will
+    // resubscribe with a fresh sequence.
+  }
+}
+
 function openSocket(): void {
   if (stopped || !hasSessionKey) return;
   teardownSocket();
@@ -117,8 +186,9 @@ function openSocket(): void {
   }
   socket.onopen = () => {
     client?.noteConnected();
-    // Reconnect always resyncs, but through the client's coalescing window so a
-    // relay that accepts and immediately closes cannot drive unbounded /v1/sync.
+    // Identify the session to the private stream backend (BR-2), then ask for a
+    // recovery snapshot. Both are bounded/coalesced by the client.
+    void sendStreamSubscribe();
     client?.requestSnapshot("reconnect");
   };
   socket.binaryType = "arraybuffer";
@@ -192,26 +262,53 @@ function requestResync(reason: ResyncReason, fromSeq: number | null): void {
   // Neutral resync path (BR-2). Best effort: the stream snapshot is the
   // authoritative recovery signal, so a failed POST must not wedge the client.
   //
-  // The request is generic: only `from_seq` (a sequence number, never a trading
-  // semantic) crosses in cleartext. We deliberately do NOT emit a cleartext
-  // control frame on the websocket: the opaque edge relays binary ciphertext
-  // only and closes on any `Message::Text` frame, and the architecture lock
-  // requires that the actual operation type never leaves the AEAD envelope.
+  // BR-7: the request is carried in an opaque AEAD envelope over
+  // `application/octet-stream`; `from_seq` (a sequence number, never a trading
+  // semantic) lives inside the ciphertext. With no c2s key we skip the POST
+  // entirely rather than ever emitting a cleartext control frame (the opaque
+  // edge relays binary ciphertext only and closes on any `Message::Text`).
   if (syncUrl.length === 0) return;
-  try {
-    void fetch(syncUrl, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from_seq: fromSeq }),
-    }).catch(() => undefined);
-  } catch {
-    // fetch unavailable in this runtime
-  }
+  const sealer = syncSealer;
+  if (sealer === null) return;
+  const kid = sessionKid;
+  const sequence = syncSequence++;
+  void (async () => {
+    const plaintext = utf8Encode(
+      JSON.stringify({ op: "sync", from_seq: fromSeq, request_id: randomRequestId() }),
+    );
+    let sealed;
+    try {
+      sealed = await sealer.seal({ kid, sequence }, plaintext);
+    } catch {
+      return;
+    } finally {
+      plaintext.fill(0);
+    }
+    const envelopeBody = utf8Encode(
+      JSON.stringify({ kid, sequence, nonce: sealed.nonce, ciphertext: sealed.ciphertext }),
+    );
+    try {
+      await fetch(syncUrl, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: envelopeBody,
+      });
+    } catch {
+      // Best effort: a failed sync POST must not wedge the client.
+    }
+  })();
 }
 
 async function start(message: Extract<MainToWorker, { type: "start" }>): Promise<void> {
   const generation = ++startGeneration;
+  // A restart for the SAME session key must not rewind the per-purpose c2s
+  // counters: the server's per-kid replay windows never reset, so replaying
+  // sequence 0 would be refused and the stream/commands would wedge. Only a
+  // genuinely new kid (a fresh BR-5 handoff) starts a new epoch at 0.
+  const previousKid = sessionKid;
+  const previousSyncSequence = syncSequence;
+  const previousStreamSequence = streamSequence;
   stop("restarting");
   stopped = false;
   attempt = 0;
@@ -233,9 +330,29 @@ async function start(message: Extract<MainToWorker, { type: "start" }>): Promise
     rawKey?.fill(0);
   }
 
+  // The c2s key only enables the best-effort `/v1/sync` probe; a missing or
+  // invalid key must not fail the stream (the "stream key only" behaviour).
+  let sealer: SessionSealer | null = null;
+  if (message.c2sKeyB64) {
+    let rawC2s: Uint8Array | undefined;
+    try {
+      rawC2s = base64ToBytes(message.c2sKeyB64);
+      sealer = await WebCryptoSealer.fromRawKey(rawC2s);
+    } catch {
+      sealer = null;
+    } finally {
+      rawC2s?.fill(0);
+    }
+  }
+
   // A stop/restart may have arrived while the key was being imported; never
   // install the client, decryptor or flush timer after a stop or a newer start.
   if (stopped || generation !== startGeneration) return;
+  const sameEpoch = previousKid.length > 0 && previousKid === message.kid;
+  sessionKid = message.kid;
+  syncSealer = sealer;
+  syncSequence = sameEpoch ? previousSyncSequence : 0;
+  streamSequence = sameEpoch ? previousStreamSequence : 0;
 
   client = new RealtimeClient({
     decryptor,

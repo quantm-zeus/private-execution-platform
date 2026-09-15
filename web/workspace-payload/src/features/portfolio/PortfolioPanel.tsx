@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, type JSX } from "solid-js";
 import { formatAge, formatClock, formatUsd, truncateAddress } from "../../core/format";
 import type { AlertView, PortfolioView } from "../../contracts/execution";
+import { parsePortfolioView } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
 import { useWorkspace } from "../../state/session";
 import {
@@ -47,6 +48,9 @@ export default function PortfolioPanel(): JSX.Element {
     capability: "portfolio",
     ttlMs: BALANCE_TTL_MS,
     clock: () => ws.nowMs(),
+    // Reject an unrenderable success document as a typed error instead of
+    // marking it `ready` and throwing on `balances` (F3).
+    validate: parsePortfolioView,
   });
   const alerts = createCommandResource<AlertsResponse>(command, "get_alerts", {
     capability: "intelligence",
@@ -57,17 +61,19 @@ export default function PortfolioPanel(): JSX.Element {
   const portfolioDenial = createMemo(() => ws.capabilityDenial("portfolio"));
   const alertsDenial = createMemo(() => ws.capabilityDenial("intelligence"));
 
-  // Load each surface once its capability is authoritatively confirmed. A
-  // one-shot `onMount` check can observe the pre-bootstrap (all-false)
-  // capability set and then never load, rendering an unqueried empty state.
+  // Load each surface once its capability is authoritatively confirmed and the
+  // encrypted command channel is installed. A one-shot `onMount` check can
+  // observe the pre-bootstrap (all-false) capability set and then never load;
+  // firing before the BR-5 handoff installs the real client would latch the
+  // fail-closed stub's `capability_missing` as a permanent `unavailable`.
   let portfolioRequested = false;
   let alertsRequested = false;
   createEffect(() => {
-    if (!portfolioRequested && portfolioDenial() === null) {
+    if (!portfolioRequested && portfolioDenial() === null && ws.commandReady()) {
       portfolioRequested = true;
       void portfolio.run();
     }
-    if (!alertsRequested && alertsDenial() === null) {
+    if (!alertsRequested && alertsDenial() === null && ws.commandReady()) {
       alertsRequested = true;
       void alerts.run();
     }

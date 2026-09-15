@@ -21,8 +21,17 @@ import type { WorkspaceErrorCode } from "./types";
  * and a corrected retry must be a genuinely new order rather than a replay of
  * the backend's cached rejection. A retryable server error (5xx/timeout) is
  * ambiguous and keeps the key.
+ *
+ * An explicit `retryable: true` is authoritative for *every* code, not just
+ * `server`. The backend marks a transient failure that may still have committed
+ * (e.g. `BackendOutcome::Unavailable` surfaced as `capability_missing`) as
+ * retryable precisely so the write stays ambiguous; treating it as determinate
+ * because the code is not `server` would rotate the idempotency key and let the
+ * next submission create a duplicate order (INVARIANTS #9). Determinacy must be
+ * proven, never inferred from the code alone.
  */
 export function isIndeterminateOutcome(code: WorkspaceErrorCode, retryable?: boolean): boolean {
+  if (retryable === true) return true;
   if (code === "server") return retryable !== false;
   return code === "network" || code === "protocol" || code === "unknown" || code === "cancelled";
 }

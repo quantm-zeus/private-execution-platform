@@ -94,12 +94,16 @@ impl<'de> Deserialize<'de> for RawObject {
     }
 }
 
-/// Channel that submitted a command. Both channels share the same restrictions.
+/// Channel that submitted a command. All channels share the same restrictions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentChannel {
     Mcp,
     Telegram,
+    /// Private web workspace command channel. Additive to the original
+    /// MCP/Telegram set; grants no additional privilege (all channels run the
+    /// identical rule set) but lets downstream source attribution stay honest.
+    Web,
 }
 
 /// Explicit amount unit. A bare number is NOT accepted anywhere.

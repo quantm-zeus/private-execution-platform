@@ -9,6 +9,8 @@ export interface RealtimeStartConfig {
   readonly baseUrl: string;
   readonly kid: string;
   readonly keyB64: string;
+  /** Base64 raw 32-byte client->server key for opaque `/v1/sync` sealing. */
+  readonly c2sKeyB64?: string;
   readonly serverSkewMs?: number;
   readonly flushMs?: Record<Priority, number>;
   readonly capacity?: number;

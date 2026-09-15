@@ -8,19 +8,37 @@ export interface HostLockMessage {
 
 export interface HostReadyMessage {
   readonly type: "evergreen:workspace-ready";
+  /**
+   * BR-5 handoff binding echoed back to the shell. The shell injects this token
+   * into the payload document; returning it proves the ping came from the
+   * document the shell instantiated (not a same-origin navigation).
+   */
+  readonly handoff: string;
+}
+
+/**
+ * Read the per-unlock handoff token the shell injected into this document.
+ * Absent (e.g. the payload loaded standalone in a test) is the empty string, so
+ * the shell simply withholds keys rather than delivering them unbound.
+ */
+export function readHandoffToken(): string {
+  if (typeof document === "undefined") return "";
+  const meta = document.querySelector('meta[name="evergreen-handoff"]');
+  const content = meta?.getAttribute("content");
+  return typeof content === "string" ? content : "";
 }
 
 export function postToHost(message: HostLockMessage | HostReadyMessage): void {
   if (typeof window === "undefined" || window.parent === window) return;
   // The payload is same-origin with the shell (BR-6), so the parent origin is
-  // known. Only fall back to "*" for an opaque origin, where the messages carry
-  // no private semantics (lock request / ready ping).
-  const targetOrigin =
-    typeof location !== "undefined" && location.origin && location.origin !== "null"
-      ? location.origin
-      : "*";
+  // known. The ready ping carries the BR-5 handoff token, so it must never be
+  // posted with a wildcard target: an opaque origin is a misconfiguration and
+  // fails closed (no message, so no keys) rather than broadcasting the token.
+  if (typeof location === "undefined" || !location.origin || location.origin === "null") {
+    return;
+  }
   try {
-    window.parent.postMessage(message, targetOrigin);
+    window.parent.postMessage(message, location.origin);
   } catch {
     // Cross-document messaging is best effort; the shell also drops the
     // iframe and revokes blob URLs on lock, which is the real boundary.
@@ -32,5 +50,5 @@ export function requestHostLock(): void {
 }
 
 export function announceWorkspaceReady(): void {
-  postToHost({ type: "evergreen:workspace-ready" });
+  postToHost({ type: "evergreen:workspace-ready", handoff: readHandoffToken() });
 }

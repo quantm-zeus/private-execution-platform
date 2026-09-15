@@ -157,6 +157,7 @@ fn every_relay_error_variant_is_redacted() {
     let errors = [
         RelayError::TradingDisabled,
         RelayError::ChainHealthUnavailable,
+        RelayError::SigningUnavailable,
         RelayError::SigningFailed,
         RelayError::SigningRequestMismatch,
         RelayError::ChainMismatch,

@@ -1,7 +1,7 @@
 import { Show, createEffect, createMemo, createSignal, type Component } from "solid-js";
 import { formatAmount, formatBps, formatPercent } from "../../core/format";
 import { workspaceError } from "../../core/errors";
-import type { WorkspaceErrorShape } from "../../core/types";
+import type { CapabilityDenial, WorkspaceErrorShape } from "../../core/types";
 import type { ExecutionProgress, RfqLegView, RfqView, TwapRequest } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
 import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/idempotency";
@@ -45,7 +45,6 @@ export const ExecutionPanel: Component = () => {
   const [twapState, setTwapState] = createSignal<ExecutionProgress | null>(null);
   const [twapError, setTwapError] = createSignal<WorkspaceErrorShape | null>(null);
   const progress = createCommandResource<ExecutionProgress>(ws.command, "get_execution_progress", {
-    capability: "twap",
     ttlMs: 5_000,
   });
   const rfq = createCommandResource<RfqView>(ws.command, "submit_rfq", {
@@ -55,13 +54,28 @@ export const ExecutionPanel: Component = () => {
 
   const twapDenial = createMemo(() => ws.mutationDenial("twap"));
   const rfqDenial = createMemo(() => ws.mutationDenial("rfq"));
-  const progressDenial = createMemo(() => ws.capabilityDenial("twap"));
+  // `get_execution_progress` is an ungated owner-scoped reconciliation read
+  // (BR-9): the server serves it even when `twap` is not advertised, so the
+  // client must not hide it behind `twap` or an UNKNOWN execution could never
+  // be reconciled. The read stays fail-closed server-side.
+  //
+  // Until the authenticated command channel is installed it must surface as
+  // "awaiting the channel" rather than an unqueried empty ("no execution
+  // running"), which a stalled handoff would otherwise show forever.
+  const progressDenial = (): CapabilityDenial | null =>
+    ws.commandReady()
+      ? null
+      : { capability: "twap", reason: "Awaiting the authenticated command channel." };
+  // ...and it must still wait for the authenticated encrypted command channel.
+  // Firing before the BR-5 handoff installs the real client hits the fail-closed
+  // stub, which maps to a permanent `unavailable` state (the request is
+  // one-shot), so gate on `commandReady` rather than on `twap`.
+  const progressReady = createMemo(() => ws.commandReady());
 
-  // Load the current execution progress once the capability is authoritatively
-  // confirmed; otherwise the surface shows an unqueried "no execution running".
+  // Load the current execution progress once the authenticated channel exists.
   let progressRequested = false;
   createEffect(() => {
-    if (progressDenial() === null && !progressRequested) {
+    if (progressReady() && !progressRequested) {
       progressRequested = true;
       void progress.run();
     }

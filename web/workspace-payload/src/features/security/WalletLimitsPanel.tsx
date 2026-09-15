@@ -161,7 +161,7 @@ export const WalletLimitsPanel: Component = () => {
 
   let requested = false;
   createEffect(() => {
-    if (!requested && readDenial() === null) {
+    if (!requested && readDenial() === null && ws.commandReady()) {
       requested = true;
       void raw.run();
     }

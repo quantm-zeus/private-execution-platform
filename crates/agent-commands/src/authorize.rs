@@ -12,6 +12,7 @@ use chain_types::ChainId;
 use crate::{AgentChannel, AgentCommand, ReadCommand, TradeCommand};
 
 /// Trusted capability context; built by the backend, never from the request body.
+#[derive(Clone)]
 pub struct AgentCapabilities {
     pub trading_enabled: bool,
     /// Chains this wallet may trade.
@@ -95,7 +96,7 @@ pub fn authorize(
     // Both channels deliberately share one rule set; the match documents that
     // there is no channel-specific privilege.
     match channel {
-        AgentChannel::Mcp | AgentChannel::Telegram => {
+        AgentChannel::Mcp | AgentChannel::Telegram | AgentChannel::Web => {
             authorize_shared(command, capabilities, valuation_usd_micros)
         }
     }

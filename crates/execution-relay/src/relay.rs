@@ -19,6 +19,7 @@ use crate::adapter::{
 use crate::error::RelayError;
 use crate::health::{ChainHealth, ChainHealthBreaker};
 use crate::plan::{SignedPayloadSource, SubmitRequest};
+use crate::signing_health::SigningFailureBreaker;
 use crate::state::{AttemptReservationStore, RelayOutcome, Reservation, SubmissionState};
 
 /// Trusted inputs for a single relay execution attempt.
@@ -50,6 +51,7 @@ pub struct ExecutionRelay<S, A, P, G> {
     payload_source: P,
     signing: G,
     breaker: ChainHealthBreaker,
+    signing_breaker: SigningFailureBreaker,
     journal: Mutex<HashMap<IdempotencyKey, SubmitRequest>>,
 }
 
@@ -87,8 +89,16 @@ where
             payload_source,
             signing,
             breaker,
+            signing_breaker: SigningFailureBreaker::default_policy(),
             journal: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Overrides the signing-failure breaker policy (additive; test/integration
+    /// seam). The default is [`SigningFailureBreaker::default_policy`].
+    pub fn with_signing_breaker(mut self, breaker: SigningFailureBreaker) -> Self {
+        self.signing_breaker = breaker;
+        self
     }
 
     /// Executes one attempt, fail-closed and with no blind retry.
@@ -146,10 +156,25 @@ where
             Err(_) => return Err(RelayError::ReservationUnavailable),
         }
 
-        // 6. Sign once. Any failure is recorded and never retried here.
+        // 6. Admit a signing attempt through the signing-failure breaker, then
+        //    sign once. The breaker gate is additive: the kill switch (step 1)
+        //    and chain-health gate (step 2) still run first and can never be
+        //    bypassed. The reservation is already claimed, so a blocked
+        //    admission is a definitive pre-send failure. A signer failure or a
+        //    mismatched reference is recorded and never retried here. The guard
+        //    resolves the half-open probe explicitly; if this future is dropped
+        //    mid-sign its `Drop` resolves it as a failure (cancellation safety).
+        let guard = match self.signing_breaker.admit_probe(input.now_ms) {
+            Some(guard) => guard,
+            None => {
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                return Err(RelayError::SigningUnavailable);
+            }
+        };
         let signed = match self.signing.sign(&signing_request).await {
             Ok(signed) => signed,
             Err(_) => {
+                guard.failure(input.now_ms);
                 self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
                 return Err(RelayError::SigningFailed);
             }
@@ -158,9 +183,11 @@ where
             || signed.intent_id() != signing_request.intent_id()
             || signed.idempotency_key() != signing_request.idempotency_key()
         {
+            guard.failure(input.now_ms);
             self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
             return Err(RelayError::SigningRequestMismatch);
         }
+        guard.success();
 
         // 7. Mark the signing success durably.
         if self.store.record_signed(key, &request_digest).is_err() {
@@ -291,6 +318,12 @@ where
     #[doc(hidden)]
     pub fn breaker(&self) -> &ChainHealthBreaker {
         &self.breaker
+    }
+
+    /// Borrows the signing-failure breaker (diagnostics and tests only).
+    #[doc(hidden)]
+    pub fn signing_breaker(&self) -> &SigningFailureBreaker {
+        &self.signing_breaker
     }
 
     /// Borrows the policy engine that gates this relay (diagnostics/composition only).

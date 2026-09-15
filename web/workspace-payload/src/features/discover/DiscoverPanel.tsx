@@ -226,18 +226,18 @@ const TokenDetailView: Component<{ detail: TokenDetail }> = (props) => {
 
 export default function DiscoverPanel(): JSX.Element {
   const ws = useWorkspace();
-  const denial = createMemo(() => ws.capabilityDenial("intelligence"));
+  const denial = createMemo(() => ws.capabilityDenial("market"));
 
   const [query, setQuery] = createSignal("");
   const [selected, setSelected] = createSignal<TokenRef | null>(null);
 
   const search = createCommandResource<SearchPayload>(ws.command, "search_token", {
-    capability: "intelligence",
+    capability: "market",
     ttlMs: SEARCH_TTL_MS,
     clock: () => ws.nowMs(),
   });
   const detail = createCommandResource<TokenDetail>(ws.command, "get_token", {
-    capability: "intelligence",
+    capability: "market",
     ttlMs: DETAIL_TTL_MS,
     clock: () => ws.nowMs(),
   });

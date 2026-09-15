@@ -227,6 +227,55 @@ describe("ExecutionPanel", () => {
     expect(screen.getByText("1/4")).toBeTruthy();
   });
 
+  it("waits for the encrypted command channel before reading execution progress", async () => {
+    const ops: string[] = [];
+    // No injected command: the store starts on the fail-closed unavailable
+    // client, exactly like the BR-5 handoff window before the real channel is
+    // installed.
+    const store = createWorkspaceStore({
+      manualClock: true,
+      clock: () => 1_000,
+      session: parseWorkspaceSession({
+        protocol_version: 1,
+        capabilities: { twap: true, rfq: true, market: true, realtime: true },
+        trading_enabled: true,
+        kill_switch: { enabled: false, reason: null },
+        chains: [{ id: "base", display: "Base", enabled: true, native_token: EXEC_QUOTE_TOKEN }],
+        session: { key_id: "kid-1", expires_at_ms: 1_700_000_000_000 },
+        server_time_ms: 1_699_999_000_000,
+      }),
+    });
+    store.reload();
+    await flush();
+    render(() => (
+      <WorkspaceProvider store={store}>
+        <ExecutionPanel />
+      </WorkspaceProvider>
+    ));
+    await flush();
+    expect(ops).not.toContain("get_execution_progress");
+
+    store.setCommand({
+      async send<T>(op: string): Promise<T> {
+        ops.push(op);
+        return {
+          executionId: "ex-1",
+          kind: "twap",
+          state: "running",
+          chunksTotal: 1,
+          chunksDone: 0,
+          filledAmount: "0",
+          remainingAmount: "1",
+          realizedVsEstimateBps: null,
+          haltReason: null,
+        } as unknown as T;
+      },
+    });
+    await flush();
+    await flush();
+    expect(ops).toContain("get_execution_progress");
+  });
+
   it("keeps a TWAP UNKNOWN guarded and requires a two-step discard", async () => {
     const keys: (string | undefined)[] = [];
     let mode: "network" | "auth" = "network";

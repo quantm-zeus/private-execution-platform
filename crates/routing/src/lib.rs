@@ -17,8 +17,8 @@
 //! never brute-forces the token graph.
 //!
 //! # Non-goals
-//! Exact-output *planning*, depth-aware ranking, and any signing/policy/storage/
-//! relay wiring are explicitly out of scope; the additive [`adapter`] boundary
+//! Exact-output *planning* and any signing/policy/storage/relay wiring are
+//! explicitly out of scope; the additive [`adapter`] boundary
 //! provides pure exact-in/exact-out quotes and swap-instruction construction over
 //! the same kernels without touching the planner. Provider
 //! benchmarking is provided by the additive [`benchmark`] comparator, which only
@@ -32,6 +32,7 @@
 
 pub mod adapter;
 pub mod benchmark;
+pub mod depth;
 pub mod error;
 pub mod graph;
 pub mod impact;
@@ -46,7 +47,7 @@ pub mod types;
 
 use domain::{AmountType, RouteScore, TradeIntent};
 use execution_preview::validate_delta_preview_with_assessment;
-use market_types::{AtomicAmount, FreshnessPolicy};
+use market_types::{AtomicAmount, Bps, FreshnessPolicy};
 use serde::{Deserialize, Serialize};
 use tax_engine::TaxAssessment;
 
@@ -59,6 +60,7 @@ pub use benchmark::{
     BenchmarkSource, BenchmarkVerdict, LocalRouteQuote, ProviderQuote, RealizedExecution,
     RouteComparisonRecord,
 };
+pub use depth::{depth_at_bps, depth_rank, DepthLevel, DepthProfile, DepthRank, DEPTH_TARGETS_BPS};
 pub use error::{BridgeRejectClass, RoutingError};
 pub use graph::{enumerate_candidates, CandidateLeg, CandidatePath, CandidateSet, PoolDescriptor};
 pub use label::{PoolRefLabel, VenueLabel};
@@ -118,6 +120,10 @@ pub struct RouteRequest<'a> {
     pub gas: Option<&'a dyn GasEstimator>,
     /// Asset-bound gas-asset to output-asset conversion, when a gas view exists.
     pub gas_price_in_output: Option<GasConversion>,
+    /// Optional exact CLMM/Bin depth bands used as a strictly lower-priority
+    /// ranking key after simulated net output. Empty (the default) disables
+    /// depth entirely and leaves planning byte-identical.
+    pub depth_targets: &'a [Bps],
 }
 
 /// A quoted route together with its assembled score.
@@ -230,7 +236,10 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
 
     let candidate_set = graph::enumerate_candidates(req.intent, req.max_hops, req.descriptors)?;
 
-    let mut ranked: Vec<(ScoredRoute, Option<u128>)> = Vec::new();
+    // Depth is opt-in: an empty target list leaves the planner byte-identical.
+    let depth_enabled = !req.depth_targets.is_empty();
+
+    let mut ranked: Vec<(ScoredRoute, Option<u128>, Option<depth::DepthRank>)> = Vec::new();
     let mut failures: Vec<RoutingError> = Vec::new();
 
     for path in &candidate_set.paths {
@@ -247,6 +256,35 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
                 failures.push(error);
                 continue;
             }
+        };
+        // Depth is defined only for a single direct CLMM/Bin hop. A computation
+        // failure degrades that candidate's depth key to `None`; it never drops
+        // the candidate or aborts the search. The profiled size is the exact
+        // first-hop input (post sell tax), matching the hop the impact models.
+        let depth_amount = quote
+            .plan
+            .legs
+            .first()
+            .map(|leg| leg.amount_in)
+            .unwrap_or(req.amount_in);
+        let depth_rank = if depth_enabled && path.legs.len() == 1 {
+            path.legs.first().and_then(|leg| {
+                req.descriptors.get(leg.descriptor_index).and_then(|desc| {
+                    match &desc.envelope.state {
+                        market_types::PoolKindState::Clmm(_)
+                        | market_types::PoolKindState::Bin(_) => depth::depth_rank(
+                            &desc.envelope.state,
+                            &leg.token_in,
+                            depth_amount,
+                            req.depth_targets,
+                        )
+                        .ok(),
+                        _ => None,
+                    }
+                })
+            })
+        } else {
+            None
         };
         let score = score::build_score(
             req.intent,
@@ -266,14 +304,23 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
                 continue;
             }
         };
-        ranked.push((ScoredRoute { quote, score }, net_after));
+        ranked.push((ScoredRoute { quote, score }, net_after, depth_rank));
     }
 
     if ranked.is_empty() {
         return Err(aggregate_failure(&failures));
     }
 
-    ranked.sort_by(|left, right| score::compare_scored(&left.0, left.1, &right.0, right.1));
+    ranked.sort_by(|left, right| {
+        score::compare_scored(
+            &left.0,
+            left.1,
+            left.2.as_ref(),
+            &right.0,
+            right.1,
+            right.2.as_ref(),
+        )
+    });
 
     let mut final_routes: Vec<ScoredRoute> = Vec::with_capacity(ranked.len());
     let mut first_reject: Option<BridgeRejectClass> = None;
@@ -281,7 +328,7 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
     // Verification is unconditional: every surviving candidate must pass the
     // locked bridge against the intent and the fresh assessment. There is no
     // caller-controlled bypass.
-    for (route, _) in ranked {
+    for (route, _, _) in ranked {
         match validate_delta_preview_with_assessment(
             req.intent,
             &route.quote.plan,

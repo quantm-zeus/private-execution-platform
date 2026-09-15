@@ -653,6 +653,7 @@ try {
   // 2f. Shell code & bundle contains no third-party network calls, analytics, or persistent storage
   const shellSourceFiles = [
     resolve("web/workspace-shell/src/index.tsx"),
+    resolve("web/workspace-shell/src/passkey-auth.ts"),
     resolve("web/workspace-shell/src/wasm-loader.ts"),
     resolve("web/workspace-shell/src/unlock-runtime.ts"),
     shellHtmlPath,
@@ -785,7 +786,11 @@ try {
   const SHELL_PRIVATE_PATHS = [
     "/internal/artifact",
     "/internal/artifact/grant",
+    "/internal/auth/challenge",
     "/internal/auth/enroll",
+    "/internal/auth/register/challenge",
+    "/internal/auth/register/verify",
+    "/internal/auth/verify",
   ];
   const shellPrivatePaths = new Set();
   for (const path of await filesUnder(resolve("web/workspace-shell/src"))) {
@@ -819,7 +824,7 @@ try {
   // differently. Regenerating the wasm is a reviewed change: update this digest
   // in the same commit.
   const EXPECTED_WASM_SHA256 =
-    "dbf0c80c5cc27a298b46febe67171c250e75a78f0d3f7eaddf46924b17fda7d3";
+    "60d2b137f2b8449c4ecb19a561726a047b1020344cf5dcac22871bd6a11744a8";
   const wasmSha256 = digest(wasmBytes);
   if (wasmSha256 !== EXPECTED_WASM_SHA256) {
     throw new Error(
@@ -1291,6 +1296,16 @@ try {
     fromBase64,
     loadWasm: loadShellWasm,
   } = await import("../web/workspace-shell/src/unlock-runtime.ts");
+  const { HandoffGate } = await import("../web/workspace-shell/src/handoff-gate.ts");
+  // Capture the fresh per-unlock token the real runtime arms so the live
+  // assertions below use the actual injected value. The first arm is the live
+  // unlock; the standalone gate checks later re-arm their own instances.
+  const capturedHandoffTokens = [];
+  const handoffArmOriginal = HandoffGate.prototype.arm;
+  HandoffGate.prototype.arm = function (sessionKeys, token) {
+    capturedHandoffTokens.push(token);
+    return handoffArmOriginal.call(this, sessionKeys, token);
+  };
 
   // 10a. Audited WASM loads and binds
   await loadShellWasm();
@@ -1546,6 +1561,63 @@ try {
   if (!unlockResult.htmlUrl.startsWith("blob:")) throw new Error("mounted HTML URL must be a blob: URL");
   if (unlockResult.files.size !== expectedPayloadFiles.length) {
     throw new Error("mounted file count does not match payload build");
+  }
+
+  // 10f. BR-5 handoff gate: one-shot, token-bound, and disarmed by lock().
+  //
+  // This is the control that stops a same-origin document which navigated into
+  // the frame from harvesting live session keys with a forged ready ping.
+  {
+    // First prove the *live* runtime (armed by the real unlock above with the
+    // freshly generated token) refuses a missing/wrong token and releases the
+    // keys exactly once for the real injected token.
+    HandoffGate.prototype.arm = handoffArmOriginal;
+    const liveHandoffToken = capturedHandoffTokens[0];
+    if (typeof liveHandoffToken !== "string" || liveHandoffToken.length === 0) {
+      throw new Error("runtime did not arm a handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff(undefined) !== null) {
+      throw new Error("runtime released keys without a handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff("not-the-token") !== null) {
+      throw new Error("runtime released keys for a wrong handoff token");
+    }
+    const liveKeys = runtime.takeSessionKeysForHandoff(liveHandoffToken);
+    if (!liveKeys || typeof liveKeys.kid !== "string" || liveKeys.kid.length === 0) {
+      throw new Error("runtime did not release keys for the injected handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff(liveHandoffToken) !== null) {
+      throw new Error("runtime released keys twice for the same unlock");
+    }
+
+    // Then exercise every branch of the pure gate, including disarm (which the
+    // live runtime cannot reach a second time without a fresh unlock).
+    const session = { kid: "kid-test", s2cKeyB64: "s2c-test", c2sKeyB64: "c2s-test" };
+    const gate = new HandoffGate();
+    // Unarmed: nothing is ever released, not even the right-looking token.
+    for (const candidate of [undefined, null, "", "token-1", 0, {}]) {
+      if (gate.take(candidate) !== null) throw new Error("unarmed handoff gate released keys");
+    }
+    gate.arm(session, "token-1");
+    // Missing, empty, non-string and wrong tokens are all refused.
+    for (const bad of [undefined, null, "", 0, {}, "token-2"]) {
+      if (gate.take(bad) !== null) {
+        throw new Error(`handoff gate accepted a bad token: ${String(bad)}`);
+      }
+    }
+    // The exact token releases the armed session exactly once.
+    if (gate.take("token-1") !== session) throw new Error("handoff gate did not release the armed session");
+    if (gate.take("token-1") !== null) throw new Error("handoff gate released twice");
+    // Re-arming for the next unlock retires the previous token and resets the
+    // one-shot state.
+    gate.arm(session, "token-2");
+    if (gate.take("token-1") !== null) throw new Error("handoff gate accepted a retired token");
+    if (gate.take("token-2") !== session) throw new Error("re-armed handoff gate did not release");
+    // Disarming refuses everything until the next arm.
+    gate.disarm();
+    for (const bad of ["token-2", "token-1", undefined, ""]) {
+      if (gate.take(bad) !== null) throw new Error("disarmed handoff gate released keys");
+    }
   }
 
   // Verify server received ONLY public metadata (never secret, private key, or content key)

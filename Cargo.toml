@@ -6,6 +6,7 @@ members = [
     "crates/chain-types",
     "crates/crypto-envelope",
     "crates/crypto-envelope-wasm",
+    "crates/session-transport",
     "crates/storage",
     "crates/telemetry",
     "crates/auth",
@@ -22,6 +23,7 @@ members = [
     "crates/simulation",
     "crates/tax-engine",
     "crates/routing",
+    "crates/risk-engine",
     "crates/execution-preview",
     "crates/execution-relay",
     "crates/audit",
@@ -36,6 +38,7 @@ members = [
     "crates/privacy",
     "crates/okx-client",
     "crates/provider-verification",
+    "crates/provider-benchmark",
 ]
 
 [workspace.package]
@@ -54,6 +57,7 @@ rpc-mtls-proof = { path = "crates/rpc-mtls-proof" }
 market-types = { path = "crates/market-types" }
 chain-types = { path = "crates/chain-types" }
 crypto-envelope = { path = "crates/crypto-envelope" }
+session-transport = { path = "crates/session-transport" }
 storage = { path = "crates/storage" }
 telemetry = { path = "crates/telemetry" }
 auth = { path = "crates/auth" }
@@ -64,6 +68,7 @@ provider-broker = { path = "crates/provider-broker" }
 simulation = { path = "crates/simulation" }
 tax-engine = { path = "crates/tax-engine" }
 routing = { path = "crates/routing" }
+risk-engine = { path = "crates/risk-engine" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
 audit = { path = "crates/audit" }
@@ -78,6 +83,7 @@ adaptive-exec = { path = "crates/adaptive-exec" }
 privacy = { path = "crates/privacy" }
 okx-client = { path = "crates/okx-client" }
 provider-verification = { path = "crates/provider-verification" }
+provider-benchmark = { path = "crates/provider-benchmark" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }

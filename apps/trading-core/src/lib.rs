@@ -1,5 +1,6 @@
 //! Phase-0 Trading Core orchestration skeleton. Live execution remains unavailable.
 
+pub mod benchmark;
 pub mod composition;
 pub mod service;
 

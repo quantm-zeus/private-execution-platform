@@ -36,6 +36,7 @@ dependencies = [
  "market-types",
  "mcp-server",
  "okx-client",
+ "provider-benchmark",
  "routing",
  "serde",
  "serde_json",
@@ -730,13 +731,17 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "chain-types",
+ "crypto-envelope",
  "futures-util",
  "http-body-util",
  "hyper-util",
  "private-api",
  "rcgen",
  "rpc-contracts",
+ "serde_json",
  "service-identity",
+ "session-transport",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1384,6 +1389,7 @@ dependencies = [
 name = "limit-engine"
 version = "0.1.0"
 dependencies = [
+ "adaptive-exec",
  "async-trait",
  "chain-types",
  "crypto-envelope",
@@ -1986,18 +1992,26 @@ dependencies = [
 name = "private-api"
 version = "0.1.0"
 dependencies = [
+ "agent-commands",
+ "async-trait",
  "auth",
  "axum",
+ "chain-types",
  "crypto-envelope",
  "getrandom 0.2.17",
  "http-body-util",
+ "libc",
+ "mcp-server",
  "rcgen",
  "rpc-contracts",
  "serde",
  "serde_json",
  "service-identity",
+ "session-transport",
+ "subtle",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "zeroize",
@@ -2142,6 +2156,20 @@ name = "protoc-bin-vendored-win32"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
+
+[[package]]
+name = "provider-benchmark"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chain-types",
+ "market-types",
+ "provider-broker",
+ "routing",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
 
 [[package]]
 name = "provider-broker"
@@ -2362,6 +2390,14 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "risk-engine"
+version = "0.1.0"
+dependencies = [
+ "market-types",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2687,6 +2723,19 @@ dependencies = [
  "time",
  "tonic",
  "zeroize",
+]
+
+[[package]]
+name = "session-transport"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "crypto-envelope",
+ "getrandom 0.2.17",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3312,6 +3361,8 @@ dependencies = [
  "mcp-server",
  "policy",
  "privy",
+ "provider-benchmark",
+ "provider-broker",
  "routing",
  "serde_json",
  "storage",

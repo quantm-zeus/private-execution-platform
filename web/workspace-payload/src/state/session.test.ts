@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { bytesToBase64 } from "../core/base64";
 import { FRAME_FRESHNESS_TTL_MS, isConnectionFresh } from "../core/types";
 import { parseWorkspaceSession } from "../transport/bootstrap";
 import { createWorkspaceStore } from "./session";
@@ -14,6 +15,18 @@ const BASE_PAYLOAD = {
 };
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/** Await bootstrap settling; key import is async, so one macrotask may not do. */
+async function settle(store: ReturnType<typeof createWorkspaceStore>): Promise<void> {
+  for (let i = 0; i < 20 && store.state().kind === "loading"; i += 1) await flush();
+}
+
+const KEY_B64 = bytesToBase64(new Uint8Array(32).fill(5));
+const hostKeyProvider = async () => ({
+  kid: "kid-1",
+  c2sKeyB64: KEY_B64,
+  s2cKeyB64: KEY_B64,
+});
 
 describe("createWorkspaceStore", () => {
   it("exposes capabilities from an injected session and fails mutations closed", async () => {
@@ -186,9 +199,10 @@ describe("createWorkspaceStore", () => {
       clock: () => 1_000,
       baseUrl: "https://workspace.example",
       fetchFn: (async () => ({ ok: false, status: 404 })) as unknown as typeof fetch,
+      hostKeyProvider,
     });
     store.reload();
-    await flush();
+    await settle(store);
     expect(store.state().kind).toBe("unavailable");
     expect(store.session()).toBeUndefined();
     expect(store.capabilities().market).toBe(false);
@@ -201,9 +215,10 @@ describe("createWorkspaceStore", () => {
       clock: () => 1_000,
       baseUrl: "https://workspace.example",
       fetchFn: (async () => ({ ok: false, status: 503 })) as unknown as typeof fetch,
+      hostKeyProvider,
     });
     store.reload();
-    await flush();
+    await settle(store);
     const state = store.state();
     expect(state.kind).toBe("error");
     if (state.kind === "error") {

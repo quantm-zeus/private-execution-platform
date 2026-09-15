@@ -9,6 +9,9 @@ enum Route {
   ROUTE_BOOTSTRAP = 1;
   ROUTE_SYNC = 2;
   ROUTE_BLOB = 3;
+  // Opaque encrypted command channel (BR-3/BR-7). The edge relays ciphertext
+  // only; no operation type or trading semantic is visible here.
+  ROUTE_COMMAND = 4;
 }
 
 message RelayRequest {

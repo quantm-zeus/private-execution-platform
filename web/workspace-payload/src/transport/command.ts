@@ -1,5 +1,6 @@
 import { base64ToBytes, bytesToBase64, utf8Encode, utf8Decode } from "../core/base64";
 import { toWorkspaceErrorShape, workspaceError } from "../core/errors";
+import { randomRequestId } from "../core/request-id";
 import type { WorkspaceErrorShape } from "../core/types";
 import type { SessionDecryptor } from "../realtime/decryptor";
 import { validateEnvelope } from "../realtime/envelope";
@@ -48,30 +49,10 @@ const WRITE_OPS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Per-request random challenge. It travels only inside the AEAD request and must
- * be echoed inside the AEAD response, so a captured stream frame (which has no
- * `request_id`) or a replayed older command response cannot be substituted for
- * the answer to this request.
+ * Bound the wait for a command response while preserving any caller signal.
+ * `AbortSignal.timeout` may be unavailable, in which case only the caller signal
+ * applies.
  */
-function randomRequestId(): string {
-  const cryptoObj: Crypto | undefined = globalThis.crypto;
-  if (cryptoObj !== undefined && typeof cryptoObj.randomUUID === "function") {
-    return cryptoObj.randomUUID();
-  }
-  // The per-request challenge is an anti-replay nonce; a predictable value would
-  // weaken the authenticated-echo binding, so a deployment without `crypto`
-  // fails closed rather than using `Math.random()`.
-  if (cryptoObj !== undefined && typeof cryptoObj.getRandomValues === "function") {
-    const bytes = new Uint8Array(16);
-    cryptoObj.getRandomValues(bytes);
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  }
-  throw workspaceError(
-    "protocol",
-    "A cryptographically secure request id could not be generated.",
-  );
-}
-
 function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal | undefined {
   if (typeof AbortSignal === "undefined" || typeof AbortSignal.timeout !== "function") {
     return signal;
@@ -146,19 +127,21 @@ export class EncryptedCommandClient implements CommandClient {
       plaintext.fill(0);
     }
 
-    const envelopeBody = JSON.stringify({
-      kid: this.options.kid,
-      sequence,
-      nonce: sealed.nonce,
-      ciphertext: sealed.ciphertext,
-    });
+    const envelopeBody = utf8Encode(
+      JSON.stringify({
+        kid: this.options.kid,
+        sequence,
+        nonce: sealed.nonce,
+        ciphertext: sealed.ciphertext,
+      }),
+    );
 
     let response: Response;
     try {
       response = await fetchFn(url.toString(), {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/octet-stream" },
         body: envelopeBody,
         signal: withTimeout(options.signal, COMMAND_TIMEOUT_MS),
       });
@@ -212,6 +195,20 @@ export class EncryptedCommandClient implements CommandClient {
       }
       if (!("result" in record)) {
         throw workspaceError("protocol", "Command response carried no result.");
+      }
+      // A capital-committing write must prove it committed with a concrete
+      // result. `{request_id, result:null}` is an authenticated envelope but no
+      // evidence of a commit, so it is indeterminate and the caller keeps its
+      // idempotency key rather than recording a false success.
+      if (
+        WRITE_OPS.has(op) &&
+        (record.result === null ||
+          typeof record.result !== "object" ||
+          Array.isArray(record.result))
+      ) {
+        throw workspaceError("unknown", "Write command outcome was not confirmed.", {
+          retryable: true,
+        });
       }
       return record.result as T;
     } finally {

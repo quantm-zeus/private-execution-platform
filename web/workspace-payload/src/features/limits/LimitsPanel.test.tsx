@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@solidjs/testing-library";
+import { bytesToBase64, utf8Encode } from "../../core/base64";
 import { workspaceError } from "../../core/errors";
 import type { CommandClient, CommandSendOptions } from "../../transport/command";
 import { parseWorkspaceSession } from "../../transport/bootstrap";
+import { WebCryptoDecryptor } from "../../realtime/decryptor";
+import { sealerFromBase64 } from "../../realtime/sealer";
 import { WorkspaceProvider, createWorkspaceStore } from "../../state/session";
 import type { LimitOrderView, TradeIntentView } from "../../contracts/execution";
 import LimitsPanel from "./LimitsPanel";
@@ -301,11 +304,16 @@ describe("LimitsPanel", () => {
   });
 
   it("rotates the idempotency key after a determinate rejection but keeps it on an ambiguous failure", async () => {
-    let mode: "freshness" | "network" = "freshness";
+    let mode: "rejected" | "network" = "rejected";
     const client = new FakeCommandClient({
       get_orders: () => ({ orders: [] }),
       place_limit_order: () => {
-        throw workspaceError(mode, mode === "freshness" ? "state changed" : "offline");
+        if (mode === "rejected") {
+          // A non-retryable rejection proves no commit: a new attempt is a
+          // genuinely new logical order with a fresh key.
+          throw workspaceError("freshness", "state changed", { retryable: false });
+        }
+        throw workspaceError("network", "offline");
       },
     });
     const store = await readyStore({ command: client });
@@ -347,40 +355,77 @@ describe("LimitsPanel", () => {
   });
 
   it("loads orders once bootstrap resolves, even when mounted before it", async () => {
-    let resolveFetch!: (value: Response) => void;
-    const pending = new Promise<Response>((resolve) => {
-      resolveFetch = resolve;
+    const rawKey = new Uint8Array(32).fill(7);
+    const keyB64 = bytesToBase64(rawKey);
+    let captured: RequestInit | null = null;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    // Bootstrap stays pending until the test releases it; the request is sealed
+    // as an octet-stream envelope and the response is sealed back at its
+    // sequence with the request id echoed.
+    const fetchFn = (async (_url: string, init: RequestInit) => {
+      captured = init;
+      await gate;
+      const envelope = JSON.parse(new TextDecoder().decode(init.body as Uint8Array)) as {
+        sequence: number;
+      };
+      const decryptor = await WebCryptoDecryptor.fromRawKey(rawKey, "kid-1");
+      const request = JSON.parse(new TextDecoder().decode(await decryptor.decrypt(envelope as never))) as {
+        request_id: string;
+      };
+      const sealer = await sealerFromBase64(keyB64);
+      const sealed = await sealer.seal(
+        { kid: "kid-1", sequence: envelope.sequence },
+        utf8Encode(
+          JSON.stringify({
+            protocol_version: 1,
+            capabilities: { limits: true, portfolio: true },
+            trading_enabled: true,
+            kill_switch: { enabled: false, reason: null },
+            chains: [],
+            session: { key_id: "kid-1", expires_at_ms: 1_700_000_000_000 },
+            server_time_ms: 1_699_999_000_000,
+            request_id: request.request_id,
+          }),
+        ),
+      );
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            kid: "kid-1",
+            sequence: envelope.sequence,
+            nonce: sealed.nonce,
+            ciphertext: sealed.ciphertext,
+          }),
+      } as Response;
+    }) as unknown as typeof fetch;
+
     const client = new FakeCommandClient({ get_orders: () => ({ orders: [] }) });
     const store = createWorkspaceStore({
       manualClock: true,
       clock: () => 1000,
       command: client,
-      fetchFn: () => pending,
+      hostKeyProvider: async () => ({ kid: "kid-1", c2sKeyB64: keyB64, s2cKeyB64: keyB64 }),
+      fetchFn,
     });
     // Begin bootstrap but do not let it resolve: capabilities are all-false.
     store.reload();
     renderPanel(store);
     await flush();
+    for (let i = 0; i < 10 && captured === null; i += 1) await flush();
+    expect(captured).not.toBeNull();
     expect(client.count("get_orders")).toBe(0);
 
     // Bootstrap resolves with the limits capability: the panel must load now,
     // not stay on an unqueried "no limit orders".
-    resolveFetch({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        protocol_version: 1,
-        capabilities: { limits: true, portfolio: true },
-        trading_enabled: true,
-        kill_switch: { enabled: false, reason: null },
-        chains: [],
-        session: { key_id: "kid-1", expires_at_ms: 1_700_000_000_000 },
-        server_time_ms: 1_699_999_000_000,
-      }),
-    } as unknown as Response);
+    release();
     await flush();
     await flush();
+    for (let i = 0; i < 20 && client.count("get_orders") === 0; i += 1) await flush();
     expect(client.count("get_orders")).toBe(1);
   });
 

@@ -8,16 +8,24 @@
 //! network contact, config mismatch fail-closed, and the edge HTTP
 //! content-type gate staying intact.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use edge_gateway::private_relay::{PrivateRelay, PrivateRelayConfig};
-use edge_gateway::{EdgeError, EdgeState, OpaqueRelay, OpaqueRoute};
+use edge_gateway::{AuthorizationBackend, EdgeError, EdgeState, OpaqueRelay, OpaqueRoute};
+use http_body_util::BodyExt;
+use private_api::opaque::{
+    FailClosedBootstrap, FailClosedDispatcher, OpaqueClock, OpaqueServiceState,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 use service_identity::{configure_client_endpoint, load_server_tls_config, ServiceIdentityConfig};
+use session_transport::{parse_wire_envelope, ClientSession, ServerSession, SessionRegistry};
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 const SERVER_DNS: &str = "private-api.internal.proof";
 const WRONG_CA_DNS: &str = "other.internal.proof";
@@ -216,6 +224,7 @@ impl OpaqueRelay for TestOverrideRelay {
             OpaqueRoute::Bootstrap => Route::Bootstrap as i32,
             OpaqueRoute::Sync => Route::Sync as i32,
             OpaqueRoute::Blob => Route::Blob as i32,
+            OpaqueRoute::Command => Route::Command as i32,
         };
         if payload.is_empty() || payload.len() > edge_gateway::DEFAULT_MAX_OPAQUE_BODY_BYTES {
             return Err(EdgeError::PayloadTooLarge);
@@ -344,4 +353,117 @@ async fn default_edge_router_stays_fail_closed() {
             .err(),
         Some(EdgeError::BackendUnavailable)
     );
+}
+
+/// The production hop the in-process e2e harnesses substitute: a browser-shaped
+/// `/v1/command` envelope enters the real edge HTTP route, crosses the real mTLS
+/// client boundary, is decrypted by the real `EncryptedRelayService`, denied
+/// fail-closed by the injected Trading Core seam, and sealed back to the browser.
+#[tokio::test]
+async fn encrypted_command_round_trips_over_the_real_mtls_relay() {
+    struct FixedClock(i64);
+    impl OpaqueClock for FixedClock {
+        fn now_ms(&self) -> Option<i64> {
+            Some(self.0)
+        }
+    }
+
+    struct AllowAllAuthorization;
+    #[async_trait::async_trait]
+    impl AuthorizationBackend for AllowAllAuthorization {
+        async fn authorize(&self, _headers: &HeaderMap) -> Result<(), EdgeError> {
+            Ok(())
+        }
+    }
+
+    const KID: [u8; 16] = [0x7A; 16];
+    let keys = crypto_envelope::hpke::AppDirectionKeys::from_bytes([0x51u8; 32], [0x62u8; 32]);
+    let sessions = Arc::new(Mutex::new(SessionRegistry::new()));
+    sessions
+        .lock()
+        .expect("registry lock")
+        .insert(ServerSession::new(KID, &keys, i64::MAX).expect("session"))
+        .expect("insert session");
+    let state = OpaqueServiceState::new(
+        sessions,
+        Arc::new(FailClosedDispatcher),
+        Arc::new(FailClosedBootstrap),
+        Arc::new(FixedClock(1_000)),
+        60_000,
+    )
+    .expect("opaque state");
+
+    // A real mTLS `EncryptedRelayService` (not the passthrough echo), so the
+    // ciphertext is actually decrypted and re-sealed on the private side.
+    let pki = build_test_pki();
+    let server_tls =
+        load_server_tls_config(&identity_config(&pki, &pki.server)).expect("server TLS config");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let router =
+        private_api::opaque::relay_tls_router_with(state, server_tls).expect("apply server TLS");
+    let handle = tokio::spawn(async move {
+        router
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+            .expect("mTLS encrypted relay server run");
+    });
+
+    // The edge dials through the same pinned mTLS channel adapter the production
+    // `PrivateRelay` uses (identical identity validation and route mapping).
+    let relay = dial_override_relay(&pki, &pki.good_client, addr).await;
+    let edge = EdgeState::new(
+        Arc::new(AllowAllAuthorization),
+        Arc::new(relay),
+        1024 * 1024,
+    )
+    .expect("edge state");
+
+    let mut client = ClientSession::new(KID, &keys).expect("client");
+    let envelope = client
+        .seal_next(
+            br#"{"op":"execute_market_order","payload":{},"request_id":"live-exec","idempotency_key":"k1"}"#,
+        )
+        .expect("seal");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/command")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(envelope.to_wire_bytes()))
+        .expect("request");
+    let response = edge_gateway::router(edge)
+        .oneshot(request)
+        .await
+        .expect("edge response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let sealed = parse_wire_envelope(&body).expect("sealed envelope");
+    assert_eq!(
+        sealed.sequence, envelope.sequence,
+        "response binds the request sequence"
+    );
+    let plaintext = client.open(&sealed).expect("open response");
+    let value: serde_json::Value = serde_json::from_slice(&plaintext).expect("response json");
+    assert_eq!(value["request_id"], "live-exec");
+    assert_eq!(value["error"]["code"], "capability_missing");
+    assert!(
+        value.get("result").is_none(),
+        "no false success over the real relay"
+    );
+
+    let _ = shutdown_tx.send(());
+    handle.await.expect("server task");
 }

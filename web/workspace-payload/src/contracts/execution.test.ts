@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  parseOrdersResponse,
+  parsePortfolioView,
   parseRouterSource,
   routerSourceLabel,
   type RouterPreference,
@@ -90,5 +92,144 @@ describe("parseRouterSource (W15 canonical + object wire forms)", () => {
   it("labels the canonical ids for display without leaking provider internals", () => {
     expect(routerSourceLabel("okx")).toBe("OKX");
     expect(routerSourceLabel("local")).toBe("Local Router");
+  });
+});
+
+/**
+ * F2/F3: the private API is authoritative for the orders/portfolio shapes. A
+ * document the view cannot render must fail as a typed protocol error, never a
+ * `ready` value whose render throws. The canonical `agent-backend` document is
+ * the concrete hostile example (snake_case, nested under `portfolio`, no
+ * `intent`/`fills`).
+ */
+describe("parseOrdersResponse", () => {
+  const validIntent = {
+    id: "intent-1",
+    chain: "base",
+    tokenIn: "0x1",
+    tokenOut: "0x2",
+    side: "buy",
+    amountType: "token",
+    amount: "5",
+    orderType: "limit",
+    limitPrice: "2.50",
+    maxBuyTaxBps: null,
+    maxSellTaxBps: null,
+    maxPriceImpactBps: 50,
+    maxSlippageBps: 50,
+    maxTotalCostUsd: null,
+    allowPartialFill: true,
+    expiryMs: 1_700_000_000_000,
+  };
+  const validOrder = {
+    orderId: "order-1",
+    intent: validIntent,
+    state: "ACTIVE",
+    filledAmount: "0",
+    remainingAmount: "10",
+    fills: [],
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    nextActionMs: null,
+    failureReason: null,
+  };
+
+  it("accepts the web order document", () => {
+    expect(parseOrdersResponse({ orders: [validOrder] }).orders).toHaveLength(1);
+    expect(parseOrdersResponse({ orders: [] }).orders).toEqual([]);
+  });
+
+  it("accepts a fully formed fill", () => {
+    const withFill = {
+      ...validOrder,
+      fills: [{ executionId: "exec-1", amountIn: "1", amountOut: "2", atMs: 3 }],
+    };
+    expect(parseOrdersResponse({ orders: [withFill] }).orders).toHaveLength(1);
+  });
+
+  it.each([
+    [null, "null"],
+    [{}, "missing orders"],
+    [{ orders: {} }, "non-array orders"],
+    [{ orders: [null] }, "null entry"],
+    [{ orders: [{ ...validOrder, orderId: "" }] }, "empty id"],
+    [{ orders: [{ ...validOrder, state: "" }] }, "empty state"],
+    [{ orders: [{ ...validOrder, filledAmount: 0 }] }, "non-string fill amount"],
+    [{ orders: [{ ...validOrder, intent: null }] }, "missing intent"],
+    [{ orders: [{ ...validOrder, intent: {} }] }, "intent without side"],
+    [{ orders: [{ ...validOrder, intent: { ...validIntent, amount: null } }] }, "intent without amount"],
+    [{ orders: [{ ...validOrder, fills: null }] }, "missing fills"],
+    // A shape-passing-but-unrenderable fill must be rejected here, not crash the
+    // order list on `fill.executionId`.
+    [{ orders: [{ ...validOrder, fills: [null] }] }, "null fill entry"],
+    [
+      { orders: [{ ...validOrder, fills: [{ executionId: "e", amountIn: "1", amountOut: "2" }] }] },
+      "fill without atMs",
+    ],
+    [
+      { orders: [{ ...validOrder, fills: [{ executionId: "", amountIn: "1", amountOut: "2", atMs: 3 }] }] },
+      "fill without id",
+    ],
+  ] as const)("rejects malformed document %# (%s)", (value, _label) => {
+    expect(() => parseOrdersResponse(value)).toThrowError(/order/i);
+  });
+
+  it("rejects the canonical snake_case OrderSummary document", () => {
+    // Verbatim shape of crates/agent-backend/src/order.rs OrderSummary.
+    expect(() =>
+      parseOrdersResponse({
+        orders: [
+          {
+            order_id: "order-1",
+            wallet_ref: "w",
+            status: "active",
+            filled_input: "0",
+            expires_at_ms: 1,
+          },
+        ],
+      }),
+    ).toThrowError(/order/i);
+  });
+});
+
+describe("parsePortfolioView", () => {
+  it("accepts the web portfolio document", () => {
+    const view = parsePortfolioView({
+      walletRef: "w",
+      balances: [{ chain: "base", token: "t", symbol: "T", amount: "1", usdValue: null, ageMs: null }],
+      equityUsd: null,
+      slot: null,
+      sourceAgeMs: 0,
+    });
+    expect(view.balances).toHaveLength(1);
+    expect(parsePortfolioView({ walletRef: "w", balances: [], equityUsd: null, slot: null, sourceAgeMs: 0 }).balances).toEqual([]);
+  });
+
+  it.each([
+    [null, "null"],
+    [{}, "missing balances"],
+    [{ balances: {} }, "non-array balances"],
+    [{ balances: [], equityUsd: null, slot: null, sourceAgeMs: 0 }, "missing walletRef"],
+    [{ walletRef: 1, balances: [], equityUsd: null, slot: null, sourceAgeMs: 0 }, "non-string walletRef"],
+    [{ walletRef: "w", balances: [], equityUsd: null, slot: null, sourceAgeMs: "0" }, "non-numeric sourceAgeMs"],
+    [{ balances: [null] }, "null balance"],
+    [{ balances: [{ asset: "x" }] }, "balance without amount"],
+    [{ balances: [{ chain: "base", token: "t", amount: "1" }] }, "balance without symbol"],
+  ] as const)("rejects malformed document %# (%s)", (value, _label) => {
+    expect(() => parsePortfolioView(value)).toThrowError(/portfolio|balance/i);
+  });
+
+  it("rejects the canonical nested PortfolioSummary document", () => {
+    // Verbatim shape of crates/agent-backend/src/portfolio.rs PortfolioSummary.
+    expect(() =>
+      parsePortfolioView({
+        portfolio: {
+          balances: [{ asset: { chain: "base", address: "0x0" }, amount: "1" }],
+          open_orders: 0,
+          filled_orders: 0,
+          total_orders: 0,
+        },
+      }),
+    ).toThrowError(/portfolio/i);
   });
 });

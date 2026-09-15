@@ -11,6 +11,12 @@ export interface WorkerStartMessage {
   /** Base64 raw 32-byte AES-256-GCM session key. Cleared from memory on stop. */
   readonly keyB64: string;
   /**
+   * Base64 raw 32-byte client->server key used to seal the opaque `/v1/sync`
+   * request. Optional: with no key the worker skips the best-effort sync POST
+   * rather than emitting a cleartext control frame.
+   */
+  readonly c2sKeyB64?: string;
+  /**
    * Server-clock offset (server minus local) captured from bootstrap, used to
    * reject replayed frames by their authenticated `server_time_ms` (BR-15).
    */

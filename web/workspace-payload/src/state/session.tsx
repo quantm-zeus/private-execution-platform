@@ -31,6 +31,7 @@ import {
   type SessionBootstrapOptions,
   type WorkspaceSession,
 } from "../transport/bootstrap";
+import { awaitHostSessionKey, type HostSessionKey } from "../realtime/session-key";
 import { UnavailableCommandClient, type CommandClient } from "../transport/command";
 
 export interface WorkspaceStore {
@@ -69,6 +70,13 @@ export interface WorkspaceStore {
   setSelectedInstrument(ref: InstrumentRef | null): void;
   /** Current encrypted command channel (swapped in after the key handoff). */
   readonly command: CommandClient;
+  /**
+   * True once the authenticated encrypted command channel is installed. Panels
+   * must not issue a command before this: the fail-closed stub answers
+   * `capability_missing`, and a one-shot read would latch a permanent
+   * `unavailable` state instead of waiting for the real channel.
+   */
+  readonly commandReady: Accessor<boolean>;
   setConnection(status: ConnectionStatus): void;
   /** Install the encrypted command channel once a session key is available. */
   setCommand(client: CommandClient): void;
@@ -142,7 +150,20 @@ export interface CreateWorkspaceStoreOptions extends SessionBootstrapOptions {
   readonly clock?: () => number;
   /** Encrypted command channel; defaults to a fail-closed client. */
   readonly command?: CommandClient;
+  /**
+   * How long the store waits for the BR-5 host key before bootstrap fails
+   * closed. Defaults to 2s; the shell posts the key as soon as the payload
+   * signals readiness.
+   */
+  readonly hostKeyTimeoutMs?: number;
 }
+
+/**
+ * BR-5 handoff window. The shell only posts the keys after the payload's
+ * `evergreen:workspace-ready` ping (AppShell onMount), so bootstrap must be
+ * patient enough not to race that round-trip but still fail closed promptly.
+ */
+const DEFAULT_HOST_KEY_TIMEOUT_MS = 2_000;
 
 export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}): WorkspaceStore {
   const clock = options.clock ?? (() => Date.now());
@@ -171,12 +192,30 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
   const [sessionDeadlineMs, setSessionDeadlineMs] = createSignal(0);
   let generation = 0;
   let commandClient: CommandClient = options.command ?? new UnavailableCommandClient();
+  const [commandReady, setCommandReady] = createSignal(
+    !(commandClient instanceof UnavailableCommandClient),
+  );
   // Stable proxy so panels that capture `ws.command` at setup still reach the
   // encrypted client once the host key handoff installs it.
   const commandProxy: CommandClient = {
     send: (op, payload, sendOptions) => commandClient.send(op, payload, sendOptions),
   };
   let ticker: number | undefined;
+  // BR-5: arm the host key listener when the store is created (before
+  // `reload()` runs) so a key the shell posts on readiness is not missed.
+  const hostKeyAbort = new AbortController();
+  let hostKeyPromise: Promise<HostSessionKey | null> | null =
+    typeof window !== "undefined"
+      ? awaitHostSessionKey(
+          options.hostKeyTimeoutMs ?? DEFAULT_HOST_KEY_TIMEOUT_MS,
+          window,
+          hostKeyAbort.signal,
+        )
+      : null;
+  // Bootstrap must never reuse sequence 0 for the same `kid` (the server's replay
+  // window never resets), so each bootstrap attempt takes a strictly increasing
+  // sequence. A fresh `kid` also accepts a higher first sequence.
+  let bootstrapSequence = 0;
 
   const session = (): WorkspaceSession | undefined => {
     const current = state();
@@ -196,7 +235,20 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     setSelectedInstrument(null);
     setState(loadingState<WorkspaceSession>(clock()));
     setConnection({ ...DISCONNECTED, phase: "connecting" });
-    bootstrapWorkspaceSession(options).then(
+    // Prefer an explicit key source from the caller; otherwise bootstrap waits on
+    // the store's shared BR-5 handoff promise. An injected `session` still
+    // short-circuits inside `bootstrapWorkspaceSession` before any key is needed.
+    const hasExplicitKeys = Boolean(options.kid && options.c2sKeyB64 && options.s2cKeyB64);
+    // Snapshot the mutable reference so the provider closure is typed non-null.
+    const keyPromise = hostKeyPromise;
+    const bootstrapOptions: SessionBootstrapOptions =
+      options.hostKeyProvider || hasExplicitKeys || keyPromise === null
+        ? options
+        : { ...options, hostKeyProvider: () => keyPromise };
+    // A retry/reload under the same key must not replay bootstrap sequence 0.
+    const sequence = options.sequence ?? bootstrapSequence;
+    if (options.sequence === undefined) bootstrapSequence += 1;
+    bootstrapWorkspaceSession({ ...bootstrapOptions, sequence }).then(
       (value) => {
         if (token !== generation) return;
         setServerSkewMs(boundedServerSkew(value.serverTimeMs, clock()));
@@ -244,6 +296,11 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
   }
 
   function dispose(): void {
+    hostKeyAbort.abort();
+    // Drop the resolved BR-5 key reference so a torn-down workspace does not pin
+    // the base64 session keys in a closure.
+    hostKeyPromise = null;
+    setCommandReady(false);
     if (ticker !== undefined) {
       window.clearInterval(ticker);
       ticker = undefined;
@@ -265,9 +322,11 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     selectedInstrument,
     setSelectedInstrument,
     command: commandProxy,
+    commandReady,
     setConnection,
     setCommand(client: CommandClient) {
       commandClient = client;
+      setCommandReady(!(client instanceof UnavailableCommandClient));
     },
     dispose,
     reload,

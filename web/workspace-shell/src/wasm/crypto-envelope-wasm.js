@@ -22,6 +22,23 @@ export class WasmInitiatorSession {
         wasm.__wbg_wasminitiatorsession_free(ptr, 0);
     }
     /**
+     * Directional app session keys for the private payload (BR-5):
+     * `c2s(32) || s2c(32)`.
+     *
+     * SECRET. This is the only key export on the boundary, and it exists so
+     * the trusted same-origin shell can hand the keys to the sandboxed payload
+     * over a same-document `postMessage`. The caller must import them as
+     * non-extractable `CryptoKey`s, zeroize the returned buffer, and never
+     * persist, log or serialize it. The artifact-session keys are not exposed.
+     * @returns {Uint8Array}
+     */
+    app_session_keys() {
+        const ret = wasm.wasminitiatorsession_app_session_keys(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
      * Authenticated decrypt of a server->client session envelope:
      * `kid(16) || nonce(12) || sequence(u64 BE) || ciphertext`.
      * @param {Uint8Array} envelope_wire
@@ -61,6 +78,16 @@ export class WasmInitiatorSession {
             throw takeFromExternrefTable0(ret[1]);
         }
         return WasmInitiatorSession.__wrap(ret[0]);
+    }
+    /**
+     * The 16-byte session key id (public wire material).
+     * @returns {Uint8Array}
+     */
+    kid() {
+        const ret = wasm.wasminitiatorsession_kid(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
     }
 }
 if (Symbol.dispose) WasmInitiatorSession.prototype[Symbol.dispose] = WasmInitiatorSession.prototype.free;

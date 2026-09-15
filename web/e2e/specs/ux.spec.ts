@@ -72,9 +72,13 @@ test.describe("accessibility", () => {
 test.describe("performance budgets (local harness)", () => {
   test("post-auth workspace load stays under the 2s budget", async ({ page, request }) => {
     await resetServer(request);
-    await configureSession(request, randomKeyB64(), randomKeyB64());
+    const s2c = randomKeyB64();
+    const c2s = randomKeyB64();
+    await configureSession(request, s2c, c2s);
     const startedAt = Date.now();
     await page.goto("/");
+    // Opaque bootstrap needs the BR-5 handoff before it can resolve.
+    await handoffKey(page, s2c, c2s);
     await expect(page.getByText("TRADING ENABLED")).toBeVisible();
     const loadMs = Date.now() - startedAt;
     // eslint-disable-next-line no-console

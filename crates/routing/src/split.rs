@@ -197,6 +197,9 @@ fn quote_branch(
         scoring: req.scoring,
         gas: req.gas,
         gas_price_in_output: req.gas_price_in_output.clone(),
+        // Split branches keep the pre-depth economics: depth ranking is a
+        // single-path key and never changes split leg selection.
+        depth_targets: &[],
     };
     quote::quote_path(&branch_req, req.descriptors, path)
 }
@@ -742,8 +745,10 @@ pub fn plan_split(
         score::compare_scored(
             &left.scored,
             left.net_after_gas,
+            None,
             &right.scored,
             right.net_after_gas,
+            None,
         )
     });
 

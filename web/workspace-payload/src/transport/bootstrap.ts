@@ -4,8 +4,15 @@
 // authoritative capability set and fails closed (typed `unavailable`/`auth`
 // errors) when the contract is missing or malformed. No default capability is
 // ever enabled optimistically.
+//
+// BR-7: the request and response are opaque AEAD envelopes carried as
+// `application/octet-stream` (UTF-8 JSON of the generic envelope). There is no
+// cleartext operation type on the wire; without a BR-5 session key bootstrap
+// fails closed rather than falling back to a cleartext JSON probe.
 
+import { base64ToBytes, utf8Decode, utf8Encode } from "../core/base64";
 import { workspaceError } from "../core/errors";
+import { randomRequestId } from "../core/request-id";
 import {
   CAPABILITY_KEYS,
   type CapabilityKey,
@@ -13,6 +20,10 @@ import {
   type ChainInfo,
   type KillSwitchState,
 } from "../core/types";
+import { WebCryptoDecryptor } from "../realtime/decryptor";
+import { validateEnvelope } from "../realtime/envelope";
+import { WebCryptoSealer } from "../realtime/sealer";
+import type { HostSessionKey } from "../realtime/session-key";
 import { assertNeutralUrl } from "./paths";
 import { readBoundedJson } from "./http-body";
 
@@ -34,6 +45,21 @@ export interface SessionBootstrapOptions {
   readonly signal?: AbortSignal;
   /** Test/host injection: an already-validated session. */
   readonly session?: WorkspaceSession;
+  /**
+   * BR-5 host key handoff. Bootstrap waits for this before sealing the request;
+   * a `null`/missing key fails closed (never a cleartext fallback).
+   */
+  readonly hostKeyProvider?: () => Promise<HostSessionKey | null>;
+  /** Explicit test/host key source (prefer `hostKeyProvider`). */
+  readonly kid?: string;
+  readonly c2sKeyB64?: string;
+  readonly s2cKeyB64?: string;
+  /**
+   * Monotonic per-`kid` bootstrap sequence. The server keeps a replay window for
+   * the lifetime of the key, so a retry/reload must not reuse sequence 0; the
+   * store supplies a strictly increasing value. Defaults to 0 for a fresh key.
+   */
+  readonly sequence?: number;
 }
 
 function allCapabilitiesFalse(): CapabilitySet {
@@ -144,9 +170,61 @@ function mapBootstrapFailure(status: number): never {
   });
 }
 
+interface BootstrapKeys {
+  readonly kid: string;
+  readonly c2sKeyB64: string;
+  readonly s2cKeyB64: string;
+}
+
+/**
+ * Resolve the BR-5 directional keys bootstrap needs. Both directions are
+ * required: c2s seals the request and s2c opens the response. Without a key
+ * source bootstrap cannot speak the opaque contract and must fail closed.
+ */
+async function resolveBootstrapKeys(
+  options: SessionBootstrapOptions,
+): Promise<BootstrapKeys> {
+  if (options.hostKeyProvider) {
+    const key = await options.hostKeyProvider();
+    if (!key || !key.c2sKeyB64) {
+      throw workspaceError(
+        "capability_missing",
+        "Private API session key is unavailable (BR-5).",
+        { retryable: false, detail: "bootstrap key handoff missing" },
+      );
+    }
+    return { kid: key.kid, c2sKeyB64: key.c2sKeyB64, s2cKeyB64: key.s2cKeyB64 };
+  }
+  if (options.kid && options.c2sKeyB64 && options.s2cKeyB64) {
+    return { kid: options.kid, c2sKeyB64: options.c2sKeyB64, s2cKeyB64: options.s2cKeyB64 };
+  }
+  throw workspaceError("capability_missing", "Private API session key is unavailable (BR-5).", {
+    retryable: false,
+    detail: "bootstrap key handoff missing",
+  });
+}
+
+async function importBootstrapCrypto(
+  keys: BootstrapKeys,
+): Promise<{ sealer: WebCryptoSealer; decryptor: WebCryptoDecryptor }> {
+  const c2sRaw = base64ToBytes(keys.c2sKeyB64);
+  const s2cRaw = base64ToBytes(keys.s2cKeyB64);
+  try {
+    const sealer = await WebCryptoSealer.fromRawKey(c2sRaw);
+    const decryptor = await WebCryptoDecryptor.fromRawKey(s2cRaw, keys.kid);
+    return { sealer, decryptor };
+  } finally {
+    // Zeroize the raw key byte arrays now that they are imported as
+    // non-extractable CryptoKeys (the import helpers zeroize their own copy).
+    c2sRaw.fill(0);
+    s2cRaw.fill(0);
+  }
+}
+
 /**
  * Resolve the workspace session. Prefers an injected session (host handoff or
- * tests); otherwise performs the neutral `/v1/bootstrap` probe and fails closed.
+ * tests); otherwise performs the neutral opaque `/v1/bootstrap` probe and fails
+ * closed.
  */
 export async function bootstrapWorkspaceSession(
   options: SessionBootstrapOptions = {},
@@ -163,14 +241,41 @@ export async function bootstrapWorkspaceSession(
     throw workspaceError("capability_missing", "Private API is not reachable from this runtime.");
   }
 
+  const keys = await resolveBootstrapKeys(options);
+  const { sealer, decryptor } = await importBootstrapCrypto(keys);
+
+  // Bootstrap owns its own sequence window (per-purpose server replay windows).
+  // The server never resets that window for the life of the `kid`, so a
+  // retry/reload must advance the sequence; reusing 0 would be rejected as a
+  // replay and wedge the workspace until a manual re-unlock.
+  const sequence = options.sequence ?? 0;
+  const requestId = randomRequestId();
+  const plaintext = utf8Encode(
+    JSON.stringify({ op: "bootstrap", protocol_version: 1, request_id: requestId }),
+  );
+  let sealed;
+  try {
+    sealed = await sealer.seal({ kid: keys.kid, sequence }, plaintext);
+  } finally {
+    plaintext.fill(0);
+  }
+  const envelopeBody = utf8Encode(
+    JSON.stringify({
+      kid: keys.kid,
+      sequence,
+      nonce: sealed.nonce,
+      ciphertext: sealed.ciphertext,
+    }),
+  );
+
   const url = assertNeutralUrl("/v1/bootstrap", baseUrl);
   let response: Response;
   try {
     response = await fetchFn(url.toString(), {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: envelopeBody,
       signal: options.signal,
     });
   } catch (error) {
@@ -184,6 +289,38 @@ export async function bootstrapWorkspaceSession(
 
   // The response is bounded before parsing: a compromised relay must not be able
   // to OOM the main thread with a multi-gigabyte body (the command path already
-  // enforces the same ceiling).
-  return parseWorkspaceSession(await readBoundedJson(response));
+  // enforces the same ceiling). The response is the bare envelope (a wrapped
+  // `{envelope}` shape is still accepted for compatibility).
+  const raw = await readBoundedJson(response);
+  if (!raw || typeof raw !== "object") {
+    throw workspaceError("protocol", "Malformed bootstrap response.");
+  }
+  const envelope = validateEnvelope((raw as Record<string, unknown>).envelope ?? raw);
+  if (envelope.sequence !== sequence) {
+    throw workspaceError("protocol", "Bootstrap response sequence mismatch.", {
+      retryable: false,
+      detail: `expected ${sequence}, received ${envelope.sequence}`,
+    });
+  }
+  const decrypted = await decryptor.decrypt(envelope);
+  try {
+    let body: unknown;
+    try {
+      body = JSON.parse(utf8Decode(decrypted));
+    } catch {
+      throw workspaceError("protocol", "Bootstrap response was not valid JSON.");
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw workspaceError("protocol", "Bootstrap response was malformed.");
+    }
+    if ((body as Record<string, unknown>).request_id !== requestId) {
+      throw workspaceError("protocol", "Bootstrap response was not bound to this request.", {
+        retryable: false,
+        detail: "request binding",
+      });
+    }
+    return parseWorkspaceSession(body);
+  } finally {
+    decrypted.fill(0);
+  }
 }
