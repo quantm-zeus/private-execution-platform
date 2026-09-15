@@ -9,7 +9,8 @@ use provider_broker::{
     RequestContext, RequestPriority,
 };
 use routing::{
-    compare_route, BenchmarkVerdict, LocalRouteQuote, ProviderQuote, RouteComparisonRecord,
+    compare_route, BenchmarkError, BenchmarkVerdict, LocalRouteQuote, ProviderQuote,
+    RouteComparisonRecord,
 };
 
 use crate::policy::{BenchmarkPolicyError, BenchmarkServicePolicy};
@@ -207,6 +208,17 @@ impl ProviderBenchmarkService {
                 0,
             );
         }
+        // A local basis from the future is a caller-side comparator error. Gate
+        // it before any spend so a bad caller basis can never be misattributed
+        // to the provider (circuit failure + negative cache).
+        if request.local.observed_at_ms > now_ms {
+            return skipped(
+                BenchmarkSkipReason::ComparatorRejected,
+                CacheState::Miss,
+                None,
+                0,
+            );
+        }
 
         self.calls = self.calls.wrapping_add(1);
         if self.calls % PRUNE_INTERVAL_CALLS == 0 {
@@ -337,16 +349,22 @@ impl ProviderBenchmarkService {
             let mut guard = ProbeGuard::new(&mut self.circuit, now);
             match source.fetch_quote(&quote_request).await {
                 Ok(quote) if binds(&self.policy, &request.local, &quote, now_ms) => {
-                    // A quote the comparator structurally rejects (for example a
-                    // zero provider output) is a malformed response, not a
-                    // provider success: fail the probe and negatively cache it.
-                    if compare_route(&request.local, &quote, &self.policy.benchmark, now_ms).is_ok()
-                    {
-                        guard.succeed();
-                        Ok(quote)
-                    } else {
-                        guard.fail();
-                        Err(FetchFailure::Unbound)
+                    match compare_route(&request.local, &quote, &self.policy.benchmark, now_ms) {
+                        // A zero provider output is a provider contract
+                        // violation: fail the probe and negatively cache it.
+                        Err(BenchmarkError::ZeroProviderOutput) => {
+                            guard.fail();
+                            Err(FetchFailure::Unbound)
+                        }
+                        // The quote binds and is structurally valid. Any other
+                        // comparator error (for example arithmetic overflow) is
+                        // caller-side, so it must not be charged to the provider
+                        // circuit or negative cache; `compare_outcome` surfaces
+                        // the comparator's own rejection later.
+                        _ => {
+                            guard.succeed();
+                            Ok(quote)
+                        }
                     }
                 }
                 Ok(_) => {
