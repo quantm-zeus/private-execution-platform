@@ -137,18 +137,19 @@ impl BenchmarkRequestSource for EmptyBenchmarkRequestSource {
 
 /// Builds the exact bound benchmark request for a local route preview.
 ///
-/// The local basis is taken verbatim from the locked `RouteQuote` net delta
-/// (input asset, output asset, wallet-debit net input, and net output), so the
-/// comparator sees the same economics the execution path would. `now_ms` is the
-/// caller's reference instant and becomes the local observation time; the
-/// candidate gate and priority are supplied by the caller.
+/// The local basis is taken verbatim from the locked `RouteQuote`: the
+/// wallet-debit net input and net output come from its `net_delta`, and the
+/// local observation instant is the quote's own `plan.state.observed_at_ms` —
+/// the same freshness timestamp the execution path derives its state age from.
+/// The caller's comparison reference instant is supplied separately to
+/// [`ProviderBenchmarkLoop::run_pass`], so the P80 local-state-staleness guard
+/// stays live for a re-used or stale preview instead of being pinned to zero.
 ///
 /// This is a pure constructor: no clock, network, or provider access.
 pub fn benchmark_request_from_preview(
     quote: &RouteQuote,
     candidate: CandidateContext,
     priority: RequestPriority,
-    now_ms: i64,
 ) -> BenchmarkRequest {
     let net = &quote.net_delta;
     let local = LocalRouteQuote::new(
@@ -157,7 +158,7 @@ pub fn benchmark_request_from_preview(
         net.token_out.clone(),
         net.net_input.amount.get(),
         net.net_output.amount.get(),
-        now_ms,
+        quote.plan.state.observed_at_ms,
     );
     BenchmarkRequest {
         local,
