@@ -307,15 +307,15 @@ fn bridged_local_basis_keeps_the_state_age_guard_live() {
     );
     let provider = provider_quote();
 
-    // `NOW + 10s` is far beyond the default 2s local-state bound: the
-    // comparator must skip rather than report a deviation. With the state
-    // timestamp discarded (the pre-fix behavior) the age was zero and this
-    // assertion failed with `Agree`/`Disagree`.
+    // `NOW + 3s` exceeds the default 2s local-state bound while staying within
+    // the 5s provider bound, so this isolates the local-state guard. With the
+    // state timestamp discarded (the pre-fix behavior) the age was zero and
+    // this assertion failed with `Agree`/`Disagree`.
     let verdict = compare_route(
         &request.local,
         &provider,
         &BenchmarkPolicy::default(),
-        NOW + 10_000,
+        NOW + 3_000,
     )
     .expect("comparison");
     assert_eq!(
