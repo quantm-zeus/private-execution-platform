@@ -1,14 +1,16 @@
 // Passkey-bound workspace recovery wrapping primitives.
 //
-// Design: a random 32-byte workspace *root key* is wrapped locally under each
-// recovery credential. For a passkey, the wrapping key is derived from the
-// WebAuthn PRF extension output:
+// Design: the workspace *root key material* is wrapped locally under each
+// recovery credential. In the wired production path that key material is the
+// existing 32-byte unlock secret (`key_source = "unlock_secret_v1"`), so the
+// artifact and its derivation are unchanged. For a passkey, the wrapping key is
+// derived from the WebAuthn PRF extension output:
 //
 //   PRF output --HKDF-SHA256(salt, info)--> AES-256-GCM wrapping key
-//             --AES-GCM(root key)--> wrapped root key (stored server-side)
+//             --AES-GCM(key material)--> wrapped record (stored server-side)
 //
-// The PRF output, wrapping key and unwrapped root key never leave the browser in
-// plaintext. A normal passkey signature is NOT key material and is never used
+// The PRF output, wrapping key and unwrapped key material never leave the browser
+// in plaintext. A normal passkey signature is NOT key material and is never used
 // here. PRF is optional in WebAuthn, so a mandatory high-entropy offline
 // recovery secret remains the fallback.
 //
