@@ -2,8 +2,10 @@
 //! ranking, score assembly, and validated [`RoutePlan`] construction.
 //!
 //! This slice deliberately implements single-hop, single-leg direct routes only.
-//! Splits, multi-hop search, depth targets, gas modelling, provider benchmarks,
-//! and DEX adapters are deferred (see the slice non-goals).
+//! Splits, multi-hop search, depth targets, gas modelling, and DEX adapters are
+//! deferred (see the slice non-goals). Provider benchmarking lives in the
+//! additive [`crate::benchmark`] comparator, which only compares externally
+//! supplied quotes; this planner never calls it.
 
 use std::cmp::Ordering;
 

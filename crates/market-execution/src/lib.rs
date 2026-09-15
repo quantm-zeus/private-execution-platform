@@ -43,15 +43,26 @@
 
 #![forbid(unsafe_code)]
 
+pub mod okx;
+
+pub use okx::{
+    ApprovedProviderSink, OkxExecutionConfig, ProviderProposalError, ProviderProposalSource,
+    ProviderRevalidationGate, UnavailableApprovedProviderSink, UnavailableProviderProposalSource,
+    UnavailableProviderRevalidationGate, VerifiedProviderExecutionPort,
+};
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
+    RouterSource,
 };
 use async_trait::async_trait;
-use domain::{cmp_u128_products, mul_u128_wide, RoutePlan, TaxObservation, TradeIntent};
+use domain::{
+    cmp_u128_products, mul_u128_wide, IdempotencyKey, RoutePlan, TaxObservation, TradeIntent,
+};
 use execution_preview::{
     revalidate_pre_sign, AllowanceObservation, RevalidationInput, RevalidationOutcome,
     RouteBinding, WalletBalance,
@@ -216,6 +227,15 @@ where
         &self,
         request: MarketExecutionRequest,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        // P84B source boundary: this port composes the *local* relay path only.
+        // An OKX-sourced quote must go through the P84C verified-proposal
+        // boundary before it can be signed, so a non-Local source is denied here
+        // rather than being signed as if it were a local route. This makes a
+        // source mismatch a final pre-sign denial (no sign/submit occurs).
+        if request.router_source != RouterSource::Local {
+            return Err(MarketExecutionError::Denied);
+        }
+
         let trust = self.trust.trust(&request)?;
 
         // Authority is checked on the *same* engine that gates the relay, so the
@@ -275,6 +295,29 @@ where
             now_ms: request.now_ms,
         };
         map_outcome(self.relay.execute(input).await)
+    }
+
+    /// Reconciles a previously delegated attempt by its idempotency key.
+    ///
+    /// # Invariants
+    /// - **MR-1 (no sign/submit).** This delegates to [`ExecutionRelay::reconcile`],
+    ///   which only queries/reconciles the process-local journal and the chain
+    ///   adapter. It never runs the policy/trust/revalidation gates, never signs,
+    ///   never submits, and never advances a reservation; the only write is a
+    ///   best-effort record of the observed outcome in the process-local
+    ///   reservation store (the reservation digest is unchanged, so at-most-once
+    ///   holds).
+    /// - **MR-2 (no fabricated fill).** The result goes through the same private
+    ///   [`map_outcome`]: a `Filled` is produced only from a relay
+    ///   `Confirmed { fill: Some }` observation carrying exact amounts; a
+    ///   confirmation without amounts, an ambiguous transport error, or a missing
+    ///   journal entry is `Unknown`, never a guessed fill.
+    async fn reconcile(
+        &self,
+        idempotency_key: &IdempotencyKey,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        map_outcome(self.relay.reconcile(idempotency_key, now_ms).await)
     }
 }
 

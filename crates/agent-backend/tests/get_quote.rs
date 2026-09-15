@@ -13,7 +13,7 @@ use agent_backend::{
     UnavailableOrderValuation, UnavailablePortfolioReadModel,
 };
 use agent_commands::{
-    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, ReadCommand,
+    AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, ReadCommand, RouterSource,
 };
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
@@ -214,6 +214,8 @@ fn get_quote(token_in: &str, token_out: &str, amount: AmountSpec) -> AgentComman
         token_in: AssetRef::new(ChainId::Base, token_in).expect("in"),
         token_out: AssetRef::new(ChainId::Base, token_out).expect("out"),
         amount,
+        // Every pre-P84B test in this file pins the byte-identical Local path.
+        router: RouterSource::Local,
     })
 }
 
@@ -314,6 +316,7 @@ async fn get_quote_rejects_structural_denials() {
                 token_in: AssetRef::new(ChainId::Solana, "USDC").expect("in"),
                 token_out: AssetRef::new(ChainId::Base, "TOKEN").expect("out"),
                 amount: AmountSpec::TokenAtomic(AMOUNT),
+                router: RouterSource::Local,
             })
         )
         .await,
@@ -367,7 +370,7 @@ async fn get_quote_is_available_while_trading_is_disabled() {
     let mut chains = HashSet::new();
     chains.insert(ChainId::Base);
     let server = McpServer::new(backend, AgentCapabilities::new(false, chains, 0));
-    let command = r#"{"tool":"get_quote","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"amount":{"unit":"token_atomic","value":1000000000}}"#;
+    let command = r#"{"tool":"get_quote","token_in":{"chain":{"kind":"base"},"address":"USDC"},"token_out":{"chain":{"kind":"base"},"address":"TOKEN"},"amount":{"unit":"token_atomic","value":1000000000},"router_preference":"local"}"#;
     let frame = mcp_server::tools_call_frame(command).expect("frame");
     let response = server.handle(&frame).await;
     let parsed: Value = serde_json::from_str(&response).expect("json");

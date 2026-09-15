@@ -35,6 +35,7 @@ dependencies = [
  "limit-engine",
  "market-types",
  "mcp-server",
+ "okx-client",
  "routing",
  "serde",
  "serde_json",
@@ -1436,17 +1437,21 @@ name = "market-execution"
 version = "0.1.0"
 dependencies = [
  "agent-backend",
+ "agent-commands",
  "async-trait",
  "chain-types",
  "domain",
  "execution-preview",
  "execution-relay",
  "market-types",
+ "okx-client",
  "policy",
  "privy",
+ "provider-verification",
  "routing",
  "simulation",
  "tax-engine",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
@@ -1668,6 +1673,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
 dependencies = [
  "asn1-rs 0.7.2",
+]
+
+[[package]]
+name = "okx-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chain-types",
+ "hmac",
+ "market-types",
+ "routing",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2132,6 +2155,20 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "provider-verification"
+version = "0.1.0"
+dependencies = [
+ "chain-types",
+ "domain",
+ "execution-preview",
+ "market-types",
+ "serde_json",
+ "sha2 0.11.0",
+ "tax-engine",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3261,11 +3298,23 @@ dependencies = [
 name = "trading-core"
 version = "0.1.0"
 dependencies = [
+ "agent-backend",
+ "agent-commands",
+ "async-trait",
  "chain-types",
+ "crypto-envelope",
  "domain",
+ "execution-preview",
+ "execution-relay",
+ "limit-engine",
+ "market-execution",
  "market-types",
+ "mcp-server",
  "policy",
  "privy",
+ "routing",
+ "serde_json",
+ "storage",
  "thiserror 2.0.20",
  "tokio",
 ]

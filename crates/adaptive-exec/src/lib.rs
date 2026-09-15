@@ -29,10 +29,15 @@
 
 #![forbid(unsafe_code)]
 
+mod analytics;
 mod engine;
 mod plan;
 mod rfq;
 
+pub use analytics::{
+    analyze, AnalyticsError, Delta, DeltaDirection, ExecutionAnalytics, ExecutionEstimate,
+    RealizedExecution,
+};
 pub use engine::{AdaptiveTwap, ChunkReason, HaltReason, TwapDecision};
 pub use plan::{MarketObservation, TwapPlan, TwapPolicy, TwapState};
 pub use rfq::{

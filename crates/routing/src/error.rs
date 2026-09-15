@@ -67,6 +67,10 @@ pub enum RoutingError {
     #[error("unsupported pool kind")]
     UnsupportedPoolKind,
 
+    /// A swap instruction's output floor exceeds the quote's available output.
+    #[error("minimum output exceeds the quoted amount")]
+    MinAmountOutExceedsQuote,
+
     /// Tax composition is unsupported for the Bin/DLMM leg configuration.
     #[error("unsupported bin tax composition")]
     UnsupportedBinTaxComposition,
@@ -162,6 +166,18 @@ pub enum RoutingError {
     /// An internal invariant failed; the reason is a fixed static string.
     #[error("internal routing error: {0}")]
     Internal(&'static str),
+
+    /// The configured split leg count is outside `MIN_SPLIT_LEGS..=MAX_SPLIT_LEGS`.
+    #[error("unsupported split leg count")]
+    UnsupportedSplitLegCount,
+
+    /// The split configuration is internally inconsistent or unbound.
+    #[error("invalid split configuration")]
+    InvalidSplitConfig,
+
+    /// The split search exceeded its bounded exact-quote budget.
+    #[error("split quote budget exceeded")]
+    SplitBudgetExceeded,
 }
 
 /// Payload-free classification of a [`BridgeError`] rejection.

@@ -30,7 +30,9 @@
 
 use std::sync::Arc;
 
-use agent_commands::{AgentChannel, AmountSpec, LimitPriceSpec, ReadCommand, TradeCommand};
+use agent_commands::{
+    AgentChannel, AmountSpec, LimitPriceSpec, ReadCommand, RouterSource, TradeCommand,
+};
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use domain::{
@@ -43,7 +45,7 @@ use limit_engine::{
 };
 use market_types::{AssetAmount, AtomicAmount, Bps};
 use mcp_server::{AgentBackend, BackendOutcome};
-use routing::GasEstimator;
+use routing::{quote_provider_route, GasEstimator, PoolRefLabel, ProviderRouteInput, VenueLabel};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -57,6 +59,7 @@ use crate::market::{
     plan_market_preview, MarketPreview, MarketPreviewError, MarketSnapshotSource,
     UnavailableMarketSnapshot,
 };
+use crate::okx::{OkxQuoteError, OkxQuoteSource, UnavailableOkxQuoteSource};
 use crate::order::{OrderReadModel, OrderSummary};
 use crate::portfolio::PortfolioReadModel;
 
@@ -178,6 +181,7 @@ pub struct TradingAgentBackend<O: OrderReadModel, P: PortfolioReadModel, S> {
     market: Arc<dyn MarketSnapshotSource>,
     gas: Option<Arc<dyn GasEstimator>>,
     execution: Arc<dyn MarketExecutionPort>,
+    provider: Arc<dyn OkxQuoteSource>,
 }
 
 impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
@@ -204,6 +208,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             market: Arc::new(UnavailableMarketSnapshot),
             gas: None,
             execution: Arc::new(UnavailableMarketExecution),
+            provider: Arc::new(UnavailableOkxQuoteSource),
         }
     }
 
@@ -222,6 +227,16 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     /// Installs the market-execution port used by `execute_market_order`.
     pub fn with_market_execution(mut self, execution: Arc<dyn MarketExecutionPort>) -> Self {
         self.execution = execution;
+        self
+    }
+
+    /// Installs the read-only OKX quote source used by the `Okx` route.
+    ///
+    /// The default is [`UnavailableOkxQuoteSource`], so an OKX-selected command
+    /// fails closed until a source is explicitly installed; it never silently
+    /// falls back to the local router.
+    pub fn with_okx_quote_source(mut self, source: Arc<dyn OkxQuoteSource>) -> Self {
+        self.provider = source;
         self
     }
 
@@ -279,7 +294,10 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     ///
     /// No timestamp is included, so an identical preview request yields an
     /// identical derived intent/idempotency identity. The effective risk caps
-    /// are part of the identity because they bound the quoted route.
+    /// are part of the identity because they bound the quoted route, and the
+    /// selected `router` source is bound so a Local quote can never be replayed
+    /// as an OKX execution (or vice versa).
+    #[allow(clippy::too_many_arguments)]
     fn preview_parts(
         &self,
         token_in: &agent_commands::AssetRef,
@@ -288,8 +306,9 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount_in: AtomicAmount,
         max_slippage: Bps,
         max_price_impact: Bps,
+        router: RouterSource,
     ) -> Vec<Vec<u8>> {
-        vec![
+        let mut parts = vec![
             self.config.owner.as_str().as_bytes().to_vec(),
             self.config.wallet_ref.as_str().as_bytes().to_vec(),
             chain_code(&self.config.chain).into_bytes(),
@@ -306,7 +325,14 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             max_price_impact.get().to_be_bytes().to_vec(),
             self.config.risk.max_buy_tax.get().to_be_bytes().to_vec(),
             self.config.risk.max_sell_tax.get().to_be_bytes().to_vec(),
-        ]
+        ];
+        // Source-bound identity: OKX appends its discriminant so a Local quote
+        // can never be replayed as an OKX execution. Local appends nothing, so a
+        // pre-P84B Local intent/idempotency identity is preserved byte-for-byte.
+        if router == RouterSource::Okx {
+            parts.push(b"okx".to_vec());
+        }
+        parts
     }
 
     /// Builds the trusted intent for one market preview.
@@ -327,6 +353,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount: &AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
+        router: RouterSource,
     ) -> Result<(TradeIntent, AtomicAmount), BackendError> {
         // Bind the command to the configured chain before any state is built.
         if token_in.chain != self.config.chain || token_out.chain != self.config.chain {
@@ -356,6 +383,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             amount_in,
             max_slippage,
             max_price_impact,
+            router,
         );
         let derived = DerivedIdentity::preview(&parts);
         let risk = RiskConstraints {
@@ -398,8 +426,15 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
     /// trusted intent (and route) to the execution port that produced the quote.
     /// The caller supplies `now_ms` so one command reads the trusted clock once
     /// and uses the same instant for pricing and execution.
+    ///
+    /// `router` selects the source. [`RouterSource::Local`] is byte-identical to
+    /// the previous local planner path. [`RouterSource::Okx`] fetches the trusted
+    /// snapshot for the tax assessment/scoring, computes the provider input, calls
+    /// the injected [`OkxQuoteSource`], and composes through the locked provider
+    /// bridge. It **never** falls back to Local: a provider outage or rejection
+    /// is surfaced as unavailability/denial.
     #[allow(clippy::too_many_arguments)]
-    fn quote_market_preview(
+    async fn quote_market_preview(
         &self,
         channel: AgentChannel,
         token_in: agent_commands::AssetRef,
@@ -409,6 +444,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
         now_ms: i64,
+        router: RouterSource,
     ) -> Result<(TradeIntent, MarketPreview), BackendError> {
         let (intent, amount_in) = self.preview_intent(
             channel,
@@ -418,19 +454,88 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             &amount,
             max_slippage_bps,
             max_price_impact_bps,
+            router,
         )?;
-        let preview = plan_market_preview(
-            self.market.as_ref(),
-            self.gas.as_deref(),
-            &intent,
-            amount_in,
-            now_ms,
-        )
-        .map_err(|error| match error {
-            MarketPreviewError::Unavailable => BackendError::Unavailable,
-            MarketPreviewError::NoViableRoute => BackendError::Denied,
-        })?;
-        Ok((intent, preview))
+        match router {
+            RouterSource::Local => {
+                let preview = plan_market_preview(
+                    self.market.as_ref(),
+                    self.gas.as_deref(),
+                    &intent,
+                    amount_in,
+                    now_ms,
+                )
+                .map_err(|error| match error {
+                    MarketPreviewError::Unavailable => BackendError::Unavailable,
+                    MarketPreviewError::NoViableRoute => BackendError::Denied,
+                })?;
+                Ok((intent, preview))
+            }
+            RouterSource::Okx => {
+                // The trusted snapshot still supplies the tax assessment, the
+                // freshness policy, and the score inputs; the gross output comes
+                // from the provider and is validated through the locked bridge.
+                let snapshot = self
+                    .market
+                    .snapshot(&intent, amount_in, now_ms)
+                    .map_err(|_| BackendError::Unavailable)?;
+                // Sell-side input tax is charged before the swap, so the provider
+                // only sees the transferable remainder.
+                let provider_amount_in = match intent.side {
+                    TradeSide::Buy => amount_in,
+                    TradeSide::Sell => {
+                        snapshot
+                            .assessment
+                            .apply_sell_tax_to_input(&AssetAmount {
+                                asset: intent.token_in.clone(),
+                                amount: amount_in,
+                            })
+                            .map_err(|_| BackendError::Denied)?
+                            .net_transferable_input
+                            .amount
+                    }
+                };
+                let normalized = self
+                    .provider
+                    .fetch_quote(
+                        intent.chain.clone(),
+                        intent.token_in.clone(),
+                        intent.token_out.clone(),
+                        provider_amount_in,
+                        Some(intent.risk.max_slippage),
+                        now_ms,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        OkxQuoteError::Unavailable => BackendError::Unavailable,
+                        OkxQuoteError::Rejected => BackendError::Denied,
+                    })?;
+                let venue = VenueLabel::new("okx").map_err(|_| BackendError::Denied)?;
+                let pool_ref = PoolRefLabel::new("okx").map_err(|_| BackendError::Denied)?;
+                let input = ProviderRouteInput {
+                    intent: &intent,
+                    amount_in,
+                    provider_gross_output: AtomicAmount::new(normalized.amount_out()),
+                    assessment: &snapshot.assessment,
+                    freshness_policy: &snapshot.freshness_policy,
+                    now_ms,
+                    venue: &venue,
+                    pool_ref: &pool_ref,
+                    scoring: &snapshot.scoring,
+                    price_impact_bps: normalized.price_impact_bps(),
+                };
+                let composed = quote_provider_route(&input).map_err(|_| BackendError::Denied)?;
+                Ok((
+                    intent,
+                    MarketPreview {
+                        quote: composed.quote,
+                        score: composed.score,
+                        truncated: false,
+                        router_source: RouterSource::Okx,
+                    },
+                ))
+            }
+        }
     }
 
     /// Executes a market order by delegating the exact quote to the injected port.
@@ -444,20 +549,25 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         amount: AmountSpec,
         max_slippage_bps: Option<u16>,
         max_price_impact_bps: Option<u16>,
+        router: RouterSource,
     ) -> BackendOutcome {
         // Read the trusted clock once: the quote and the execution request must
         // be stamped with the same instant.
         let now_ms = self.clock.now_ms();
-        let (intent, preview) = match self.quote_market_preview(
-            channel,
-            token_in,
-            token_out,
-            side,
-            amount,
-            max_slippage_bps,
-            max_price_impact_bps,
-            now_ms,
-        ) {
+        let (intent, preview) = match self
+            .quote_market_preview(
+                channel,
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+                now_ms,
+                router,
+            )
+            .await
+        {
             Ok(quoted) => quoted,
             Err(BackendError::Denied) => return BackendOutcome::Denied,
             Err(BackendError::Unavailable) => return BackendOutcome::Unavailable,
@@ -467,6 +577,7 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             quote: preview.quote,
             score: preview.score,
             now_ms,
+            router_source: router,
         };
         match self.execution.execute(request).await {
             Ok(outcome) => execution_outcome(outcome),
@@ -475,31 +586,120 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
         }
     }
 
-    /// Serves the read-only `get_quote` command from the exact local router.
+    /// Reconciles a previously delegated market attempt, returning the typed
+    /// [`MarketExecutionOutcome`] instead of a rendered [`BackendOutcome`].
+    ///
+    /// This is the additive typed seam used by the composition root's read-only
+    /// reconcile loop. It rebuilds the deterministic preview identity from the
+    /// same parameters [`Self::execute_market_order`] uses (via `preview_intent`),
+    /// so the idempotency key handed to the port is byte-identical to the one the
+    /// execution used (P76 MR-4 identity parity); a structural denial is returned
+    /// without touching the port. No quote is needed to derive the identity, so
+    /// no [`MarketSnapshotSource`] is consulted, and the call never signs or
+    /// submits.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_market_order_outcome(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+        router: RouterSource,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        // Read the trusted clock once, exactly as `execute_market_order` does.
+        let now_ms = self.clock.now_ms();
+        let (intent, _amount_in) = match self.preview_intent(
+            channel,
+            token_in,
+            token_out,
+            side,
+            &amount,
+            max_slippage_bps,
+            max_price_impact_bps,
+            router,
+        ) {
+            Ok(intent) => intent,
+            Err(BackendError::Denied) => return Err(MarketExecutionError::Denied),
+            Err(BackendError::Unavailable) => return Err(MarketExecutionError::Unavailable),
+        };
+        self.execution
+            .reconcile(&intent.idempotency_key, now_ms)
+            .await
+    }
+
+    /// Reconciles an already-submitted market order identified by the same
+    /// command parameters that produced it. Read-only: it never signs or submits.
+    ///
+    /// Thin rendering wrapper over [`Self::reconcile_market_order_outcome`], so
+    /// the typed and backend-shaped surfaces can never drift: it delegates the
+    /// identity rebuild and the port call exactly once, then maps the outcome via
+    /// `execution_outcome` identically to before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_market_order(
+        &self,
+        channel: AgentChannel,
+        token_in: agent_commands::AssetRef,
+        token_out: agent_commands::AssetRef,
+        side: TradeSide,
+        amount: AmountSpec,
+        max_slippage_bps: Option<u16>,
+        max_price_impact_bps: Option<u16>,
+        router: RouterSource,
+    ) -> BackendOutcome {
+        match self
+            .reconcile_market_order_outcome(
+                channel,
+                token_in,
+                token_out,
+                side,
+                amount,
+                max_slippage_bps,
+                max_price_impact_bps,
+                router,
+            )
+            .await
+        {
+            Ok(outcome) => execution_outcome(outcome),
+            Err(MarketExecutionError::Denied) => BackendOutcome::Denied,
+            Err(MarketExecutionError::Unavailable) => BackendOutcome::Unavailable,
+        }
+    }
+
+    /// Serves the read-only `get_quote` command from the selected router.
     ///
     /// `get_quote` carries no side, so it quotes the exact-input direction:
     /// spending `token_in` to receive `token_out` (a Buy of `token_out`). The
     /// result is the same locked route and full-net-economics preview that
     /// `preview_market_order` returns, so a displayed quote is never mistaken
-    /// for an approximate price. No funds move and no execution port is touched.
-    fn quote_read(
+    /// for an approximate price. `router` selects the same Local/OKX source as
+    /// `preview_market_order`; an OKX outage fails closed. No funds move and no
+    /// execution port is touched.
+    async fn quote_read(
         &self,
         channel: AgentChannel,
         token_in: agent_commands::AssetRef,
         token_out: agent_commands::AssetRef,
         amount: AmountSpec,
+        router: RouterSource,
     ) -> BackendOutcome {
         let now_ms = self.clock.now_ms();
-        match self.quote_market_preview(
-            channel,
-            token_in,
-            token_out,
-            TradeSide::Buy,
-            amount,
-            None,
-            None,
-            now_ms,
-        ) {
+        match self
+            .quote_market_preview(
+                channel,
+                token_in,
+                token_out,
+                TradeSide::Buy,
+                amount,
+                None,
+                None,
+                now_ms,
+                router,
+            )
+            .await
+        {
             Ok((_intent, preview)) => BackendOutcome::Value(json!({ "quote": preview })),
             Err(BackendError::Denied) => BackendOutcome::Denied,
             Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
@@ -535,7 +735,11 @@ where
                 token_in,
                 token_out,
                 amount,
-            }) => self.quote_read(channel, token_in, token_out, amount),
+                router,
+            }) => {
+                self.quote_read(channel, token_in, token_out, amount, router)
+                    .await
+            }
             agent_commands::AgentCommand::Read(read) => {
                 self.reads
                     .execute(channel, agent_commands::AgentCommand::Read(read))
@@ -588,18 +792,23 @@ where
                 amount,
                 max_slippage_bps,
                 max_price_impact_bps,
+                router,
             } => {
                 let now_ms = self.clock.now_ms();
-                match self.quote_market_preview(
-                    channel,
-                    token_in,
-                    token_out,
-                    side,
-                    amount,
-                    max_slippage_bps,
-                    max_price_impact_bps,
-                    now_ms,
-                ) {
+                match self
+                    .quote_market_preview(
+                        channel,
+                        token_in,
+                        token_out,
+                        side,
+                        amount,
+                        max_slippage_bps,
+                        max_price_impact_bps,
+                        now_ms,
+                        router,
+                    )
+                    .await
+                {
                     Ok((_intent, preview)) => BackendOutcome::Value(json!({ "preview": preview })),
                     Err(BackendError::Denied) => BackendOutcome::Denied,
                     Err(BackendError::Unavailable) => BackendOutcome::Unavailable,
@@ -612,6 +821,7 @@ where
                 amount,
                 max_slippage_bps,
                 max_price_impact_bps,
+                router,
             } => {
                 self.execute_market_order(
                     channel,
@@ -621,6 +831,7 @@ where
                     amount,
                     max_slippage_bps,
                     max_price_impact_bps,
+                    router,
                 )
                 .await
             }

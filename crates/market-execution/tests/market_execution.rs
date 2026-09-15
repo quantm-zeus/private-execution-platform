@@ -13,15 +13,15 @@ use std::sync::Arc;
 
 use agent_backend::{MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort};
 use execution_relay::{
-    ChainHealthBreaker, InMemoryReservationStore, ObservedFill, PrivySigningBoundaryAdapter,
-    RelayOutcome, UnavailableChainAdapter,
+    ChainHealthBreaker, ChainObservation, InMemoryReservationStore, ObservedFill,
+    PrivySigningBoundaryAdapter, RelayOutcome, UnavailableChainAdapter,
 };
 use market_execution::RelayMarketExecutionPort;
 use market_types::AtomicAmount;
 use policy::{PolicyContext, TurnoverSnapshot, UsdMicros};
 use support::{
-    harness, policy, request, request_with, scripted_port, trust, Behavior, CountingSource,
-    FakePreparedRefs, FakeTrust, TestSource, NOW_MS,
+    harness, policy, reconcile_harness, request, request_with, scripted_port, trust, Behavior,
+    CountingSource, FakePreparedRefs, FakeTrust, TestSource, NOW_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,30 @@ async fn trading_disabled_denies_before_signer_or_adapter() {
         0,
         "denial must precede the prepared-reference source"
     );
+}
+
+#[tokio::test]
+async fn non_local_router_source_denies_before_signer_or_adapter() {
+    // P84B: the local relay port must never sign an OKX-sourced quote; that
+    // path belongs to the P84C verified-proposal boundary.
+    let h = harness(true, Behavior::Accept, trust(), false);
+
+    let mut okx_request = request();
+    okx_request.router_source = agent_backend::RouterSource::Okx;
+
+    let outcome = h.port.execute(okx_request).await;
+
+    assert_eq!(outcome, Err(MarketExecutionError::Denied));
+    assert_eq!(
+        h.signer.calls.load(Ordering::SeqCst),
+        0,
+        "a non-Local source must be denied before signing"
+    );
+    assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 0);
+
+    // The same port still accepts the Local source, so the denial above is the
+    // source boundary and not an unrelated failure.
+    assert!(h.port.execute(request()).await.is_ok());
 }
 
 #[tokio::test]
@@ -369,4 +393,138 @@ async fn trading_disabled_after_preview_denies() {
     assert_eq!(h.prepared_calls.load(Ordering::SeqCst), 0);
     assert_eq!(h.signer.calls.load(Ordering::SeqCst), 0);
     assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------------------
+// P76 — read-only reconcile / observation seam
+// ---------------------------------------------------------------------------
+
+/// Populates the relay's process-local journal with exactly one ordinary
+/// `execute`, then zeroes the signer/submit counters so the following read-only
+/// `reconcile` can be held to zero signer and zero adapter submits.
+async fn journal_one_attempt(h: &support::ReconcileHarness) {
+    let executed = h.port.execute(request()).await;
+    assert_eq!(executed, Ok(MarketExecutionOutcome::Submitted));
+    h.signer.calls.store(0, Ordering::SeqCst);
+    h.adapter.submits.store(0, Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn reconcile_maps_an_observed_fill_to_filled() {
+    let h = reconcile_harness(ChainObservation::Confirmed {
+        reference: "confirmed-ref".to_string(),
+        fill: Some(ObservedFill {
+            net_input: 1_000,
+            net_output: 240,
+        }),
+    });
+    journal_one_attempt(&h).await;
+
+    let outcome = h
+        .port
+        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .await;
+
+    assert_eq!(
+        outcome,
+        Ok(MarketExecutionOutcome::Filled {
+            net_input: 1_000,
+            net_output: 240,
+        })
+    );
+    assert_eq!(
+        h.signer.calls.load(Ordering::SeqCst),
+        0,
+        "reconcile must never sign"
+    );
+    assert_eq!(
+        h.adapter.submits.load(Ordering::SeqCst),
+        0,
+        "reconcile must never submit"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_without_amounts_is_unknown() {
+    let h = reconcile_harness(ChainObservation::Confirmed {
+        reference: "confirmed-ref".to_string(),
+        fill: None,
+    });
+    journal_one_attempt(&h).await;
+
+    let outcome = h
+        .port
+        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .await;
+
+    assert_eq!(
+        outcome,
+        Ok(MarketExecutionOutcome::Unknown),
+        "a confirmation without exact amounts is never a fabricated fill"
+    );
+    assert_eq!(h.signer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reconcile_with_an_unknown_journal_key_is_unknown() {
+    // No execute: the key is absent from the process-local journal, so the relay
+    // reports `InvalidTransition`. That is observational ambiguity, never a
+    // definitive failure.
+    let h = reconcile_harness(ChainObservation::Unknown);
+
+    let outcome = h
+        .port
+        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .await;
+
+    assert_eq!(outcome, Ok(MarketExecutionOutcome::Unknown));
+    assert_eq!(h.signer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reconcile_never_signs_or_submits() {
+    let observations = [
+        ChainObservation::Confirmed {
+            reference: "confirmed-ref".to_string(),
+            fill: Some(ObservedFill {
+                net_input: 1_000,
+                net_output: 240,
+            }),
+        },
+        ChainObservation::Confirmed {
+            reference: "confirmed-ref".to_string(),
+            fill: None,
+        },
+        ChainObservation::Pending,
+        ChainObservation::Rejected {
+            final_reason: "reverted".to_string(),
+        },
+        ChainObservation::Unknown,
+    ];
+    for observation in observations {
+        let h = reconcile_harness(observation);
+        journal_one_attempt(&h).await;
+        let _ = h
+            .port
+            .reconcile(&request().intent.idempotency_key, NOW_MS)
+            .await;
+        assert_eq!(
+            h.signer.calls.load(Ordering::SeqCst),
+            0,
+            "reconcile must never sign"
+        );
+        assert_eq!(
+            h.adapter.submits.load(Ordering::SeqCst),
+            0,
+            "reconcile must never submit"
+        );
+        assert_eq!(h.trust_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.prepared_calls.load(Ordering::SeqCst),
+            1,
+            "reconcile must not run the prepared-reference/execute composition"
+        );
+    }
 }

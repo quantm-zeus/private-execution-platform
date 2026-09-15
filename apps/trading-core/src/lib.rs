@@ -1,5 +1,8 @@
 //! Phase-0 Trading Core orchestration skeleton. Live execution remains unavailable.
 
+pub mod composition;
+pub mod service;
+
 use std::sync::Arc;
 
 use domain::{RoutePlan, TradeIntent, ValidatedExecutionPreview};

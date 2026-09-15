@@ -51,6 +51,7 @@ mod backend;
 mod error;
 mod execute;
 mod market;
+mod okx;
 mod order;
 mod portfolio;
 mod trade;
@@ -65,6 +66,7 @@ pub use market::{
     plan_market_preview, MarketPreview, MarketPreviewError, MarketSnapshot, MarketSnapshotSource,
     UnavailableMarketSnapshot,
 };
+pub use okx::{OkxQuoteError, OkxQuoteSource, UnavailableOkxQuoteSource};
 pub use order::{DurableOrderReadModel, OrderReadModel, OrderSummary, DEFAULT_ORDER_PAGE};
 pub use portfolio::{
     BalanceEntry, BalanceProvider, ComposedPortfolioReadModel, PortfolioReadModel,
@@ -74,3 +76,6 @@ pub use trade::{
     FixedClock, OrderValuation, SystemClock, TradingAgentBackend, TradingBackendConfig,
     TrustedClock, UnavailableOrderValuation,
 };
+
+/// Routing-source preference re-exported for execution-seam implementors.
+pub use agent_commands::RouterSource;

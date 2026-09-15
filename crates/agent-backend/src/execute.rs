@@ -29,6 +29,10 @@ use routing::RouteQuote;
 ///
 /// `intent` is the trusted `TradeIntent`; `quote` is the exact, contract-validated
 /// route and net delta; `score` is the gas-aware score for the same candidate.
+/// `router_source` is the additive P84B routing discriminant the quote was
+/// produced under; it is bound into the intent identity (see
+/// `TradingAgentBackend::preview_parts`) so a Local quote cannot be replayed as
+/// an OKX execution or vice versa.
 pub struct MarketExecutionRequest {
     /// Trusted market intent (owner/wallet/chain/risk bound).
     pub intent: TradeIntent,
@@ -38,6 +42,8 @@ pub struct MarketExecutionRequest {
     pub score: RouteScore,
     /// Caller-supplied reference time.
     pub now_ms: i64,
+    /// Routing source that produced the quote.
+    pub router_source: agent_commands::RouterSource,
 }
 
 impl fmt::Debug for MarketExecutionRequest {
@@ -46,6 +52,7 @@ impl fmt::Debug for MarketExecutionRequest {
         formatter
             .debug_struct("MarketExecutionRequest")
             .field("now_ms", &self.now_ms)
+            .field("router_source", &self.router_source)
             .finish_non_exhaustive()
     }
 }
@@ -107,6 +114,19 @@ pub trait MarketExecutionPort: Send + Sync {
         &self,
         request: MarketExecutionRequest,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError>;
+
+    /// Reconciles a previously delegated market attempt by its idempotency key.
+    ///
+    /// Reconciliation is read-only: an implementation must never sign or submit.
+    /// The default has no observation capability and fails closed to `Unknown`; a
+    /// `Filled` may only be produced from exact observed amounts.
+    async fn reconcile(
+        &self,
+        _idempotency_key: &domain::IdempotencyKey,
+        _now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        Ok(MarketExecutionOutcome::Unknown)
+    }
 }
 
 /// Fail-closed default: no execution pipeline is installed.

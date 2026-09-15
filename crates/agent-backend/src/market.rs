@@ -24,6 +24,7 @@
 
 use std::fmt;
 
+use agent_commands::RouterSource;
 use domain::{RouteScore, TradeIntent};
 use market_types::{AtomicAmount, FreshnessPolicy};
 use routing::{
@@ -124,6 +125,10 @@ pub enum MarketPreviewError {
 /// (`execution_preview::revalidate_pre_sign`), but the router itself does not
 /// filter candidates on slippage: the preview reflects the exact route
 /// economics rather than a slippage-filtered result.
+///
+/// `router_source` is the additive P84B routing discriminant. It is `Local` for
+/// every preview produced by [`plan_market_preview`] (the local builder); the
+/// hybrid OKX path sets it to `Okx` when it composes a provider route.
 #[derive(Clone, Serialize)]
 pub struct MarketPreview {
     /// Selected route, per-hop exact economics, and normalized net delta.
@@ -132,6 +137,8 @@ pub struct MarketPreview {
     pub score: RouteScore,
     /// `true` when a bridge-asset or route-candidate cap clipped enumeration.
     pub truncated: bool,
+    /// Routing source that produced this preview.
+    pub router_source: RouterSource,
 }
 
 impl fmt::Debug for MarketPreview {
@@ -140,6 +147,7 @@ impl fmt::Debug for MarketPreview {
         formatter
             .debug_struct("MarketPreview")
             .field("truncated", &self.truncated)
+            .field("router_source", &self.router_source)
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +187,8 @@ pub fn plan_market_preview(
         quote: best.quote.clone(),
         score: best.score.clone(),
         truncated: decision.truncated,
+        // This builder is the LOCAL path by construction.
+        router_source: RouterSource::Local,
     })
 }
 

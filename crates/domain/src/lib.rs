@@ -8,8 +8,8 @@ use thiserror::Error;
 pub mod execution_preview;
 
 pub use execution_preview::{
-    cmp_u128_products, mul_u128_wide, validate_execution_preview, ExecutionCostComponents,
-    ExecutionPreview, ValidatedExecutionPreview,
+    cmp_u128_products, mul_u128_wide, validate_execution_preview, validate_split_execution_preview,
+    ExecutionCostComponents, ExecutionPreview, ValidatedExecutionPreview,
 };
 
 macro_rules! string_id {
@@ -380,6 +380,37 @@ pub struct RoutePlan {
     pub state: Freshness,
 }
 
+/// Hard bound on parallel branches in one split plan (PRD: "at most 3-5 legs").
+pub const MAX_SPLIT_LEGS: usize = 5;
+
+/// One parallel branch of a split: a gross input budget plus a full contiguous
+/// route from `intent.token_in` to `intent.token_out`.
+///
+/// `amount_in` is the GROSS wallet debit allocated to this branch (denominated
+/// in `intent.token_in`), NOT the first route leg's `amount_in`: for a sell the
+/// first route leg carries the post-sell-tax transferable input, so
+/// `route.legs[0].amount_in <= leg.amount_in` with equality on buy and on
+/// tax-free sells.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitLeg {
+    pub amount_in: AtomicAmount,
+    pub route: RoutePlan,
+}
+
+/// A spatial split: N parallel contiguous routes that all start at
+/// `intent.token_in` and end at `intent.token_out`, funded by disjoint gross
+/// input budgets that sum to the executed input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitPlan {
+    /// Parallel branches, `1..=MAX_SPLIT_LEGS`.
+    pub legs: Vec<SplitLeg>,
+    /// Checked sum of every branch's `route.expected_net_output`; `token_out`.
+    pub expected_net_output: AssetAmount,
+    /// Aggregate freshness: min observed_at_ms and min sequence across branches
+    /// (mirrors `quote_path`'s aggregate freshness).
+    pub state: Freshness,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteScore {
     pub gross_output: AssetAmount,
@@ -466,6 +497,102 @@ impl RoutePlan {
         self.expected_net_output
             .validate_nonzero()
             .map_err(|_| DomainError::ZeroTradeAmount)?;
+        Ok(())
+    }
+}
+
+impl SplitPlan {
+    /// Validates the split structurally and against the intent's pair/chain.
+    ///
+    /// Every constraint is explicit and fails closed on the first violation.
+    /// Aggregate input conservation (`sum(leg.amount_in) == simulated_net_input`)
+    /// is deliberately NOT checked here: the executed input is only known from
+    /// the aggregate preview, so `ExecutionPreview::validate_split` enforces it.
+    pub fn validate(&self, intent: &TradeIntent) -> Result<(), DomainError> {
+        if self.legs.is_empty() {
+            return Err(DomainError::EmptySplitPlan);
+        }
+        if self.legs.len() > MAX_SPLIT_LEGS {
+            return Err(DomainError::SplitLegCountExceeded);
+        }
+
+        let mut output_sum: u128 = 0;
+        let mut observed_min = i64::MAX;
+        let mut sequence_min: Option<Sequence> = None;
+        // Parallel branches are simulated independently against the *initial*
+        // pool state, so a pool must not appear in two branches (or twice in one
+        // branch): that would double-count its liquidity and overstate output.
+        let mut used_pools: Vec<&str> = Vec::new();
+
+        for leg in &self.legs {
+            if leg.amount_in.is_zero() {
+                return Err(DomainError::ZeroTradeAmount);
+            }
+            leg.route.validate()?;
+            let first = leg.route.legs.first().ok_or(DomainError::EmptyRoute)?;
+            let last = leg.route.legs.last().ok_or(DomainError::EmptyRoute)?;
+            if first.token_in != intent.token_in || last.token_out != intent.token_out {
+                return Err(DomainError::SplitLegTokenMismatch);
+            }
+            for route_leg in &leg.route.legs {
+                if route_leg.token_in.chain != intent.chain
+                    || route_leg.token_out.chain != intent.chain
+                {
+                    return Err(DomainError::ChainMismatch);
+                }
+                if used_pools.contains(&route_leg.pool_ref.as_str()) {
+                    return Err(DomainError::SplitPoolReused);
+                }
+                used_pools.push(route_leg.pool_ref.as_str());
+            }
+            // Multi-hop funding: each hop must be funded by the previous hop's
+            // realized output, mirroring the locked single-route validator.
+            for window in leg.route.legs.windows(2) {
+                if window[1].amount_in > window[0].expected_amount_out {
+                    return Err(DomainError::SplitLegUnmodeledFunding);
+                }
+            }
+            if leg.route.expected_net_output.asset != intent.token_out {
+                return Err(DomainError::SplitOutputAssetMismatch);
+            }
+            if first.amount_in > leg.amount_in {
+                return Err(DomainError::SplitLegUnmodeledFunding);
+            }
+
+            output_sum = output_sum
+                .checked_add(leg.route.expected_net_output.amount.get())
+                .ok_or(DomainError::SplitOutputOverflow)?;
+            observed_min = observed_min.min(leg.route.state.observed_at_ms);
+            let sequence = leg.route.state.sequence;
+            sequence_min = Some(match sequence_min {
+                Some(current) if current.get() <= sequence.get() => current,
+                _ => sequence,
+            });
+        }
+
+        if intent.token_in == intent.token_out {
+            return Err(DomainError::SameAssetPair);
+        }
+
+        if self.expected_net_output.asset != intent.token_out
+            || self.expected_net_output.amount.get() != output_sum
+        {
+            return Err(DomainError::SplitOutputConservationViolated);
+        }
+        if self.expected_net_output.amount.is_zero() {
+            return Err(DomainError::ZeroTradeAmount);
+        }
+
+        if self.state.observed_at_ms <= 0 {
+            return Err(DomainError::StaleMarketState);
+        }
+        if self.state.sequence.is_zero() {
+            return Err(DomainError::ResyncRequired);
+        }
+        let expected_sequence = sequence_min.ok_or(DomainError::EmptySplitPlan)?;
+        if self.state.observed_at_ms != observed_min || self.state.sequence != expected_sequence {
+            return Err(DomainError::SplitStateMismatch);
+        }
         Ok(())
     }
 }
@@ -583,6 +710,26 @@ pub enum DomainError {
     InvalidNetPriceDecision(&'static str),
     #[error("unsupported amount type")]
     UnsupportedAmountType,
+    #[error("split plan must contain at least one leg")]
+    EmptySplitPlan,
+    #[error("split plan exceeds the maximum leg count")]
+    SplitLegCountExceeded,
+    #[error("split leg does not run intent.token_in -> intent.token_out")]
+    SplitLegTokenMismatch,
+    #[error("split leg input exceeds its allocated gross budget")]
+    SplitLegUnmodeledFunding,
+    #[error("split leg expected_net_output asset must equal intent.token_out")]
+    SplitOutputAssetMismatch,
+    #[error("split aggregate output sum overflowed u128")]
+    SplitOutputOverflow,
+    #[error("split expected_net_output must equal the sum of branch outputs")]
+    SplitOutputConservationViolated,
+    #[error("split aggregate freshness does not match branch minimums")]
+    SplitStateMismatch,
+    #[error("split input sum must equal the executed simulated net input")]
+    SplitInputConservationViolated,
+    #[error("split branches must not reuse a pool")]
+    SplitPoolReused,
 }
 
 #[cfg(test)]

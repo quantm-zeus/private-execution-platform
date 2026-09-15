@@ -1,0 +1,22 @@
+[package]
+name = "provider-verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chain-types.workspace = true
+domain.workspace = true
+execution-preview.workspace = true
+market-types.workspace = true
+sha2 = "0.11"
+tax-engine.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

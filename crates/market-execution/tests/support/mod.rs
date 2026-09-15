@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agent_backend::{MarketExecutionError, MarketExecutionRequest};
+use agent_commands::RouterSource;
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
 use domain::{
@@ -179,6 +180,7 @@ pub fn request_with(
         quote: quote_with(expected_net_output, net_output),
         score: score(),
         now_ms: NOW_MS,
+        router_source: RouterSource::Local,
     }
 }
 
@@ -552,4 +554,113 @@ pub fn scripted_port(
         },
     );
     (port, adapter, signer)
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile fixtures (P76)
+// ---------------------------------------------------------------------------
+
+/// Chain adapter whose `query`/`reconcile` observation is fixed at construction.
+///
+/// `submit` still acknowledges and counts, so a test can drive one ordinary
+/// `execute` to populate the relay's process-local journal and then exercise the
+/// read-only reconcile path against a scripted chain observation. Neither
+/// `query` nor `reconcile` ever submits.
+pub struct ObservingAdapter {
+    pub submits: Arc<AtomicUsize>,
+    pub observation: ChainObservation,
+}
+
+#[async_trait]
+impl ChainSubmissionAdapter for ObservingAdapter {
+    async fn submit(
+        &self,
+        _request: &execution_relay::SubmitRequest,
+    ) -> Result<SubmissionReceipt, RelayError> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        SubmissionReceipt::new("receipt-ref")
+    }
+
+    async fn query(
+        &self,
+        _request: &execution_relay::SubmitRequest,
+        _now_ms: i64,
+    ) -> Result<ChainObservation, RelayError> {
+        Ok(self.observation.clone())
+    }
+
+    async fn reconcile(
+        &self,
+        _request: &execution_relay::SubmitRequest,
+        _now_ms: i64,
+    ) -> Result<ChainObservation, RelayError> {
+        Ok(self.observation.clone())
+    }
+
+    fn health(&self, _now_ms: i64) -> ChainHealth {
+        ChainHealth::Healthy
+    }
+}
+
+pub type ObservingAdapterRef = Arc<ObservingAdapter>;
+pub type ObservingPort = RelayMarketExecutionPort<
+    InMemoryReservationStore,
+    ObservingAdapterRef,
+    TestSource,
+    TestSigner,
+    FakeTrust,
+    FakePreparedRefs,
+>;
+
+pub struct ReconcileHarness {
+    pub port: ObservingPort,
+    pub adapter: ObservingAdapterRef,
+    pub source: TestSource,
+    pub signer: TestSigner,
+    pub trust_calls: Arc<AtomicUsize>,
+    pub prepared_calls: Arc<AtomicUsize>,
+}
+
+/// Wires a relay-backed port whose adapter observes `observation` on
+/// `query`/`reconcile`. `execute` still signs and submits once so the journal is
+/// populated; a test resets the counters before calling `reconcile` to prove the
+/// read-only path never signs or submits.
+pub fn reconcile_harness(observation: ChainObservation) -> ReconcileHarness {
+    let adapter = Arc::new(ObservingAdapter {
+        submits: Arc::new(AtomicUsize::new(0)),
+        observation,
+    });
+    let source = Arc::new(CountingSource::new());
+    let signer = Arc::new(CountingSigner {
+        calls: Arc::new(AtomicUsize::new(0)),
+        fail: false,
+    });
+    let relay = ExecutionRelay::new_with_seams(
+        policy(true),
+        InMemoryReservationStore::new(),
+        Arc::clone(&adapter),
+        Arc::clone(&source),
+        Arc::clone(&signer),
+        ChainHealthBreaker::new(2, 5_000),
+    );
+    let trust_calls = Arc::new(AtomicUsize::new(0));
+    let prepared_calls = Arc::new(AtomicUsize::new(0));
+    let port = RelayMarketExecutionPort::new(
+        relay,
+        FakeTrust {
+            trust: trust(),
+            calls: Arc::clone(&trust_calls),
+        },
+        FakePreparedRefs {
+            calls: Arc::clone(&prepared_calls),
+        },
+    );
+    ReconcileHarness {
+        port,
+        adapter,
+        source,
+        signer,
+        trust_calls,
+        prepared_calls,
+    }
 }
