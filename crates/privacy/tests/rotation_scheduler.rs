@@ -39,17 +39,17 @@ fn empty_set_is_an_empty_plan() {
 }
 
 #[test]
-fn nothing_due_reports_the_earliest_next_rotation() {
-    // Neither is due; the earliest `next_rotation_at_ms` is the min over all.
+fn nothing_due_reports_the_earliest_age_bound() {
+    // Neither is due; the earliest `created_at + max_age_ms` is the min over all.
     let artifacts = [
-        artifact(1, NOW, 0),       // next = NOW + 500 = 10_500
-        artifact(2, NOW - 500, 0), // next = NOW = 10_000
-        artifact(3, NOW - 100, 3), // next = NOW + 400 = 10_400
+        artifact(1, NOW, 0),       // next = NOW + 1000 = 11_000
+        artifact(2, NOW - 500, 0), // next = NOW + 500 = 10_500
+        artifact(3, NOW - 100, 3), // next = NOW + 900 = 10_900
     ];
     let plan = plan_rotations(&artifacts, &policy(), NOW, 4).expect("valid bounds");
     assert!(plan.rotate.is_empty());
     assert!(!plan.deferred);
-    assert_eq!(plan.next_deadline_ms, Some(NOW));
+    assert_eq!(plan.next_deadline_ms, Some(NOW + 500));
 }
 
 #[test]
@@ -64,8 +64,40 @@ fn some_due_rotates_exactly_them_ascending_and_excludes_them_from_the_deadline()
     let plan = plan_rotations(&artifacts, &policy(), NOW, 4).expect("valid bounds");
     assert_eq!(plan.rotate, vec![1, 5, 7]);
     assert!(!plan.deferred);
-    // Rotated artifacts are excluded; only 3 and 9 remain, min = 10_300.
-    assert_eq!(plan.next_deadline_ms, Some(NOW + 300));
+    // Scheduled artifacts are excluded; only 3 and 9 remain, min = NOW + 800.
+    assert_eq!(plan.next_deadline_ms, Some(NOW + 800));
+}
+
+#[test]
+fn duplicate_ids_exclude_only_the_scheduled_entry_from_the_deadline() {
+    // Two entries share id 1: the first is due, the second is not. Only the
+    // scheduled element must be excluded; the untouched duplicate still drives
+    // the deadline (regression: exclusion by id dropped both).
+    let artifacts = [
+        artifact(1, NOW - 2_000, 0), // due by age
+        artifact(1, NOW, 0),         // not due; age bound = NOW + 1000
+    ];
+    let plan = plan_rotations(&artifacts, &policy(), NOW, 1).expect("valid bounds");
+    assert_eq!(plan.rotate, vec![1]);
+    assert!(!plan.deferred);
+    assert_eq!(plan.next_deadline_ms, Some(NOW + 1_000));
+}
+
+#[test]
+fn deadline_is_the_age_bound_not_a_late_nominal_window() {
+    // `window_ms` far exceeds `max_age_ms`: the deadline must be the age bound,
+    // not `created + window_ms`, or a caller would sleep past the artifact's
+    // actual due time.
+    let p = RotationPolicy::new(RotationConfig {
+        max_age_ms: 1_000,
+        max_uses: 10,
+        window_ms: 100_000,
+    })
+    .expect("valid policy");
+    let artifacts = [artifact(1, NOW, 0)];
+    let plan = plan_rotations(&artifacts, &p, NOW, 1).expect("valid bounds");
+    assert!(plan.rotate.is_empty());
+    assert_eq!(plan.next_deadline_ms, Some(NOW + 1_000));
 }
 
 #[test]
@@ -112,9 +144,8 @@ fn age_boundary_is_inclusive() {
 
     let not_due = plan_rotations(&one_below, &p, NOW, 1).expect("valid bounds");
     assert!(not_due.rotate.is_empty());
-    // The untouched artifact carries its own nominal next rotation, even when
-    // that nominal time is already behind `now_ms`.
-    assert_eq!(not_due.next_deadline_ms, Some((NOW - 999) + 500));
+    // The deadline is the exact age bound, so it is strictly after `now_ms`.
+    assert_eq!(not_due.next_deadline_ms, Some(NOW + 1));
 }
 
 #[test]
@@ -128,7 +159,7 @@ fn uses_boundary_is_inclusive() {
 
     let not_due = plan_rotations(&one_below, &p, NOW, 1).expect("valid bounds");
     assert!(not_due.rotate.is_empty());
-    assert_eq!(not_due.next_deadline_ms, Some(NOW + 500));
+    assert_eq!(not_due.next_deadline_ms, Some(NOW + 1_000));
 }
 
 #[test]

@@ -47,8 +47,9 @@ pub struct RotationPlan {
     /// Whether further artifacts are due but were deferred by the bound.
     pub deferred: bool,
     /// Earliest time the caller should run the next pass: `Some(now_ms)` when
-    /// `deferred`, else the minimum future `next_rotation_at_ms` over the
-    /// artifacts that were NOT rotated, or `None` when there is nothing left.
+    /// `deferred`, else the minimum age-based due time (`created_at_ms +
+    /// max_age_ms`) over the artifacts that were NOT scheduled, or `None` when
+    /// there is nothing left.
     pub next_deadline_ms: Option<i64>,
 }
 
@@ -79,29 +80,46 @@ pub fn plan_rotations(
         return Err(PrivacyError::InvalidRotationBounds);
     }
 
-    let mut due: Vec<u64> = artifacts
+    // Track the *element index* of each due artifact so the deadline can exclude
+    // exactly the entries that were scheduled, even when two entries share an
+    // `artifact_id` (ids are caller-defined and need not be unique).
+    let mut due: Vec<(u64, usize)> = artifacts
         .iter()
-        .filter(|artifact| {
+        .enumerate()
+        .filter(|(_, artifact)| {
             policy.should_rotate(now_ms.saturating_sub(artifact.created_at_ms), artifact.uses)
         })
-        .map(|artifact| artifact.artifact_id)
+        .map(|(index, artifact)| (artifact.artifact_id, index))
         .collect();
-    // Ascending, deterministic regardless of registry order.
+    // Ascending by id, then by registry index, so the plan is deterministic
+    // regardless of the registry order.
     due.sort_unstable();
 
     let deferred = due.len() > max_per_pass;
-    let rotate: Vec<u64> = due.iter().take(max_per_pass).copied().collect();
+    let scheduled = &due[..due.len().min(max_per_pass)];
+    let rotate: Vec<u64> = scheduled
+        .iter()
+        .map(|(artifact_id, _)| *artifact_id)
+        .collect();
 
     let next_deadline_ms = if deferred {
         // More work is already due; the caller should run again immediately.
         Some(now_ms)
     } else {
-        // Rotated artifacts get a fresh creation time, so only the untouched
-        // ones can carry the next deadline.
+        // Scheduled entries get a fresh creation time, so only the untouched ones
+        // carry the next deadline. The deadline is the exact age bound
+        // (`created_at_ms + max_age_ms`), never the nominal `window_ms`: a
+        // `window_ms` below the age bound could report a deadline at or before
+        // `now_ms` and spin the caller, and one above it could report a deadline
+        // after the artifact is already due. A `uses`-based rotation may still
+        // become due sooner, so callers re-plan after each use.
+        let scheduled_indices: Vec<usize> = scheduled.iter().map(|(_, index)| *index).collect();
+        let max_age_ms = policy.config().max_age_ms;
         artifacts
             .iter()
-            .filter(|artifact| !rotate.contains(&artifact.artifact_id))
-            .map(|artifact| policy.next_rotation_at_ms(artifact.created_at_ms))
+            .enumerate()
+            .filter(|(index, _)| !scheduled_indices.contains(index))
+            .map(|(_, artifact)| artifact.created_at_ms.saturating_add(max_age_ms))
             .min()
     };
 
