@@ -433,12 +433,12 @@ summary:focus-visible {
   flex: none;
 }
 
-.stages__item--pending .stages__dot {
+.stages__item--done .stages__dot {
   background: var(--ok);
   border-color: var(--ok);
 }
 
-.stages__item--pending {
+.stages__item--done {
   color: var(--ink);
 }
 
@@ -450,6 +450,10 @@ summary:focus-visible {
 .stages__item--active .stages__dot {
   background: var(--accent);
   border-color: var(--accent);
+}
+
+.stages__item--pending {
+  color: var(--muted);
 }
 
 .stages__state {

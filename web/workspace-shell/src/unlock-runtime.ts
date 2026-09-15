@@ -94,9 +94,11 @@ export function fromBase64(str: string): Uint8Array {
  * SHA-256 fingerprint of a workspace public key, standard base64.
  *
  * Matches the server's `public_key_fingerprint_b64`. Returns `null` when
- * WebCrypto is unavailable so a missing digest API can never silently accept a
- * mismatched key: the caller only uses this for an *additional* local
- * preflight, and the server independently enforces the same check.
+ * WebCrypto is unavailable. A `null` result *skips* the optional local
+ * preflight, so this is defence in depth only: the server independently
+ * enforces the same fingerprint in its compatibility preflight, and artifact
+ * decryption fails closed, so a missing digest API cannot by itself turn a
+ * mismatch into a successful unlock.
  */
 export async function publicKeyFingerprintB64(
   publicKey: Uint8Array,
@@ -106,6 +108,20 @@ export async function publicKeyFingerprintB64(
   try {
     const digest = await subtle.digest("SHA-256", publicKey as unknown as BufferSource);
     return toBase64(new Uint8Array(digest));
+  } catch {
+    return null;
+  }
+}
+
+/** SHA-256 as lowercase hex, or `null` when WebCrypto is unavailable. */
+export async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || typeof subtle.digest !== "function") return null;
+  try {
+    const digest = await subtle.digest("SHA-256", bytes as unknown as BufferSource);
+    let out = "";
+    for (const byte of new Uint8Array(digest)) out += byte.toString(16).padStart(2, "0");
+    return out;
   } catch {
     return null;
   }
@@ -538,14 +554,16 @@ export class WorkspaceUnlockRuntime {
       }
 
       // U4: decrypt the transport envelope in WASM and extract the BR-5
-      // directional app session keys, then drop the transport session.
+      // directional app session keys, then drop the transport session. The
+      // binding-returned buffers are zeroized in place; wrapping them in another
+      // `Uint8Array` would leave the first copy in memory.
       let sealedArtifactBytes: Uint8Array;
       let sessionMaterial: ShellSessionKeys | null = null;
       try {
-        sealedArtifactBytes = new Uint8Array(initiator.decrypt(sessionEnvelopeWire));
-        const rawAppKeys = new Uint8Array(initiator.app_session_keys());
+        sealedArtifactBytes = initiator.decrypt(sessionEnvelopeWire);
+        const rawAppKeys = initiator.app_session_keys();
         try {
-          const rawKid = new Uint8Array(initiator.kid());
+          const rawKid = initiator.kid();
           try {
             if (rawAppKeys.length !== 64 || rawKid.length !== 16) {
               throw new UnlockError("U4_TRANSPORT", "transport_rejected");
@@ -573,13 +591,25 @@ export class WorkspaceUnlockRuntime {
         initiator = null;
       }
 
+      // U5: verify the authenticated descriptor's size/digest binding before the
+      // inner decrypt, so a substituted-but-well-formed artifact is rejected here
+      // rather than silently trusted. Missing fields (legacy descriptor) skip
+      // the local check and rely on the server preflight.
+      if (descriptor.artifact_size > 0 && sealedArtifactBytes.length !== descriptor.artifact_size) {
+        throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+      }
+      if (descriptor.artifact_sha256_hex) {
+        const actualDigest = await sha256Hex(sealedArtifactBytes);
+        if (actualDigest === null || actualDigest !== descriptor.artifact_sha256_hex) {
+          throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+        }
+      }
+
       // U5: decrypt the inner workspace artifact with the in-memory key.
       onStage("U5_ARTIFACT");
       let decryptedPayloadBytes: Uint8Array;
       try {
-        decryptedPayloadBytes = new Uint8Array(
-          workspaceKey.decrypt_artifact(sealedArtifactBytes),
-        );
+        decryptedPayloadBytes = workspaceKey.decrypt_artifact(sealedArtifactBytes);
       } catch {
         throw new UnlockError("U5_ARTIFACT", "artifact_decrypt_failed");
       }
@@ -611,9 +641,12 @@ export class WorkspaceUnlockRuntime {
       if (!sessionMaterial) {
         throw new UnlockError("U7_BOOT", "handoff_unavailable");
       }
+      // Transfer ownership of the WASM key before arming the handoff, so a throw
+      // from `arm` cannot leave both `this.currentKey` and the local
+      // `workspaceKey` pointing at the same allocation (a double free).
       this.currentKey = workspaceKey;
-      this.handoff.arm(sessionMaterial, handoffToken);
       workspaceKey = null;
+      this.handoff.arm(sessionMaterial, handoffToken);
       unlocked = true;
       this.isUnlocked = true;
 

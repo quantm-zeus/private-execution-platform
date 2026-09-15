@@ -100,6 +100,17 @@ export function releaseIdFor(sourceSha, artifactDigestHex) {
   return `${sha}-${artifactDigestHex.slice(0, 12)}`;
 }
 
+/** The exact shape `releaseIdFor` emits; also the only safe path component. */
+const RELEASE_ID_PATTERN = /^[0-9a-f]{1,12}-[0-9a-f]{12}$/;
+
+/** Reject any release id that is not a single canonical directory name. */
+export function assertReleaseId(releaseId) {
+  if (typeof releaseId !== "string" || !RELEASE_ID_PATTERN.test(releaseId)) {
+    throw new Error("invalid release id");
+  }
+  return releaseId;
+}
+
 /** Build the immutable manifest for an already-sealed artifact. */
 export function computeReleaseManifest({
   releaseId,
@@ -156,6 +167,15 @@ export function validateReleaseManifest(manifest, artifact) {
     throw new Error("unsupported manifest version");
   }
   if (!manifest.release_id || !manifest.source_sha) throw new Error("manifest identity incomplete");
+  if (!manifest.artifact || typeof manifest.artifact !== "object") {
+    throw new Error("manifest artifact missing");
+  }
+  if (!manifest.recipient || typeof manifest.recipient !== "object") {
+    throw new Error("manifest recipient missing");
+  }
+  if (!manifest.workspace_protocol || typeof manifest.workspace_protocol !== "object") {
+    throw new Error("manifest protocol missing");
+  }
   if (!Buffer.isBuffer(artifact) || artifact.length < MIN_ARTIFACT_BYTES) {
     throw new Error("artifact missing or truncated");
   }
@@ -208,9 +228,22 @@ export function validateReleaseManifest(manifest, artifact) {
   return manifest;
 }
 
-/** Write the shell caching headers: HTML revalidates, hashed assets immutable. */
+/**
+ * Add cache rules to the shell `_headers` **without dropping the hardened
+ * security headers** the shell build ships. HTML revalidates, hashed assets are
+ * immutable; the existing `/*` rule (CSP, nosniff, frame-deny, referrer policy,
+ * no-store) is preserved because a release must never weaken the clear shell
+ * that hosts the recovery-code input.
+ */
 export async function writeShellCacheHeaders(shellDir) {
-  const headers = [
+  const headersPath = join(shellDir, "_headers");
+  let existing = "";
+  try {
+    existing = await readFile(headersPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const cacheRules = [
     "/index.html",
     "  Cache-Control: no-store, must-revalidate",
     "",
@@ -218,7 +251,11 @@ export async function writeShellCacheHeaders(shellDir) {
     "  Cache-Control: public, max-age=31536000, immutable",
     "",
   ].join("\n");
-  await writeFile(join(shellDir, "_headers"), headers, { mode: 0o644 });
+  const base =
+    existing.trim().length > 0
+      ? `${existing.trimEnd()}\n\n`
+      : "/*\n  Cache-Control: no-store\n\n";
+  await writeFile(headersPath, `${base}${cacheRules}`, { mode: 0o644 });
 }
 
 async function linkTarget(linkPath) {
@@ -237,18 +274,19 @@ async function atomicSymlink(linkPath, target) {
 
 /** Atomically point `current` at an existing validated release. */
 export async function switchCurrent(releasesRoot, releaseId) {
-  const releaseDir = join(releasesRoot, releaseId);
+  const id = assertReleaseId(releaseId);
+  const releaseDir = join(releasesRoot, id);
   // A release is only switchable after its manifest, artifact bytes and shell
   // digest all validate.
-  await readRelease(releasesRoot, releaseId);
+  await readRelease(releasesRoot, id);
   const currentPath = join(releasesRoot, CURRENT_LINK);
   const previousPath = join(releasesRoot, PREVIOUS_LINK);
   const current = await linkTarget(currentPath);
-  if (current && current !== releaseId) {
+  if (current && current !== id) {
     await atomicSymlink(previousPath, current);
   }
-  await atomicSymlink(currentPath, releaseId);
-  return releaseId;
+  await atomicSymlink(currentPath, id);
+  return id;
 }
 
 /**
@@ -274,10 +312,19 @@ export async function rollbackCurrent(releasesRoot) {
  * the shell tree digest the manifest binds.
  */
 export async function readRelease(releasesRoot, releaseId) {
-  const releaseDir = join(releasesRoot, releaseId);
+  const id = assertReleaseId(releaseId);
+  const releaseDir = join(releasesRoot, id);
   const manifest = JSON.parse(await readFile(join(releaseDir, MANIFEST_FILE), "utf8"));
   const artifact = await readFile(join(releaseDir, ARTIFACT_FILE));
   validateReleaseManifest(manifest, artifact);
+  // The manifest must describe *this* directory, not merely a self-consistent
+  // release elsewhere: reject a renamed/copied directory whose identity differs.
+  if (manifest.release_id !== id) {
+    throw new Error("manifest release id does not match its directory");
+  }
+  if (releaseIdFor(manifest.source_sha, manifest.artifact.sha256_hex) !== id) {
+    throw new Error("manifest does not derive its own release id");
+  }
   const shellDigest = await digestDirectory(join(releaseDir, SHELL_DIR));
   if (shellDigest !== manifest.shell.asset_digest_hex) {
     throw new Error("shell asset digest mismatch");
@@ -301,16 +348,6 @@ export async function publishRelease({
   const artifactDigest = sha256Hex(artifact);
   const releaseId = releaseIdFor(sourceSha, artifactDigest);
   const releaseDir = join(releasesRoot, releaseId);
-  let exists = false;
-  try {
-    await lstat(releaseDir);
-    exists = true;
-  } catch (error) {
-    // Only a genuinely absent directory means "new release"; any other stat
-    // failure (EACCES/EIO) must not be treated as absent.
-    if (error?.code !== "ENOENT") throw error;
-  }
-  if (exists) throw new Error("release already exists and is immutable");
   const shellAssetDigest = await digestDirectory(shellDir);
   const manifest = computeReleaseManifest({
     releaseId,
@@ -322,6 +359,7 @@ export async function publishRelease({
   });
   const staging = join(releasesRoot, `.staging-${Date.now()}-${process.pid}`);
   await mkdir(staging, { recursive: true });
+  let shippedShellDigest;
   try {
     await writeFile(join(staging, ARTIFACT_FILE), artifact, { mode: 0o600 });
     const stagedShell = join(staging, SHELL_DIR);
@@ -329,17 +367,47 @@ export async function publishRelease({
     await copyTree(shellDir, stagedShell);
     await writeShellCacheHeaders(stagedShell);
     // The manifest covers the shell as shipped (including _headers).
-    const shippedShellDigest = await digestDirectory(stagedShell);
+    shippedShellDigest = await digestDirectory(stagedShell);
     manifest.shell.asset_digest_hex = shippedShellDigest;
     await writeFile(join(staging, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, {
       mode: 0o644,
     });
     validateReleaseManifest(manifest, artifact);
-    await rename(staging, releaseDir);
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
+
+  let exists = false;
+  try {
+    await lstat(releaseDir);
+    exists = true;
+  } catch (error) {
+    // Only a genuinely absent directory means "new release"; any other stat
+    // failure (EACCES/EIO) must not be treated as absent.
+    if (error?.code !== "ENOENT") {
+      await rm(staging, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+  }
+  if (exists) {
+    // Re-publishing is idempotent only when the release is byte-identical:
+    // same artifact AND same shipped shell digest. The release id is derived
+    // from the artifact, so a shell-only change under the same source SHA must
+    // be refused rather than silently switching to the stale shell.
+    const existing = await readRelease(releasesRoot, releaseId);
+    await rm(staging, { recursive: true, force: true }).catch(() => {});
+    if (
+      !existing.artifact.equals(artifact) ||
+      existing.manifest.shell.asset_digest_hex !== shippedShellDigest
+    ) {
+      throw new Error("release already exists and is immutable");
+    }
+    await switchCurrent(releasesRoot, releaseId);
+    return { releaseId, manifest: existing.manifest };
+  }
+
+  await rename(staging, releaseDir);
   await switchCurrent(releasesRoot, releaseId);
   return { releaseId, manifest };
 }

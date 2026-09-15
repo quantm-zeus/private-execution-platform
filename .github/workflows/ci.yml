@@ -31,6 +31,10 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:web
       - run: pnpm test:shell
+      # Release/tooling gate: immutable manifest + atomic publish/rollback and
+      # hardened shell cache headers. Also runs the production-faithful unlock
+      # proof (real private-api loader + production-build-script artifact).
+      - run: node --test scripts/workspace-release.test.mjs
       - run: pnpm verify:web-boundary
   web-e2e:
     runs-on: ubuntu-latest

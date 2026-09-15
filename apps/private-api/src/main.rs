@@ -191,10 +191,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let ready_flag = relay_ready.clone();
         tokio::spawn(async move {
-            ready_flag.store(true, Ordering::SeqCst);
-            if relay_router.serve_with_incoming(incoming).await.is_err() {
-                ready_flag.store(false, Ordering::SeqCst);
+            // Clear the flag however the task ends: after `serve` returns (Ok or
+            // Err) and while unwinding if it panics, so a process whose relay has
+            // stopped can never keep reporting readiness.
+            struct ReadinessGuard(Arc<AtomicBool>);
+            impl Drop for ReadinessGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
             }
+            let _guard = ReadinessGuard(ready_flag.clone());
+            ready_flag.store(true, Ordering::SeqCst);
+            let _ = relay_router.serve_with_incoming(incoming).await;
         });
     }
     let state = state.with_relay_readiness(relay_required, relay_ready);

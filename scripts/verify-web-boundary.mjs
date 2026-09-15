@@ -1118,6 +1118,47 @@ try {
     throw new Error("decrypted artifact contains header configuration artifact reference");
   }
 
+  // 8e. Production-faithful loader proof (P0-C): hand the exact artifact produced
+  // by the production build script to the REAL private-api
+  // `load_workspace_artifact` (no test loader override). The ignored Rust test
+  // also drives the real per-grant HPKE routes, the inner artifact decrypt and
+  // the production package unpack.
+  {
+    const fixturePath = `${artifactPath}.fixture.json`;
+    await writeFile(
+      fixturePath,
+      JSON.stringify({
+        artifactPath,
+        secretB64: unlockSecret.toString("base64"),
+        kidB64: kid.toString("base64"),
+      }),
+    );
+    const result = spawnSync(
+      "cargo",
+      [
+        "test",
+        "-p",
+        "private-api",
+        "production_build_script_artifact_loads_delivers_and_unpacks",
+        "--",
+        "--ignored",
+      ],
+      {
+        stdio: "inherit",
+        env: { ...process.env, WORKSPACE_BUILD_SCRIPT_FIXTURE: fixturePath },
+      },
+    );
+    await rm(fixturePath, { force: true });
+    if (result.error) {
+      throw new Error(`production loader test could not run: ${result.error.message}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(
+        "production build-script artifact did not pass the real private-api loader test",
+      );
+    }
+  }
+
   // =========================================================================
   // 9. Negative cryptographic tamper and error handling proofs
   // =========================================================================
@@ -1319,8 +1360,8 @@ try {
     protocol_version: 1,
     artifact_version: ARTIFACT_VERSION,
     artifact_kid_b64: kid.toString("base64"),
-    artifact_size: 0,
-    artifact_sha256_hex: "",
+    artifact_size: rawArtifact.length,
+    artifact_sha256_hex: createHash("sha256").update(rawArtifact).digest("hex"),
     package_format_version: 1,
     release_id: "release-test",
     source_sha: "test-sha",
@@ -1736,6 +1777,40 @@ try {
   if (!unlockFailed) throw new Error("runtime unlock accepted wrong kid");
   if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
 
+  // Tampered artifact digest: the descriptor's authenticated SHA-256 no longer
+  // matches the delivered artifact, so the runtime rejects it as U5 before the
+  // inner decrypt.
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret,
+      { ...descriptor, artifact_sha256_hex: "00".repeat(32) },
+      { fetchFn: mockFetch },
+    );
+  } catch (e) {
+    unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
+      throw new Error(`artifact digest mismatch must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+    }
+  }
+  if (!unlockFailed) throw new Error("runtime accepted a mismatched artifact digest");
+
+  // Tampered artifact size is rejected the same way.
+  unlockFailed = false;
+  try {
+    await runtime.unlock(
+      unlockSecret,
+      { ...descriptor, artifact_size: descriptor.artifact_size + 1 },
+      { fetchFn: mockFetch },
+    );
+  } catch (e) {
+    unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
+      throw new Error(`artifact size mismatch must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+    }
+  }
+  if (!unlockFailed) throw new Error("runtime accepted a mismatched artifact size");
+
   // All-zero secret fails closed before network
   unlockFailed = false;
   try {
@@ -1951,10 +2026,18 @@ try {
     ARTIFACT_VERSION,
   );
   await writeFile(notPackagePath, notPackageArtifact);
+  // Keep the authenticated descriptor's size/digest binding consistent with the
+  // substituted ciphertext so the failure is classified at U6 (package), not U5
+  // (descriptor/artifact mismatch).
+  const notPackageDescriptor = {
+    ...descriptor,
+    artifact_size: notPackageArtifact.length,
+    artifact_sha256_hex: digest(notPackageArtifact),
+  };
   await expectUnlockStage(
     "U6_PACKAGE",
     () =>
-      runtime.unlock(unlockSecret, descriptor, {
+      runtime.unlock(unlockSecret, notPackageDescriptor, {
         fetchFn: async (url, init = {}) => {
           const parsed = new URL(url, "https://localhost:8081");
           if (parsed.pathname.includes("enroll")) return { ok: true, status: 200 };

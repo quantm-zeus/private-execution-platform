@@ -409,6 +409,18 @@ impl PrivateApiState {
         })
     }
 
+    /// Load the configured workspace artifact off the async runtime.
+    ///
+    /// The loader performs synchronous file I/O and the artifact can be large,
+    /// so it runs on the blocking pool. A join failure (for example a panicking
+    /// loader) is a fail-closed `503`, never an unwrapped panic on the worker.
+    async fn load_artifact(&self) -> Result<Vec<u8>, StatusCode> {
+        let loader = self.artifact_loader.clone();
+        tokio::task::spawn_blocking(move || loader())
+            .await
+            .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
+    }
+
     #[cfg(test)]
     fn with_artifact_loader(mut self, loader: ArtifactLoader) -> Self {
         self.artifact_loader = loader;
@@ -465,10 +477,11 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
-    let (artifact_ok, manifest_ok) = match (state.artifact_loader)() {
+    let (artifact_ok, manifest_ok) = match state.load_artifact().await {
         Ok(artifact) => {
-            // Cheap structural check: a malformed artifact is not ready even
-            // when no manifest is configured, without hashing the whole file.
+            // Header parse plus (when a manifest is configured) the manifest
+            // digest. The artifact was already size-bounded by the loader, and
+            // the read runs on the blocking pool so it cannot stall workers.
             let header_ok = crypto_envelope::ArtifactEnvelope::from_bytes(&artifact).is_ok();
             match release::load_release_manifest_from_env() {
                 Ok(Some(manifest)) => (
@@ -1098,7 +1111,7 @@ async fn get_workspace_descriptor_handler(
     let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
         return clear_session(generic_error(StatusCode::UNAUTHORIZED));
     };
-    let artifact = match (state.artifact_loader)() {
+    let artifact = match state.load_artifact().await {
         Ok(artifact) => artifact,
         Err(status) => return generic_error(status),
     };
@@ -1246,6 +1259,10 @@ async fn issue_artifact_grant(
 
 /// Loads the sealed workspace artifact, if configured and readable. Absence is a
 /// fail-closed 503 at delivery time, never an error surfaced to logs with content.
+///
+/// The size is bounded from metadata *before* the read so a misconfigured path
+/// (or a hostile local writer) cannot force an unbounded allocation. The read
+/// itself runs on the blocking pool via `PrivateApiState::load_artifact`.
 fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1253,7 +1270,15 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     if path.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    std::fs::read(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    let metadata = std::fs::metadata(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let bytes = std::fs::read(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(bytes)
 }
 
 async fn deliver_artifact(
@@ -1309,19 +1334,21 @@ async fn deliver_artifact(
     if hex_encode(pending_grant.grant_id.as_bytes()) != request.grant_id {
         return clear_grant(clear_session(generic_error(StatusCode::UNAUTHORIZED)));
     }
-    let artifact = match (state.artifact_loader)() {
+    let artifact = match state.load_artifact().await {
         Ok(artifact) => artifact,
         Err(status) => return clear_grant(generic_error(status)),
     };
     if artifact.len() > MAX_ARTIFACT_BYTES.saturating_sub(ENVELOPE_OVERHEAD_BYTES) {
         return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE));
     }
-    // Compatibility preflight (F1/F7/F10): never wrap and deliver an artifact
-    // that cannot be decrypted by the workspace enrollment bound to this
-    // session, and never serve a release whose manifest does not describe these
-    // exact bytes. This rejects the production KID/stale-artifact class of
-    // failure before any transport crypto runs, and it compares only public
-    // metadata so it is not a secret-validation oracle.
+    // Compatibility preflight (F1/F7/F10): reject an artifact that does not
+    // match the version/KID bound to this session, and (when a release manifest
+    // is configured) an artifact whose bytes or recipient fingerprint the
+    // manifest does not describe. This rejects the production KID/stale-artifact
+    // class of failure before any transport crypto runs. Without a manifest the
+    // server cannot verify the recipient key, so a wrong key falls through to
+    // the browser's fail-closed `decrypt_artifact`. It compares only public
+    // metadata, so it is not a secret-validation oracle.
     let manifest = match release::load_release_manifest_from_env() {
         Ok(manifest) => manifest,
         Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
@@ -1684,6 +1711,9 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicI64, Ordering};
     use tower::ServiceExt;
+
+    /// Serializes tests that mutate the process-global `WORKSPACE_ARTIFACT_PATH`.
+    static WORKSPACE_ARTIFACT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct FixedClock(AtomicI64);
     impl Clock for FixedClock {
@@ -4344,8 +4374,7 @@ mod tests {
     /// and unpacked with the production package layout.
     #[tokio::test]
     async fn production_artifact_loader_delivers_and_unpacks_a_real_package() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = ENV_LOCK.lock().await;
+        let _guard = WORKSPACE_ARTIFACT_ENV_LOCK.lock().await;
 
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         // No loader override: `test_state` keeps the real `load_workspace_artifact`.
@@ -4423,6 +4452,147 @@ mod tests {
         assert_eq!(files[1].0, "assets/index-abc.js");
     }
 
+    /// The loader bounds the artifact size from metadata before reading, so an
+    /// oversized or non-file path cannot force an unbounded allocation even on
+    /// the unauthenticated `/ready` probe.
+    #[tokio::test]
+    async fn artifact_loader_bounds_size_before_reading() {
+        let _guard = WORKSPACE_ARTIFACT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.artifact");
+        let file = std::fs::File::create(&path).unwrap();
+        // Sparse file: metadata reports the size without committing bytes.
+        file.set_len(MAX_ARTIFACT_BYTES as u64 + 1).unwrap();
+        drop(file);
+
+        let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &path);
+        let oversized = load_workspace_artifact();
+        // A directory at the configured path is refused, not read.
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", dir.path());
+        let directory = load_workspace_artifact();
+        match previous {
+            Some(value) => std::env::set_var("WORKSPACE_ARTIFACT_PATH", value),
+            None => std::env::remove_var("WORKSPACE_ARTIFACT_PATH"),
+        }
+
+        assert_eq!(oversized, Err(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(directory, Err(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    /// P0-C production-faithful test: the artifact bytes are produced by the
+    /// real production build script (`scripts/build-workspace-encrypted.mjs`),
+    /// read by the real `load_workspace_artifact` (no loader override), wrapped
+    /// by the real per-grant HPKE transport over the real routes, then decrypted
+    /// with the matching production-derived workspace key and unpacked with the
+    /// production package layout.
+    ///
+    /// Ignored by default because it needs a fixture produced by the Node build
+    /// script; `scripts/verify-web-boundary.mjs` builds that fixture and runs
+    /// this test with `--ignored`.
+    #[tokio::test]
+    #[ignore = "run by verify:web-boundary with WORKSPACE_BUILD_SCRIPT_FIXTURE set"]
+    async fn production_build_script_artifact_loads_delivers_and_unpacks() {
+        let _guard = WORKSPACE_ARTIFACT_ENV_LOCK.lock().await;
+        let fixture_path = std::env::var("WORKSPACE_BUILD_SCRIPT_FIXTURE")
+            .expect("WORKSPACE_BUILD_SCRIPT_FIXTURE must name the build-script fixture");
+        let fixture_bytes = std::fs::read(&fixture_path).expect("fixture readable");
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&fixture_bytes).expect("fixture json");
+        let artifact_path = fixture["artifactPath"]
+            .as_str()
+            .expect("artifactPath")
+            .to_string();
+        let secret_bytes = release::decode_canonical_b64(
+            fixture["secretB64"].as_str().expect("secretB64"),
+            crypto_envelope::UNLOCK_SECRET_LEN,
+        )
+        .expect("fixture secret");
+        let kid_bytes = release::decode_canonical_b64(
+            fixture["kidB64"].as_str().expect("kidB64"),
+            auth::WORKSPACE_KID_BYTES,
+        )
+        .expect("fixture kid");
+        let secret: [u8; crypto_envelope::UNLOCK_SECRET_LEN] =
+            secret_bytes.try_into().expect("secret length");
+        let kid: [u8; auth::WORKSPACE_KID_BYTES] = kid_bytes.try_into().expect("kid length");
+        let keypair =
+            crypto_envelope::derive_workspace_keypair(&secret, auth::ARTIFACT_VERSION, &kid)
+                .expect("derive workspace keypair");
+        let expected_artifact = std::fs::read(&artifact_path).expect("artifact readable");
+
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+
+        let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &artifact_path);
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+        let (encapsulated, mut initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let delivered = response.into_body().collect().await.unwrap().to_bytes();
+        match previous {
+            Some(value) => std::env::set_var("WORKSPACE_ARTIFACT_PATH", value),
+            None => std::env::remove_var("WORKSPACE_ARTIFACT_PATH"),
+        }
+
+        assert_eq!(status, StatusCode::OK, "real loader delivery must succeed");
+        let envelope = crypto_envelope::Envelope {
+            kid: delivered[..16].try_into().unwrap(),
+            nonce: delivered[16..28].try_into().unwrap(),
+            sequence: u64::from_be_bytes(delivered[28..36].try_into().unwrap()),
+            ciphertext: delivered[36..].to_vec(),
+        };
+        let delivered_artifact = initiator.receive(&envelope).unwrap();
+        assert_eq!(
+            delivered_artifact, expected_artifact,
+            "delivered bytes must equal the production build-script artifact"
+        );
+        let package = crypto_envelope::decrypt_artifact(&keypair, &delivered_artifact)
+            .expect("inner artifact decrypt");
+        let files = unpack_test_package(&package);
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            names.contains(&"index.html"),
+            "production payload must contain index.html, got {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("assets/") && name.ends_with(".js")),
+            "production payload must contain a hashed JS asset, got {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("assets/") && name.ends_with(".css")),
+            "production payload must contain a hashed CSS asset, got {names:?}"
+        );
+        let index = files
+            .iter()
+            .find(|(name, _)| name == "index.html")
+            .expect("index.html");
+        assert!(!index.1.is_empty(), "index.html must not be empty");
+    }
+
     // ---- F5 relay readiness tests ----
 
     #[tokio::test]
@@ -4487,5 +4657,17 @@ mod tests {
             get(router(broken), "/ready").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+
+        // Malformed artifact with no manifest configured: the header parse fails,
+        // so readiness stays false rather than trusting an unparseable file.
+        let malformed = state
+            .clone()
+            .with_artifact_loader(Arc::new(|| Ok(b"not-an-artifact".to_vec())));
+        let ready = get(router(malformed), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["artifact"], false);
     }
 }

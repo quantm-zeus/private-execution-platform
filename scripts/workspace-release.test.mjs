@@ -122,11 +122,45 @@ test("directory digest changes with content and is path sensitive", async () => 
   }
 });
 
-test("shell cache headers keep HTML uncached and assets immutable", async () => {
+test("shell cache headers preserve the hardened security headers", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-headers-"));
+  try {
+    await writeFile(
+      join(root, "_headers"),
+      [
+        "/*",
+        "  Cache-Control: no-store",
+        "  X-Content-Type-Options: nosniff",
+        "  X-Frame-Options: DENY",
+        "  Referrer-Policy: no-referrer",
+        "  Content-Security-Policy: default-src 'self'",
+        "",
+      ].join("\n"),
+    );
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    // Hardening from the shell build must survive publication.
+    assert.match(headers, /^\/\*/m);
+    assert.match(headers, /Content-Security-Policy: default-src 'self'/);
+    assert.match(headers, /X-Content-Type-Options: nosniff/);
+    assert.match(headers, /X-Frame-Options: DENY/);
+    assert.match(headers, /Referrer-Policy: no-referrer/);
+    // Cache rules are appended, not substituted for the security block.
+    assert.match(headers, /\/index\.html[\s\S]*no-store, must-revalidate/);
+    assert.match(headers, /\/assets\/\*[\s\S]*immutable/);
+    // The `/*` rule must precede the more specific overrides.
+    assert.ok(headers.indexOf("/*") < headers.indexOf("/index.html"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shell cache headers synthesize a wildcard rule when none shipped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-synth-"));
   try {
     await writeShellCacheHeaders(root);
     const headers = await readFile(join(root, "_headers"), "utf8");
+    assert.match(headers, /^\/\*/m);
     assert.match(headers, /\/index\.html[\s\S]*no-store/);
     assert.match(headers, /\/assets\/\*[\s\S]*immutable/);
   } finally {
@@ -153,18 +187,18 @@ test("publish, switch and rollback are atomic and immutable", async () => {
     });
     assert.equal(await readlink(join(root, CURRENT_LINK)), first.releaseId);
 
-    // Republishing the same immutable release must refuse.
-    await assert.rejects(
-      publishRelease({
-        releasesRoot: root,
-        artifact,
-        publicKeyB64: PUBLIC_KEY_B64,
-        kidB64: KID_B64,
-        sourceSha: "9a5a712",
-        shellDir,
-      }),
-      /immutable/,
-    );
+    // Republishing identical bytes is idempotent: the release id is a content
+    // address, so re-running publication must not fail (or rewrite the dir).
+    const again = await publishRelease({
+      releasesRoot: root,
+      artifact,
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    assert.equal(again.releaseId, first.releaseId);
+    assert.equal(await readlink(join(root, CURRENT_LINK)), first.releaseId);
 
     // Publish a second, different release and switch.
     const secondArtifact = Buffer.concat([Buffer.from([1]), KID, Buffer.alloc(32, 5), Buffer.alloc(16, 6)]);
@@ -247,4 +281,92 @@ test("release ids cannot escape the releases root", () => {
   }
   assert.throws(() => releaseIdFor("", digest), /hex/);
   assert.throws(() => releaseIdFor("!!!!", digest), /hex/);
+});
+
+test("a shell-only change under the same release id is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-shell-change-"));
+  const shellA = await mkdtemp(join(tmpdir(), "release-shell-a-"));
+  const shellB = await mkdtemp(join(tmpdir(), "release-shell-b-"));
+  try {
+    await writeFile(join(shellA, "index.html"), "<!doctype html>a");
+    await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir: shellA,
+    });
+    // Same artifact and source SHA => same content-addressed release id, but a
+    // different shell must not be silently published over the existing release.
+    await writeFile(join(shellB, "index.html"), "<!doctype html>b");
+    await assert.rejects(
+      publishRelease({
+        releasesRoot: root,
+        artifact: fakeArtifact(),
+        publicKeyB64: PUBLIC_KEY_B64,
+        kidB64: KID_B64,
+        sourceSha: "9a5a712",
+        shellDir: shellB,
+      }),
+      /immutable/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellA, { recursive: true, force: true });
+    await rm(shellB, { recursive: true, force: true });
+  }
+});
+
+test("read/switch reject a release id that is not a single directory name", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-traversal-"));
+  try {
+    for (const bad of ["../../etc/passwd", "../x", "a/b", "9A5A712-abcdef012345", ".", ""]) {
+      await assert.rejects(readRelease(root, bad), /invalid release id/);
+      await assert.rejects(switchCurrent(root, bad), /invalid release id/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a manifest that disagrees with its directory is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-mismatch-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-mismatch-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    const manifestPath = join(root, releaseId, MANIFEST_FILE);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.release_id = "deadbeefde-000000000000";
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await assert.rejects(readRelease(root, releaseId), /does not match its directory/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
+test("validateReleaseManifest rejects missing manifest blocks without a TypeError", () => {
+  const artifact = fakeArtifact();
+  const manifest = manifestFor(artifact);
+  assert.throws(
+    () => validateReleaseManifest({ ...manifest, artifact: undefined }, artifact),
+    /artifact missing/,
+  );
+  assert.throws(
+    () => validateReleaseManifest({ ...manifest, recipient: undefined }, artifact),
+    /recipient missing/,
+  );
+  assert.throws(
+    () => validateReleaseManifest({ ...manifest, workspace_protocol: undefined }, artifact),
+    /protocol missing/,
+  );
 });

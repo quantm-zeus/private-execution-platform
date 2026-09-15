@@ -54,6 +54,7 @@ function App() {
   const [enrollmentOpen, setEnrollmentOpen] = createSignal(false);
   const [descriptor, setDescriptor] = createSignal<WorkspaceDescriptor | null>(null);
   const [descriptorError, setDescriptorError] = createSignal("");
+  const [descriptorLoading, setDescriptorLoading] = createSignal(false);
   const [recoveryCode, setRecoveryCode] = createSignal("");
   const [unlockStage, setUnlockStage] = createSignal<UnlockStage | null>(null);
   const [unlockFailure, setUnlockFailure] = createSignal<UnlockRecovery | null>(null);
@@ -106,6 +107,7 @@ function App() {
   const loadDescriptor = async () => {
     setDescriptorError("");
     setDescriptor(null);
+    setDescriptorLoading(true);
     try {
       const value = await fetchWorkspaceDescriptor();
       setDescriptor(value);
@@ -118,6 +120,8 @@ function App() {
       setDescriptorError(
         "The server did not publish a usable workspace release descriptor. Retry, or contact the operator.",
       );
+    } finally {
+      setDescriptorLoading(false);
     }
   };
 
@@ -179,7 +183,7 @@ function App() {
   const handleEnroll = async (e: Event) => {
     e.preventDefault();
     if (isEnrolling()) return;
-    const secretValue = enrollSecret();
+    const secretValue = enrollSecret().trim();
     setEnrollSecret("");
     if (!secretValue) {
       setAuthMessage("Enrollment secret required.");
@@ -275,6 +279,16 @@ function App() {
         : recoveryFor("U7_BOOT", "unknown");
       setUnlockFailure(failure);
       setStatus("Workspace unlock failed.");
+      if (
+        isUnlockError(error) &&
+        error.stage === "U2_ENROLL" &&
+        error.reason === "enrollment_required"
+      ) {
+        // The cached descriptor claimed an enrollment the server no longer has
+        // for this session; refetch so a retry posts the enrollment again
+        // instead of deterministically skipping it.
+        void loadDescriptor();
+      }
       defaultRuntime.lock();
       queueMicrotask(() => alertRef?.focus());
     } finally {
@@ -373,6 +387,14 @@ function App() {
         <div class="notice notice--error" role="alert">
           <p class="notice__title">Release descriptor unavailable</p>
           <p class="notice__detail">{descriptorError()}</p>
+          <button
+            type="button"
+            class="button"
+            onClick={loadDescriptor}
+            disabled={descriptorLoading() || authState() !== "authenticated"}
+          >
+            {descriptorLoading() ? "Checking release..." : "Retry release check"}
+          </button>
         </div>
       </Show>
 
@@ -486,10 +508,6 @@ function App() {
                       <dd>{active().package_format_version}</dd>
                     </div>
                     <div class="meta__row">
-                      <dt>Artifact key ID</dt>
-                      <dd class="meta__mono">{active().artifact_kid_b64}</dd>
-                    </div>
-                    <div class="meta__row">
                       <dt>Workspace protocol</dt>
                       <dd>
                         {active().min_shell_protocol}–{active().max_shell_protocol}
@@ -539,10 +557,15 @@ function App() {
                       <li
                         class="stages__item"
                         classList={{
+                          "stages__item--done":
+                            unlockStage() !== null &&
+                            STAGES.findIndex((s) => s.id === stage.id) <
+                              STAGES.findIndex((s) => s.id === unlockStage()),
                           "stages__item--active": unlockStage() === stage.id,
                           "stages__item--pending":
-                            STAGES.findIndex((s) => s.id === stage.id) <
-                            STAGES.findIndex((s) => s.id === unlockStage()),
+                            unlockStage() !== null &&
+                            STAGES.findIndex((s) => s.id === stage.id) >
+                              STAGES.findIndex((s) => s.id === unlockStage()),
                         }}
                       >
                         <span class="stages__dot" aria-hidden="true" />
@@ -576,7 +599,7 @@ function App() {
               frame = element;
             }}
             src={payloadUrl()}
-            onLoad={() => defaultRuntime.releaseDocumentUrl(payloadUrl())}
+            onLoad={(event) => defaultRuntime.releaseDocumentUrl(event.currentTarget.src)}
             title="Private trading workspace"
             sandbox="allow-scripts allow-same-origin"
             class="workspace-frame"

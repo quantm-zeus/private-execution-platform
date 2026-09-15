@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { lstat, readdir, readFile, writeFile, mkdir, rm, mkdtemp } from "node:fs/promises";
+import { lstat, readdir, readFile, stat, writeFile, mkdir, rm, mkdtemp } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
@@ -280,13 +280,20 @@ export async function packDirectory(rootDir) {
   for (const full of files) {
     const rel = relative(root, full).split(sep).join("/");
     const pathBytes = Buffer.from(rel, "utf8");
-    const data = await readFile(full);
+    // Bound the size from metadata BEFORE reading, so an oversized file cannot
+    // be pulled into memory just to be rejected.
+    const fileStat = await stat(full);
     if (
       !rel ||
       rel.startsWith("../") ||
       pathBytes.length > MAX_PATH_BYTES ||
-      data.length > MAX_FILE_BYTES
+      fileStat.size > MAX_FILE_BYTES ||
+      total + 6 + pathBytes.length + fileStat.size > MAX_PACKAGE_BYTES
     ) {
+      throw new Error("invalid artifact file");
+    }
+    const data = await readFile(full);
+    if (data.length > MAX_FILE_BYTES || data.length !== fileStat.size) {
       throw new Error("invalid artifact file");
     }
     const meta = Buffer.allocUnsafe(6);

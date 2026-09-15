@@ -31,6 +31,17 @@ pub const MANIFEST_VERSION: u8 = 1;
 /// Environment variable naming the immutable release manifest.
 pub const RELEASE_MANIFEST_ENV: &str = "WORKSPACE_RELEASE_MANIFEST";
 
+/// Upper bound on the operator-configured release manifest file. The manifest is
+/// a small public document; a larger file is a misconfiguration and must not be
+/// read unbounded from an unauthenticated readiness probe.
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Upper bounds on public manifest string fields, so a hand-written manifest
+/// cannot echo an unbounded value through the authenticated descriptor.
+const MAX_RELEASE_ID_BYTES: usize = 256;
+const MAX_SOURCE_SHA_BYTES: usize = 128;
+const MAX_DIGEST_HEX_BYTES: usize = 128;
+
 /// Failures that must map to a fail-closed HTTP status, never a detail leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorError {
@@ -179,6 +190,13 @@ impl ReleaseManifest {
         if self.release_id.trim().is_empty() || self.source_sha.trim().is_empty() {
             return Err(DescriptorError::ManifestInvalid);
         }
+        if self.release_id.len() > MAX_RELEASE_ID_BYTES
+            || self.source_sha.len() > MAX_SOURCE_SHA_BYTES
+            || self.artifact.kid_b64.len() > MAX_DIGEST_HEX_BYTES
+            || self.artifact.sha256_hex.len() > MAX_DIGEST_HEX_BYTES
+        {
+            return Err(DescriptorError::ManifestInvalid);
+        }
         if self.artifact.package_format_version != PACKAGE_FORMAT_VERSION {
             return Err(DescriptorError::ManifestInvalid);
         }
@@ -192,11 +210,13 @@ impl ReleaseManifest {
             return Err(DescriptorError::ManifestInvalid);
         }
         if let Some(shell) = &self.shell {
-            if shell.asset_digest_hex.is_empty()
+            // The release tool emits exactly 64 lowercase hex chars; require the
+            // same so a lax manifest cannot bind a differently-shaped digest.
+            if shell.asset_digest_hex.len() != 64
                 || !shell
                     .asset_digest_hex
                     .bytes()
-                    .all(|b| b.is_ascii_hexdigit())
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             {
                 return Err(DescriptorError::ManifestInvalid);
             }
@@ -231,16 +251,29 @@ pub fn load_release_manifest_from_env() -> Result<Option<ReleaseManifest>, Descr
         Ok(value) if !value.trim().is_empty() => value,
         _ => return Ok(None),
     };
-    let bytes = std::fs::read(&path).map_err(|_| DescriptorError::ManifestInvalid)?;
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&bytes).map_err(|_| DescriptorError::ManifestInvalid)?;
-    Ok(Some(manifest))
+    load_release_manifest_from(std::path::Path::new(&path)).map(Some)
+}
+
+/// Read and parse a manifest from an explicit path, bounding the read. Exposed
+/// to tests without touching process-global environment state.
+fn load_release_manifest_from(path: &std::path::Path) -> Result<ReleaseManifest, DescriptorError> {
+    let metadata = std::fs::metadata(path).map_err(|_| DescriptorError::ManifestInvalid)?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(DescriptorError::ManifestInvalid);
+    }
+    let bytes = std::fs::read(path).map_err(|_| DescriptorError::ManifestInvalid)?;
+    serde_json::from_slice(&bytes).map_err(|_| DescriptorError::ManifestInvalid)
 }
 
 /// Evaluate the artifact/enrollment compatibility contract.
 ///
 /// The decision is derived only from public metadata (artifact header, enrolled
 /// public key, release fingerprint); it is not an oracle for the unlock secret.
+/// With no configured release manifest the server has no trusted recipient
+/// public key to compare, so it enforces the version/KID binding only; a
+/// mismatched key in that mode is still rejected fail-closed by the browser's
+/// `decrypt_artifact` and by the enrolled-key fingerprint when a manifest is
+/// present.
 pub fn preflight(
     artifact: &[u8],
     enrollment: Option<&EnrollmentSnapshot>,
@@ -443,7 +476,7 @@ mod tests {
                 max: WORKSPACE_PROTOCOL_VERSION,
             },
             shell: Some(ManifestShell {
-                asset_digest_hex: "abc123".into(),
+                asset_digest_hex: "ab".repeat(32),
             }),
         }
     }
@@ -498,6 +531,17 @@ mod tests {
             public_key_fingerprint_b64(&[0u8; 32]);
         assert_eq!(
             preflight(&artifact, Some(&snapshot), Some(&wrong_fingerprint)),
+            UnlockCompatibility::ArtifactIncompatible
+        );
+
+        // A shell digest that is not exactly 64 lowercase hex is rejected, so a
+        // lax manifest cannot bind a differently-shaped digest.
+        let mut bad_shell_digest = manifest.clone();
+        bad_shell_digest.shell = Some(ManifestShell {
+            asset_digest_hex: "abc123".into(),
+        });
+        assert_eq!(
+            preflight(&artifact, Some(&snapshot), Some(&bad_shell_digest)),
             UnlockCompatibility::ArtifactIncompatible
         );
     }
