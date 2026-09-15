@@ -286,6 +286,42 @@ impl GasEstimator for FixedGas {
     }
 }
 
+/// Gas model returning a caller-supplied amount per call, in candidate order.
+///
+/// Used to pin ranking-key ordering when two candidates share the same hop count
+/// (so a hop-count-based estimator cannot distinguish them).
+pub struct SequenceGas {
+    pub asset: AssetId,
+    pub amounts: Vec<u128>,
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl SequenceGas {
+    pub fn new(asset: AssetId, amounts: Vec<u128>) -> Self {
+        Self {
+            asset,
+            amounts,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl GasEstimator for SequenceGas {
+    fn estimate_gas(
+        &self,
+        _chain: &ChainId,
+        _hop_count: usize,
+    ) -> Result<AssetAmount, RoutingError> {
+        use std::sync::atomic::Ordering;
+        let index = self.cursor.fetch_add(1, Ordering::SeqCst);
+        let amount = self.amounts.get(index).copied().unwrap_or(0);
+        Ok(AssetAmount {
+            asset: self.asset.clone(),
+            amount: AtomicAmount::new(amount),
+        })
+    }
+}
+
 /// Builds a full [`RouteRequest`] borrowing the supplied fixtures.
 #[allow(clippy::too_many_arguments)]
 pub fn request<'a>(

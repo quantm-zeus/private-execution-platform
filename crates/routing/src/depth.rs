@@ -258,8 +258,12 @@ fn clmm_within(pool_sqrt: u128, resulting_sqrt: u128, target_bps: u16) -> bool {
 
 /// Exact predicate: is the Bin price move within `target_bps`?
 ///
-/// Fails closed (`false`, never a guessed band) when either per-bin price is not
-/// representable in the kernel's reduced form.
+/// Prefers the kernel's reduced per-bin prices (exact even when `|diff|` is large
+/// relative to `|bin_id|`). If an endpoint price is not representable — the kernel
+/// can still quote by skipping a zero-reserve active bin — it falls back to the
+/// signed-exponent ratio `base^|diff|`, which is exact whenever that power fits
+/// `u128`; a power that overflows implies an impact beyond any representable band,
+/// so `false` is the correct fail-closed answer.
 fn bin_within(
     bin_step: u16,
     decimals_0: u8,
@@ -271,13 +275,58 @@ fn bin_within(
     if resulting_bin_id == active_bin_id {
         return true;
     }
-    let (Ok(before), Ok(after)) = (
+    if let (Ok(before), Ok(after)) = (
         atomic_bin_price(bin_step, decimals_0, decimals_1, active_bin_id),
         atomic_bin_price(bin_step, decimals_0, decimals_1, resulting_bin_id),
+    ) {
+        return bin_price_within(before, after, resulting_bin_id > active_bin_id, target_bps);
+    }
+    bin_exponent_within(bin_step, active_bin_id, resulting_bin_id, target_bps)
+}
+
+/// Fallback predicate for an unrepresentable endpoint price, using the signed
+/// exponent of the reduced bin base.
+fn bin_exponent_within(
+    bin_step: u16,
+    active_bin_id: i32,
+    resulting_bin_id: i32,
+    target_bps: u16,
+) -> bool {
+    let diff = resulting_bin_id as i64 - active_bin_id as i64;
+    if diff == 0 {
+        return true;
+    }
+    let (base_num, base_den) = bin_base(bin_step);
+    let exponent = diff.unsigned_abs() as u32;
+    let t = target_bps as u128;
+    let (Some(np), Some(dp)) = (
+        base_num.checked_pow(exponent),
+        base_den.checked_pow(exponent),
     ) else {
         return false;
     };
-    bin_price_within(before, after, resulting_bin_id > active_bin_id, target_bps)
+    if diff > 0 {
+        cmp_u128_products(np, 10_000, 10_000 + t, dp) != Ordering::Greater
+    } else {
+        cmp_u128_products(dp, 10_000, 10_000 - t, np) != Ordering::Less
+    }
+}
+
+/// Reduced bin price base `((10_000 + bin_step) / 10_000)`.
+fn bin_base(bin_step: u16) -> (u128, u128) {
+    let num = 10_000u128 + bin_step as u128;
+    let den = 10_000u128;
+    let divisor = gcd_u128(num, den);
+    (num / divisor, den / divisor)
+}
+
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
 }
 
 /// Exact predicate: is `after / before` within `target_bps` of one?
@@ -551,5 +600,28 @@ mod tests {
         assert_eq!(scale_u256((0, 1u128 << 127), 2), (0, 1, 0));
         // High-limb carry into the top limb.
         assert_eq!(scale_u256((u128::MAX, 0), 2), (1, u128::MAX - 1, 0));
+        // Middle-limb carry into the top limb (independently recomputed).
+        assert_eq!(
+            scale_u256(
+                (
+                    226_854_911_280_625_642_308_916_404_954_512_140_970u128,
+                    u128::MAX
+                ),
+                3
+            ),
+            (2, 0, u128::MAX - 2)
+        );
+    }
+
+    #[test]
+    fn bin_within_falls_back_when_an_endpoint_price_overflows() {
+        // The active bin 38 is unrepresentable while the adjacent bin 37 is not:
+        // the kernel can still quote by skipping the empty active bin, so the
+        // predicate must fall back to the signed-exponent ratio.
+        assert!(atomic_bin_price(1_000, 0, 0, 38).is_err());
+        assert!(atomic_bin_price(1_000, 0, 0, 37).is_ok());
+        // One bin below active is a 10/11 move: 909.09 bps -> within 910, not 909.
+        assert!(bin_within(1_000, 0, 0, 38, 37, 910));
+        assert!(!bin_within(1_000, 0, 0, 38, 37, 909));
     }
 }

@@ -507,3 +507,99 @@ fn depth_survives_a_one_unit_rounding_hole() {
         .iter()
         .any(|level| level.absorbed_in.is_some()));
 }
+
+/// A one-sided active bin whose own price overflows `u128`: the kernel skips the
+/// empty active bin and prices the adjacent representable bin.
+fn one_sided_active_bin_pool() -> BinPoolState {
+    BinPoolState {
+        token_0: weth(),
+        token_1: usdc(),
+        decimals_0: 0,
+        decimals_1: 0,
+        active_bin_id: 38,
+        bin_step: 1_000,
+        fee_bps: bps(0),
+        bins: vec![
+            LiquidityBin::new(37, AtomicAmount::new(0), AtomicAmount::new(1_000_000_000)),
+            LiquidityBin::new(38, AtomicAmount::new(1_000_000_000), AtomicAmount::new(0)),
+        ],
+    }
+}
+
+#[test]
+fn bin_depth_survives_an_unrepresentable_active_bin() {
+    let state = PoolKindState::Bin(one_sided_active_bin_pool());
+    let profile = depth_at_bps(&state, &weth(), AtomicAmount::new(100), &targets(&[1_000]))
+        .expect("one-sided active-bin depth profile");
+    // The kernel skips the empty active bin 38 and quotes into bin 37 at 10/11 of
+    // the price: impact = 1 - 10/11 = 909.09 bps -> whole-bp ceiling 910.
+    assert_eq!(profile.trade_impact_bps, Some(bps(910)));
+    // Exhausting bin 37 costs ceil(1e9 * 10^37 / 11^37) = 29_408_350.
+    assert_eq!(
+        profile.levels[0].absorbed_in,
+        Some(AtomicAmount::new(29_408_350))
+    );
+}
+
+#[test]
+fn depth_does_not_override_gas_cost() {
+    let intent = buy(weth(), usdc(), 1_000_000);
+    let tax = zero_tax_for(&intent);
+    let scoring = scoring();
+    let policy = caller_policy();
+    let targets = default_targets();
+    let descriptors = vec![
+        descriptor(
+            "uniswap_v3",
+            "pool-narrow",
+            PoolKindState::Clmm(narrow_pool(30)),
+            NOW_MS,
+            1,
+            None,
+        ),
+        descriptor(
+            "uniswap_v3",
+            "pool-wide",
+            PoolKindState::Clmm(wide_pool(30)),
+            NOW_MS,
+            1,
+            None,
+        ),
+    ];
+    // Charge the deeper (wide) pool more gas than the shallow (narrow) one, in
+    // whichever order enumeration happens to consult the estimator.
+    for amounts in [vec![100u128, 50], vec![50, 100]] {
+        let gas = SequenceGas::new(weth(), amounts);
+        let req = request_with_depth(
+            &intent,
+            &descriptors,
+            1_000_000,
+            &tax,
+            1,
+            &policy,
+            &scoring,
+            Some(&gas),
+            None,
+            &targets,
+        );
+        let decision = plan_single_path(&req).expect("planner succeeds");
+        let gas_of = |pool: &str| {
+            decision
+                .candidates
+                .iter()
+                .find(|candidate| candidate.quote.plan.legs[0].pool_ref == pool)
+                .and_then(|candidate| candidate.score.gas_cost.as_ref())
+                .map(|cost| cost.amount.get())
+                .expect("scored candidate has a gas cost")
+        };
+        if gas_of("pool-wide") > gas_of("pool-narrow") {
+            let selected = decision.selected.expect("a winner");
+            assert_eq!(
+                selected.plan.legs[0].pool_ref, "pool-narrow",
+                "gas cost must outrank depth at equal net output"
+            );
+            return;
+        }
+    }
+    panic!("test setup: no enumeration order charged the deeper pool more gas");
+}
