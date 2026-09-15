@@ -18,6 +18,7 @@ limit-engine.workspace = true
 market-types.workspace = true
 mcp-server.workspace = true
 okx-client.workspace = true
+provider-benchmark.workspace = true
 routing.workspace = true
 serde.workspace = true
 serde_json.workspace = true

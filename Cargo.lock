@@ -36,6 +36,7 @@ dependencies = [
  "market-types",
  "mcp-server",
  "okx-client",
+ "provider-benchmark",
  "routing",
  "serde",
  "serde_json",

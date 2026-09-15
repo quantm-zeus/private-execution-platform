@@ -52,6 +52,7 @@ mod error;
 mod execute;
 mod market;
 mod okx;
+mod okx_benchmark;
 mod order;
 mod portfolio;
 mod trade;
@@ -67,6 +68,7 @@ pub use market::{
     UnavailableMarketSnapshot,
 };
 pub use okx::{OkxQuoteError, OkxQuoteSource, UnavailableOkxQuoteSource};
+pub use okx_benchmark::OkxBenchmarkQuoteSource;
 pub use order::{DurableOrderReadModel, OrderReadModel, OrderSummary, DEFAULT_ORDER_PAGE};
 pub use portfolio::{
     BalanceEntry, BalanceProvider, ComposedPortfolioReadModel, PortfolioReadModel,
