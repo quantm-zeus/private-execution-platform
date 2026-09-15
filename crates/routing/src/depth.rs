@@ -290,6 +290,11 @@ fn bin_within(
 /// The ratio is compared exactly by a small bignum rather than by materialising
 /// `base^|diff|` in `u128`: for a near-one ratio (small `bin_step`) both powers can
 /// overflow while the exact move is still only a few basis points.
+///
+/// Bin ids may be sparse within `±MAX_BIN_ID`, so the numeric gap is **not** bounded
+/// by the kernel's bin-crossing budget. Cheap exact necessary-condition early-outs
+/// plus [`MAX_IN_BAND_EXPONENT`] bound the exponent that ever reaches the bignum, so
+/// a sparse pool with a far active bin can never turn this into an unbounded loop.
 fn bin_exponent_within(
     bin_step: u16,
     active_bin_id: i32,
@@ -303,16 +308,40 @@ fn bin_exponent_within(
     let (base_num, base_den) = bin_base(bin_step);
     let exponent = diff.unsigned_abs() as u32;
     let t = target_bps as u64;
+    let step = bin_step as u64;
     if diff > 0 {
+        // Bernoulli: `(1 + s/10_000)^e >= 1 + e*s/10_000`, so `e*s > t` is already
+        // outside the band; that also bounds the bignum exponent by `MAX_IN_BAND_EXPONENT`.
+        if exponent as u64 * step > t || exponent > MAX_IN_BAND_EXPONENT {
+            return false;
+        }
         // `(base_num/base_den)^e <= (10_000 + t)/10_000`
         //   <=>  `10_000 * base_num^e <= (10_000 + t) * base_den^e`.
         bin_pow_cmp(base_num, base_den, exponent, 10_000, 10_000 + t) != Ordering::Greater
     } else {
+        if t >= 10_000 {
+            // The fall band is `[0, 1]`: any non-negative ratio is within it.
+            return true;
+        }
+        // Bernoulli: in band only when `1 + e*s/10_000 <= 10_000/(10_000-t)`.
+        if exponent as u64 * step * (10_000 - t) > 10_000 * t || exponent > MAX_IN_BAND_EXPONENT {
+            return false;
+        }
         // `(base_den/base_num)^e >= (10_000 - t)/10_000`
         //   <=>  `(10_000 - t) * base_num^e <= 10_000 * base_den^e`.
         bin_pow_cmp(base_num, base_den, exponent, 10_000 - t, 10_000) != Ordering::Greater
     }
 }
+
+/// Hard bound on an exponent that can still be inside any band.
+///
+/// For a fall with `t < 10_000`, in-band requires
+/// `(1 + s/10_000)^e <= 10_000/(10_000-t) <= 10_000`; since `s >= 1`,
+/// `(1.0001)^e <= 10_000` gives `e < 92_108`. The rise is bounded far lower by the
+/// Bernoulli early-out (`e*s <= t <= 10_000`). `100_000` is a safe round bound: any
+/// larger exponent is certainly out of band, so the exact bignum comparison is only
+/// ever run for a bounded exponent.
+const MAX_IN_BAND_EXPONENT: u32 = 100_000;
 
 /// Little-endian `u64` bignum limbs.
 type Big = Vec<u64>;
@@ -701,6 +730,17 @@ mod tests {
         assert!(!bin_within(1, 0, 0, 0, 10, 10));
         // A far move is correctly rejected.
         assert!(!bin_within(1, 0, 0, 10, 0, 1));
+    }
+
+    #[test]
+    fn bin_exponent_within_bounds_a_huge_sparse_gap() {
+        // `8_000_000` is a legal (sparse) bin id and the active per-bin price is
+        // unrepresentable, but the move is far outside every band: the predicate
+        // must early-out instead of materialising `10001^8_000_000`.
+        assert!(!bin_within(1, 0, 0, 8_000_000, 0, 250));
+        assert!(!bin_within(1, 0, 0, 8_000_000, 0, 1));
+        // `Bps::MAX` is the one band a fall always satisfies.
+        assert!(bin_within(1, 0, 0, 8_000_000, 0, 10_000));
     }
 
     #[test]

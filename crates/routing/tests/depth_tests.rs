@@ -473,6 +473,41 @@ fn far_active_bin_pool() -> BinPoolState {
 }
 
 #[test]
+fn bin_depth_bounds_a_huge_sparse_id_gap() {
+    // Sparse legal ids: the active bin is unrepresentable and the next initialized
+    // bin is 8_000_000 away. The numeric gap is not bounded by the kernel's
+    // crossing budget, so the depth fallback must early-out rather than
+    // materialise an astronomically large power.
+    let pool = BinPoolState {
+        token_0: weth(),
+        token_1: usdc(),
+        decimals_0: 0,
+        decimals_1: 0,
+        active_bin_id: 8_000_000,
+        bin_step: 1,
+        fee_bps: bps(0),
+        bins: vec![
+            LiquidityBin::new(0, AtomicAmount::new(0), AtomicAmount::new(1_000_000_000)),
+            LiquidityBin::new(
+                8_000_000,
+                AtomicAmount::new(1_000_000_000),
+                AtomicAmount::new(0),
+            ),
+        ],
+    };
+    let state = PoolKindState::Bin(pool);
+    let profile = depth_at_bps(&state, &weth(), AtomicAmount::new(100), &default_targets())
+        .expect("sparse pool profiles without hanging");
+    // The price collapses over 8_000_000 bins: the whole move is beyond every
+    // finite band, so no target has coverage and the impact saturates at `Bps::MAX`.
+    assert!(profile
+        .levels
+        .iter()
+        .all(|level| level.absorbed_in.is_none()));
+    assert_eq!(profile.trade_impact_bps, Some(bps(10_000)));
+}
+
+#[test]
 fn bin_depth_is_exact_for_a_far_from_zero_active_bin() {
     let state = PoolKindState::Bin(far_active_bin_pool());
     let profile = depth_at_bps(&state, &usdc(), AtomicAmount::new(1_000), &targets(&[250]))
