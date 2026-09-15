@@ -41,18 +41,24 @@ the browser transport session:
    `{type:"evergreen:session-key", kid, s2cKeyB64, c2sKeyB64}` to its own
    sandboxed frame **only** after the payload echoes the per-unlock handoff token
    the shell injected into the payload document (`<meta name="evergreen-handoff">`).
-   The delivery is one-shot per unlock: a same-origin document that navigated into
-   the frame (or a repointed `frame.src`) cannot produce the token, so an
-   unauthenticated `evergreen:workspace-ready` ping can no longer harvest live
-   keys. `lock()` drops both the key reference and the token.
+   The delivery is one-shot per unlock and the shell revokes the payload
+   document's `blob:` URL once the frame has loaded it, so a same-origin document
+   that navigated into the frame (or a repointed `frame.src`) cannot re-fetch the
+   payload to read the token, and an unauthenticated `evergreen:workspace-ready`
+   ping can no longer harvest live keys. `lock()` drops both the key reference and
+   the token.
 5. The payload imports the raw keys as **non-extractable** `CryptoKey`s
    (AES-GCM encrypt/decrypt) and zeroizes the base64/byte copies.
 
-The key epoch is retired server-side: each `ServerSession` is bound to the
-authenticated workspace `SessionId` and a fresh handoff for the same owner calls
-`SessionRegistry::retire_owner` before inserting the new `kid`. A `kid` issued
-before a lock (or an earlier unlock) therefore stops being accepted immediately
-rather than lingering until its TTL.
+The key epoch is retired server-side on a fresh handoff: each `ServerSession` is
+bound to the authenticated workspace `SessionId` and a fresh handoff for the same
+owner calls `SessionRegistry::retire_owner` before inserting the new `kid`, so a
+`kid` from an earlier unlock stops being accepted as soon as the next unlock
+completes. A client-side `lock()` sends no server call, so it does not by itself
+retire the epoch: the shell drops the keys locally, and the old `kid` is refused
+server-side at the next handoff or at its TTL, whichever comes first. The owner
+is the auth session, so two tabs sharing one auth session share one epoch and a
+fresh unlock in either tab retires the other's `kid`.
 
 No key is persisted. The payload keeps the browser-side byte copies in
 zeroizable buffers and drops them after import. On the Rust side
@@ -165,17 +171,23 @@ It derives nothing on its own:
   deployments.
 - `preview_market_order` (browser payload `{intent:{…}, router_preference}`) and
   `place_limit_order` (flat payload) are translated into lossless canonical
-  `AssetRef`s and `AmountSpec`s. `usd` → `usd_micros` (6 dp) needs no registry;
-  `stablecoin`/`token` use the token_in decimals. A decimal with more precision
-  than the asset supports, exponent notation, a non-positive amount, or an
-  over-range value is a **protocol rejection**, never a silent rounding of a
+  `AssetRef`s and `AmountSpec`s. `usd` is a **determinate protocol refusal**: the
+  canonical backend deliberately has no trusted USD price and accepts only
+  input-asset atomics, so the private layer refuses rather than inventing a
+  conversion; `stablecoin`/`token` use the token_in decimals. A decimal with more
+  precision than the asset supports, exponent notation, a non-positive amount, or
+  an over-range value is a **protocol rejection**, never a silent rounding of a
   trade size.
 - `place_limit_order`'s human quote-per-base `limit_price` becomes an exact atomic
   `LimitPriceSpec` (`numerator_atomic`/`denominator_atomic`) using the canonical
   orientation: buy → `(token_in, token_out)`, sell → `(token_out, token_in)`.
-  The web-only risk caps and `order_type` fields are dropped (the canonical
-  command owns only the eight accepted keys; wallet limits come from backend
-  config), and the canonical parser rejects any leaked field.
+  A non-null web-only risk cap (`max_buy_tax_bps`/`max_sell_tax_bps`/
+  `max_price_impact_bps`/`max_slippage_bps`/`max_total_cost_usd`) is a determinate
+  protocol refusal, because the canonical command cannot enforce it and accepting
+  it would present an unenforced safety control as applied; an explicit `null`
+  means "no cap". `order_type` is dropped (the canonical command owns only the
+  eight accepted keys; wallet limits come from backend config), and the canonical
+  parser rejects any leaked field.
 - `preview_market_order` stores the **translated canonical execute intent** under
   a 128-bit random, memory-only `quote_id`, scoped to the authenticated session
   `kid` (`CommandDispatcher::dispatch_for_session`) with a bounded TTL.
@@ -206,16 +218,17 @@ fail-closed state and never enables trading by itself.
 ## Tests
 
 - `crates/session-transport`: envelope/AEAD/replay/expiry/sequence-binding plus
-  stream-frame schema, monotonic stream sequence, stale-server-time refusal and
-  subscribe purpose-window tests (20).
-- `apps/private-api`: 95 lib tests, including the real gRPC bidi
+  stream-frame schema, monotonic stream sequence, stale-server-time refusal,
+  owner-epoch retirement and subscribe purpose-window tests (25).
+- `apps/private-api`: 112 lib tests, including the real gRPC bidi
   `RelayStreamService` subscribe + snapshot round-trip, driver fail-closed /
   resync tests, the `WebContractDispatcher` no-false-success + kill-switch tests,
-  and the BR-11 translation / preview projection / quote-binding tests.
+  the capability-map / OKX-preference / seam-derivation production tests, and the
+  BR-11 translation / preview projection / quote-binding tests.
 - `apps/edge-gateway/tests/opaque_command_e2e.rs`: browser-shaped opaque envelope
   -> edge `/v1/command` + `/v1/bootstrap` -> private-api session service, plus
   replay rejection, JSON-body rejection, and BR-10/BR-12 no-false-success
-  assertions through the web-contract layer (7).
+  assertions through the web-contract layer (9).
 - `apps/edge-gateway/tests/opaque_web_integration_e2e.rs`: true end-to-end through
   the **real composed chain** (`web_command_dispatcher` -> `AgentCommandDispatcher`
   -> `WebContractDispatcher` -> `WebIntegrationDispatcher`) to an injected
@@ -223,8 +236,8 @@ fail-closed state and never enables trading by itself.
   `AssetRef`/`AmountSpec`, preview projects a `quoteId`, execute binds the quote
   and source, `TRADING_ENABLED=false` denies the write, an unknown instrument
   never reaches the backend, and an unattributable execute is indeterminate (5).
-- `web/workspace-payload`: 357 unit tests including the worker subscribe-frame
-  test (`realtime/worker.test.ts`).
+- `web/workspace-payload`: the payload unit suite including the worker
+  subscribe-frame test (`realtime/worker.test.ts`).
 
 ## Fail-closed hardening (fresh-context adversarial review)
 
@@ -318,6 +331,45 @@ All CRITICAL/HIGH and relevant MEDIUM findings were fixed with regression tests:
   same-origin document that sent `workspace-ready`. Delivery is now one-shot and
   gated on a random per-unlock token injected into the payload document.
 
+## Fourth adversarial review (independent verification of this slice)
+
+Two fresh-context reviewers audited the uncommitted production-wiring slice. No
+CRITICAL/HIGH false-success or capital-write bypass was found; all CRITICAL/HIGH
+and relevant MEDIUM findings were fixed with regression tests:
+
+- **OKX capability was unrepresentable and unenforced (HIGH).** `WiredCapabilities`
+  had no `okx` field and `document_for` hardcoded `okx: false`, so a genuinely
+  OKX-capable deployment advertised it false (dead default path) while a crafted
+  client could still force `router_preference:"okx"`. `okx`/`twitter`/`gmgn` are
+  now plumbed through, and `CapabilitySet::permits_router_preference` denies an
+  explicit `okx` preference before dispatch unless `okx` is advertised.
+- **Capability map was default-allow for unlisted ops (MEDIUM).** An op outside
+  the map ran even when its surface was advertised unavailable. `permits` now
+  denies an unmapped op unless it is one of the explicitly ungated BR-9
+  reconciliation reads (`get_order_by_client_id`, `get_withdrawal_by_request_id`,
+  `get_execution_progress`), so an unknown op cannot escape the gate while
+  UNKNOWN resolution stays available.
+- **Advertised document trusted the caller (MEDIUM).** `build_opaque` now derives
+  the document from the seams that are actually present: no dispatcher forces
+  every command capability false and engages the kill switch; no stream source
+  forces `realtime` false.
+- **Edge access assertion could be misconfigured (MEDIUM).** The assertion header
+  must now be a custom (`cf-`/`x-`) header; a standard/browser header name
+  (`accept`, `cookie`, `authorization`, `content-type`, …) is a startup error, so
+  the perimeter assertion cannot accidentally authorize ordinary requests. A
+  partial/blank composition (including a single identity variable) refuses
+  startup rather than silently serving 503s.
+- **Unbounded relay dial held the channel lock (MEDIUM).** The edge relay now
+  dials under a dedicated lock with a bounded connect timeout, so a black-holed
+  private API cannot block cached-channel readers.
+- **Same-origin token re-fetch (MEDIUM).** The shell revokes the payload
+  *document* `blob:` URL once the frame has loaded it, so a navigated same-origin
+  frame cannot read `frame.src` and re-fetch the payload to recover the handoff
+  token; the unguarded `sessionKeys()` accessor was removed. `injectHandoffToken`
+  now inserts after the doctype/head (never `<header>`) via tag-boundary patterns.
+- **Web-only ops with no canonical tool** and **response-shape projection for
+  `get_orders`/`get_portfolio`** remain explicit residuals (below).
+
 ## Residuals (explicit)
 
 - **USD-notional amounts (Trading Core capability, not a private-layer bug)**: the
@@ -333,9 +385,9 @@ All CRITICAL/HIGH and relevant MEDIUM findings were fixed with regression tests:
   becomes a determinate protocol denial. A default policy belongs to the Trading
   Core, not the translator.
 - **User risk caps on `place_limit_order`**: the canonical command carries no
-  `max_*_bps`/`max_total_cost_usd` fields, so those web inputs are dropped and the
-  backend-configured wallet policy governs. A per-order cap contract is a
-  canonical-vocabulary change.
+  `max_*_bps`/`max_total_cost_usd` fields, so a non-null web cap is a determinate
+  `protocol` refusal (never silently dropped) and the backend-configured wallet
+  policy governs. A per-order cap contract is a canonical-vocabulary change.
 - **Web-only ops with no canonical tool**: `start_twap`, `submit_rfq`,
   `request_withdrawal` (submit), `get_alerts` and `get_provider_health` fall
   through to `capability_missing`. They belong on the injected
@@ -345,6 +397,19 @@ All CRITICAL/HIGH and relevant MEDIUM findings were fixed with regression tests:
   `portfolio`, while the web views expect camelCase/top-level fields. The
   projection is not implemented yet; the surfaces stay non-fabricating but
   partially blank.
+- **Shell BR-5 handoff test coverage**: the shell's token injection and one-shot
+  gate are implemented and were verified by the fresh-context review, but
+  `web/workspace-shell` has no unit-test runner and the browser e2e delivers the
+  session key to the payload directly, so there is no automated regression test
+  for "no token / wrong token / repeat ping delivers nothing". Adding one needs a
+  shell test setup or a shell-level e2e that asserts delivery only after the
+  token echo.
+- **Client/server capability-label mismatches (pre-existing)**: the shipped UI
+  gates `search_token`/`get_token` on `intelligence` (the server maps them to
+  `market`) and `get_execution_progress` on `twap` (the server leaves it
+  ungated). The server is authoritative and fail-closed, so this can only hide a
+  surface prematurely or return a determinate `capability_missing`; aligning the
+  client labels is a small web-only follow-up.
 - **Operator wiring (partially closed)**: the production binaries now compose
   honestly instead of always serving the fail-closed stub:
   - `apps/edge-gateway` builds its router from `production::router_from_env()`.
@@ -374,8 +439,7 @@ All CRITICAL/HIGH and relevant MEDIUM findings were fixed with regression tests:
   s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
   substitution today; the cross-route c2s DoS is now fixed by validating before
   consuming a sequence); a shared `Notify` can waste one resync wake-up across
-  stream generations; the s2c stream can emit frames after session expiry (the
-  client deadline still blocks mutations); the WASM export path leaves raw key /
+  stream generations; the WASM export path leaves raw key /
   plaintext copies in linear memory because wasm-bindgen `free` does not zeroize
   (the JS copies are zeroized); the base64 key strings in worker `postMessage`
   payloads and the store closure survive until GC / iframe teardown (the imported

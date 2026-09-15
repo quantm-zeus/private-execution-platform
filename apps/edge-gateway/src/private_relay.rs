@@ -58,6 +58,10 @@ impl std::fmt::Debug for PrivateRelayConfig {
 pub struct PrivateRelay {
     config: PrivateRelayConfig,
     channel: RwLock<Option<tonic::transport::Channel>>,
+    /// Serializes dials. Held across the network wait *instead of* the channel
+    /// write lock, so a black-holed backend cannot block readers that only need
+    /// the cached channel.
+    dial: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for PrivateRelay {
@@ -81,6 +85,7 @@ impl PrivateRelay {
         Ok(Arc::new(Self {
             config,
             channel: RwLock::new(None),
+            dial: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -89,15 +94,18 @@ impl PrivateRelay {
     /// The unary relay and the realtime bidi stream share one channel so a
     /// reconnect never leaves two divergent TLS sessions to the same peer.
     pub(crate) async fn channel(&self) -> Result<tonic::transport::Channel, EdgeError> {
-        {
-            let guard = self.channel.read().await;
-            if let Some(channel) = guard.as_ref() {
-                return Ok(channel.clone());
-            }
+        // Fast path: a cached channel, under a read guard released immediately.
+        let cached = { self.channel.read().await.clone() };
+        if let Some(channel) = cached {
+            return Ok(channel);
         }
-        let mut guard = self.channel.write().await;
-        if let Some(channel) = guard.as_ref() {
-            return Ok(channel.clone());
+        // Serialize dials without holding the channel lock across the network
+        // wait, so a black-holed backend cannot block every reader behind one
+        // in-flight dial.
+        let _dial = self.dial.lock().await;
+        let cached = { self.channel.read().await.clone() };
+        if let Some(channel) = cached {
+            return Ok(channel);
         }
         let endpoint = service_identity::configure_client_endpoint(
             tonic::transport::Endpoint::from_shared(self.config.endpoint_origin.clone())
@@ -105,11 +113,14 @@ impl PrivateRelay {
             &self.config.identity,
         )
         .map_err(|_| EdgeError::InvalidConfiguration)?;
+        // A bounded connect timeout keeps one unreachable backend from wedging
+        // the relay indefinitely.
         let channel = endpoint
+            .connect_timeout(std::time::Duration::from_secs(10))
             .connect()
             .await
             .map_err(|_| EdgeError::BackendUnavailable)?;
-        *guard = Some(channel.clone());
+        *self.channel.write().await = Some(channel.clone());
         Ok(channel)
     }
 

@@ -46,8 +46,17 @@ impl TradingGate {
     }
 
     /// Read `TRADING_ENABLED` from the process environment.
+    ///
+    /// A present-but-non-Unicode value is a configuration error, not "unset":
+    /// treating it as disabled would silently ignore an operator's attempt to
+    /// enable trading, and treating it as enabled is impossible. Fail closed by
+    /// refusing startup.
     pub fn from_env() -> Result<Self, TradingGateError> {
-        Self::parse(std::env::var("TRADING_ENABLED").ok().as_deref())
+        match std::env::var("TRADING_ENABLED") {
+            Ok(value) => Self::parse(Some(&value)),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Disabled),
+            Err(std::env::VarError::NotUnicode(_)) => Err(TradingGateError),
+        }
     }
 
     pub fn is_enabled(self) -> bool {
@@ -85,6 +94,9 @@ pub struct WiredCapabilities {
     pub rfq: bool,
     pub withdraw: bool,
     pub intelligence: bool,
+    pub twitter: bool,
+    pub gmgn: bool,
+    pub okx: bool,
 }
 
 impl WiredCapabilities {
@@ -115,9 +127,9 @@ pub fn document_for(gate: TradingGate, wired: WiredCapabilities) -> BootstrapDoc
         limits: wired.limits,
         portfolio: wired.portfolio,
         intelligence: wired.intelligence,
-        twitter: false,
-        gmgn: false,
-        okx: false,
+        twitter: wired.twitter,
+        gmgn: wired.gmgn,
+        okx: wired.okx,
         twap: wired.twap,
         rfq: wired.rfq,
         withdraw: wired.withdraw,
@@ -206,20 +218,38 @@ impl std::fmt::Debug for OpaqueComposition {
 /// With the fail-closed defaults (no dispatcher, nothing wired) the surface
 /// denies every mutation and emits a single authenticated error frame — never
 /// fabricated data.
+///
+/// The advertised document is derived from the seams that are actually present,
+/// not from the caller-supplied [`WiredCapabilities`] alone: an absent dispatcher
+/// forces every command capability false and an absent stream source forces
+/// `realtime` false, so the document cannot advertise a command surface when no
+/// command backend is present. Presence is a necessary condition, not a
+/// guarantee of capability — the injected seam still enforces its own denials.
 pub fn build_opaque(composition: OpaqueComposition) -> Result<OpaqueProduction, &'static str> {
-    let mut document = document_for(composition.gate, composition.wired);
+    let dispatcher = composition.dispatcher;
+    let stream_source = composition.stream_source;
+    let mut wired = composition.wired;
+    if dispatcher.is_none() {
+        // No command backend: every command capability is unservable, whatever
+        // the caller claimed. `realtime` is handled separately below.
+        wired = WiredCapabilities {
+            realtime: wired.realtime,
+            ..WiredCapabilities::default()
+        };
+    }
+    if stream_source.is_none() {
+        wired.realtime = false;
+    }
+
+    let mut document = document_for(composition.gate, wired);
     document.chains = composition.chains;
     let state = OpaqueServiceState::with_stream(
         composition.sessions,
-        composition
-            .dispatcher
-            .unwrap_or_else(|| Arc::new(FailClosedDispatcher)),
+        dispatcher.unwrap_or_else(|| Arc::new(FailClosedDispatcher)),
         Arc::new(FixedBootstrap::new(document)),
         composition.clock,
         composition.session_ttl_ms,
-        composition
-            .stream_source
-            .unwrap_or_else(|| Arc::new(FailClosedStreamSource)),
+        stream_source.unwrap_or_else(|| Arc::new(FailClosedStreamSource)),
     )?;
     Ok(OpaqueProduction {
         state,
@@ -286,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn a_wired_okx_route_is_advertised() {
+        // BR-10: `okx` is a first-class wire capability, not hardcoded false, so
+        // an OKX-capable deployment can advertise it and the server can enforce
+        // it. A Local-only deployment leaves it false.
+        assert!(!WiredCapabilities::read_only().okx);
+        let mut wired = WiredCapabilities::read_only();
+        wired.okx = true;
+        let document = document_for(TradingGate::Enabled, wired);
+        assert!(document.capabilities.okx);
+        // Advertising the OKX route does not by itself enable execution.
+        assert!(!document.capabilities.execute);
+    }
+
+    #[test]
     fn build_opaque_defaults_to_the_fail_closed_surface() {
         let sessions = Arc::new(std::sync::Mutex::new(
             session_transport::SessionRegistry::new(),
@@ -305,5 +349,84 @@ mod tests {
         let document = produced.state.bootstrap().document();
         assert!(!document.trading_enabled);
         assert!(document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_forces_capabilities_whose_seam_is_absent() {
+        // A caller that claims capabilities while supplying no backing seam must
+        // not get a document that advertises them: the document is derived from
+        // what is actually present.
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Enabled,
+            dispatcher: None,
+            wired: WiredCapabilities {
+                execute: true,
+                limits: true,
+                realtime: true,
+                okx: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: None,
+            chains: Vec::new(),
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        assert!(
+            !document.capabilities.execute,
+            "no dispatcher => execute unservable"
+        );
+        assert!(
+            !document.capabilities.limits,
+            "no dispatcher => limits unservable"
+        );
+        assert!(
+            !document.capabilities.okx,
+            "no dispatcher => okx unservable"
+        );
+        assert!(
+            !document.capabilities.realtime,
+            "no stream source => realtime unservable"
+        );
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_advertises_a_capability_when_its_seam_is_wired() {
+        // Presence of the seam is necessary for the capability to be advertised
+        // (the inverse of the absent-seam test above). It is not a promise that
+        // the seam will accept every request: `FailClosedDispatcher` still denies
+        // its own operations, so this test only pins the document derivation.
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Enabled,
+            dispatcher: Some(Arc::new(FailClosedDispatcher)),
+            wired: WiredCapabilities {
+                execute: true,
+                okx: true,
+                realtime: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: Some(Arc::new(FailClosedStreamSource)),
+            chains: Vec::new(),
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        assert!(document.capabilities.execute);
+        assert!(document.capabilities.okx);
+        assert!(document.capabilities.realtime);
+        assert!(document.trading_enabled);
+        assert!(!document.kill_switch_enabled);
     }
 }

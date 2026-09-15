@@ -104,6 +104,9 @@ fn permissive_bootstrap() -> Arc<dyn BootstrapProvider> {
     document.capabilities.quotes = true;
     document.capabilities.portfolio = true;
     document.capabilities.wallet_limits = true;
+    // BR-10: these tests route explicitly through OKX, so the harness must
+    // advertise the authoritative `okx` capability (the server enforces it).
+    document.capabilities.okx = true;
     Arc::new(StaticBootstrap::new(document))
 }
 

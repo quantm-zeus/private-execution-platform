@@ -195,6 +195,9 @@ fn harness(
         document.capabilities.quotes = true;
         document.capabilities.portfolio = true;
         document.capabilities.wallet_limits = true;
+        // BR-10: the preview/execute fixtures route explicitly through OKX, so
+        // the authoritative `okx` capability must be advertised.
+        document.capabilities.okx = true;
         Arc::new(StaticBootstrap::new(document))
     } else {
         // Trading is disabled: mutations stay denied, but the PRD requires
@@ -205,6 +208,8 @@ fn harness(
         document.capabilities.preview = true;
         document.capabilities.quotes = true;
         document.capabilities.portfolio = true;
+        // BR-10: the read-only preview fixtures also request the OKX route.
+        document.capabilities.okx = true;
         // Deliberately NOT advertising `execute`/`limits`.
         Arc::new(StaticBootstrap::new(document))
     };

@@ -249,23 +249,17 @@ export class WorkspaceUnlockRuntime {
   }
 
   /**
-   * BR-5 session keys for the payload handoff, or `null` before unlock/after
-   * lock. The caller must only deliver these over the same-document channel to
-   * its own sandboxed frame.
-   */
-  public sessionKeys(): ShellSessionKeys | null {
-    return this.currentSession;
-  }
-
-  /**
    * One-shot, token-bound BR-5 key delivery.
    *
    * Returns the keys only when `token` matches the per-unlock token injected
-   * into the payload document, and only once. A same-origin document that
-   * navigated into the frame (or a repointed `frame.src`) cannot echo the token,
-   * so an unauthenticated `workspace-ready` ping can no longer harvest the live
+   * into the payload document, and only once. A document that navigated into the
+   * frame (or a repointed `frame.src`) cannot echo the token, so an
+   * unauthenticated `workspace-ready` ping can no longer harvest the live
    * session keys. Returns `null` on a missing/mismatched token, before unlock,
    * after lock, or on a repeat call.
+   *
+   * There is deliberately no unguarded key accessor: the only way to obtain the
+   * keys is through this token-and-one-shot gate.
    */
   public takeSessionKeysForHandoff(token: unknown): ShellSessionKeys | null {
     if (this.currentSession === null || this.handoffToken === null) return null;
@@ -277,6 +271,22 @@ export class WorkspaceUnlockRuntime {
     if (token !== this.handoffToken) return null;
     this.handoffDelivered = true;
     return this.currentSession;
+  }
+
+  /**
+   * Revoke the payload *document* blob URL once the frame has loaded it.
+   *
+   * The loaded document stays live in the frame and its subresource blob URLs
+   * remain valid, but the document URL is no longer fetchable. That closes the
+   * same-origin path where a document that navigated into the frame reads
+   * `frame.src` from the parent and re-fetches the still-live document blob to
+   * harvest the injected handoff token. The token itself is never the boundary;
+   * this removes the copy an attacker could otherwise read.
+   */
+  public releaseDocumentUrl(url: string): void {
+    if (!url) return;
+    revokeSafeBlobUrl(url);
+    this.activeUrls.delete(url);
   }
 
   public async unlock(
@@ -496,9 +506,9 @@ export class WorkspaceUnlockRuntime {
 
     // BR-5 handoff binding: inject the per-unlock token into the payload document
     // itself (same-document capability, never persisted, never in a URL). The
-    // payload echoes it on `workspace-ready`; a document the shell did not
-    // instantiate cannot produce it, so live keys cannot be harvested by a
-    // same-origin navigation.
+    // payload echoes it on `workspace-ready`; the shell revokes the document
+    // blob URL once the frame has loaded it, so a same-origin document that
+    // navigated into the frame cannot re-fetch the payload to read the token.
     indexHtml = injectHandoffToken(indexHtml, handoffToken);
 
     const assetNames = [...files.keys()].filter((name) => name !== "index.html");
@@ -573,20 +583,34 @@ function generateHandoffToken(): string {
 /**
  * Inject the handoff token into the payload document as a `<meta>` element.
  *
- * The value is base64 (no HTML-special characters), and it is inserted after an
- * existing `<head>`/`<html>` when present so it is available to the payload
- * before any script runs. It is never placed in a URL, the DOM tree the user
- * can select, or any storage.
+ * The value is base64 (no HTML-special characters), and it is inserted
+ * immediately after the document's `<head>` opening tag (creating a `<head>`
+ * after `<html>` or the doctype when the build output has none), so it is
+ * available to the payload before any script runs. The tag patterns require a
+ * tag boundary (`<head>`/`<head ...>`, never `<header>`). It is never placed in
+ * a URL or any storage; it lives in the document DOM by design and the document
+ * blob URL is revoked once the frame has loaded it.
  */
 function injectHandoffToken(html: string, token: string): string {
   const meta = `<meta name="evergreen-handoff" content="${token}">`;
-  if (/<head[^>]*>/i.test(html)) {
-    return html.replace(/<head[^>]*>/i, (match) => `${match}${meta}`);
+  const head = /<head(?:\s[^>]*)?>/i.exec(html);
+  if (head) {
+    const at = head.index + head[0].length;
+    return html.slice(0, at) + meta + html.slice(at);
   }
-  if (/<html[^>]*>/i.test(html)) {
-    return html.replace(/<html[^>]*>/i, (match) => `${match}<head>${meta}</head>`);
+  const htmlTag = /<html(?:\s[^>]*)?>/i.exec(html);
+  if (htmlTag) {
+    const at = htmlTag.index + htmlTag[0].length;
+    return html.slice(0, at) + `<head>${meta}</head>` + html.slice(at);
   }
-  return `${meta}${html}`;
+  const doctype = /<!doctype[^>]*>/i.exec(html);
+  if (doctype) {
+    // After the doctype (not before) so the injected markup cannot force quirks
+    // mode.
+    const at = doctype.index + doctype[0].length;
+    return html.slice(0, at) + `<head>${meta}</head>` + html.slice(at);
+  }
+  return `<head>${meta}</head>${html}`;
 }
 
 export const defaultRuntime = new WorkspaceUnlockRuntime();

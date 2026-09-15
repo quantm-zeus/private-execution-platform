@@ -35,6 +35,15 @@ describe("isIndeterminateOutcome", () => {
       expect(isIndeterminateOutcome(code, true)).toBe(true);
     }
   });
+
+  it("keeps transport/protocol codes indeterminate even when explicitly marked non-retryable", () => {
+    // The inverse asymmetry is deliberate and safe: for a code that can never
+    // prove the write did not commit, the key is kept regardless of an explicit
+    // `retryable:false`, because rotating it risks a duplicate order.
+    for (const code of ["network", "protocol", "unknown", "cancelled"] as const) {
+      expect(isIndeterminateOutcome(code, false)).toBe(true);
+    }
+  });
 });
 
 describe("newIdempotencyKey", () => {

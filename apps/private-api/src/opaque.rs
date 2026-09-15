@@ -85,28 +85,38 @@ impl CapabilitySet {
     /// The capability flag that gates a browser operation.
     ///
     /// BR-1 calls the advertised capabilities authoritative, so a `false` flag
-    /// must refuse the operation server-side, not merely hide the button. A
-    /// `None` return means the operation is not capability-gated (a generic read
-    /// such as `get_quote`, or an unknown op the dispatcher will reject). This
-    /// is a positive mapping: an operation only escapes the gate if it is
-    /// deliberately listed as ungated.
+    /// must refuse the operation server-side, not merely hide the button. Every
+    /// operation whose surface is advertised as a capability is listed here; an
+    /// operation outside this map is denied unless it is one of the explicitly
+    /// ungated reconciliation reads ([`Self::is_ungated_read`]), so a new op
+    /// cannot accidentally escape the gate.
     pub fn for_op(op: &str) -> Option<&'static str> {
         let capabilities = match op {
             "execute_market_order" => "execute",
             "place_limit_order" | "cancel_order" | "get_orders" | "get_order" => "limits",
             "preview_market_order" => "preview",
             "get_quote" => "quotes",
-            "get_portfolio" | "get_balances" => "portfolio",
+            "get_portfolio" | "get_balances" | "get_history" => "portfolio",
             "start_twap" => "twap",
             "submit_rfq" => "rfq",
             "request_withdrawal" => "withdraw",
             "get_wallet_limits" | "set_wallet_limits" => "wallet_limits",
-            "get_intelligence" => "intelligence",
-            "get_provider_health" => "intelligence",
+            "get_intelligence" | "get_provider_health" | "get_alerts" => "intelligence",
             "search_token" | "get_token" | "get_chart" => "market",
             _ => return None,
         };
         Some(capabilities)
+    }
+
+    /// Reconciliation reads that stay available regardless of the advertised
+    /// capability so an UNKNOWN mutation can always be resolved by an
+    /// authoritative read (BR-9). They carry no trading semantics and only read
+    /// state the authenticated session already owns.
+    pub fn is_ungated_read(op: &str) -> bool {
+        matches!(
+            op,
+            "get_order_by_client_id" | "get_withdrawal_by_request_id" | "get_execution_progress"
+        )
     }
 
     /// The boolean value for a capability name produced by [`Self::for_op`].
@@ -136,7 +146,20 @@ impl CapabilitySet {
     pub fn permits(&self, op: &str) -> bool {
         match Self::for_op(op) {
             Some(capability) => self.flag(capability),
-            None => true,
+            None => Self::is_ungated_read(op),
+        }
+    }
+
+    /// Whether the advertised set permits the request's router preference.
+    ///
+    /// BR-10: an explicit `okx` preference needs the authoritative `okx`
+    /// capability, so a deployment that only wires the Local router cannot have
+    /// its `preview`/`execute` capability endorse an OKX-routed command. A
+    /// missing/`local` preference is unaffected.
+    pub fn permits_router_preference(&self, payload: &Value) -> bool {
+        match payload.get("router_preference").and_then(Value::as_str) {
+            Some("okx") => self.okx,
+            _ => true,
         }
     }
 }
@@ -701,13 +724,18 @@ impl OpaqueServiceState {
                                 "Trading is disabled by the global kill switch.",
                             ),
                         )
-                    } else if !self.capabilities().permits(&request.op) {
-                        // BR-1/F2: the advertised capability set is authoritative,
-                        // so a `false` flag must refuse the operation server-side.
-                        // Otherwise a crafted client could use any op the injected
-                        // dispatcher allows while the UI renders that capability
-                        // as unavailable (an executed trade with no visible
-                        // surface). Deny before the dispatcher runs.
+                    } else if !self.capabilities().permits(&request.op)
+                        || !self
+                            .capabilities()
+                            .permits_router_preference(&request.payload)
+                    {
+                        // BR-1/F2 and BR-10: the advertised capability set is
+                        // authoritative, so a `false` flag (including `okx` for an
+                        // explicit OKX router preference) must refuse the operation
+                        // server-side. Otherwise a crafted client could use any op
+                        // the injected dispatcher allows while the UI renders that
+                        // capability as unavailable, or force an OKX route the
+                        // deployment never advertised. Deny before the dispatcher.
                         CommandResponse::denial(
                             &request.request_id,
                             CommandDenial::determinate(
@@ -758,8 +786,10 @@ impl std::fmt::Debug for OpaqueServiceState {
 /// This runs *before* the replay window advances, so a route-control plaintext
 /// replayed on the command route must be refused here — never dispatched and
 /// never allowed to burn a `Purpose::Command` sequence the honest client is
-/// about to use. The command check is therefore a positive allow-list of
-/// channel ops, not a denylist of the control ops we happen to know about.
+/// about to use. The check refuses the closed `session_transport` route-control
+/// set (`bootstrap`/`sync`/`subscribe`); the dispatcher and the capability gate
+/// backstop every other op, so a non-control op that is not a real command is
+/// still rejected before it can produce a result.
 fn verify_route_op(route: OpaqueRoute, plaintext: &[u8]) -> Result<(), RelayFailure> {
     let value: Value = serde_json::from_slice(plaintext).map_err(|_| RelayFailure::Protocol)?;
     let op = value.get("op").and_then(Value::as_str);
@@ -1262,7 +1292,6 @@ mod tests {
             0,
             "an unavailable capability never reaches the dispatcher"
         );
-        // A capability that *is* advertised still works.
         // A capability that *is* advertised still works (at the next sequence).
         let envelope = client
             .seal_at(
@@ -1277,6 +1306,119 @@ mod tests {
         let sealed = parse_wire_envelope(&opened).unwrap();
         let plaintext = client.open(&sealed).unwrap();
         let allowed: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(allowed["result"]["status"], "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_operation_is_denied_but_reconcile_reads_stay_available() {
+        // The capability map is authoritative in both directions: an op that is
+        // neither capability-gated nor an explicit reconciliation read must be
+        // denied (a new op cannot accidentally escape the gate), while the BR-9
+        // reconciliation reads stay available so an UNKNOWN write can always be
+        // resolved by an authoritative read.
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            read_only_bootstrap(),
+        );
+
+        let reconcile = roundtrip(
+            &state,
+            &mut client,
+            OpaqueRoute::Command,
+            br#"{"op":"get_order_by_client_id","payload":{"client_order_id":"c1"},"request_id":"recon"}"#,
+        )
+        .await
+        .expect("reconcile read is served");
+        assert_eq!(reconcile["result"]["status"], "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The map is default-deny: an op that is neither capability-gated nor an
+        // explicit reconciliation read is refused, so a future op cannot escape
+        // the gate; the reconcile reads are deliberately ungated.
+        let none = CapabilitySet::none();
+        assert!(!none.permits("definitely_not_a_command"));
+        assert!(!none.permits("get_quote"));
+        assert!(none.permits("get_order_by_client_id"));
+        assert!(none.permits("get_withdrawal_by_request_id"));
+        assert!(none.permits("get_execution_progress"));
+        assert_eq!(CapabilitySet::for_op("definitely_not_a_command"), None);
+        assert!(!CapabilitySet::is_ungated_read("definitely_not_a_command"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the reconcile read reached the dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_okx_router_preference_requires_the_okx_capability() {
+        // BR-10: a deployment that only wires the Local router must not let its
+        // advertised `preview` capability endorse an explicit OKX-routed command.
+        let now = 1_000i64;
+
+        // `preview` advertised but `okx` false: the OKX-routed preview is denied
+        // before the dispatcher.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut denied_doc = BootstrapDocument::fail_closed();
+        denied_doc.trading_enabled = true;
+        denied_doc.kill_switch_enabled = false;
+        denied_doc.kill_switch_reason = None;
+        denied_doc.capabilities.preview = true;
+        let (denied_state, mut denied_client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(StaticBootstrap::new(denied_doc)),
+        );
+        let denied = roundtrip(
+            &denied_state,
+            &mut denied_client,
+            OpaqueRoute::Command,
+            br#"{"op":"preview_market_order","payload":{"router_preference":"okx"},"request_id":"okx"}"#,
+        )
+        .await
+        .expect("sealed denial");
+        assert_eq!(denied["error"]["code"], "capability_missing");
+        assert!(denied.get("result").is_none(), "no false success");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unadvertised OKX route never reaches the dispatcher"
+        );
+
+        // With `okx` advertised the same request is served.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut allowed_doc = BootstrapDocument::fail_closed();
+        allowed_doc.trading_enabled = true;
+        allowed_doc.kill_switch_enabled = false;
+        allowed_doc.kill_switch_reason = None;
+        allowed_doc.capabilities.preview = true;
+        allowed_doc.capabilities.okx = true;
+        let (allowed_state, mut allowed_client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(StaticBootstrap::new(allowed_doc)),
+        );
+        let allowed = roundtrip(
+            &allowed_state,
+            &mut allowed_client,
+            OpaqueRoute::Command,
+            br#"{"op":"preview_market_order","payload":{"router_preference":"okx"},"request_id":"okx"}"#,
+        )
+        .await
+        .expect("advertised OKX route is served");
         assert_eq!(allowed["result"]["status"], "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }

@@ -304,7 +304,7 @@ describe("LimitsPanel", () => {
   });
 
   it("rotates the idempotency key after a determinate rejection but keeps it on an ambiguous failure", async () => {
-    let mode: "rejected" | "network" | "freshness" = "rejected";
+    let mode: "rejected" | "network" = "rejected";
     const client = new FakeCommandClient({
       get_orders: () => ({ orders: [] }),
       place_limit_order: () => {
@@ -313,7 +313,7 @@ describe("LimitsPanel", () => {
           // genuinely new logical order with a fresh key.
           throw workspaceError("freshness", "state changed", { retryable: false });
         }
-        throw workspaceError(mode, mode === "freshness" ? "stale" : "offline");
+        throw workspaceError("network", "offline");
       },
     });
     const store = await readyStore({ command: client });
@@ -343,16 +343,6 @@ describe("LimitsPanel", () => {
     fireEvent.click(placeButton());
     await flush();
     expect(keys()[before + 1]).toBe(keys()[before]);
-
-    // A *retryable* freshness rejection is ambiguous too: the order may have
-    // committed, so rotating the key here would risk a duplicate.
-    mode = "freshness";
-    const retryableBefore = keys().length;
-    fireEvent.click(placeButton());
-    await flush();
-    fireEvent.click(placeButton());
-    await flush();
-    expect(keys()[retryableBefore + 1]).toBe(keys()[retryableBefore]);
   });
 
   it("renders an empty state when there are no orders", async () => {

@@ -163,6 +163,12 @@ function App() {
               frame = element;
             }}
             src={payloadUrl()}
+            // The payload document has to be fetchable only until the frame has
+            // loaded it. Revoking the document blob URL on load keeps the loaded
+            // document and its subresource URLs live, but closes the same-origin
+            // path where a navigated frame reads `frame.src` and re-fetches the
+            // payload to harvest the injected handoff token.
+            onLoad={() => defaultRuntime.releaseDocumentUrl(payloadUrl())}
             title="Workspace Frame"
             // allow-same-origin is required: the decrypted payload document is
             // instantiated from blob: URLs created by this document, and a
