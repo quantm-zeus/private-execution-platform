@@ -715,6 +715,34 @@ async fn negative_reference_time_skips_without_calling_the_source() {
 }
 
 #[tokio::test]
+async fn future_dated_local_basis_is_rejected_before_any_spend() {
+    // The provider quote is valid, but the caller's local basis is from the
+    // future. The comparator's `LocalFromFuture` is caller-side: it must be
+    // rejected up front with no provider fetch, budget spend, circuit penalty,
+    // or negative caching.
+    let source = Arc::new(ScriptedSource::quoting(label("okx"), 10_000));
+    let outcome = run(
+        source.clone(),
+        policy(label("okx")),
+        &request_at(1_000, 10_000, BASE_MS + 1),
+        BASE_MS,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        BenchmarkOutcome::Skipped {
+            reason: BenchmarkSkipReason::ComparatorRejected,
+            meta: BenchmarkMeta {
+                cache_state: CacheState::Miss,
+                degraded_reason: None,
+                request_cost: 0,
+            },
+        }
+    );
+    assert_eq!(source.calls(), 0);
+}
+
+#[tokio::test]
 async fn negative_entry_prefers_a_stale_fallback() {
     // Call 1 succeeds; call 2 (a stale-age refresh) fails and negative-caches
     // the key while the positive data entry is still present.
