@@ -72,8 +72,19 @@ impl<S: OkxQuoteSource + 'static> ProviderQuoteSource for OkxBenchmarkQuoteSourc
                 OkxQuoteError::Unavailable => ProviderQuoteSourceError::Unavailable,
                 OkxQuoteError::Rejected => ProviderQuoteSourceError::Rejected,
             })?;
-        normalized
+        let quote = normalized
             .to_provider_quote(self.label.clone())
-            .map_err(|_| ProviderQuoteSourceError::Rejected)
+            .map_err(|_| ProviderQuoteSourceError::Rejected)?;
+        // Defense in depth: the source is contracted to return the requested
+        // basis, but the adapter independently re-checks it so a
+        // contract-violating source can never yield an unbound benchmark quote.
+        if quote.chain != request.chain
+            || quote.token_in != request.token_in
+            || quote.token_out != request.token_out
+            || quote.amount_in != request.amount_in
+        {
+            return Err(ProviderQuoteSourceError::Rejected);
+        }
+        Ok(quote)
     }
 }
