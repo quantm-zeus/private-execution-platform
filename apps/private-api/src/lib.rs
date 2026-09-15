@@ -25,11 +25,16 @@ use axum::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod opaque;
+pub mod stream;
 
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
     CommandDispatcher, FailClosedBootstrap, FailClosedDispatcher, OpaqueClock, OpaqueRoute,
     OpaqueServiceState, StaticBootstrap, SystemClock as OpaqueSystemClock,
+};
+pub use stream::{
+    EncryptedStreamService, FailClosedStreamSource, FrameSink, SourceFrame, StreamDriver,
+    StreamHub, StreamSource,
 };
 
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";

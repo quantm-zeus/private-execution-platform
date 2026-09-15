@@ -18,6 +18,7 @@ rpc-contracts.workspace = true
 service-identity.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "net"] }
+tokio-stream = "0.1"
 tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 
@@ -30,5 +31,4 @@ rcgen = { version = "=0.14.5", features = ["x509-parser"] }
 serde_json.workspace = true
 session-transport.workspace = true
 tempfile = "3"
-tokio-stream = "0.1"
 tokio-tungstenite = "0.29"

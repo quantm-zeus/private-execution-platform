@@ -23,7 +23,8 @@ serde.workspace = true
 serde_json.workspace = true
 service-identity.workspace = true
 session-transport.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 

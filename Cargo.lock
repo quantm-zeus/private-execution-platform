@@ -2005,6 +2005,7 @@ dependencies = [
  "session-transport",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower",
  "zeroize",

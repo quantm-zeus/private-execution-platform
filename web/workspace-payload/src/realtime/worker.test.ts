@@ -87,9 +87,52 @@ describe("realtime worker", () => {
     const socket = latestSocket();
     expect(socket.url).toBe("ws://localhost/v1/stream");
     socket.onopen?.();
-    // The worker resyncs over POST /v1/sync; it must never write to the
-    // binary-only relay (the opaque edge closes on any client frame).
+    // Without a c2s key the worker cannot seal a subscribe frame, so it must
+    // not write anything: the opaque edge relays binary ciphertext only and a
+    // cleartext control frame would both leak the operation type and be closed.
     expect(socket.sent).toHaveLength(0);
+  });
+
+  it("subscribes with an encrypted binary frame on open when a c2s key is present (BR-2)", async () => {
+    const c2sB64 = keyB64();
+    const originalFetch = (globalThis as { fetch?: unknown }).fetch;
+    (globalThis as { fetch?: unknown }).fetch = async () =>
+      ({ ok: true, status: 200 }) as Response;
+    try {
+      await startWorker(c2sB64);
+      const socket = latestSocket();
+      socket.onopen?.();
+      await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+      const bytes = socket.sent[0] as Uint8Array;
+      expect(ArrayBuffer.isView(bytes)).toBe(true);
+      const wire = new TextDecoder().decode(bytes);
+      // No cleartext control semantics on the wire.
+      expect(wire).not.toContain("subscribe");
+      expect(wire).not.toContain("from_seq");
+      const envelope = JSON.parse(wire) as {
+        kid: string;
+        nonce: string;
+        sequence: number;
+        ciphertext: string;
+      };
+      expect(Object.keys(envelope).sort()).toEqual(["ciphertext", "kid", "nonce", "sequence"]);
+      expect(envelope.sequence).toBe(0);
+      expect(envelope.kid).toBe("kid-test");
+      const decryptor = await WebCryptoDecryptor.fromRawKey(
+        Buffer.from(c2sB64, "base64"),
+        "kid-test",
+      );
+      const plain = await decryptor.decrypt(envelope);
+      try {
+        const request = JSON.parse(new TextDecoder().decode(plain)) as Record<string, unknown>;
+        expect(request.op).toBe("subscribe");
+        expect(request).toHaveProperty("from_seq");
+      } finally {
+        plain.fill(0);
+      }
+    } finally {
+      (globalThis as { fetch?: unknown }).fetch = originalFetch;
+    }
   });
 
   it("rejects an over-limit wire frame before decoding, with no send", async () => {

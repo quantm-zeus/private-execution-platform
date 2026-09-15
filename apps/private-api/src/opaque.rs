@@ -23,6 +23,7 @@ use agent_commands::{
 use async_trait::async_trait;
 use mcp_server::{AgentBackend, BackendOutcome};
 use rpc_contracts::relay_service::{RelayService, RelayServiceServer};
+use rpc_contracts::relay_stream_service::RelayStreamServiceServer;
 use rpc_contracts::{
     validate_relay_request, RelayRequest, RelayResponse, RelayResponseResult, Route,
 };
@@ -33,6 +34,10 @@ use session_transport::{
     SessionError, SessionRegistry, WireEnvelope,
 };
 use tonic::{Request, Response, Status};
+
+use crate::stream::{
+    EncryptedStreamService, FailClosedStreamSource, StreamDriver, StreamHub, StreamSource,
+};
 
 /// Closed capability set exposed to the browser. Authoritative and
 /// fail-closed: every field defaults to `false`.
@@ -412,6 +417,8 @@ pub struct OpaqueServiceState {
     bootstrap: Arc<dyn BootstrapProvider>,
     clock: Arc<dyn OpaqueClock>,
     session_ttl_ms: i64,
+    stream_hub: Arc<StreamHub>,
+    stream_source: Arc<dyn StreamSource>,
 }
 
 impl OpaqueServiceState {
@@ -422,6 +429,25 @@ impl OpaqueServiceState {
         clock: Arc<dyn OpaqueClock>,
         session_ttl_ms: i64,
     ) -> Result<Self, &'static str> {
+        Self::with_stream(
+            sessions,
+            dispatcher,
+            bootstrap,
+            clock,
+            session_ttl_ms,
+            Arc::new(FailClosedStreamSource),
+        )
+    }
+
+    /// Full constructor with an injected realtime source (BR-2).
+    pub fn with_stream(
+        sessions: Arc<Mutex<SessionRegistry>>,
+        dispatcher: Arc<dyn CommandDispatcher>,
+        bootstrap: Arc<dyn BootstrapProvider>,
+        clock: Arc<dyn OpaqueClock>,
+        session_ttl_ms: i64,
+        stream_source: Arc<dyn StreamSource>,
+    ) -> Result<Self, &'static str> {
         if session_ttl_ms <= 0 {
             return Err("session ttl must be positive");
         }
@@ -431,6 +457,8 @@ impl OpaqueServiceState {
             bootstrap,
             clock,
             session_ttl_ms,
+            stream_hub: Arc::new(StreamHub::new()),
+            stream_source,
         })
     }
 
@@ -451,6 +479,29 @@ impl OpaqueServiceState {
 
     pub fn sessions(&self) -> Arc<Mutex<SessionRegistry>> {
         self.sessions.clone()
+    }
+
+    pub fn clock(&self) -> Arc<dyn OpaqueClock> {
+        self.clock.clone()
+    }
+
+    pub fn stream_hub(&self) -> Arc<StreamHub> {
+        self.stream_hub.clone()
+    }
+
+    pub fn stream_source(&self) -> Arc<dyn StreamSource> {
+        self.stream_source.clone()
+    }
+
+    /// Build a stream driver bound to this service's session registry, clock and
+    /// injected realtime source.
+    pub fn stream_driver(&self) -> StreamDriver {
+        StreamDriver::new(
+            self.sessions.clone(),
+            self.stream_hub.clone(),
+            self.clock.clone(),
+            self.stream_source.clone(),
+        )
     }
 
     /// Handle one opaque envelope end-to-end (no gRPC), returning the sealed
@@ -490,6 +541,14 @@ impl OpaqueServiceState {
         };
 
         verify_route_op(route, &plaintext)?;
+        // BR-2: an authenticated `/v1/sync` asks the active stream connection for
+        // a fresh snapshot at/after the client's high-water mark. The snapshot is
+        // delivered on the stream (never in this HTTP body), matching the web
+        // worker's contract.
+        if route == OpaqueRoute::Sync {
+            self.stream_hub
+                .request_resync(kid, extract_from_seq_u64(&plaintext));
+        }
         let response_bytes = self
             .build_response(route, &envelope, &plaintext, now)
             .await?;
@@ -596,6 +655,12 @@ fn extract_from_seq(plaintext: &[u8]) -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn extract_from_seq_u64(plaintext: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Value>(plaintext)
+        .ok()
+        .and_then(|value| value.get("from_seq").and_then(Value::as_u64))
+}
+
 /// gRPC relay service that owns the encrypted session service.
 pub struct EncryptedRelayService {
     state: OpaqueServiceState,
@@ -623,15 +688,19 @@ impl RelayService for EncryptedRelayService {
     }
 }
 
-/// Build the TLS-ready gRPC server with the encrypted relay service.
+/// Build the TLS-ready gRPC server with the encrypted relay + realtime stream
+/// services.
 pub fn relay_tls_router_with(
     state: OpaqueServiceState,
     tls: tonic::transport::ServerTlsConfig,
 ) -> Result<tonic::transport::server::Router, tonic::transport::Error> {
+    let stream_service = EncryptedStreamService::new(state.clone());
     tonic::transport::Server::builder()
         .tls_config(tls)
         .map(|mut server| {
-            server.add_service(RelayServiceServer::new(EncryptedRelayService::new(state)))
+            server
+                .add_service(RelayServiceServer::new(EncryptedRelayService::new(state)))
+                .add_service(RelayStreamServiceServer::new(stream_service))
         })
 }
 

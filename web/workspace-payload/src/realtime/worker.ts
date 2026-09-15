@@ -40,6 +40,11 @@ let syncSealer: SessionSealer | null = null;
 // The sync channel owns its own 0-based sequence window (the server tracks a
 // per-purpose replay window, so it must not share the command counter).
 let syncSequence = 0;
+// The realtime subscribe channel owns a third, independent 0-based window
+// (`Purpose::Stream` server-side). It persists across reconnects for the
+// lifetime of the session key: the server rejects a reused sequence as a
+// replay, so only start()/stop() (a new key epoch) may reset it.
+let streamSequence = 0;
 let hasSessionKey = false;
 let startGeneration = 0;
 
@@ -82,6 +87,7 @@ function stop(reason: string): void {
   // reuses a sequence under a dropped key.
   syncSealer = null;
   syncSequence = 0;
+  streamSequence = 0;
   sessionKid = "";
   if (client) {
     client.stop();
@@ -117,6 +123,53 @@ function scheduleReconnect(): void {
   retryTimer = setTimeout(openSocket, delay);
 }
 
+/**
+ * BR-2: the browser WebSocket itself carries no browser -> server frame, so the
+ * private backend cannot know which BR-5 session key to encrypt for. On every
+ * (re)connect the worker sends one opaque, AEAD-sealed `subscribe` frame whose
+ * cleartext envelope `kid` identifies the session and whose encrypted body
+ * carries the client's applied-sequence high-water mark. The edge relays the
+ * binary ciphertext unchanged.
+ *
+ * Skipped without a c2s key (the "stream key only" mode); the server then never
+ * receives a subscription and the stream stays fail-closed.
+ */
+async function sendStreamSubscribe(): Promise<void> {
+  const sealer = syncSealer;
+  const socketRef = socket;
+  if (sealer === null || socketRef === null) return;
+  const sequence = streamSequence++;
+  const plaintext = utf8Encode(
+    JSON.stringify({
+      op: "subscribe",
+      from_seq: client?.expectedSeq ?? null,
+      request_id: randomRequestId(),
+    }),
+  );
+  let sealed;
+  try {
+    sealed = await sealer.seal({ kid: sessionKid, sequence }, plaintext);
+  } catch {
+    return;
+  } finally {
+    plaintext.fill(0);
+  }
+  const envelopeBody = utf8Encode(
+    JSON.stringify({
+      kid: sessionKid,
+      sequence,
+      nonce: sealed.nonce,
+      ciphertext: sealed.ciphertext,
+    }),
+  );
+  try {
+    socketRef.send(envelopeBody);
+  } catch {
+    // The socket closed between the seal and the send; the reconnect path will
+    // resubscribe with a fresh sequence.
+  }
+}
+
 function openSocket(): void {
   if (stopped || !hasSessionKey) return;
   teardownSocket();
@@ -129,8 +182,9 @@ function openSocket(): void {
   }
   socket.onopen = () => {
     client?.noteConnected();
-    // Reconnect always resyncs, but through the client's coalescing window so a
-    // relay that accepts and immediately closes cannot drive unbounded /v1/sync.
+    // Identify the session to the private stream backend (BR-2), then ask for a
+    // recovery snapshot. Both are bounded/coalesced by the client.
+    void sendStreamSubscribe();
     client?.requestSnapshot("reconnect");
   };
   socket.binaryType = "arraybuffer";
@@ -286,6 +340,7 @@ async function start(message: Extract<MainToWorker, { type: "start" }>): Promise
   sessionKid = message.kid;
   syncSealer = sealer;
   syncSequence = 0;
+  streamSequence = 0;
 
   client = new RealtimeClient({
     decryptor,

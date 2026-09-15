@@ -86,6 +86,14 @@ pub enum SessionError {
     UnknownOperation,
     #[error("session registry rejected a duplicate key id")]
     DuplicateSession,
+    #[error("stream frame is malformed")]
+    MalformedFrame,
+    #[error("stream frame channel is unknown")]
+    UnknownChannel,
+    #[error("stream frame server time regressed for this session key")]
+    StaleServerTime,
+    #[error("stream sequence space was exhausted for this session key")]
+    SequenceExhausted,
 }
 
 /// Direction-separated AES-256-GCM key. Redacted `Debug`, never `Clone`.
@@ -307,6 +315,9 @@ pub enum Purpose {
     Bootstrap,
     Sync,
     Command,
+    /// Browser -> server realtime stream control (the encrypted `subscribe`
+    /// frame that identifies the session and the client's high-water mark).
+    Stream,
 }
 
 impl Purpose {
@@ -315,7 +326,158 @@ impl Purpose {
             Purpose::Bootstrap => 0,
             Purpose::Sync => 1,
             Purpose::Command => 2,
+            Purpose::Stream => 3,
         }
+    }
+}
+
+/// Closed set of realtime channels the browser decoder understands
+/// (`web/workspace-payload/src/realtime/decoder.ts`).
+pub const STREAM_CHANNELS: &[&str] = &[
+    "ohlcv",
+    "depth",
+    "trades",
+    "market",
+    "orders",
+    "execution",
+    "alerts",
+    "portfolio",
+    "providers",
+    "system",
+];
+/// Largest accepted inner frame payload, matching the web decoder.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 512 * 1024;
+/// Largest accepted `entity_key`, matching the web decoder.
+pub const MAX_ENTITY_KEY_LEN: usize = 256;
+
+/// Inner realtime frame operation. Serialized as the bare snake_case string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamOp {
+    Snapshot,
+    Delta,
+    Heartbeat,
+    Mark,
+    Error,
+}
+
+/// Decrypted realtime frame. Byte-compatible with the browser decoder: the
+/// cleartext envelope stays generic, and every field here (including
+/// `server_time_ms`) is authenticated by the AEAD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamFrame {
+    pub op: StreamOp,
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    pub source_age_ms: u64,
+    /// Server wall clock at emission (BR-15). AEAD-authenticated and enforced
+    /// non-decreasing across the lifetime of the session key.
+    pub server_time_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+impl StreamFrame {
+    /// A state frame (`snapshot`/`delta`) with a payload.
+    pub fn state(
+        op: StreamOp,
+        channel: impl Into<String>,
+        server_time_ms: i64,
+        source_age_ms: u64,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            op,
+            channel: channel.into(),
+            priority: None,
+            entity_key: None,
+            slot: None,
+            source_age_ms,
+            server_time_ms,
+            payload: Some(payload),
+        }
+    }
+
+    /// A control frame (`heartbeat`/`mark`/`error`) with no payload.
+    pub fn control(
+        op: StreamOp,
+        channel: impl Into<String>,
+        server_time_ms: i64,
+        source_age_ms: u64,
+    ) -> Self {
+        Self {
+            op,
+            channel: channel.into(),
+            priority: None,
+            entity_key: None,
+            slot: None,
+            source_age_ms,
+            server_time_ms,
+            payload: None,
+        }
+    }
+
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    pub fn with_entity_key(mut self, key: impl Into<String>) -> Self {
+        self.entity_key = Some(key.into());
+        self
+    }
+
+    pub fn with_slot(mut self, slot: u64) -> Self {
+        self.slot = Some(slot);
+        self
+    }
+
+    /// Strict validation so the server can never emit a frame the browser
+    /// decoder would refuse. Value-free errors.
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if !STREAM_CHANNELS.contains(&self.channel.as_str()) {
+            return Err(SessionError::UnknownChannel);
+        }
+        if let Some(priority) = self.priority {
+            if priority > 3 {
+                return Err(SessionError::MalformedFrame);
+            }
+        }
+        if self.source_age_ms > i64::MAX as u64 {
+            return Err(SessionError::MalformedFrame);
+        }
+        if self.server_time_ms < 0 {
+            return Err(SessionError::MalformedFrame);
+        }
+        if let Some(entity_key) = &self.entity_key {
+            if entity_key.is_empty() || entity_key.len() > MAX_ENTITY_KEY_LEN {
+                return Err(SessionError::MalformedFrame);
+            }
+        }
+        let needs_payload = matches!(self.op, StreamOp::Snapshot | StreamOp::Delta);
+        match (&self.payload, needs_payload) {
+            (Some(payload), true) => {
+                let encoded =
+                    serde_json::to_vec(payload).map_err(|_| SessionError::MalformedFrame)?;
+                if encoded.len() > MAX_FRAME_PAYLOAD_BYTES {
+                    return Err(SessionError::MalformedFrame);
+                }
+            }
+            (None, true) => return Err(SessionError::MalformedFrame),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, SessionError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| SessionError::MalformedFrame)
     }
 }
 
@@ -328,8 +490,14 @@ pub struct ServerSession {
     kid_bytes: [u8; KID_BYTES],
     open_key: AeadKey,
     seal_key: AeadKey,
-    replay: [ReplayWindow; 3],
+    replay: [ReplayWindow; 4],
     expires_at_ms: i64,
+    /// Next s2c stream sequence. Monotonic for the lifetime of the session key
+    /// (`kid`); a backend that resets its sequence space MUST do so behind a new
+    /// `kid` (BR-2 epoch rule). Command responses do not consume this counter.
+    stream_sequence: u64,
+    /// Highest authenticated `server_time_ms` emitted on the stream (BR-15).
+    max_server_time_ms: Option<i64>,
 }
 
 impl fmt::Debug for ServerSession {
@@ -337,6 +505,7 @@ impl fmt::Debug for ServerSession {
         f.debug_struct("ServerSession")
             .field("kid", &"[REDACTED]")
             .field("expires_at_ms", &self.expires_at_ms)
+            .field("stream_sequence", &self.stream_sequence)
             .finish_non_exhaustive()
     }
 }
@@ -358,8 +527,11 @@ impl ServerSession {
                 ReplayWindow::default(),
                 ReplayWindow::default(),
                 ReplayWindow::default(),
+                ReplayWindow::default(),
             ],
             expires_at_ms,
+            stream_sequence: 0,
+            max_server_time_ms: None,
         })
     }
 
@@ -414,6 +586,39 @@ impl ServerSession {
             sequence,
             ciphertext: B64.encode(ciphertext),
         })
+    }
+
+    /// Next s2c stream sequence this session will emit.
+    pub fn stream_sequence(&self) -> u64 {
+        self.stream_sequence
+    }
+
+    /// Highest authenticated stream `server_time_ms` emitted, if any.
+    pub fn max_server_time_ms(&self) -> Option<i64> {
+        self.max_server_time_ms
+    }
+
+    /// Seal one realtime frame at the session's next stream sequence.
+    ///
+    /// Enforces the BR-15 monotonic server clock: a frame whose authenticated
+    /// `server_time_ms` regresses is refused (and does not consume a sequence).
+    /// The caller must not reset this counter for the same `kid`; sequence epoch
+    /// resets require a fresh BR-5 handoff (new `kid`).
+    pub fn seal_stream_frame(&mut self, frame: &StreamFrame) -> Result<WireEnvelope, SessionError> {
+        if let Some(previous) = self.max_server_time_ms {
+            if frame.server_time_ms < previous {
+                return Err(SessionError::StaleServerTime);
+            }
+        }
+        let plaintext = frame.to_bytes()?;
+        let sequence = self.stream_sequence;
+        let next = sequence
+            .checked_add(1)
+            .ok_or(SessionError::SequenceExhausted)?;
+        let envelope = self.seal(sequence, &plaintext)?;
+        self.stream_sequence = next;
+        self.max_server_time_ms = Some(frame.server_time_ms);
+        Ok(envelope)
     }
 }
 
@@ -685,6 +890,36 @@ impl CommandResponse {
     }
 }
 
+/// Inbound realtime stream control frame (browser -> server). The payload stays
+/// generic; only the operation name and the client high-water mark are read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamControlRequest {
+    pub op: String,
+    #[serde(default)]
+    pub from_seq: Option<u64>,
+    #[serde(default)]
+    pub request_id: String,
+}
+
+impl StreamControlRequest {
+    pub const SUBSCRIBE: &'static str = "subscribe";
+
+    /// Strictly decode an authenticated stream control plaintext. Only the
+    /// encrypted `subscribe` operation is accepted on the realtime channel.
+    pub fn parse(bytes: &[u8]) -> Result<Self, SessionError> {
+        let request: StreamControlRequest =
+            serde_json::from_slice(bytes).map_err(|_| SessionError::MalformedCommand)?;
+        if request.op != Self::SUBSCRIBE {
+            return Err(SessionError::UnknownOperation);
+        }
+        if request.request_id.len() > MAX_REQUEST_ID_LEN {
+            return Err(SessionError::MalformedRequestId);
+        }
+        Ok(request)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +1147,133 @@ mod tests {
         assert!(text.contains("[REDACTED]"));
         assert!(!text.contains("171")); // 0xAB
         assert!(!text.contains("17")); // 0x11
+    }
+
+    fn snapshot(server_time_ms: i64) -> StreamFrame {
+        StreamFrame::state(
+            StreamOp::Snapshot,
+            "market",
+            server_time_ms,
+            5,
+            serde_json::json!({"pools": []}),
+        )
+        .with_priority(2)
+        .with_entity_key("market:default")
+        .with_slot(42)
+    }
+
+    #[test]
+    fn stream_frame_serializes_to_the_browser_shape() {
+        let frame = snapshot(1_700_000_000_000);
+        let value: serde_json::Value = serde_json::from_slice(&frame.to_bytes().unwrap()).unwrap();
+        assert_eq!(value["op"], "snapshot");
+        assert_eq!(value["channel"], "market");
+        assert_eq!(value["priority"], 2);
+        assert_eq!(value["entity_key"], "market:default");
+        assert_eq!(value["slot"], 42);
+        assert_eq!(value["source_age_ms"], 5);
+        assert_eq!(value["server_time_ms"], 1_700_000_000_000i64);
+        assert_eq!(value["payload"]["pools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn stream_sequence_is_monotonic_and_independent_of_command_responses() {
+        let (mut server, mut client) = established();
+        let first = server.seal_stream_frame(&snapshot(1_000)).unwrap();
+        let second = server
+            .seal_stream_frame(&StreamFrame::control(
+                StreamOp::Heartbeat,
+                "system",
+                1_050,
+                0,
+            ))
+            .unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 1);
+        assert_eq!(server.stream_sequence(), 2);
+
+        // A command response sealed at the request sequence does not move the
+        // stream counter.
+        let request = client.seal_next(b"{}").unwrap();
+        let _ = server.open(&request, 0, Purpose::Command).unwrap();
+        let response = server.seal(request.sequence, b"{}").unwrap();
+        assert_eq!(response.sequence, 0);
+        assert_eq!(server.stream_sequence(), 2);
+
+        // Both frames still authenticate under the s2c key.
+        let opened = client.open(&first).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(value["op"], "snapshot");
+    }
+
+    #[test]
+    fn stale_stream_server_time_is_refused_without_consuming_a_sequence() {
+        let (mut server, _client) = established();
+        let _ = server.seal_stream_frame(&snapshot(2_000)).unwrap();
+        assert_eq!(
+            server.seal_stream_frame(&snapshot(1_999)),
+            Err(SessionError::StaleServerTime)
+        );
+        assert_eq!(server.stream_sequence(), 1);
+        assert_eq!(server.max_server_time_ms(), Some(2_000));
+        // Equal time is allowed (non-decreasing, not strictly increasing).
+        assert!(server.seal_stream_frame(&snapshot(2_000)).is_ok());
+    }
+
+    #[test]
+    fn stream_frame_validation_is_fail_closed() {
+        let mut bad_channel = snapshot(1);
+        bad_channel.channel = "not-a-channel".to_string();
+        assert_eq!(bad_channel.validate(), Err(SessionError::UnknownChannel));
+
+        let mut bad_priority = snapshot(1);
+        bad_priority.priority = Some(4);
+        assert_eq!(bad_priority.validate(), Err(SessionError::MalformedFrame));
+
+        let mut missing_payload = snapshot(1);
+        missing_payload.payload = None;
+        assert_eq!(missing_payload.validate(), Err(SessionError::MalformedFrame));
+
+        let mut bad_time = snapshot(1);
+        bad_time.server_time_ms = -1;
+        assert_eq!(bad_time.validate(), Err(SessionError::MalformedFrame));
+
+        // A control frame legitimately carries no payload.
+        assert!(StreamFrame::control(StreamOp::Heartbeat, "system", 1, 0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn stream_subscribe_has_its_own_purpose_window() {
+        let (mut server, client) = established();
+        // The command client and the stream client each start at 0; the
+        // subscribe frame must not collide with the command replay window.
+        let command = client.seal_at(0, b"{}").unwrap();
+        assert!(server.open(&command, 0, Purpose::Command).is_ok());
+        let subscribe = client
+            .seal_at(0, br#"{"op":"subscribe","from_seq":null,"request_id":"s1"}"#)
+            .unwrap();
+        let plaintext = server.open(&subscribe, 0, Purpose::Stream).unwrap();
+        let parsed = StreamControlRequest::parse(&plaintext).unwrap();
+        assert_eq!(parsed.op, "subscribe");
+        assert_eq!(parsed.request_id, "s1");
+        // Replaying the subscribe inside the stream purpose is still refused.
+        assert_eq!(
+            server.open(&subscribe, 0, Purpose::Stream),
+            Err(SessionError::ReplayDetected)
+        );
+    }
+
+    #[test]
+    fn stream_control_rejects_non_subscribe_operations() {
+        assert_eq!(
+            StreamControlRequest::parse(br#"{"op":"sync","request_id":"x"}"#).unwrap_err(),
+            SessionError::UnknownOperation
+        );
+        assert!(StreamControlRequest::parse(
+            br#"{"op":"subscribe","from_seq":9,"request_id":"x"}"#
+        )
+        .is_ok());
     }
 }
