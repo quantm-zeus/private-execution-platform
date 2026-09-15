@@ -336,12 +336,12 @@ fn bin_exponent_within(
 /// Hard bound on an exponent that can still be inside any band.
 ///
 /// For a fall with `t < 10_000`, in-band requires
-/// `(1 + s/10_000)^e <= 10_000/(10_000-t) <= 10_000`; since `s >= 1`,
-/// `(1.0001)^e <= 10_000` gives `e < 92_108`. The rise is bounded far lower by the
-/// Bernoulli early-out (`e*s <= t <= 10_000`). `100_000` is a safe round bound: any
-/// larger exponent is certainly out of band, so the exact bignum comparison is only
-/// ever run for a bounded exponent.
-const MAX_IN_BAND_EXPONENT: u32 = 100_000;
+/// `(1 + s/10_000)^e <= 10_000/(10_000-t) <= 10_000`; since `s >= 1` and
+/// `(1.0001)^92_108 = 9_999.99 <= 10_000 < 10_000.99 = (1.0001)^92_109`, any
+/// `e > 92_108` is certainly out of band. The rise is bounded far lower by the
+/// Bernoulli early-out (`e*s <= t <= 10_000`). The exact bignum comparison is thus
+/// only ever run for a bounded exponent.
+const MAX_IN_BAND_EXPONENT: u32 = 92_108;
 
 /// Little-endian `u64` bignum limbs.
 type Big = Vec<u64>;
@@ -350,8 +350,8 @@ type Big = Vec<u64>;
 /// `rhs_scale * base_den^exponent`.
 ///
 /// `base_num`/`base_den` come from [`bin_base`] (at most `11_000`/`10_000`) and the
-/// exponent is bounded by the kernel's bin-crossing budget, so the exact powers fit
-/// comfortably in a small little-endian bignum. This is the only way to compare a
+/// exponent is bounded by [`MAX_IN_BAND_EXPONENT`] at every call site, so the exact
+/// powers fit in a small little-endian bignum. This is the only way to compare a
 /// near-one ratio whose individual powers overflow `u128`.
 fn bin_pow_cmp(
     base_num: u128,
@@ -739,6 +739,9 @@ mod tests {
         // must early-out instead of materialising `10001^8_000_000`.
         assert!(!bin_within(1, 0, 0, 8_000_000, 0, 250));
         assert!(!bin_within(1, 0, 0, 8_000_000, 0, 1));
+        // A near-`Bps::MAX` target is not caught by the Bernoulli early-out, so it
+        // pins the `MAX_IN_BAND_EXPONENT` cap specifically.
+        assert!(!bin_within(1, 0, 0, 8_000_000, 0, 9_999));
         // `Bps::MAX` is the one band a fall always satisfies.
         assert!(bin_within(1, 0, 0, 8_000_000, 0, 10_000));
     }
