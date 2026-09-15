@@ -1292,6 +1292,15 @@ try {
     loadWasm: loadShellWasm,
   } = await import("../web/workspace-shell/src/unlock-runtime.ts");
   const { HandoffGate } = await import("../web/workspace-shell/src/handoff-gate.ts");
+  // Capture the fresh per-unlock token the real runtime arms so the live
+  // assertions below use the actual injected value. The first arm is the live
+  // unlock; the standalone gate checks later re-arm their own instances.
+  const capturedHandoffTokens = [];
+  const handoffArmOriginal = HandoffGate.prototype.arm;
+  HandoffGate.prototype.arm = function (sessionKeys, token) {
+    capturedHandoffTokens.push(token);
+    return handoffArmOriginal.call(this, sessionKeys, token);
+  };
 
   // 10a. Audited WASM loads and binds
   await loadShellWasm();
@@ -1552,10 +1561,32 @@ try {
   // 10f. BR-5 handoff gate: one-shot, token-bound, and disarmed by lock().
   //
   // This is the control that stops a same-origin document which navigated into
-  // the frame from harvesting live session keys with a forged ready ping. It is
-  // pure logic, so exercise every branch directly rather than only through the
-  // full unlock.
+  // the frame from harvesting live session keys with a forged ready ping.
   {
+    // First prove the *live* runtime (armed by the real unlock above with the
+    // freshly generated token) refuses a missing/wrong token and releases the
+    // keys exactly once for the real injected token.
+    HandoffGate.prototype.arm = handoffArmOriginal;
+    const liveHandoffToken = capturedHandoffTokens[0];
+    if (typeof liveHandoffToken !== "string" || liveHandoffToken.length === 0) {
+      throw new Error("runtime did not arm a handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff(undefined) !== null) {
+      throw new Error("runtime released keys without a handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff("not-the-token") !== null) {
+      throw new Error("runtime released keys for a wrong handoff token");
+    }
+    const liveKeys = runtime.takeSessionKeysForHandoff(liveHandoffToken);
+    if (!liveKeys || typeof liveKeys.kid !== "string" || liveKeys.kid.length === 0) {
+      throw new Error("runtime did not release keys for the injected handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff(liveHandoffToken) !== null) {
+      throw new Error("runtime released keys twice for the same unlock");
+    }
+
+    // Then exercise every branch of the pure gate, including disarm (which the
+    // live runtime cannot reach a second time without a fresh unlock).
     const session = { kid: "kid-test", s2cKeyB64: "s2c-test", c2sKeyB64: "c2s-test" };
     const gate = new HandoffGate();
     // Unarmed: nothing is ever released, not even the right-looking token.
@@ -1582,15 +1613,6 @@ try {
     for (const bad of ["token-2", "token-1", undefined, ""]) {
       if (gate.take(bad) !== null) throw new Error("disarmed handoff gate released keys");
     }
-    // The live runtime delegates to the same gate: after a real unlock a
-    // missing or wrong token yields nothing, so a forged ready ping cannot
-    // harvest keys.
-    if (runtime.takeSessionKeysForHandoff(undefined) !== null) {
-      throw new Error("runtime released keys without a handoff token");
-    }
-    if (runtime.takeSessionKeysForHandoff("not-the-token") !== null) {
-      throw new Error("runtime released keys for a wrong handoff token");
-    }
   }
 
   // Verify server received ONLY public metadata (never secret, private key, or content key)
@@ -1611,11 +1633,6 @@ try {
   runtime.lock();
   if (runtime.unlocked) throw new Error("runtime should be locked after lock()");
   if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime active URLs not revoked after lock()");
-  // Lock disarms the handoff gate: even a token that would have been valid
-  // before lock cannot release keys afterwards.
-  if (runtime.takeSessionKeysForHandoff("token-1") !== null) {
-    throw new Error("runtime released keys after lock()");
-  }
 
   // 10h. Negative runtime unlock tests fail closed with no secret leakage
   // Wrong unlock secret

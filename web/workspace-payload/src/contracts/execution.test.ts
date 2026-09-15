@@ -103,9 +103,27 @@ describe("parseRouterSource (W15 canonical + object wire forms)", () => {
  * `intent`/`fills`).
  */
 describe("parseOrdersResponse", () => {
+  const validIntent = {
+    id: "intent-1",
+    chain: "base",
+    tokenIn: "0x1",
+    tokenOut: "0x2",
+    side: "buy",
+    amountType: "token",
+    amount: "5",
+    orderType: "limit",
+    limitPrice: "2.50",
+    maxBuyTaxBps: null,
+    maxSellTaxBps: null,
+    maxPriceImpactBps: 50,
+    maxSlippageBps: 50,
+    maxTotalCostUsd: null,
+    allowPartialFill: true,
+    expiryMs: 1_700_000_000_000,
+  };
   const validOrder = {
     orderId: "order-1",
-    intent: { side: "buy" },
+    intent: validIntent,
     state: "ACTIVE",
     filledAmount: "0",
     remainingAmount: "10",
@@ -121,6 +139,14 @@ describe("parseOrdersResponse", () => {
     expect(parseOrdersResponse({ orders: [] }).orders).toEqual([]);
   });
 
+  it("accepts a fully formed fill", () => {
+    const withFill = {
+      ...validOrder,
+      fills: [{ executionId: "exec-1", amountIn: "1", amountOut: "2", atMs: 3 }],
+    };
+    expect(parseOrdersResponse({ orders: [withFill] }).orders).toHaveLength(1);
+  });
+
   it.each([
     [null, "null"],
     [{}, "missing orders"],
@@ -128,9 +154,22 @@ describe("parseOrdersResponse", () => {
     [{ orders: [null] }, "null entry"],
     [{ orders: [{ ...validOrder, orderId: "" }] }, "empty id"],
     [{ orders: [{ ...validOrder, state: "" }] }, "empty state"],
+    [{ orders: [{ ...validOrder, filledAmount: 0 }] }, "non-string fill amount"],
     [{ orders: [{ ...validOrder, intent: null }] }, "missing intent"],
     [{ orders: [{ ...validOrder, intent: {} }] }, "intent without side"],
+    [{ orders: [{ ...validOrder, intent: { ...validIntent, amount: null } }] }, "intent without amount"],
     [{ orders: [{ ...validOrder, fills: null }] }, "missing fills"],
+    // A shape-passing-but-unrenderable fill must be rejected here, not crash the
+    // order list on `fill.executionId`.
+    [{ orders: [{ ...validOrder, fills: [null] }] }, "null fill entry"],
+    [
+      { orders: [{ ...validOrder, fills: [{ executionId: "e", amountIn: "1", amountOut: "2" }] }] },
+      "fill without atMs",
+    ],
+    [
+      { orders: [{ ...validOrder, fills: [{ executionId: "", amountIn: "1", amountOut: "2", atMs: 3 }] }] },
+      "fill without id",
+    ],
   ] as const)("rejects malformed document %# (%s)", (value, _label) => {
     expect(() => parseOrdersResponse(value)).toThrowError(/order/i);
   });
@@ -170,8 +209,12 @@ describe("parsePortfolioView", () => {
     [null, "null"],
     [{}, "missing balances"],
     [{ balances: {} }, "non-array balances"],
+    [{ balances: [], equityUsd: null, slot: null, sourceAgeMs: 0 }, "missing walletRef"],
+    [{ walletRef: 1, balances: [], equityUsd: null, slot: null, sourceAgeMs: 0 }, "non-string walletRef"],
+    [{ walletRef: "w", balances: [], equityUsd: null, slot: null, sourceAgeMs: "0" }, "non-numeric sourceAgeMs"],
     [{ balances: [null] }, "null balance"],
     [{ balances: [{ asset: "x" }] }, "balance without amount"],
+    [{ balances: [{ chain: "base", token: "t", amount: "1" }] }, "balance without symbol"],
   ] as const)("rejects malformed document %# (%s)", (value, _label) => {
     expect(() => parsePortfolioView(value)).toThrowError(/portfolio|balance/i);
   });

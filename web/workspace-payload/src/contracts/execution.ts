@@ -240,15 +240,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNullableNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === "number" && Number.isFinite(value));
+}
+
 /**
  * Validate a `get_orders` success document before the renderer consumes it.
  *
  * The private API is authoritative for the shape. A document the client cannot
  * render (for example the canonical snake_case `OrderSummary` before the web
  * projection exists) must become a typed protocol error, never a `ready` state
- * whose value throws inside the renderer. This is deliberately strict: it
- * checks exactly the fields the order list reads, so an unknown shape fails
- * closed instead of producing a partial or fabricated view.
+ * whose value throws inside the renderer. The checks cover every field the order
+ * list dereferences (the intent `side`, each fill entry, the fill amounts), so a
+ * malformed-but-plausible document fails closed instead of producing a crash or
+ * a partial/fabricated view.
  */
 export function parseOrdersResponse(value: unknown): { readonly orders: readonly LimitOrderView[] } {
   if (!isRecord(value) || !Array.isArray(value.orders)) {
@@ -262,11 +271,39 @@ export function parseOrdersResponse(value: unknown): { readonly orders: readonly
     if (typeof order.state !== "string" || order.state.length === 0) {
       throw workspaceError("protocol", "Order is missing a state.");
     }
-    if (!isRecord(order.intent) || typeof order.intent.side !== "string") {
+    if (typeof order.filledAmount !== "string" || typeof order.remainingAmount !== "string") {
+      throw workspaceError("protocol", "Order is missing its fill amounts.");
+    }
+    const intent = order.intent;
+    if (!isRecord(intent) || typeof intent.side !== "string" || intent.side.length === 0) {
       throw workspaceError("protocol", "Order is missing its intent.");
+    }
+    if (
+      typeof intent.amount !== "string" ||
+      typeof intent.amountType !== "string" ||
+      !isNullableString(intent.limitPrice) ||
+      !isNullableNumber(intent.expiryMs) ||
+      !isNullableNumber(intent.maxPriceImpactBps) ||
+      !isNullableNumber(intent.maxSlippageBps) ||
+      !isNullableNumber(intent.maxTotalCostUsd)
+    ) {
+      throw workspaceError("protocol", "Order intent is malformed.");
     }
     if (!Array.isArray(order.fills)) {
       throw workspaceError("protocol", "Order is missing its fills.");
+    }
+    for (const fill of order.fills) {
+      if (
+        !isRecord(fill) ||
+        typeof fill.executionId !== "string" ||
+        fill.executionId.length === 0 ||
+        typeof fill.amountIn !== "string" ||
+        typeof fill.amountOut !== "string" ||
+        typeof fill.atMs !== "number" ||
+        !Number.isFinite(fill.atMs)
+      ) {
+        throw workspaceError("protocol", "Order fill is malformed.");
+      }
     }
   }
   return value as unknown as { readonly orders: readonly LimitOrderView[] };
@@ -278,14 +315,34 @@ export function parseOrdersResponse(value: unknown): { readonly orders: readonly
  * Same rationale as {@link parseOrdersResponse}: the canonical document nests
  * the summary under `portfolio` with `{asset, amount}` balances, which the
  * portfolio view cannot render, so it must surface as a typed protocol error
- * rather than a `ready` value that throws on `balances`.
+ * rather than a `ready` value whose fields are missing. The checks cover the
+ * wallet/freshness fields and every balance column the table reads.
  */
 export function parsePortfolioView(value: unknown): PortfolioView {
   if (!isRecord(value) || !Array.isArray(value.balances)) {
     throw workspaceError("protocol", "Malformed portfolio document.");
   }
+  if (typeof value.walletRef !== "string") {
+    throw workspaceError("protocol", "Portfolio is missing its wallet reference.");
+  }
+  if (
+    typeof value.sourceAgeMs !== "number" ||
+    !Number.isFinite(value.sourceAgeMs) ||
+    !isNullableNumber(value.equityUsd) ||
+    !isNullableNumber(value.slot)
+  ) {
+    throw workspaceError("protocol", "Portfolio is missing its freshness fields.");
+  }
   for (const balance of value.balances) {
-    if (!isRecord(balance) || typeof balance.amount !== "string") {
+    if (
+      !isRecord(balance) ||
+      typeof balance.chain !== "string" ||
+      typeof balance.token !== "string" ||
+      typeof balance.symbol !== "string" ||
+      typeof balance.amount !== "string" ||
+      !isNullableNumber(balance.usdValue) ||
+      !isNullableNumber(balance.ageMs)
+    ) {
       throw workspaceError("protocol", "Malformed balance entry.");
     }
   }

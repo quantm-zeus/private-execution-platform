@@ -476,11 +476,11 @@ were fixed:
 
 - **BR-5 handoff gate is now a pure, tested module.**
   `web/workspace-shell/src/handoff-gate.ts` owns the one-shot, token-bound
-  delivery decision, and `verify:web-boundary` asserts every branch against a
-  live unlocked runtime: unarmed, missing/empty/non-string/wrong token, exact
-  token once, repeat refused, re-arm retires the old token, and `lock()` refuses
-  everything. This closes the last priority-1 security control that had no
-  automated regression coverage.
+  delivery decision. `verify:web-boundary` captures the real per-unlock token the
+  live runtime arms and asserts the live path (missing/wrong token refused, the
+  exact injected token released once, repeat refused), then exercises every branch
+  of the pure gate including disarm. This closes the last priority-1 security
+  control that had no automated regression coverage.
 - **Payload ready/token echo is tested.** `state/host.test.ts` pins
   `announceWorkspaceReady` to the exact `{type, handoff}` message at the known
   origin (never `*`), the empty token when no meta is injected, and no post when

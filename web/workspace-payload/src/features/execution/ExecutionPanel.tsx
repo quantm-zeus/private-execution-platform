@@ -59,12 +59,19 @@ export const ExecutionPanel: Component = () => {
   // client must not hide it behind `twap` or an UNKNOWN execution could never
   // be reconciled. The read stays fail-closed server-side.
   const progressDenial = (): null => null;
+  // ...but it must still wait for the authenticated session to settle. Firing
+  // before bootstrap completes hits the fail-closed command stub, which maps to
+  // a permanent `unavailable` state (the request is one-shot), so gate on the
+  // bootstrap state being ready rather than on `twap`.
+  const progressReady = createMemo(() => {
+    const current = ws.state();
+    return current.kind === "ready" || current.kind === "stale";
+  });
 
-  // Load the current execution progress immediately; the ungated reconcile read
-  // is always safe to attempt and the surface treats a failure as an error.
+  // Load the current execution progress once the authenticated session exists.
   let progressRequested = false;
   createEffect(() => {
-    if (progressDenial() === null && !progressRequested) {
+    if (progressReady() && !progressRequested) {
       progressRequested = true;
       void progress.run();
     }

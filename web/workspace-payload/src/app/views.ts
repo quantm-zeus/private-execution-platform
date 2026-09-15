@@ -37,7 +37,9 @@ export const VIEWS: readonly ViewDef[] = [
     label: "Discover",
     description: "Token search, market stats and risk/intelligence evidence.",
     group: "Market",
-    capability: "intelligence",
+    // Matches the server's operation map: `search_token`/`get_token` are gated
+    // on the authoritative `market` capability (`opaque.rs`), not `intelligence`.
+    capability: "market",
   },
   {
     id: "terminal",
