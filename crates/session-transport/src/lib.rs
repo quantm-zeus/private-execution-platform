@@ -36,15 +36,41 @@ pub const KID_BYTES: usize = KID_LEN;
 pub const WIRE_NONCE_LEN: usize = NONCE_LEN;
 /// Provider (GCM) tag length.
 pub const AEAD_TAG_LEN: usize = 16;
-/// Largest accepted ciphertext (base64-decoded) in bytes, matching the web
-/// `MAX_CIPHERTEXT_BYTES`.
-pub const MAX_CIPHERTEXT_BYTES: usize = 1024 * 1024;
-/// Largest accepted raw wire body in bytes, matching the web `MAX_WIRE_BYTES`.
-pub const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
+/// Largest accepted ciphertext (base64-decoded) in bytes.
+///
+/// The wire body is the UTF-8 JSON envelope, whose standard-base64 `ciphertext`
+/// field expands by 4/3. The edge body bound (`DEFAULT_MAX_OPAQUE_BODY_BYTES`)
+/// and the internal relay bound (`rpc_contracts::MAX_PAYLOAD_BYTES`) both cap the
+/// *wire body* at 1 MiB, so the ciphertext bound must leave room for that
+/// expansion: 720 KiB -> ~960 KiB base64 plus ~80 bytes of JSON overhead, still
+/// under 1 MiB. This keeps the server's accept bound no looser than the narrowest
+/// hop between the browser and the private origin.
+pub const MAX_CIPHERTEXT_BYTES: usize = 720 * 1024;
+/// Largest accepted raw wire body in bytes, matching the edge/relay 1 MiB bound.
+pub const MAX_WIRE_BYTES: usize = 1024 * 1024;
 /// Largest accepted `request_id`.
 pub const MAX_REQUEST_ID_LEN: usize = 128;
 /// Largest accepted operation name.
 pub const MAX_OP_LEN: usize = 64;
+
+/// Closed set of client operations that commit capital or change a safety limit.
+///
+/// The private command service applies the advertised trading/kill-switch gate to
+/// exactly these; reads and previews stay available when the kill switch is
+/// engaged (PRD: "disable execution while leaving read-only data available").
+/// This mirrors the web client's `WRITE_OPS` so the two layers cannot drift.
+pub fn is_mutating_op(op: &str) -> bool {
+    matches!(
+        op,
+        "execute_market_order"
+            | "place_limit_order"
+            | "cancel_order"
+            | "start_twap"
+            | "submit_rfq"
+            | "request_withdrawal"
+            | "set_wallet_limits"
+    )
+}
 /// Replay window width in sequence numbers.
 const REPLAY_WINDOW: u64 = 64;
 
@@ -549,11 +575,33 @@ impl ServerSession {
 
     /// Authenticate, decrypt and replay-check an inbound c2s envelope for the
     /// given logical purpose.
+    ///
+    /// Convenience wrapper over [`ServerSession::open_unverified`] +
+    /// [`ServerSession::accept_sequence`]; callers that validate the plaintext
+    /// (route/operation) before consuming a sequence slot must use the two-step
+    /// form so a cross-route replay cannot burn a slot.
     pub fn open(
         &mut self,
         envelope: &WireEnvelope,
         now_ms: i64,
         purpose: Purpose,
+    ) -> Result<Vec<u8>, SessionError> {
+        let plaintext = self.open_unverified(envelope, now_ms)?;
+        self.accept_sequence(envelope.sequence, purpose)?;
+        Ok(plaintext)
+    }
+
+    /// Authenticate and decrypt without advancing the replay window.
+    ///
+    /// The caller MUST call [`ServerSession::accept_sequence`] once it has
+    /// validated the authenticated plaintext, otherwise a legitimate replay of
+    /// the same sequence is possible. Validating before advancing means a
+    /// captured c2s envelope replayed on a *different* route cannot consume the
+    /// sequence slot the honest client is about to use.
+    pub fn open_unverified(
+        &self,
+        envelope: &WireEnvelope,
+        now_ms: i64,
     ) -> Result<Vec<u8>, SessionError> {
         if self.is_expired(now_ms) {
             return Err(SessionError::Expired);
@@ -568,10 +616,13 @@ impl ServerSession {
         let nonce = envelope.decode_nonce()?;
         let ciphertext = envelope.decode_ciphertext()?;
         let aad = envelope_aad(&self.kid, envelope.sequence);
-        let plaintext = self.open_key.open(&nonce, &aad, &ciphertext)?;
-        // Replay state advances only after successful authentication.
-        self.replay[purpose.index()].accept(envelope.sequence)?;
-        Ok(plaintext)
+        self.open_key.open(&nonce, &aad, &ciphertext)
+    }
+
+    /// Consume a sequence in the replay window after the plaintext has been
+    /// validated. Replay state advances only after successful authentication.
+    pub fn accept_sequence(&mut self, sequence: u64, purpose: Purpose) -> Result<(), SessionError> {
+        self.replay[purpose.index()].accept(sequence)
     }
 
     /// Seal an s2c envelope at an explicit sequence (command responses bind the
@@ -1281,5 +1332,68 @@ mod tests {
             br#"{"op":"subscribe","from_seq":9,"request_id":"x"}"#
         )
         .is_ok());
+    }
+
+    #[test]
+    fn mutating_op_set_is_closed_and_matches_the_web_contract() {
+        for op in [
+            "execute_market_order",
+            "place_limit_order",
+            "cancel_order",
+            "start_twap",
+            "submit_rfq",
+            "request_withdrawal",
+            "set_wallet_limits",
+        ] {
+            assert!(is_mutating_op(op), "{op} must be gated");
+        }
+        for op in [
+            "get_quote",
+            "preview_market_order",
+            "get_orders",
+            "get_portfolio",
+            "get_wallet_limits",
+            "get_order",
+        ] {
+            assert!(!is_mutating_op(op), "{op} must stay available");
+        }
+    }
+
+    #[test]
+    fn wire_bound_is_no_looser_than_the_edge_can_relay() {
+        // The wire body JSON base64-encodes the ciphertext (~4/3 expansion) plus a
+        // small fixed overhead, so a max-size ciphertext must still fit in the
+        // 1 MiB the edge and the internal relay forward.
+        let base64_len = MAX_CIPHERTEXT_BYTES.div_ceil(3) * 4;
+        assert!(
+            base64_len + 128 <= MAX_WIRE_BYTES,
+            "ciphertext bound must fit inside the wire bound"
+        );
+        const {
+            assert!(
+                MAX_WIRE_BYTES <= 1024 * 1024,
+                "must match the edge/relay cap"
+            )
+        };
+    }
+
+    #[test]
+    fn validating_before_accepting_preserves_the_sequence_slot() {
+        let (mut server, client) = established();
+        // A captured envelope decrypted but rejected by the caller's route/op
+        // validation must not consume the sequence: the honest command at the same
+        // sequence is still accepted (cross-route replay is a fail-closed no-op).
+        let captured = client.seal_at(0, b"{\"op\":\"bootstrap\"}").unwrap();
+        let plaintext = server.open_unverified(&captured, 0).unwrap();
+        assert_eq!(plaintext, b"{\"op\":\"bootstrap\"}");
+        let honest = client.seal_at(0, b"{\"op\":\"get_quote\"}").unwrap();
+        let plaintext = server.open(&honest, 0, Purpose::Command).unwrap();
+        assert_eq!(plaintext, b"{\"op\":\"get_quote\"}");
+        // Once the honest envelope is accepted, replaying the captured one is
+        // still refused.
+        assert_eq!(
+            server.open(&captured, 0, Purpose::Command),
+            Err(SessionError::ReplayDetected)
+        );
     }
 }

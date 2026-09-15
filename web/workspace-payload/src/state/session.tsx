@@ -70,11 +70,6 @@ export interface WorkspaceStore {
   setSelectedInstrument(ref: InstrumentRef | null): void;
   /** Current encrypted command channel (swapped in after the key handoff). */
   readonly command: CommandClient;
-  /**
-   * BR-5 host key handoff armed when the store was created. Bootstrap waits on
-   * it; it resolves `null` on timeout/abort so the workspace fails closed.
-   */
-  readonly hostKey: () => Promise<HostSessionKey | null>;
   setConnection(status: ConnectionStatus): void;
   /** Install the encrypted command channel once a session key is available. */
   setCommand(client: CommandClient): void;
@@ -150,7 +145,7 @@ export interface CreateWorkspaceStoreOptions extends SessionBootstrapOptions {
   readonly command?: CommandClient;
   /**
    * How long the store waits for the BR-5 host key before bootstrap fails
-   * closed. Defaults to 5s; the shell posts the key as soon as the payload
+   * closed. Defaults to 2s; the shell posts the key as soon as the payload
    * signals readiness.
    */
   readonly hostKeyTimeoutMs?: number;
@@ -199,7 +194,7 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
   // BR-5: arm the host key listener when the store is created (before
   // `reload()` runs) so a key the shell posts on readiness is not missed.
   const hostKeyAbort = new AbortController();
-  const hostKeyPromise: Promise<HostSessionKey | null> | null =
+  let hostKeyPromise: Promise<HostSessionKey | null> | null =
     typeof window !== "undefined"
       ? awaitHostSessionKey(
           options.hostKeyTimeoutMs ?? DEFAULT_HOST_KEY_TIMEOUT_MS,
@@ -207,6 +202,10 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
           hostKeyAbort.signal,
         )
       : null;
+  // Bootstrap must never reuse sequence 0 for the same `kid` (the server's replay
+  // window never resets), so each bootstrap attempt takes a strictly increasing
+  // sequence. A fresh `kid` also accepts a higher first sequence.
+  let bootstrapSequence = 0;
 
   const session = (): WorkspaceSession | undefined => {
     const current = state();
@@ -230,11 +229,16 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     // the store's shared BR-5 handoff promise. An injected `session` still
     // short-circuits inside `bootstrapWorkspaceSession` before any key is needed.
     const hasExplicitKeys = Boolean(options.kid && options.c2sKeyB64 && options.s2cKeyB64);
+    // Snapshot the mutable reference so the provider closure is typed non-null.
+    const keyPromise = hostKeyPromise;
     const bootstrapOptions: SessionBootstrapOptions =
-      options.hostKeyProvider || hasExplicitKeys || hostKeyPromise === null
+      options.hostKeyProvider || hasExplicitKeys || keyPromise === null
         ? options
-        : { ...options, hostKeyProvider: () => hostKeyPromise };
-    bootstrapWorkspaceSession(bootstrapOptions).then(
+        : { ...options, hostKeyProvider: () => keyPromise };
+    // A retry/reload under the same key must not replay bootstrap sequence 0.
+    const sequence = options.sequence ?? bootstrapSequence;
+    if (options.sequence === undefined) bootstrapSequence += 1;
+    bootstrapWorkspaceSession({ ...bootstrapOptions, sequence }).then(
       (value) => {
         if (token !== generation) return;
         setServerSkewMs(boundedServerSkew(value.serverTimeMs, clock()));
@@ -283,6 +287,9 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
 
   function dispose(): void {
     hostKeyAbort.abort();
+    // Drop the resolved BR-5 key reference so a torn-down workspace does not pin
+    // the base64 session keys in a closure.
+    hostKeyPromise = null;
     if (ticker !== undefined) {
       window.clearInterval(ticker);
       ticker = undefined;
@@ -304,7 +311,6 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     selectedInstrument,
     setSelectedInstrument,
     command: commandProxy,
-    hostKey: () => hostKeyPromise ?? Promise.resolve(null),
     setConnection,
     setCommand(client: CommandClient) {
       commandClient = client;

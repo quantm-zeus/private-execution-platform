@@ -264,6 +264,28 @@ describe("EncryptedCommandClient", () => {
     expect(sequences).toEqual([0, 1]);
     expect(new Set(nonces).size).toBe(2);
   });
+
+  it("treats a null result on a write as an indeterminate outcome", async () => {
+    // A 2xx authenticated envelope with `result: null` is not proof that a
+    // capital-committing write committed: the client must keep its idempotency
+    // key and surface UNKNOWN rather than a false success.
+    const fetchFn = (async (_url: string, init: RequestInit) => {
+      const body = decodeEnvelopeBody(init);
+      const sealer = await WebCryptoSealer.fromRawKey(rawKey);
+      const request = await readRequest(body);
+      const envelope = await sealResponse(sealer, body.sequence, {
+        request_id: request.request_id,
+        result: null,
+      });
+      return { ok: true, status: 200, json: async () => envelope } as Response;
+    }) as unknown as typeof fetch;
+    const client = await buildClient(fetchFn);
+    await expect(
+      client.send("execute_market_order", { quote_id: "q1", router_preference: "okx" }),
+    ).rejects.toMatchObject({ code: "unknown", retryable: true });
+    // A read may legitimately carry no result document.
+    await expect(client.send("get_quote", {})).resolves.toBeNull();
+  });
 });
 
 describe("cleartext envelope boundary", () => {

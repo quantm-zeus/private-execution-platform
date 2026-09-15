@@ -137,7 +137,11 @@ function scheduleReconnect(): void {
 async function sendStreamSubscribe(): Promise<void> {
   const sealer = syncSealer;
   const socketRef = socket;
-  if (sealer === null || socketRef === null) return;
+  // Capture the key id once: `stop()`/`start()` may run while the seal is
+  // pending, and the cleartext envelope must identify the same kid the tag was
+  // bound to.
+  const kid = sessionKid;
+  if (sealer === null || socketRef === null || kid.length === 0) return;
   const sequence = streamSequence++;
   const plaintext = utf8Encode(
     JSON.stringify({
@@ -148,7 +152,7 @@ async function sendStreamSubscribe(): Promise<void> {
   );
   let sealed;
   try {
-    sealed = await sealer.seal({ kid: sessionKid, sequence }, plaintext);
+    sealed = await sealer.seal({ kid, sequence }, plaintext);
   } catch {
     return;
   } finally {
@@ -156,7 +160,7 @@ async function sendStreamSubscribe(): Promise<void> {
   }
   const envelopeBody = utf8Encode(
     JSON.stringify({
-      kid: sessionKid,
+      kid,
       sequence,
       nonce: sealed.nonce,
       ciphertext: sealed.ciphertext,

@@ -18,10 +18,12 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use edge_gateway::{AuthorizationBackend, EdgeError, EdgeState, OpaqueRelay, OpaqueRoute};
 use http_body_util::BodyExt;
 use private_api::opaque::{
-    FailClosedBootstrap, FailClosedDispatcher, OpaqueClock, OpaqueRoute as PrivateRoute,
-    OpaqueServiceState,
+    BootstrapDocument, BootstrapProvider, FailClosedBootstrap, FailClosedDispatcher, OpaqueClock,
+    OpaqueRoute as PrivateRoute, OpaqueServiceState, StaticBootstrap,
 };
-use private_api::{CommandDispatcher, WebContractDispatcher};
+use private_api::{
+    AgentCapabilities, CommandDispatcher, FailClosedWebContract, WebContractDispatcher,
+};
 use session_transport::{
     parse_wire_envelope, ClientSession, CommandDenial, CommandRequest, ServerSession,
     SessionRegistry, WireEnvelope,
@@ -78,12 +80,38 @@ struct Harness {
 }
 
 fn harness(now_ms: i64) -> Harness {
-    harness_with(Arc::new(FailClosedDispatcher), now_ms)
+    harness_full(
+        Arc::new(FailClosedDispatcher),
+        Arc::new(FailClosedBootstrap),
+        now_ms,
+    )
 }
 
-/// Build the edge -> private-api path with an explicit command dispatcher so a
-/// scripted Trading Core seam can be exercised end-to-end.
-fn harness_with(dispatcher: Arc<dyn CommandDispatcher>, now_ms: i64) -> Harness {
+/// A bootstrap document that permits writes, used to exercise the dispatcher and
+/// response-normalization seams (the advertised kill switch is authoritative for
+/// mutating commands, so a fail-closed document would short-circuit them).
+fn permissive_bootstrap() -> Arc<dyn BootstrapProvider> {
+    let mut document = BootstrapDocument::fail_closed();
+    document.trading_enabled = true;
+    document.kill_switch_enabled = false;
+    document.kill_switch_reason = None;
+    Arc::new(StaticBootstrap::new(document))
+}
+
+/// A web contract over a scripted canonical dispatcher with trading enabled.
+fn trading_web_contract(canonical: Arc<dyn CommandDispatcher>) -> Arc<dyn CommandDispatcher> {
+    Arc::new(WebContractDispatcher::with_capabilities(
+        canonical,
+        Arc::new(FailClosedWebContract),
+        AgentCapabilities::new(true, std::collections::HashSet::new(), u64::MAX),
+    ))
+}
+
+fn harness_full(
+    dispatcher: Arc<dyn CommandDispatcher>,
+    bootstrap: Arc<dyn BootstrapProvider>,
+    now_ms: i64,
+) -> Harness {
     let keys = crypto_envelope::hpke::AppDirectionKeys::from_bytes([0x11u8; 32], [0x22u8; 32]);
     let sessions = Arc::new(Mutex::new(SessionRegistry::new()));
     sessions
@@ -94,7 +122,7 @@ fn harness_with(dispatcher: Arc<dyn CommandDispatcher>, now_ms: i64) -> Harness 
     let opaque = OpaqueServiceState::new(
         sessions,
         dispatcher,
-        Arc::new(FailClosedBootstrap),
+        bootstrap,
         Arc::new(FixedClock(now_ms)),
         60_000,
     )
@@ -258,8 +286,9 @@ async fn execute_without_a_backend_identity_echo_is_indeterminate_through_the_ed
     let canonical = Arc::new(ScriptedDispatcher {
         value: serde_json::json!({ "execution": { "state": "submitted" } }),
     });
-    let mut harness = harness_with(
-        Arc::new(WebContractDispatcher::with_fail_closed_web(canonical)),
+    let mut harness = harness_full(
+        trading_web_contract(canonical),
+        permissive_bootstrap(),
         1_000,
     );
     let (status, _content_type, _sealed, plaintext) = roundtrip(
@@ -283,8 +312,9 @@ async fn place_limit_without_an_order_id_is_indeterminate_through_the_edge() {
     let canonical = Arc::new(ScriptedDispatcher {
         value: serde_json::json!({ "order": { "status": "ACTIVE" } }),
     });
-    let mut harness = harness_with(
-        Arc::new(WebContractDispatcher::with_fail_closed_web(canonical)),
+    let mut harness = harness_full(
+        trading_web_contract(canonical),
+        permissive_bootstrap(),
         1_000,
     );
     let (status, _content_type, _sealed, plaintext) = roundtrip(
@@ -310,8 +340,9 @@ async fn attributable_execute_succeeds_through_the_edge() {
             "router_source": "okx",
         }),
     });
-    let mut harness = harness_with(
-        Arc::new(WebContractDispatcher::with_fail_closed_web(canonical)),
+    let mut harness = harness_full(
+        trading_web_contract(canonical),
+        permissive_bootstrap(),
         1_000,
     );
     let (_status, _content_type, _sealed, plaintext) = roundtrip(
@@ -323,4 +354,55 @@ async fn attributable_execute_succeeds_through_the_edge() {
     let value: serde_json::Value = serde_json::from_slice(&plaintext).expect("json");
     assert_eq!(value["result"]["execution_id"], "intent-42");
     assert_eq!(value["result"]["router_source"], "okx");
+}
+
+/// BR-1/F4: the advertised bootstrap kill switch is authoritative for writes. A
+/// mutating command is denied even when the composed canonical dispatcher would
+/// accept it, so a mis-composition cannot execute while the browser is told
+/// trading is halted. Reads remain available (verified by the bootstrap test).
+#[tokio::test]
+async fn mutating_command_is_denied_while_the_advertised_kill_switch_is_engaged() {
+    let canonical = Arc::new(ScriptedDispatcher {
+        value: serde_json::json!({
+            "execution": { "state": "submitted" },
+            "execution_id": "intent-42",
+            "router_source": "okx",
+        }),
+    });
+    // Trading-enabled web contract over the scripted canonical, but a fail-closed
+    // bootstrap document: the service-level gate must still deny the write.
+    let mut harness = harness_full(
+        trading_web_contract(canonical),
+        Arc::new(FailClosedBootstrap),
+        1_000,
+    );
+    let (status, _content_type, _sealed, plaintext) = roundtrip(
+        &mut harness,
+        "/v1/command",
+        br#"{"op":"execute_market_order","payload":{"quote_id":"q1","router_preference":"okx"},"request_id":"exec-kill","idempotency_key":"k9"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(&plaintext).expect("json");
+    assert_eq!(value["request_id"], "exec-kill");
+    assert_eq!(value["error"]["code"], "capability_missing");
+    assert!(value.get("result").is_none(), "no false success");
+}
+
+/// BR-3/F5: bootstrap and sync require the authenticated `request_id` challenge;
+/// a missing one is a protocol refusal, never a replayable success.
+#[tokio::test]
+async fn bootstrap_without_a_request_id_is_refused() {
+    let mut harness = harness(1_000);
+    let envelope = harness
+        .client
+        .seal_next(br#"{"op":"bootstrap","protocol_version":1}"#)
+        .expect("seal");
+    let response = edge_gateway::router(harness.state.clone())
+        .oneshot(post("/v1/bootstrap", envelope.to_wire_bytes()))
+        .await
+        .expect("edge response");
+    // The private API refuses the malformed request; the edge surfaces the opaque
+    // backend failure rather than sealing a challenge-less success.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

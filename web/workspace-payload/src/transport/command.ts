@@ -196,6 +196,20 @@ export class EncryptedCommandClient implements CommandClient {
       if (!("result" in record)) {
         throw workspaceError("protocol", "Command response carried no result.");
       }
+      // A capital-committing write must prove it committed with a concrete
+      // result. `{request_id, result:null}` is an authenticated envelope but no
+      // evidence of a commit, so it is indeterminate and the caller keeps its
+      // idempotency key rather than recording a false success.
+      if (
+        WRITE_OPS.has(op) &&
+        (record.result === null ||
+          typeof record.result !== "object" ||
+          Array.isArray(record.result))
+      ) {
+        throw workspaceError("unknown", "Write command outcome was not confirmed.", {
+          retryable: true,
+        });
+      }
       return record.result as T;
     } finally {
       decrypted.fill(0);

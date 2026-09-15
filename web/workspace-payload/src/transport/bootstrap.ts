@@ -54,6 +54,12 @@ export interface SessionBootstrapOptions {
   readonly kid?: string;
   readonly c2sKeyB64?: string;
   readonly s2cKeyB64?: string;
+  /**
+   * Monotonic per-`kid` bootstrap sequence. The server keeps a replay window for
+   * the lifetime of the key, so a retry/reload must not reuse sequence 0; the
+   * store supplies a strictly increasing value. Defaults to 0 for a fresh key.
+   */
+  readonly sequence?: number;
 }
 
 function allCapabilitiesFalse(): CapabilitySet {
@@ -238,9 +244,11 @@ export async function bootstrapWorkspaceSession(
   const keys = await resolveBootstrapKeys(options);
   const { sealer, decryptor } = await importBootstrapCrypto(keys);
 
-  // Bootstrap owns its own 0-based sequence window (per-purpose server replay
-  // windows); a single request is sealed at sequence 0.
-  const sequence = 0;
+  // Bootstrap owns its own sequence window (per-purpose server replay windows).
+  // The server never resets that window for the life of the `kid`, so a
+  // retry/reload must advance the sequence; reusing 0 would be rejected as a
+  // replay and wedge the workspace until a manual re-unlock.
+  const sequence = options.sequence ?? 0;
   const requestId = randomRequestId();
   const plaintext = utf8Encode(
     JSON.stringify({ op: "bootstrap", protocol_version: 1, request_id: requestId }),

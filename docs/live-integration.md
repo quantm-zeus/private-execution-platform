@@ -216,6 +216,53 @@ fail-closed state and never enables trading by itself.
 - `web/workspace-payload`: 357 unit tests including the worker subscribe-frame
   test (`realtime/worker.test.ts`).
 
+## Fail-closed hardening (fresh-context adversarial review)
+
+Two fresh-context reviewers audited the committed range after the `origin/main`
+merge. All valid CRITICAL/HIGH and relevant MEDIUM findings were fixed with
+regression tests:
+
+- **Kill-switch authority (BR-1/F4).** The advertised `BootstrapDocument` is now
+  an authorization input: `OpaqueServiceState` denies every mutating operation
+  while `trading_enabled=false` or the kill switch is engaged, before the injected
+  dispatcher runs. `session_transport::is_mutating_op` is the single closed write
+  set. Reads and previews stay available. Previously the kill switch was
+  client-side only.
+- **Web-contract write gate (F3).** `WebContractDispatcher` independently applies
+  the shared trading gate to canonical writes (`execute_market_order`,
+  `place_limit_order`, `cancel_order`, `start_twap`, `submit_rfq`,
+  `request_withdrawal`, plus the web-only `set_wallet_limits`), so a mis-composed
+  canonical dispatcher cannot execute while the layer advertises fail-closed
+  capabilities.
+- **Cross-route replay no longer burns a sequence (F3-crypto).** The relay
+  decrypts with `ServerSession::open_unverified`, validates the route/operation,
+  and only then calls `accept_sequence` (same ordering for the stream subscribe).
+  A captured envelope replayed on another route is a fail-closed no-op instead of
+  consuming the first sequence the honest client needs.
+- **`max_total_cost_usd` is refused, not silently dropped (F1).** The canonical
+  command vocabulary cannot enforce a per-order USD cap, so a non-null value is a
+  determinate `protocol` refusal rather than an unenforced safety control the
+  preview echoes back as accepted.
+- **Write responses must prove a commit (F2).** The browser command client treats
+  an authenticated `{request_id, result:null}` (or non-object result) on a
+  capital-committing write as an indeterminate `unknown` outcome and keeps the
+  idempotency key.
+- **`request_id` is required on every route (F5).** `/v1/bootstrap` and `/v1/sync`
+  refuse a challenge-less request instead of sealing a replayable success.
+- **Bootstrap sequence epoch (F7).** The store supplies a strictly increasing
+  bootstrap sequence so a retry/reload under the same `kid` is not rejected as a
+  replay (the server never resets the window for a key).
+- **Wire bounds aligned (F6).** `session_transport::MAX_WIRE_BYTES` now matches the
+  edge/relay 1 MiB body bound and `MAX_CIPHERTEXT_BYTES` (720 KiB) leaves room for
+  base64 expansion, so the server never accepts an envelope the edge cannot relay.
+- **Real relay coverage (F9).** `apps/edge-gateway/tests/private_relay_integration.rs`
+  now drives a browser-shaped `/v1/command` envelope through the real edge HTTP
+  route, the pinned mTLS channel and the real `EncryptedRelayService` to a
+  fail-closed Trading Core seam.
+- **Key-handoff hygiene.** The store no longer exposes the resolved BR-5 base64
+  keys through a `hostKey()` accessor and drops the reference on `dispose()`; the
+  stream subscribe frame captures the `kid` once across its seal await.
+
 ## Residuals (explicit)
 
 - **USD-notional amounts (Trading Core capability, not a private-layer bug)**: the
@@ -252,12 +299,18 @@ fail-closed state and never enables trading by itself.
   authorization backend).
 - **Accepted LOW hardening residuals (fresh-context adversarial review)**: the
   s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
-  substitution today); a captured c2s `subscribe` replayed on `/v1/command` is a
-  fail-closed DoS; a shared `Notify` can waste one resync wake-up across stream
-  generations; the s2c stream can emit frames after session expiry (the client
-  deadline still blocks mutations); and the payload keeps the BR-5 base64 key
-  strings until the iframe is torn down (the imported `CryptoKey`s are
-  non-extractable and the raw bytes are zeroized).
+  substitution today; the cross-route c2s DoS is now fixed by validating before
+  consuming a sequence); a shared `Notify` can waste one resync wake-up across
+  stream generations; the s2c stream can emit frames after session expiry (the
+  client deadline still blocks mutations); the WASM export path leaves raw key /
+  plaintext copies in linear memory because wasm-bindgen `free` does not zeroize
+  (the JS copies are zeroized); the base64 key strings in worker `postMessage`
+  payloads and the store closure survive until GC / iframe teardown (the imported
+  `CryptoKey`s are non-extractable); `RealtimeClient.start()` resets the s2c replay
+  high-water mark on a same-`kid` worker restart (bounded by the 30 s frame TTL);
+  and a concurrent `prune` can remove a session between command dispatch and seal,
+  turning a committed write into an indeterminate 503 (the client keeps its
+  idempotency key, so it is never a false success).
 - **Input-denominated fee projection**: `dex_fee` (always in `token_in`) and a
   sell-side `tax_cost` (also in `token_in`) cannot be expressed as bps of the
   gross output, so they project as `null` (unknown, never wrong). The second

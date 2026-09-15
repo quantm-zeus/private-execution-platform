@@ -22,7 +22,7 @@ use std::sync::Arc;
 use agent_commands::AgentCapabilities;
 use async_trait::async_trait;
 use serde_json::Value;
-use session_transport::{CommandDenial, CommandRequest, DenialCode};
+use session_transport::{is_mutating_op, CommandDenial, CommandRequest, DenialCode};
 
 use crate::opaque::CommandDispatcher;
 
@@ -164,6 +164,13 @@ impl WebContractDispatcher {
 #[async_trait]
 impl CommandDispatcher for WebContractDispatcher {
     async fn dispatch(&self, request: &CommandRequest) -> Result<Value, CommandDenial> {
+        // Defense in depth (F3): the canonical core authorizes its own writes, but
+        // this layer must independently honour the shared trading/kill-switch gate
+        // so a mis-composed canonical dispatcher cannot execute a write while the
+        // web contract advertises fail-closed capabilities.
+        if is_mutating_op(&request.op) {
+            self.ensure_trading_enabled()?;
+        }
         match request.op.as_str() {
             "get_wallet_limits" => self.web.wallet_limits().await,
             "set_wallet_limits" => {
@@ -174,9 +181,8 @@ impl CommandDispatcher for WebContractDispatcher {
                     .ok_or_else(|| {
                         protocol("idempotency_key is required for set_wallet_limits.")
                     })?;
-                // Web-only mutations do not travel through the canonical
-                // `authorize` core, so the kill switch must be enforced here.
-                self.ensure_trading_enabled()?;
+                // The shared gate was applied above; the web-only write never
+                // travels through the canonical `authorize` core.
                 self.web.set_wallet_limits(&request.payload, key).await
             }
             "get_order" => {
@@ -329,10 +335,46 @@ mod tests {
             calls: calls.clone(),
             value: Ok(value),
         });
+        // Trading is enabled so the response-normalization tests exercise the
+        // canonical path; the disabled-gate behaviour has its own test below.
         (
-            WebContractDispatcher::with_fail_closed_web(canonical),
+            WebContractDispatcher::with_capabilities(
+                canonical,
+                Arc::new(FailClosedWebContract),
+                capabilities(true),
+            ),
             calls,
         )
+    }
+
+    /// F3: a canonical write must be denied by the web contract when the shared
+    /// trading gate is disabled, even if the injected canonical dispatcher is
+    /// mis-composed and would otherwise accept it.
+    #[tokio::test]
+    async fn canonical_write_is_denied_while_trading_is_disabled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let canonical = Arc::new(CanonicalDispatcher {
+            calls: calls.clone(),
+            value: Ok(json!({
+                "execution": { "state": "submitted" },
+                "execution_id": "i1",
+                "router_source": "okx",
+            })),
+        });
+        let dispatcher = WebContractDispatcher::with_capabilities(
+            canonical,
+            Arc::new(FailClosedWebContract),
+            capabilities(false),
+        );
+        let denial = dispatcher
+            .dispatch(&request(
+                br#"{"op":"execute_market_order","payload":{"router_preference":"okx"},"request_id":"r","idempotency_key":"k"}"#,
+            ))
+            .await
+            .expect_err("trading disabled");
+        assert_eq!(denial.code, "capability_missing");
+        assert!(!denial.retryable);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "canonical never reached");
     }
 
     #[tokio::test]

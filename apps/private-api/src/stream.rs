@@ -531,7 +531,7 @@ async fn run_subscription(
     let kid = envelope
         .decode_kid()
         .map_err(|_| Status::invalid_argument("invalid frame"))?;
-    let plaintext = {
+    let subscribe = {
         let sessions_handle = state.sessions();
         let mut sessions = sessions_handle
             .lock()
@@ -540,12 +540,19 @@ async fn run_subscription(
         let session = sessions
             .get_mut(&kid)
             .ok_or_else(|| Status::unauthenticated("session unavailable"))?;
+        let plaintext = session
+            .open_unverified(&envelope, now)
+            .map_err(|_| Status::unauthenticated("session unavailable"))?;
+        // Validate the encrypted operation before consuming the Stream sequence
+        // slot, so a captured envelope replayed on this route cannot burn the
+        // sequence a genuine reconnect needs.
+        let subscribe = StreamControlRequest::parse(&plaintext)
+            .map_err(|_| Status::invalid_argument("invalid subscription"))?;
         session
-            .open(&envelope, now, Purpose::Stream)
-            .map_err(|_| Status::unauthenticated("session unavailable"))?
+            .accept_sequence(envelope.sequence, Purpose::Stream)
+            .map_err(|_| Status::unauthenticated("session unavailable"))?;
+        subscribe
     };
-    let subscribe = StreamControlRequest::parse(&plaintext)
-        .map_err(|_| Status::invalid_argument("invalid subscription"))?;
 
     let (generation, notify) = state.stream_hub().register(kid);
     let driver = state.stream_driver();

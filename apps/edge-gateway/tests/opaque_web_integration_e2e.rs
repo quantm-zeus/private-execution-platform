@@ -18,7 +18,8 @@ use chain_types::ChainId;
 use edge_gateway::{AuthorizationBackend, EdgeError, EdgeState, OpaqueRelay, OpaqueRoute};
 use http_body_util::BodyExt;
 use private_api::opaque::{
-    FailClosedBootstrap, OpaqueClock, OpaqueRoute as PrivateRoute, OpaqueServiceState,
+    BootstrapDocument, BootstrapProvider, FailClosedBootstrap, OpaqueClock,
+    OpaqueRoute as PrivateRoute, OpaqueServiceState, StaticBootstrap,
 };
 use private_api::{
     web_command_dispatcher, AgentBackend, AgentCapabilities, AgentChannel, AgentCommand,
@@ -178,10 +179,21 @@ fn harness(
         .expect("registry lock")
         .insert(ServerSession::new(KID, &keys, i64::MAX).expect("session"))
         .expect("insert session");
+    // The advertised bootstrap document is authoritative for mutating commands,
+    // so a trading-enabled composition must advertise a disengaged kill switch.
+    let bootstrap: Arc<dyn BootstrapProvider> = if trading_enabled {
+        let mut document = BootstrapDocument::fail_closed();
+        document.trading_enabled = true;
+        document.kill_switch_enabled = false;
+        document.kill_switch_reason = None;
+        Arc::new(StaticBootstrap::new(document))
+    } else {
+        Arc::new(FailClosedBootstrap)
+    };
     let opaque = OpaqueServiceState::new(
         sessions,
         dispatcher,
-        Arc::new(FailClosedBootstrap),
+        bootstrap,
         Arc::new(FixedClock(now_ms)),
         60_000,
     )
@@ -233,7 +245,7 @@ async fn roundtrip(
 }
 
 fn preview_payload() -> Vec<u8> {
-    br#"{"op":"preview_market_order","payload":{"intent":{"chain":"base","token_in":"USDC","token_out":"TOKEN","side":"buy","amount_type":"stablecoin","amount":"25","max_slippage_bps":100,"max_price_impact_bps":150,"max_total_cost_usd":1.0},"router_preference":"okx"},"request_id":"e2e-preview","idempotency_key":null}"#.to_vec()
+    br#"{"op":"preview_market_order","payload":{"intent":{"chain":"base","token_in":"USDC","token_out":"TOKEN","side":"buy","amount_type":"stablecoin","amount":"25","max_slippage_bps":100,"max_price_impact_bps":150,"max_total_cost_usd":null},"router_preference":"okx"},"request_id":"e2e-preview","idempotency_key":null}"#.to_vec()
 }
 
 fn execute_payload(quote_id: &str) -> Vec<u8> {

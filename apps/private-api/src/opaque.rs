@@ -531,7 +531,7 @@ impl OpaqueServiceState {
         let purpose = route.purpose().ok_or(RelayFailure::Unavailable)?;
         let sequence = envelope.sequence;
 
-        // Open the envelope under the registry lock; the lock is released
+        // Authenticate and validate under the registry lock; the lock is released
         // before any await so a slow backend cannot block other sessions.
         let plaintext = {
             let mut sessions = self
@@ -540,18 +540,28 @@ impl OpaqueServiceState {
                 .map_err(|_| RelayFailure::Unavailable)?;
             sessions.prune(now);
             let session = sessions.get_mut(&kid).ok_or(RelayFailure::UnknownSession)?;
+            // Decrypt WITHOUT consuming a sequence slot, validate the route
+            // binding, and only then advance the replay window. A captured
+            // envelope replayed on another route therefore cannot burn the slot
+            // the honest client is about to use (fail-closed DoS hardening).
+            let plaintext =
+                session
+                    .open_unverified(&envelope, now)
+                    .map_err(|error| match error {
+                        SessionError::Expired => RelayFailure::UnknownSession,
+                        _ => RelayFailure::Protocol,
+                    })?;
+            verify_route_op(route, &plaintext)?;
             session
-                .open(&envelope, now, purpose)
+                .accept_sequence(sequence, purpose)
                 .map_err(|error| match error {
-                    SessionError::Expired => RelayFailure::UnknownSession,
                     SessionError::ReplayDetected | SessionError::StaleSequence => {
                         RelayFailure::Protocol
                     }
                     _ => RelayFailure::Protocol,
-                })?
+                })?;
+            plaintext
         };
-
-        verify_route_op(route, &plaintext)?;
         // BR-2: an authenticated `/v1/sync` asks the active stream connection for
         // a fresh snapshot at/after the client's high-water mark. The snapshot is
         // delivered on the stream (never in this HTTP body), matching the web
@@ -584,18 +594,21 @@ impl OpaqueServiceState {
     ) -> Result<Vec<u8>, RelayFailure> {
         match route {
             OpaqueRoute::Bootstrap => {
-                let request_id = extract_request_id(plaintext);
+                // BR-3/F5: the request challenge is required on every route. The
+                // browser rejects a response that does not echo it, so a server
+                // that omitted it would emit an unusable (and replayable) success.
+                let request_id = extract_request_id(plaintext).ok_or(RelayFailure::Protocol)?;
                 let document = self.bootstrap.document();
                 let body = document.to_wire(
                     &envelope.kid,
                     now.saturating_add(self.session_ttl_ms),
                     now,
-                    request_id.as_deref(),
+                    Some(&request_id),
                 );
                 serde_json::to_vec(&body).map_err(|_| RelayFailure::Unavailable)
             }
             OpaqueRoute::Sync => {
-                let request_id = extract_request_id(plaintext);
+                let request_id = extract_request_id(plaintext).ok_or(RelayFailure::Protocol)?;
                 let from_seq = extract_from_seq(plaintext);
                 let body = json!({
                     "request_id": request_id,
@@ -607,14 +620,41 @@ impl OpaqueServiceState {
                 let request =
                     CommandRequest::parse(plaintext).map_err(|_| RelayFailure::Protocol)?;
                 let kid = envelope.decode_kid().map_err(|_| RelayFailure::Malformed)?;
-                let response = match self.dispatcher.dispatch_for_session(&kid, &request).await {
-                    Ok(result) => CommandResponse::success(&request.request_id, result),
-                    Err(denial) => CommandResponse::denial(&request.request_id, denial),
-                };
+                // BR-1/F4: the bootstrap document is the authoritative trading and
+                // kill-switch surface the browser renders. A mutating command must
+                // honour that same gate, so a composition whose advertised kill
+                // switch is engaged cannot execute a write through an injected
+                // dispatcher that would otherwise allow it. Reads and previews stay
+                // available.
+                let response =
+                    if session_transport::is_mutating_op(&request.op) && !self.writes_allowed() {
+                        CommandResponse::denial(
+                            &request.request_id,
+                            CommandDenial::determinate(
+                                DenialCode::CapabilityMissing,
+                                "Trading is disabled by the global kill switch.",
+                            ),
+                        )
+                    } else {
+                        match self.dispatcher.dispatch_for_session(&kid, &request).await {
+                            Ok(result) => CommandResponse::success(&request.request_id, result),
+                            Err(denial) => CommandResponse::denial(&request.request_id, denial),
+                        }
+                    };
                 Ok(response.to_bytes())
             }
             OpaqueRoute::Blob => Err(RelayFailure::Unavailable),
         }
+    }
+
+    /// Whether the advertised bootstrap document currently permits writes.
+    ///
+    /// `trading_enabled` and the kill switch must agree for writes to be allowed:
+    /// an engaged kill switch or a disabled trading gate denies mutations even if
+    /// an injected dispatcher would accept them.
+    fn writes_allowed(&self) -> bool {
+        let document = self.bootstrap.document();
+        document.trading_enabled && !document.kill_switch_enabled
     }
 }
 
@@ -938,6 +978,88 @@ mod tests {
         assert_eq!(response["request_id"], "r9");
         assert_eq!(response["result"]["status"], "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_route_replay_does_not_consume_the_target_sequence() {
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(FailClosedBootstrap),
+        );
+        // A captured bootstrap envelope at sequence 0 posted to /v1/command is a
+        // route mismatch...
+        let captured = client
+            .seal_at(0, br#"{"op":"bootstrap","request_id":"x"}"#)
+            .unwrap();
+        assert_eq!(
+            state
+                .relay_envelope(OpaqueRoute::Command, &captured.to_wire_bytes())
+                .await,
+            Err(RelayFailure::Protocol)
+        );
+        // ...and the honest command at the same sequence is still accepted: the
+        // replay window must not advance before route validation.
+        let honest = client
+            .seal_at(0, br#"{"op":"get_quote","payload":{},"request_id":"ok"}"#)
+            .unwrap();
+        let opened = state
+            .relay_envelope(OpaqueRoute::Command, &honest.to_wire_bytes())
+            .await
+            .expect("honest command must not be wedged");
+        let response = parse_wire_envelope(&opened).unwrap();
+        assert_eq!(response.sequence, 0, "response binds the request sequence");
+        let plaintext = client.open(&response).unwrap();
+        let value: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(value["result"]["status"], "ok", "response: {value}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_a_request_challenge_is_refused() {
+        let now = 1_000i64;
+        let (state, mut client) = state(now);
+        let envelope = client
+            .seal_next(br#"{"op":"bootstrap","protocol_version":1}"#)
+            .unwrap();
+        assert_eq!(
+            state
+                .relay_envelope(OpaqueRoute::Bootstrap, &envelope.to_wire_bytes())
+                .await,
+            Err(RelayFailure::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn mutating_command_is_denied_by_the_advertised_kill_switch() {
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        // A dispatcher that would accept the write, under a fail-closed bootstrap
+        // document: the advertised kill switch must win.
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(FailClosedBootstrap),
+        );
+        let response = roundtrip(
+            &state,
+            &mut client,
+            OpaqueRoute::Command,
+            br#"{"op":"execute_market_order","payload":{},"request_id":"kill","idempotency_key":"k"}"#,
+        )
+        .await
+        .expect("sealed denial");
+        assert_eq!(response["error"]["code"], "capability_missing");
+        assert!(response.get("result").is_none(), "no false success");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "dispatcher never reached");
     }
 
     #[tokio::test]

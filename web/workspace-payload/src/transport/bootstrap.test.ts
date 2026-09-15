@@ -231,6 +231,25 @@ describe("bootstrapWorkspaceSession", () => {
     expect(session.keyId).toBe("kid-1");
   });
 
+  it("seals bootstrap at the supplied sequence so a retry cannot replay 0", async () => {
+    // The server's replay window never resets for a `kid`, so a reload/retry must
+    // advance the bootstrap sequence; the response must bind that same sequence.
+    const fetchFn = (async (_url: string, init: RequestInit) => {
+      const envelope = decodeRequest(init);
+      expect(envelope.sequence).toBe(7);
+      const request = await openRequest(envelope);
+      const sealed = await sealResponse(7, { ...VALID, request_id: request.request_id });
+      return { ok: true, status: 200, text: async () => JSON.stringify(sealed) } as Response;
+    }) as unknown as typeof fetch;
+    const session = await bootstrapWorkspaceSession({
+      baseUrl: "https://workspace.example",
+      fetchFn,
+      hostKeyProvider: hostKeys(),
+      sequence: 7,
+    });
+    expect(session.keyId).toBe("kid-1");
+  });
+
   it("accepts a wrapped {envelope} response for compatibility", async () => {
     const fetchFn = (async (_url: string, init: RequestInit) => {
       const envelope = decodeRequest(init);

@@ -522,6 +522,15 @@ async fn translate_market_intent(
         .get("max_total_cost_usd")
         .cloned()
         .unwrap_or(Value::Null);
+    // F1: the canonical command vocabulary has no per-order USD total-cost cap, so
+    // a non-null `max_total_cost_usd` cannot be enforced. Echoing it back would
+    // present an unenforced safety control as accepted, so it is a determinate
+    // refusal (the same policy as an unsupported `usd` amount).
+    if with_trade_fields && !max_total_cost_usd.is_null() {
+        return Err(protocol(
+            "max_total_cost_usd is not enforceable by the canonical command; remove the cap.",
+        ));
+    }
 
     Ok(MarketIntent {
         canonical: Value::Object(canonical),
@@ -1290,7 +1299,7 @@ mod tests {
                         "amount": "25.00",
                         "max_slippage_bps": 100,
                         "max_price_impact_bps": 150,
-                        "max_total_cost_usd": 1.0
+                        "max_total_cost_usd": null
                     },
                     "router_preference": "okx"
                 }),
@@ -1323,6 +1332,35 @@ mod tests {
         assert_eq!(result["expiresAtMs"], 121_000);
         assert_eq!(result["route"][0]["venue"], "uniswap");
         assert!(result["quoteId"].as_str().expect("quote id").len() >= 32);
+    }
+
+    /// F1: the canonical command vocabulary has no per-order USD total-cost cap,
+    /// so a non-null cap is a determinate refusal rather than a silent drop of a
+    /// safety control the user believes is enforced.
+    #[tokio::test]
+    async fn unenforceable_total_cost_cap_is_refused() {
+        let inner = CapturingDispatcher::new(preview_result());
+        let dispatcher = dispatcher(inner.clone());
+        let error = dispatcher
+            .dispatch(&request(
+                "preview_market_order",
+                json!({
+                    "intent": {
+                        "chain": "base",
+                        "token_in": "USDC",
+                        "token_out": "TOKEN",
+                        "side": "buy",
+                        "amount_type": "stablecoin",
+                        "amount": "25.00",
+                        "max_total_cost_usd": 1.0
+                    },
+                    "router_preference": "okx"
+                }),
+            ))
+            .await
+            .expect_err("unenforceable cap");
+        assert_eq!(error.code, "protocol");
+        assert_eq!(inner.count(), 0, "no command reaches the backend");
     }
 
     #[tokio::test]
