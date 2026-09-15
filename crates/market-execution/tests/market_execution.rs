@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use agent_backend::{MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort};
 use execution_relay::{
-    ChainHealthBreaker, ChainObservation, InMemoryReservationStore, ObservedFill,
+    ChainHealthBreaker, ChainObservation, DeterministicDurableStore, ObservedFill,
     PrivySigningBoundaryAdapter, RelayOutcome, UnavailableChainAdapter,
 };
 use market_execution::RelayMarketExecutionPort;
@@ -239,7 +239,7 @@ async fn duplicate_execute_signs_and_submits_once() {
 async fn production_wiring_fails_closed_before_signer_or_adapter() {
     let source = Arc::new(CountingSource::new());
     let port = RelayMarketExecutionPort::<
-        InMemoryReservationStore,
+        DeterministicDurableStore,
         UnavailableChainAdapter,
         TestSource,
         PrivySigningBoundaryAdapter,
@@ -247,7 +247,7 @@ async fn production_wiring_fails_closed_before_signer_or_adapter() {
         FakePreparedRefs,
     >::production(
         policy(true),
-        InMemoryReservationStore::new(),
+        DeterministicDurableStore::new(),
         Arc::clone(&source),
         ChainHealthBreaker::new(2, 5_000),
         FakeTrust {

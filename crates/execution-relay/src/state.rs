@@ -3,14 +3,22 @@
 //! The reservation store is the authoritative exactly-once guard for a running
 //! relay: the relay claims an attempt before signing and refuses to sign, fetch,
 //! or submit again for the same `(idempotency_key, request_digest)`. The shipped
-//! implementations are process-local; durable storage is deferred.
+//! [`InMemoryReservationStore`](crate::InMemoryReservationStore) is process-local
+//! and exists for unit tests; [`DurableAttemptStore`] is the marker a store must
+//! implement before the relay's production constructor accepts it, and
+//! [`DeterministicDurableStore`](crate::DeterministicDurableStore) is a
+//! deterministic reference implementation of that durable lifecycle.
 
 use std::fmt;
 
-use domain::{IdempotencyKey, OrderStatus};
-use privy::RequestDigest;
+use async_trait::async_trait;
+use chain_types::ChainId;
+use domain::{IdempotencyKey, IntentId, OrderStatus, UserId, WalletRef};
+use privy::{PayloadDigest, ProviderIdempotencyId, RequestDigest};
+use sha2::{Digest, Sha256};
 
 use crate::error::RelayError;
+use crate::plan::{SubmitRequest, MAX_SIGNED_PAYLOAD_BYTES};
 
 /// Whether an acknowledged submission is already known on-chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +50,258 @@ impl fmt::Debug for ObservedFill {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Redacted: realized amounts are private execution economics.
         formatter.write_str("ObservedFill { .. }")
+    }
+}
+
+/// Immutable identity that uniquely binds a durable execution attempt.
+///
+/// The pair `(owner, workspace)` plus the intent's idempotency key is the
+/// durable uniqueness key: the same key under a different owner/workspace is a
+/// distinct attempt, and the request digest recorded with it is what makes a
+/// replay of the *same* attempt safe. `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttemptBinding {
+    owner: UserId,
+    workspace: WalletRef,
+    idempotency_key: IdempotencyKey,
+    intent_id: IntentId,
+    chain: ChainId,
+}
+
+impl AttemptBinding {
+    /// Binds an owner, workspace, idempotency key, intent, and chain.
+    pub fn new(
+        owner: UserId,
+        workspace: WalletRef,
+        idempotency_key: IdempotencyKey,
+        intent_id: IntentId,
+        chain: ChainId,
+    ) -> Self {
+        Self {
+            owner,
+            workspace,
+            idempotency_key,
+            intent_id,
+            chain,
+        }
+    }
+
+    /// The owner/principal the attempt belongs to.
+    pub fn owner(&self) -> &UserId {
+        &self.owner
+    }
+
+    /// The wallet/workspace the attempt is executed from.
+    pub fn workspace(&self) -> &WalletRef {
+        &self.workspace
+    }
+
+    /// The idempotency key bound into the intent.
+    pub fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+
+    /// The intent identifier (stable chain reference data).
+    pub fn intent_id(&self) -> &IntentId {
+        &self.intent_id
+    }
+
+    /// The chain the attempt is bound to (stable chain reference data).
+    pub fn chain(&self) -> &ChainId {
+        &self.chain
+    }
+}
+
+impl fmt::Debug for AttemptBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Omit owner, workspace, and idempotency key.
+        formatter.write_str("AttemptBinding { .. }")
+    }
+}
+
+/// Durable attempt lifecycle status.
+///
+/// The canonical spelling ([`Self::as_str`]) is the value persisted by a durable
+/// store; [`Self::parse`] is the fail-closed inverse for rows read back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptStatus {
+    /// The attempt identity + digest were claimed; no signer call is recorded.
+    Reserved,
+    /// A signer call was durably requested (with a provider idempotency id)
+    /// before the signing boundary was invoked.
+    SignRequested,
+    /// The signing boundary returned a reference for this attempt.
+    Signed,
+    /// A submission was attempted and its chain state could not be determined.
+    SubmissionUnknown,
+    /// The chain adapter acknowledged the submission (not yet confirmed).
+    Submitted,
+    /// The chain confirmed the attempt.
+    Confirmed,
+    /// The chain definitively rejected the attempt.
+    Rejected,
+    /// The attempt failed before any chain submission occurred.
+    FailedBeforeSubmit,
+}
+
+impl AttemptStatus {
+    /// Canonical uppercase storage spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "RESERVED",
+            Self::SignRequested => "SIGN_REQUESTED",
+            Self::Signed => "SIGNED",
+            Self::SubmissionUnknown => "SUBMISSION_UNKNOWN",
+            Self::Submitted => "SUBMITTED",
+            Self::Confirmed => "CONFIRMED",
+            Self::Rejected => "REJECTED",
+            Self::FailedBeforeSubmit => "FAILED_BEFORE_SUBMIT",
+        }
+    }
+
+    /// Parses a persisted status spelling, returning `None` for any unknown
+    /// value so a corrupt row fails closed.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "RESERVED" => Some(Self::Reserved),
+            "SIGN_REQUESTED" => Some(Self::SignRequested),
+            "SIGNED" => Some(Self::Signed),
+            "SUBMISSION_UNKNOWN" => Some(Self::SubmissionUnknown),
+            "SUBMITTED" => Some(Self::Submitted),
+            "CONFIRMED" => Some(Self::Confirmed),
+            "REJECTED" => Some(Self::Rejected),
+            "FAILED_BEFORE_SUBMIT" => Some(Self::FailedBeforeSubmit),
+            _ => None,
+        }
+    }
+
+    /// True when no further transition may occur.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Confirmed | Self::Rejected | Self::FailedBeforeSubmit
+        )
+    }
+}
+
+/// Durable record of a fully bound submission.
+///
+/// It carries exactly the stable data needed to rebuild a [`SubmitRequest`] for
+/// restart reconciliation: the bound identifiers, the chain, the signed
+/// provider reference, and the signed payload bytes. It never carries private
+/// key material. Construction recomputes the payload digest and fails closed on
+/// an empty, oversize, or mismatched payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DurableSubmission {
+    intent_id: IntentId,
+    idempotency_key: IdempotencyKey,
+    chain: ChainId,
+    request_digest: RequestDigest,
+    payload_digest: PayloadDigest,
+    signed_reference: String,
+    chain_reference: Option<String>,
+    payload: Vec<u8>,
+}
+
+impl DurableSubmission {
+    /// Builds a durable submission, validating the payload digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        intent_id: IntentId,
+        idempotency_key: IdempotencyKey,
+        chain: ChainId,
+        request_digest: RequestDigest,
+        payload_digest: PayloadDigest,
+        signed_reference: impl Into<String>,
+        chain_reference: Option<String>,
+        payload: Vec<u8>,
+    ) -> Result<Self, RelayError> {
+        let signed_reference = signed_reference.into();
+        if signed_reference.trim().is_empty() {
+            return Err(RelayError::SigningFailed);
+        }
+        if payload.is_empty() {
+            return Err(RelayError::SignedPayloadEmpty);
+        }
+        if payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
+            return Err(RelayError::SignedPayloadTooLarge);
+        }
+        let actual = PayloadDigest::from_bytes(Sha256::digest(&payload).into());
+        if actual != payload_digest {
+            return Err(RelayError::SignedPayloadDigestMismatch);
+        }
+        Ok(Self {
+            intent_id,
+            idempotency_key,
+            chain,
+            request_digest,
+            payload_digest,
+            signed_reference,
+            chain_reference,
+            payload,
+        })
+    }
+
+    /// Builds a durable submission directly from a bound submit request.
+    pub fn from_request(request: &SubmitRequest) -> Result<Self, RelayError> {
+        Self::new(
+            request.intent_id().clone(),
+            request.idempotency_key().clone(),
+            request.chain().clone(),
+            *request.request_digest(),
+            *request.payload_digest(),
+            request.signed_reference(),
+            request.chain_reference().map(str::to_string),
+            request.payload().to_vec(),
+        )
+    }
+
+    pub fn intent_id(&self) -> &IntentId {
+        &self.intent_id
+    }
+
+    pub fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+
+    pub fn chain(&self) -> &ChainId {
+        &self.chain
+    }
+
+    pub fn request_digest(&self) -> &RequestDigest {
+        &self.request_digest
+    }
+
+    pub fn payload_digest(&self) -> &PayloadDigest {
+        &self.payload_digest
+    }
+
+    pub fn signed_reference(&self) -> &str {
+        &self.signed_reference
+    }
+
+    /// The chain acknowledgement reference observed after submission, if any.
+    pub fn chain_reference(&self) -> Option<&str> {
+        self.chain_reference.as_deref()
+    }
+
+    /// Records the chain acknowledgement reference after a successful submit.
+    pub(crate) fn set_chain_reference(&mut self, reference: impl Into<String>) {
+        let reference = reference.into();
+        if !reference.trim().is_empty() {
+            self.chain_reference = Some(reference);
+        }
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl fmt::Debug for DurableSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Omit identifiers, chain, references, digests, and payload bytes.
+        formatter.write_str("DurableSubmission { .. }")
     }
 }
 
@@ -98,6 +358,23 @@ impl RelayOutcome {
             Self::FailedBeforeSubmit => OrderStatus::FailedRetryable,
         }
     }
+
+    /// Maps the relay outcome onto the durable attempt status a store persists.
+    ///
+    /// `Unknown` maps to [`AttemptStatus::SubmissionUnknown`] (reconcile, never
+    /// retry); a `Submitted` acknowledgement maps to [`AttemptStatus::Submitted`]
+    /// and is **not** a confirmation.
+    pub fn attempt_status(&self) -> AttemptStatus {
+        match self {
+            Self::Prepared | Self::Reserved => AttemptStatus::Reserved,
+            Self::Signed => AttemptStatus::Signed,
+            Self::Submitted { .. } => AttemptStatus::Submitted,
+            Self::Unknown => AttemptStatus::SubmissionUnknown,
+            Self::Confirmed { .. } => AttemptStatus::Confirmed,
+            Self::Rejected { .. } => AttemptStatus::Rejected,
+            Self::FailedBeforeSubmit => AttemptStatus::FailedBeforeSubmit,
+        }
+    }
 }
 
 impl fmt::Debug for RelayOutcome {
@@ -132,24 +409,121 @@ pub enum Reservation {
 
 /// Exactly-once reservation store.
 ///
-/// The shipped implementation is process-local (durable storage is deferred),
-/// but implementations must be deterministic for a given input sequence and must
-/// never permit a second reservation of the same `(key, digest)` to be treated
-/// as a fresh attempt.
+/// The shipped [`InMemoryReservationStore`](crate::InMemoryReservationStore) is
+/// process-local. Implementations must be deterministic for a given input
+/// sequence and must never permit a second reservation of the same
+/// `(key, digest)` to be treated as a fresh attempt.
+///
+/// # Durable lifecycle (additive)
+///
+/// The default bodies of the transition methods below are no-ops so that
+/// process-local unit-test stores keep compiling. A production store implements
+/// them and additionally implements the [`DurableAttemptStore`] marker, which is
+/// what the relay's production constructor requires. Every transition is
+/// persisted *before* the corresponding consequential boundary: `RESERVED`
+/// before signing, `SIGN_REQUESTED` before the signer call, `SIGNED` before the
+/// payload is fetched, the bound submission before `submit`, and the terminal
+/// outcome after.
+#[async_trait]
 pub trait AttemptReservationStore: Send + Sync {
     /// Claims `(key, digest)`, returning the existing outcome when present.
-    fn reserve(
+    async fn reserve(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<Reservation, RelayError>;
 
+    /// Claims the full `(owner, workspace, idempotency_key)` identity.
+    ///
+    /// The default delegates to [`Self::reserve`] so process-local stores keep
+    /// working; a durable store overrides this to enforce the owner/workspace
+    /// scoping and returns [`Reservation::Conflict`] when the key exists with a
+    /// different request digest.
+    async fn reserve_bound(
+        &self,
+        binding: &AttemptBinding,
+        digest: &RequestDigest,
+    ) -> Result<Reservation, RelayError> {
+        self.reserve(binding.idempotency_key(), digest).await
+    }
+
+    /// Durably records the `SIGN_REQUESTED` transition before the signer is
+    /// called, together with the stable provider idempotency identifier.
+    ///
+    /// The default is a no-op. A durable store must persist this **before** the
+    /// signing boundary is invoked; a store error must abort the attempt
+    /// fail-closed without signing.
+    async fn record_sign_requested(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        provider_idempotency: &ProviderIdempotencyId,
+    ) -> Result<(), RelayError> {
+        let _ = (key, digest, provider_idempotency);
+        Ok(())
+    }
+
     /// Records that the signing boundary produced a reference for `(key, digest)`.
-    fn record_signed(&self, key: &IdempotencyKey, digest: &RequestDigest)
-        -> Result<(), RelayError>;
+    async fn record_signed(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+    ) -> Result<(), RelayError>;
+
+    /// Records `SIGNED` together with the opaque signed reference.
+    ///
+    /// The default forwards to [`Self::record_signed`] so existing stores keep
+    /// working; a durable store persists the reference for reconciliation.
+    async fn record_signed_reference(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        signed_reference: &str,
+    ) -> Result<(), RelayError> {
+        let _ = signed_reference;
+        self.record_signed(key, digest).await
+    }
+
+    /// Durably persists the fully bound submission **before** the chain adapter
+    /// is called, so a restart can reconcile it instead of resubmitting.
+    ///
+    /// The default is a no-op (process-local tests keep an in-memory journal). A
+    /// durable store error must abort before any submit.
+    async fn record_submission(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        request: &SubmitRequest,
+    ) -> Result<(), RelayError> {
+        let _ = (key, digest, request);
+        Ok(())
+    }
+
+    /// Loads the durable submission for restart reconciliation.
+    ///
+    /// Returns `Ok(None)` when no durable submission exists (the default), and
+    /// fails closed if the lookup is ambiguous or the store is unavailable.
+    async fn load_submission(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<DurableSubmission>, RelayError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Loads the durable outcome for restart reconciliation and monotonicity.
+    ///
+    /// Returns `Ok(None)` when no outcome is stored (the default). A terminal
+    /// outcome ([`AttemptStatus::is_terminal`]) lets `reconcile` return it
+    /// directly, so a later ambiguous chain read can never downgrade a confirmed
+    /// or rejected attempt.
+    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
+        let _ = key;
+        Ok(None)
+    }
 
     /// Records the terminal/in-flight outcome for `(key, digest)`.
-    fn record_outcome(
+    async fn record_outcome(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
@@ -157,29 +531,101 @@ pub trait AttemptReservationStore: Send + Sync {
     ) -> Result<(), RelayError>;
 }
 
+/// Marker for a store that claims durable persistence of the full attempt
+/// lifecycle.
+///
+/// Only stores implementing this marker can be passed to the relay's production
+/// constructors ([`ExecutionRelay::production`](crate::ExecutionRelay::production),
+/// `production_with_chain`). The shipped durable adapter is
+/// `execution_store::PostgresExecutionAttemptStore`; the relay's default
+/// composition installs a fail-closed unavailable durable store rather than an
+/// in-memory one.
+///
+/// # Honest scope
+///
+/// This is a type-level claim, not a proof: [`AttemptReservationStore`] keeps
+/// no-op defaults for the durable transitions so the process-local test seam
+/// (`ExecutionRelay::new_with_seams`) stays usable, and a malicious or careless
+/// implementor could satisfy the marker without real durability. Production
+/// composition must inject the Postgres adapter; the default is fail-closed.
+pub trait DurableAttemptStore: AttemptReservationStore {}
+
+#[async_trait]
 impl<T: AttemptReservationStore + ?Sized> AttemptReservationStore for std::sync::Arc<T> {
-    fn reserve(
+    async fn reserve(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<Reservation, RelayError> {
-        (**self).reserve(key, digest)
+        (**self).reserve(key, digest).await
     }
 
-    fn record_signed(
+    async fn reserve_bound(
+        &self,
+        binding: &AttemptBinding,
+        digest: &RequestDigest,
+    ) -> Result<Reservation, RelayError> {
+        (**self).reserve_bound(binding, digest).await
+    }
+
+    async fn record_sign_requested(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        provider_idempotency: &ProviderIdempotencyId,
+    ) -> Result<(), RelayError> {
+        (**self)
+            .record_sign_requested(key, digest, provider_idempotency)
+            .await
+    }
+
+    async fn record_signed(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        (**self).record_signed(key, digest)
+        (**self).record_signed(key, digest).await
     }
 
-    fn record_outcome(
+    async fn record_signed_reference(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        signed_reference: &str,
+    ) -> Result<(), RelayError> {
+        (**self)
+            .record_signed_reference(key, digest, signed_reference)
+            .await
+    }
+
+    async fn record_submission(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        request: &SubmitRequest,
+    ) -> Result<(), RelayError> {
+        (**self).record_submission(key, digest, request).await
+    }
+
+    async fn load_submission(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<DurableSubmission>, RelayError> {
+        (**self).load_submission(key).await
+    }
+
+    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
+        (**self).load_outcome(key).await
+    }
+
+    async fn record_outcome(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
-        (**self).record_outcome(key, digest, outcome)
+        (**self).record_outcome(key, digest, outcome).await
     }
 }
+
+impl<T: DurableAttemptStore + ?Sized> DurableAttemptStore for std::sync::Arc<T> {}

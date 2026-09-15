@@ -60,10 +60,11 @@ pub use plan::{
     SignedExecutionRef, SignedPayload, SignedPayloadSource, SubmitRequest, MAX_SIGNED_PAYLOAD_BYTES,
 };
 pub use relay::{ExecutionRelay, RelayExecutionInput};
-pub use reservation::InMemoryReservationStore;
+pub use reservation::{DeterministicDurableStore, InMemoryReservationStore};
 pub use signing_health::{SigningFailureBreaker, SigningHealth, SigningProbeGuard};
 pub use state::{
-    AttemptReservationStore, ObservedFill, RelayOutcome, Reservation, SubmissionState,
+    AttemptBinding, AttemptReservationStore, AttemptStatus, DurableAttemptStore, DurableSubmission,
+    ObservedFill, RelayOutcome, Reservation, SubmissionState,
 };
 
 /// Acquires a mutex, recovering from poisoning.

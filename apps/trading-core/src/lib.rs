@@ -1,7 +1,9 @@
 //! Phase-0 Trading Core orchestration skeleton. Live execution remains unavailable.
 
 pub mod benchmark;
+pub mod capability;
 pub mod composition;
+pub mod live;
 pub mod service;
 
 use std::sync::Arc;

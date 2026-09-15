@@ -1,0 +1,34 @@
+[package]
+name = "execution-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+postgres-integration = []
+
+[[test]]
+name = "postgres_attempt_store_integration"
+path = "tests/postgres_attempt_store_integration.rs"
+required-features = ["postgres-integration"]
+
+[dependencies]
+async-trait.workspace = true
+chain-types.workspace = true
+domain.workspace = true
+execution-relay.workspace = true
+privy.workspace = true
+storage.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+
+[dev-dependencies]
+market-types.workspace = true
+policy.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

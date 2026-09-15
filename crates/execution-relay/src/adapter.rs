@@ -2,8 +2,11 @@
 //!
 //! No production adapter in this module performs network I/O or real broadcast:
 //! [`UnavailableChainAdapter`] always fails closed, and
-//! [`PrivySigningBoundaryAdapter`] wraps the real P40 boundary whose only public
-//! constructor installs an always-unavailable transport.
+//! [`PrivySigningBoundaryAdapter::new`] wraps the real P40 boundary whose
+//! default constructor installs an always-unavailable transport. A real
+//! transport is installed only through the explicit
+//! [`PrivySigningBoundaryAdapter::with_transport`] review seam (used by
+//! [`ExecutionRelay::production_with_chain`](crate::ExecutionRelay::production_with_chain)).
 
 use std::sync::Arc;
 
@@ -212,6 +215,18 @@ impl PrivySigningBoundaryAdapter {
     pub fn new() -> Self {
         Self {
             inner: PrivySigningBoundary::new(),
+        }
+    }
+
+    /// Builds the production adapter over an operator-injected Privy transport.
+    ///
+    /// The wrapped [`PrivySigningBoundary`] keeps every guarantee: only a fully
+    /// bound [`SigningRequest`] is submitted, the exactly-once ledger is checked
+    /// before the transport runs, and the stable provider idempotency identifier
+    /// is forwarded. There is still no generic signing surface.
+    pub fn with_transport(transport: Box<dyn privy::SigningTransport>) -> Self {
+        Self {
+            inner: PrivySigningBoundary::with_signing_transport(transport),
         }
     }
 }

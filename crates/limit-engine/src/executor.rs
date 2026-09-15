@@ -66,8 +66,8 @@
 use async_trait::async_trait;
 use domain::TradeIntent;
 use execution_relay::{
-    AttemptReservationStore, ChainHealthBreaker, ChainSubmissionAdapter, ExecutionRelay,
-    PrivySigningBoundaryAdapter, RelayError, RelayExecutionInput, RelayOutcome,
+    AttemptReservationStore, ChainHealthBreaker, ChainSubmissionAdapter, DurableAttemptStore,
+    ExecutionRelay, PrivySigningBoundaryAdapter, RelayError, RelayExecutionInput, RelayOutcome,
     SignedPayloadSource, SigningBoundary, UnavailableChainAdapter,
 };
 use policy::{PolicyContext, PolicyEngine};
@@ -115,7 +115,7 @@ where
 
 impl<S, P> RelayAttemptExecutor<S, UnavailableChainAdapter, P, PrivySigningBoundaryAdapter>
 where
-    S: AttemptReservationStore,
+    S: DurableAttemptStore,
     P: SignedPayloadSource,
 {
     /// **Production entry point**: relay over `UnavailableChainAdapter` +
@@ -124,7 +124,8 @@ where
     /// Fail-closed until a real chain adapter and Privy transport are installed
     /// under review: the adapter reports `Unavailable`, so every `execute` fails
     /// before a reservation is claimed, and the Privy boundary's transport is
-    /// always unavailable.
+    /// always unavailable. The store must implement [`DurableAttemptStore`], so a
+    /// live path cannot be composed over process-local bookkeeping.
     pub fn production(
         policy: PolicyEngine,
         store: S,

@@ -166,12 +166,61 @@ impl RequestDigest {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Rehydrates a persisted canonical digest.
+    ///
+    /// This is a durable-adapter seam: a store that persisted a request digest
+    /// uses it to rebuild a bound submission during restart reconciliation. It
+    /// cannot invent a digest that [`SigningRequest::bind`] did not produce,
+    /// because callers only persist digests read from a bound request.
+    #[doc(hidden)]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for RequestDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never print the digest bytes.
         f.debug_struct("RequestDigest").finish_non_exhaustive()
+    }
+}
+
+/// Stable, deterministic provider-side idempotency identifier for a signing
+/// request.
+///
+/// It is derived from the canonical [`RequestDigest`], so a retry of the exact
+/// same bound request reuses the identifier and the provider can collapse it,
+/// while any changed bound field yields a different identifier. It carries no
+/// key material: it is a domain-separated hex encoding of a SHA-256 digest.
+///
+/// `Debug` is redacted; only the transport that sends it to the provider reads
+/// [`ProviderIdempotencyId::as_str`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderIdempotencyId(String);
+
+impl ProviderIdempotencyId {
+    /// Borrows the opaque identifier string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Rehydrates an identifier from its persisted string form.
+    ///
+    /// This is a durable-adapter seam: a store that persisted the provider
+    /// idempotency identifier as text (for restart reconciliation) rebuilds the
+    /// type here. It does not create a signing capability.
+    #[doc(hidden)]
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl fmt::Debug for ProviderIdempotencyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never print the identifier.
+        f.debug_struct("ProviderIdempotencyId")
+            .finish_non_exhaustive()
     }
 }
 
@@ -397,6 +446,19 @@ impl SigningRequest {
     pub fn payload_digest(&self) -> &PayloadDigest {
         &self.payload_digest
     }
+
+    /// Returns the stable provider-side idempotency identifier for this request.
+    ///
+    /// The identifier is `pep-sign-v1-<hex(request_digest)>`: it is stable for
+    /// identical bound requests and changes if any bound field changes, so a
+    /// transport can forward it to a provider that supports idempotent signing
+    /// without ever receiving private signing material.
+    pub fn provider_idempotency_id(&self) -> ProviderIdempotencyId {
+        ProviderIdempotencyId(format!(
+            "pep-sign-v1-{}",
+            hex_lower(self.request_digest.as_bytes())
+        ))
+    }
 }
 
 impl fmt::Debug for SigningRequest {
@@ -474,6 +536,28 @@ fn chain_tag(chain: &ChainId) -> Result<u8, PrivyError> {
     }
 }
 
+/// Public accessor for the canonical chain tag used by the signing digest.
+///
+/// A durable execution store persists this stable tag for restart
+/// reconciliation; exposing it here keeps a single source of truth for the
+/// mapping rather than duplicating it.
+pub fn canonical_chain_tag(chain: &ChainId) -> Result<u8, PrivyError> {
+    chain_tag(chain)
+}
+
+/// Inverse of [`canonical_chain_tag`]; `None` for an unknown tag so a corrupt
+/// persisted row fails closed.
+pub fn chain_from_canonical_tag(tag: u8) -> Option<ChainId> {
+    match tag {
+        0 => Some(ChainId::Solana),
+        1 => Some(ChainId::Base),
+        2 => Some(ChainId::BnbChain),
+        3 => Some(ChainId::Ethereum),
+        4 => Some(ChainId::RobinhoodAssociated),
+        _ => None,
+    }
+}
+
 /// Canonical enum tags for the intent encoding (declaration order).
 fn trade_source_tag(source: TradeSource) -> u8 {
     match source {
@@ -522,6 +606,17 @@ fn push_asset(out: &mut Vec<u8>, asset: &AssetId) -> Result<(), PrivyError> {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Lowercase hex encoding used only for the public provider idempotency id.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn compute_route_digest(route: &RoutePlan) -> Result<RequestDigest, PrivyError> {
@@ -699,7 +794,7 @@ pub(crate) mod test_support {
     use async_trait::async_trait;
 
     use super::SigningRequest;
-    use crate::{PrivyError, SigningTransport};
+    use crate::{PrivyError, ProviderIdempotencyId, SigningTransport};
 
     /// Records how many times the transport was invoked.
     pub(crate) struct CountingTransport {
@@ -717,6 +812,7 @@ pub(crate) mod test_support {
         async fn submit_signing_request(
             &self,
             request: &SigningRequest,
+            _idempotency: &ProviderIdempotencyId,
         ) -> Result<String, PrivyError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(format!("signed-{}", request.intent_id().as_str()))
@@ -731,6 +827,7 @@ pub(crate) mod test_support {
         async fn submit_signing_request(
             &self,
             _request: &SigningRequest,
+            _idempotency: &ProviderIdempotencyId,
         ) -> Result<String, PrivyError> {
             Err(PrivyError::SignerRejected)
         }
@@ -744,6 +841,7 @@ pub(crate) mod test_support {
         async fn submit_signing_request(
             &self,
             _request: &SigningRequest,
+            _idempotency: &ProviderIdempotencyId,
         ) -> Result<String, PrivyError> {
             Ok(String::new())
         }
@@ -991,6 +1089,51 @@ mod tests {
         assert_eq!(
             format!("{:?}", request.request_digest()),
             "RequestDigest { .. }"
+        );
+    }
+
+    #[test]
+    fn provider_idempotency_id_is_stable_and_request_bound() {
+        let first = fixtures::signing_request();
+        let again = fixtures::signing_request();
+        assert_eq!(
+            first.provider_idempotency_id().as_str(),
+            again.provider_idempotency_id().as_str(),
+            "same bound request yields the same provider idempotency id"
+        );
+        assert!(first
+            .provider_idempotency_id()
+            .as_str()
+            .starts_with("pep-sign-v1-"));
+
+        let engine = fixtures::engine();
+        let mut other = fixtures::intent();
+        other.nonce = 8;
+        let approved = fixtures::approved(&engine, &other);
+        let prepared = fixtures::prepared(&other);
+        let route = fixtures::route();
+        let preview = fixtures::execution_preview(&other, &route);
+        let changed = SigningRequest::bind(
+            &engine,
+            &approved,
+            &prepared,
+            &other,
+            &route,
+            &preview,
+            fixtures::payload(),
+            fixtures::NOW_MS,
+        )
+        .expect("changed request binds");
+        assert_ne!(
+            first.provider_idempotency_id().as_str(),
+            changed.provider_idempotency_id().as_str(),
+            "a changed bound field changes the provider idempotency id"
+        );
+
+        // The identifier is opaque through `Debug`.
+        assert_eq!(
+            format!("{:?}", first.provider_idempotency_id()),
+            "ProviderIdempotencyId { .. }"
         );
     }
 

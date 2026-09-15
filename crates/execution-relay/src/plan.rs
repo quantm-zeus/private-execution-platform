@@ -148,6 +148,13 @@ pub struct SubmitRequest {
     request_digest: RequestDigest,
     payload_digest: PayloadDigest,
     signed_reference: String,
+    /// Broadcast/chain reference observed after a successful submission.
+    ///
+    /// Absent before submission and on a freshly bound request. After a
+    /// successful submit the relay (and the durable store) record the chain
+    /// acknowledgement here so reconciliation queries the chain by its own
+    /// reference rather than by the signer's opaque reference.
+    chain_reference: Option<String>,
     payload: Vec<u8>,
 }
 
@@ -189,6 +196,7 @@ impl SubmitRequest {
             request_digest: *signing.request_digest(),
             payload_digest: *signing.payload_digest(),
             signed_reference: signed.reference().to_string(),
+            chain_reference: None,
             payload: payload.bytes().to_vec(),
         })
     }
@@ -218,9 +226,70 @@ impl SubmitRequest {
         &self.signed_reference
     }
 
+    /// The chain acknowledgement reference, once a submission succeeded.
+    ///
+    /// `None` before submission. A reconciling adapter MUST prefer this over
+    /// [`Self::signed_reference`] when present, because the signer reference is
+    /// not necessarily the chain transaction hash.
+    pub fn chain_reference(&self) -> Option<&str> {
+        self.chain_reference.as_deref()
+    }
+
+    /// The reference an adapter should use to query/reconcile this submission:
+    /// the chain reference when known, otherwise the signer reference.
+    pub fn reconciliation_reference(&self) -> &str {
+        self.chain_reference
+            .as_deref()
+            .unwrap_or(&self.signed_reference)
+    }
+
+    /// Records the chain acknowledgement reference on this request.
+    #[must_use]
+    pub fn with_chain_reference(mut self, reference: impl Into<String>) -> Self {
+        let reference = reference.into();
+        if !reference.trim().is_empty() {
+            self.chain_reference = Some(reference);
+        }
+        self
+    }
+
     /// The exact payload bytes to submit.
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Rebuilds a bound submit request from a durably persisted
+    /// [`DurableSubmission`](crate::DurableSubmission).
+    ///
+    /// This is the restart-reconciliation seam: a durable store persists the
+    /// stable binding data before submission, and on restart the relay uses this
+    /// constructor to hand the same request to the adapter's read-only
+    /// `query`/`reconcile`. It re-validates the payload length and digest so a
+    /// corrupt or tampered row fails closed rather than reconciling a different
+    /// transaction. It performs no signing and no submission.
+    #[doc(hidden)]
+    pub fn restore(submission: &crate::state::DurableSubmission) -> Result<Self, RelayError> {
+        let payload = submission.payload();
+        if payload.is_empty() {
+            return Err(RelayError::SignedPayloadEmpty);
+        }
+        if payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
+            return Err(RelayError::SignedPayloadTooLarge);
+        }
+        let recomputed = PayloadDigest::from_bytes(Sha256::digest(payload).into());
+        if recomputed != *submission.payload_digest() {
+            return Err(RelayError::SignedPayloadDigestMismatch);
+        }
+        Ok(Self {
+            intent_id: submission.intent_id().clone(),
+            idempotency_key: submission.idempotency_key().clone(),
+            chain: submission.chain().clone(),
+            request_digest: *submission.request_digest(),
+            payload_digest: *submission.payload_digest(),
+            signed_reference: submission.signed_reference().to_string(),
+            chain_reference: submission.chain_reference().map(str::to_string),
+            payload: payload.to_vec(),
+        })
     }
 }
 
