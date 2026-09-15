@@ -59,16 +59,13 @@ export const ExecutionPanel: Component = () => {
   // client must not hide it behind `twap` or an UNKNOWN execution could never
   // be reconciled. The read stays fail-closed server-side.
   const progressDenial = (): null => null;
-  // ...but it must still wait for the authenticated session to settle. Firing
-  // before bootstrap completes hits the fail-closed command stub, which maps to
-  // a permanent `unavailable` state (the request is one-shot), so gate on the
-  // bootstrap state being ready rather than on `twap`.
-  const progressReady = createMemo(() => {
-    const current = ws.state();
-    return current.kind === "ready" || current.kind === "stale";
-  });
+  // ...but it must still wait for the authenticated encrypted command channel.
+  // Firing before the BR-5 handoff installs the real client hits the fail-closed
+  // stub, which maps to a permanent `unavailable` state (the request is
+  // one-shot), so gate on `commandReady` rather than on `twap`.
+  const progressReady = createMemo(() => ws.commandReady());
 
-  // Load the current execution progress once the authenticated session exists.
+  // Load the current execution progress once the authenticated channel exists.
   let progressRequested = false;
   createEffect(() => {
     if (progressReady() && !progressRequested) {

@@ -70,6 +70,13 @@ export interface WorkspaceStore {
   setSelectedInstrument(ref: InstrumentRef | null): void;
   /** Current encrypted command channel (swapped in after the key handoff). */
   readonly command: CommandClient;
+  /**
+   * True once the authenticated encrypted command channel is installed. Panels
+   * must not issue a command before this: the fail-closed stub answers
+   * `capability_missing`, and a one-shot read would latch a permanent
+   * `unavailable` state instead of waiting for the real channel.
+   */
+  readonly commandReady: Accessor<boolean>;
   setConnection(status: ConnectionStatus): void;
   /** Install the encrypted command channel once a session key is available. */
   setCommand(client: CommandClient): void;
@@ -185,6 +192,9 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
   const [sessionDeadlineMs, setSessionDeadlineMs] = createSignal(0);
   let generation = 0;
   let commandClient: CommandClient = options.command ?? new UnavailableCommandClient();
+  const [commandReady, setCommandReady] = createSignal(
+    !(commandClient instanceof UnavailableCommandClient),
+  );
   // Stable proxy so panels that capture `ws.command` at setup still reach the
   // encrypted client once the host key handoff installs it.
   const commandProxy: CommandClient = {
@@ -290,6 +300,7 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     // Drop the resolved BR-5 key reference so a torn-down workspace does not pin
     // the base64 session keys in a closure.
     hostKeyPromise = null;
+    setCommandReady(false);
     if (ticker !== undefined) {
       window.clearInterval(ticker);
       ticker = undefined;
@@ -311,9 +322,11 @@ export function createWorkspaceStore(options: CreateWorkspaceStoreOptions = {}):
     selectedInstrument,
     setSelectedInstrument,
     command: commandProxy,
+    commandReady,
     setConnection,
     setCommand(client: CommandClient) {
       commandClient = client;
+      setCommandReady(!(client instanceof UnavailableCommandClient));
     },
     dispose,
     reload,
