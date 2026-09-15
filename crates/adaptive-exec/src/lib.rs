@@ -35,8 +35,8 @@ mod plan;
 mod rfq;
 
 pub use analytics::{
-    analyze, AnalyticsError, Delta, DeltaDirection, ExecutionAnalytics, ExecutionEstimate,
-    RealizedExecution,
+    analyze, AnalyticsError, Delta, DeltaDirection, ExecutionAnalytics, ExecutionAnalyticsSink,
+    ExecutionEstimate, NoopExecutionAnalyticsSink, RealizedExecution,
 };
 pub use engine::{AdaptiveTwap, ChunkReason, HaltReason, TwapDecision};
 pub use plan::{MarketObservation, TwapPlan, TwapPolicy, TwapState};

@@ -72,6 +72,7 @@
 //!    target with zero remaining, an all-or-nothing partial fill, and a fill
 //!    that is zero or below `min_fill` are all rejected fail-closed.
 
+pub mod analytics;
 pub mod attempt;
 pub mod error;
 pub mod events;
@@ -85,6 +86,7 @@ pub mod prepare;
 pub mod store;
 pub mod trigger;
 
+pub use analytics::{fill_analytics, ExecutionAnalyticsSink, NoopExecutionAnalyticsSink};
 pub use attempt::{
     attempt_intent_id, attempt_key, attempt_prepared_reference, attempt_stream_blind_index,
     ApprovalSnapshot, AttemptPhase, BoundAttempt, OrderAttemptEvent, RealizedFill,

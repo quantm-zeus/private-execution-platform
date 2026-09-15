@@ -10,6 +10,7 @@ repository.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+adaptive-exec.workspace = true
 async-trait.workspace = true
 chain-types.workspace = true
 crypto-envelope.workspace = true

@@ -1384,6 +1384,7 @@ dependencies = [
 name = "limit-engine"
 version = "0.1.0"
 dependencies = [
+ "adaptive-exec",
  "async-trait",
  "chain-types",
  "crypto-envelope",
