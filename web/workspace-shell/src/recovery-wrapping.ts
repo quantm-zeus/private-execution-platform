@@ -250,7 +250,13 @@ export async function wrapWithPrf(
 ): Promise<WrappedRootKey | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
-  return wrapRootKey(prf, rootKey, salt);
+  try {
+    // `deriveRecoveryWrappingKey` imports the PRF bytes into WebCrypto before
+    // the async boundary returns, so the local copy can be zeroized here.
+    return await wrapRootKey(prf, rootKey, salt);
+  } finally {
+    prf.fill(0);
+  }
 }
 
 export async function unwrapWithPrf(
@@ -259,5 +265,9 @@ export async function unwrapWithPrf(
 ): Promise<Uint8Array | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
-  return unwrapRootKey(prf, record);
+  try {
+    return await unwrapRootKey(prf, record);
+  } finally {
+    prf.fill(0);
+  }
 }

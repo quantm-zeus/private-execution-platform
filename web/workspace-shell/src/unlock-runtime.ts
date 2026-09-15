@@ -324,6 +324,18 @@ export class WorkspaceUnlockRuntime {
   }
 
   /**
+   * Decrypt a server-sealed proof-of-possession challenge with the in-memory
+   * workspace key (the same HPKE recipient the artifact used). Returns the
+   * plaintext nonce; the caller must zeroize it. Fails closed when locked.
+   */
+  public decryptRecoveryChallenge(sealed: Uint8Array): Uint8Array {
+    if (!this.currentKey) {
+      throw new UnlockError("U7_BOOT", "handoff_unavailable");
+    }
+    return this.currentKey.decrypt_artifact(sealed);
+  }
+
+  /**
    * Revoke the payload *document* blob URL once the frame has loaded it.
    */
   public releaseDocumentUrl(url: string): void {
@@ -405,24 +417,27 @@ export class WorkspaceUnlockRuntime {
       // expected recipient fingerprint, a mismatch means the recovery code is
       // for a different release. Checked before the first network await so a
       // wrong-key enrollment never leaves the browser when a release manifest
-      // is configured.
-      if (
-        descriptor.expected_public_key_fingerprint_b64 &&
-        derivedFingerprint !== null &&
-        derivedFingerprint !== descriptor.expected_public_key_fingerprint_b64
-      ) {
-        throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
+      // is configured. A null derived fingerprint (no WebCrypto) is a hard
+      // failure, never a skip: otherwise a wrong code could be enrolled and
+      // only fail much later at artifact decrypt.
+      if (descriptor.expected_public_key_fingerprint_b64) {
+        if (derivedFingerprint === null) {
+          throw new UnlockError("U1_WASM", "wasm_unavailable");
+        }
+        if (derivedFingerprint !== descriptor.expected_public_key_fingerprint_b64) {
+          throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
+        }
       }
       // The session-enrollment fingerprint covers the no-manifest path: it is
       // derived server-side from the key already bound to this session, so a
       // different recovery code is rejected before it can enroll a wrong key.
-      if (
-        descriptor.enrolled &&
-        descriptor.enrolled_public_key_fingerprint_b64 &&
-        derivedFingerprint !== null &&
-        derivedFingerprint !== descriptor.enrolled_public_key_fingerprint_b64
-      ) {
-        throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
+      if (descriptor.enrolled && descriptor.enrolled_public_key_fingerprint_b64) {
+        if (derivedFingerprint === null) {
+          throw new UnlockError("U1_WASM", "wasm_unavailable");
+        }
+        if (derivedFingerprint !== descriptor.enrolled_public_key_fingerprint_b64) {
+          throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
+        }
       }
 
       // U2: bind the workspace key to the session. A page reload or a
@@ -685,22 +700,22 @@ export class WorkspaceUnlockRuntime {
       indexHtml = "<!doctype html><html><body><div id=\"root\"></div></body></html>";
     }
 
-    indexHtml = injectHandoffToken(indexHtml, handoffToken);
-
-    const assetNames = [...files.keys()].filter((name) => name !== "index.html");
-    // Longest paths first, and only at token boundaries, so a short asset name
-    // can never match inside a longer reference and corrupt the HTML.
-    assetNames.sort((a, b) => b.length - a.length);
+    // Rewrite asset references in a SINGLE pass over the original document, so
+    // an already-substituted blob URL is never rescanned and corrupted. Only
+    // path-like names (the production build emits `assets/<name>.<ext>`)
+    // participate, so a bare HTML tag/attribute name (`src`, `style`,
+    // `content`) can never be matched and rewritten. The handoff token is
+    // injected AFTER rewriting, so no asset name can ever rewrite the token or
+    // the meta element that carries it.
+    const assetNames = selectRewritableAssetNames(files.keys());
+    const urls = new Map<string, string>();
     for (const name of assetNames) {
-      const data = files.get(name)!;
-      const mime = getMimeType(name);
-      const url = createSafeBlobUrl(data, mime, this.activeUrls);
-
-      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`(?<![\\w./-])(?:\\./|/)?${escaped}(?![\\w.-])`, "g");
-      indexHtml = indexHtml.replace(pattern, url);
+      urls.set(
+        name,
+        createSafeBlobUrl(files.get(name)!, getMimeType(name), this.activeUrls),
+      );
     }
-
+    indexHtml = buildPayloadDocument(indexHtml, assetNames, urls, handoffToken);
     return createSafeBlobUrl(indexHtml, "text/html", this.activeUrls);
   }
 
@@ -750,9 +765,63 @@ function generateHandoffToken(): string {
 }
 
 /**
- * Inject the handoff token into the payload document as a `<meta>` element.
+ * Only path-like package entries participate in reference rewriting. The
+ * production build emits `assets/<name>.<ext>`; a bare HTML tag/attribute name
+ * (`src`, `style`, `content`, `meta`) must never be rewritten, or the document
+ * itself would be corrupted.
  */
-function injectHandoffToken(html: string, token: string): string {
+export function selectRewritableAssetNames(names: Iterable<string>): string[] {
+  return [...names]
+    .filter(
+      (name) => name !== "index.html" && (name.includes("/") || name.includes(".")),
+    )
+    .sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Single-pass asset-reference rewrite.
+ *
+ * Every asset name is substituted in one pass over the original document, so an
+ * already-inserted blob URL can never be rescanned and corrupted by a later,
+ * shorter name. The caller must inject the handoff token *after* this function
+ * returns; the token/meta element is never in scope of an asset match.
+ */
+export function rewriteAssetReferencesInHtml(
+  html: string,
+  assetNames: string[],
+  urlByName: Map<string, string>,
+): string {
+  if (assetNames.length === 0) return html;
+  const alternation = assetNames
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const pattern = new RegExp(
+    `(?<![\\w./-])(?:\\./|/)?(${alternation})(?![\\w.-])`,
+    "g",
+  );
+  return html.replace(pattern, (match, name: string) => urlByName.get(name) ?? match);
+}
+
+/**
+ * Assemble the in-memory payload document: rewrite asset references first, then
+ * inject the handoff token. The order is a security property, not a preference —
+ * a package file named `content`/`meta` must never be able to rewrite the token
+ * meta element that binds key delivery to this document.
+ */
+export function buildPayloadDocument(
+  indexHtml: string,
+  assetNames: string[],
+  urlByName: Map<string, string>,
+  handoffToken: string,
+): string {
+  return injectHandoffToken(
+    rewriteAssetReferencesInHtml(indexHtml, assetNames, urlByName),
+    handoffToken,
+  );
+}
+
+/** Inject the handoff token into the payload document as a `<meta>` element. */
+export function injectHandoffToken(html: string, token: string): string {
   const meta = `<meta name="evergreen-handoff" content="${token}">`;
   const head = /<head(?:\s[^>]*)?>/i.exec(html);
   if (head) {

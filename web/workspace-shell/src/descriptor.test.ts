@@ -48,6 +48,14 @@ test("rejects malformed descriptor shapes", () => {
     {},
     { ...VALID, protocol_version: "1" },
     { ...VALID, artifact_kid_b64: undefined },
+    { ...VALID, artifact_kid_b64: "" },
+    { ...VALID, artifact_size: -1 },
+    { ...VALID, artifact_size: "1024" },
+    { ...VALID, artifact_size: undefined },
+    { ...VALID, artifact_sha256_hex: "xyz" },
+    { ...VALID, artifact_sha256_hex: "AB".repeat(32) },
+    { ...VALID, artifact_sha256_hex: undefined },
+    { ...VALID, package_format_version: 1.5 },
     { ...VALID, min_shell_protocol: 2, max_shell_protocol: 1 },
   ]) {
     assert.throws(

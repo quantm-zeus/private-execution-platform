@@ -42,7 +42,8 @@ test("offline recovery secret wraps and unwraps a root key", async () => {
   const record = await wrapWithRecoverySecret(rootKey, SECRET);
   assert.equal(record.version, RECOVERY_WRAPPER_VERSION);
   assert.equal(record.algorithm, RECOVERY_WRAP_ALGORITHM);
-  assert.ok(!record.wrapped_root_key_b64.includes("\n"));
+  // 32-byte root key + 16-byte AES-GCM tag.
+  assert.equal(atob(record.wrapped_root_key_b64).length, 48);
   const unwrapped = await unwrapWithRecoverySecret(record, SECRET);
   assert.deepEqual(unwrapped, rootKey);
 });

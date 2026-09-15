@@ -34,12 +34,14 @@ use subtle::ConstantTimeEq;
 pub mod opaque;
 pub mod passkey_store;
 pub mod production;
+pub mod recovery;
 pub mod release;
 pub mod stream;
 pub mod web_contract;
 pub mod web_integration;
 
 pub use passkey_store::FilePasskeyCredentialStore;
+pub use recovery::{FileRecoveryWrapperStore, RecoveryWrapperStore};
 pub use release::{
     ArtifactDescriptor, DescriptorError, EnrollmentSnapshot, ReleaseManifest, UnlockCompatibility,
     RELEASE_MANIFEST_ENV, WORKSPACE_PROTOCOL_VERSION,
@@ -262,6 +264,15 @@ impl TransportState {
 
 type ArtifactLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
 
+/// Cheap header-only artifact loader used by the unauthenticated readiness probe
+/// so a health check never reads, copies, or hashes the whole artifact.
+type ArtifactHeaderLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
+
+/// Injectable release-manifest loader. Production reads the operator-configured
+/// path; tests inject a hermetic manifest instead of mutating process env.
+type ManifestLoader =
+    Arc<dyn Fn() -> Result<Option<ReleaseManifest>, DescriptorError> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PrivateApiState {
     config: PrivateApiConfig,
@@ -270,6 +281,15 @@ pub struct PrivateApiState {
     authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
     clock: Arc<dyn Clock>,
     artifact_loader: ArtifactLoader,
+    /// Header-only artifact read for the readiness probe.
+    artifact_header_loader: ArtifactHeaderLoader,
+    /// Release-manifest loader (production reads the operator path).
+    manifest_loader: ManifestLoader,
+    /// Optional durable passkey-bound recovery wrapper store. `None` keeps the
+    /// recovery surface closed (all recovery routes answer 503).
+    recovery_store: Option<Arc<dyn RecoveryWrapperStore>>,
+    /// Bounded, in-memory proof-of-possession challenges for wrapper mutation.
+    recovery_challenges: Arc<Mutex<recovery::RecoveryChallengeState>>,
     /// Established browser transport sessions (BR-5 key epoch). Shared with the
     /// opaque command/bootstrap/sync service.
     sessions: Arc<Mutex<session_transport::SessionRegistry>>,
@@ -307,6 +327,10 @@ impl PrivateApiState {
             authenticator: None,
             clock: Arc::new(SystemClock),
             artifact_loader: Arc::new(load_workspace_artifact),
+            artifact_header_loader: Arc::new(load_workspace_artifact_header),
+            manifest_loader: Arc::new(release::load_release_manifest_from_env),
+            recovery_store: None,
+            recovery_challenges: Arc::new(Mutex::new(recovery::RecoveryChallengeState::default())),
             sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
             enrollment_secret: None,
             allow_additional_credentials: false,
@@ -400,6 +424,10 @@ impl PrivateApiState {
             authenticator,
             clock,
             artifact_loader: Arc::new(load_workspace_artifact),
+            artifact_header_loader: Arc::new(load_workspace_artifact_header),
+            manifest_loader: Arc::new(release::load_release_manifest_from_env),
+            recovery_store: None,
+            recovery_challenges: Arc::new(Mutex::new(recovery::RecoveryChallengeState::default())),
             sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
             enrollment_secret: None,
             allow_additional_credentials: false,
@@ -421,9 +449,51 @@ impl PrivateApiState {
             .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
     }
 
+    /// Read only the bounded artifact header for the readiness probe.
+    async fn load_artifact_header(&self) -> Result<Vec<u8>, StatusCode> {
+        let loader = self.artifact_header_loader.clone();
+        tokio::task::spawn_blocking(move || loader())
+            .await
+            .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
+    }
+
+    /// Load the optional release manifest off the async runtime.
+    async fn load_manifest(&self) -> Result<Option<ReleaseManifest>, DescriptorError> {
+        let loader = self.manifest_loader.clone();
+        tokio::task::spawn_blocking(move || loader())
+            .await
+            .unwrap_or(Err(DescriptorError::ManifestInvalid))
+    }
+
+    /// Attach an optional durable recovery wrapper store. Additive: without it
+    /// the recovery surface stays closed and the offline recovery code is the
+    /// only credential.
+    pub fn with_recovery_store(mut self, store: Arc<dyn RecoveryWrapperStore>) -> Self {
+        self.recovery_store = Some(store);
+        self
+    }
+
+    /// Whether passkey recovery enrollment/management is configured.
+    pub fn recovery_enabled(&self) -> bool {
+        self.recovery_store.is_some()
+    }
+
     #[cfg(test)]
     fn with_artifact_loader(mut self, loader: ArtifactLoader) -> Self {
-        self.artifact_loader = loader;
+        self.artifact_loader = loader.clone();
+        self.artifact_header_loader = Arc::new(move || {
+            let bytes = loader()?;
+            if bytes.len() < crypto_envelope::ARTIFACT_HEADER_LEN {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Ok(bytes[..crypto_envelope::ARTIFACT_HEADER_LEN].to_vec())
+        });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_manifest_loader(mut self, loader: ManifestLoader) -> Self {
+        self.manifest_loader = loader;
         self
     }
 }
@@ -453,6 +523,22 @@ pub fn router(state: PrivateApiState) -> Router {
             "/internal/workspace/descriptor",
             get(get_workspace_descriptor_handler),
         )
+        .route(
+            "/internal/workspace/recovery",
+            get(list_recovery_wrappers).post(add_recovery_wrapper),
+        )
+        .route(
+            "/internal/workspace/recovery/challenge",
+            post(issue_recovery_challenge),
+        )
+        .route(
+            "/internal/workspace/recovery/revoke",
+            post(revoke_recovery_wrapper),
+        )
+        .route(
+            "/internal/workspace/recovery/touch",
+            post(touch_recovery_wrapper),
+        )
         .route("/internal/artifact/grant", post(issue_artifact_grant))
         .route("/internal/artifact", post(deliver_artifact))
         .layer(DefaultBodyLimit::max(
@@ -477,28 +563,35 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
-    let (artifact_ok, manifest_ok) = match state.load_artifact().await {
-        Ok(artifact) => {
-            // Header parse plus (when a manifest is configured) the manifest
-            // digest. The artifact was already size-bounded by the loader, and
-            // the read runs on the blocking pool so it cannot stall workers.
-            let header_ok = crypto_envelope::ArtifactEnvelope::from_bytes(&artifact).is_ok();
-            match release::load_release_manifest_from_env() {
-                Ok(Some(manifest)) => (
-                    header_ok,
-                    header_ok && manifest.validate_against(&artifact).is_ok(),
-                ),
-                Ok(None) => (header_ok, true),
-                Err(_) => (header_ok, false),
-            }
-        }
+    // Read only the bounded artifact header (never the full ciphertext) and any
+    // configured manifest, then compare the public version/KID binding. The full
+    // byte-level manifest digest is enforced on the authenticated descriptor and
+    // before delivery, so the unauthenticated probe stays cheap.
+    let (artifact_ok, manifest_ok) = match state.load_artifact_header().await {
+        Ok(header) => match release::parse_artifact_header(&header) {
+            Ok(parsed) => match state.load_manifest().await {
+                Ok(Some(manifest)) => (true, manifest.validate_header_against(&parsed).is_ok()),
+                Ok(None) => (true, true),
+                Err(_) => (true, false),
+            },
+            Err(_) => (false, false),
+        },
         Err(_) => (false, false),
     };
+    // A configured passkey store that cannot be read is not ready; an absent
+    // authenticator in production means every auth route is 503, so it is also
+    // not ready rather than a false-positive healthy dependency.
     let passkey_store_ok = match state.authenticator.as_ref() {
         Some(authenticator) => authenticator.has_credentials().is_ok(),
+        None => false,
+    };
+    // Recovery wrappers are optional: when the store is configured it must be
+    // readable, otherwise it is not a dependency.
+    let recovery_ok = match state.recovery_store.as_ref() {
+        Some(store) => store.list().is_ok(),
         None => true,
     };
-    let ready = relay_ok && artifact_ok && manifest_ok && passkey_store_ok;
+    let ready = relay_ok && artifact_ok && manifest_ok && passkey_store_ok && recovery_ok;
     let body = serde_json::json!({
         "ready": ready,
         "checks": {
@@ -506,6 +599,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
             "artifact": artifact_ok,
             "release_manifest": manifest_ok,
             "passkey_store": passkey_store_ok,
+            "recovery_store": recovery_ok,
         }
     })
     .to_string();
@@ -1115,7 +1209,7 @@ async fn get_workspace_descriptor_handler(
         Ok(artifact) => artifact,
         Err(status) => return generic_error(status),
     };
-    let manifest = match release::load_release_manifest_from_env() {
+    let manifest = match state.load_manifest().await {
         Ok(manifest) => manifest,
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
@@ -1136,6 +1230,324 @@ async fn get_workspace_descriptor_handler(
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
     no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
+const RECOVERY_WRAPPER_REQUEST_BYTES: usize = 8192;
+
+#[derive(serde::Serialize)]
+struct RecoveryChallengeResponse {
+    challenge_id: String,
+    sealed_challenge_b64: String,
+    expires_in_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryWrapperUpsertRequest {
+    challenge_id: String,
+    proof_b64: String,
+    wrapper: recovery::RecoveryWrapperInput,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryRevokeRequest {
+    challenge_id: String,
+    proof_b64: String,
+    credential_id_b64: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoveryTouchRequest {
+    credential_id_b64: String,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryWrapperListResponse {
+    wrappers: Vec<recovery::RecoveryWrapperRecord>,
+}
+
+/// Consume a single-use proof-of-possession challenge and compare the returned
+/// nonce in constant time. Always consumes the challenge, success or failure.
+fn consume_recovery_proof(
+    state: &PrivateApiState,
+    now_ms: i64,
+    session_id: &SessionId,
+    challenge_id: &str,
+    proof_b64: &str,
+) -> bool {
+    let expected = match state.recovery_challenges.lock() {
+        Ok(mut challenges) => challenges.consume(now_ms, challenge_id, session_id),
+        Err(_) => return false,
+    };
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(proof) = release::decode_canonical_b64(proof_b64, recovery::RECOVERY_CHALLENGE_BYTES)
+    else {
+        return false;
+    };
+    recovery::proof_matches(&proof, &expected)
+}
+
+/// Validate a client-supplied credential id (canonical base64, bounded).
+fn decode_recovery_credential_id(input: &str) -> Option<String> {
+    let bytes = release::decode_canonical_b64_variable(input)?;
+    if bytes.is_empty() || bytes.len() > recovery::MAX_CREDENTIAL_ID_BYTES {
+        return None;
+    }
+    Some(base64_encode(&bytes))
+}
+
+/// Prove possession of the workspace key, then return a single-use challenge
+/// sealed to the enrolled workspace public key.
+///
+/// This is the authorization gate for adding or revoking a recovery wrapper: a
+/// caller must already hold an existing trusted recovery factor (the workspace
+/// key derivable from the offline recovery code or a previously wrapped
+/// passkey). A bare authenticated session is not sufficient. The server learns
+/// nothing about the secret and never validates a guess at it.
+async fn issue_recovery_challenge(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    if state.recovery_store.is_none() {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let artifact = match state.load_artifact().await {
+        Ok(artifact) => artifact,
+        Err(status) => return generic_error(status),
+    };
+    // The recipient fingerprint in an immutable manifest is what stops an
+    // attacker enrolling a key they control and self-approving. Without a
+    // manifest there is no trusted recipient binding, so recovery mutation stays
+    // closed rather than trusting the session enrollment alone.
+    let manifest = match state.load_manifest().await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return typed_error(StatusCode::CONFLICT, "recovery_manifest_required"),
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let enrollment = match enrollment_snapshot(&state, &session_id, now) {
+        EnrollmentLookup::Enrolled(snapshot) => snapshot,
+        EnrollmentLookup::NotEnrolled => {
+            return typed_error(StatusCode::CONFLICT, "enrollment_required")
+        }
+        EnrollmentLookup::Unavailable => {
+            return clear_session(generic_error(StatusCode::UNAUTHORIZED))
+        }
+    };
+    if release::preflight(&artifact, Some(&enrollment), Some(&manifest))
+        != release::UnlockCompatibility::Ok
+    {
+        return typed_error(StatusCode::CONFLICT, "artifact_incompatible");
+    }
+    let envelope = match crypto_envelope::ArtifactEnvelope::from_bytes(&artifact) {
+        Ok(envelope) => envelope,
+        Err(_) => return typed_error(StatusCode::CONFLICT, "artifact_incompatible"),
+    };
+    let mut nonce = [0u8; recovery::RECOVERY_CHALLENGE_BYTES];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let sealed = match crypto_envelope::seal_artifact(
+        &crypto_envelope::hpke::HpkePublicKey(enrollment.public_key),
+        envelope.version,
+        &envelope.kid,
+        &nonce,
+    ) {
+        Ok(sealed) => sealed,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut challenge_id_bytes = [0u8; recovery::RECOVERY_CHALLENGE_ID_BYTES];
+    if getrandom::getrandom(&mut challenge_id_bytes).is_err() {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let challenge_id = hex_encode(&challenge_id_bytes);
+    let issued = match state.recovery_challenges.lock() {
+        Ok(mut challenges) => {
+            challenges.issue(now, session_id, challenge_id.clone(), nonce.to_vec())
+        }
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if issued.is_err() {
+        return generic_error(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let body = match serde_json::to_vec(&RecoveryChallengeResponse {
+        challenge_id,
+        sealed_challenge_b64: base64_encode(&sealed),
+        expires_in_ms: recovery::RECOVERY_CHALLENGE_TTL_MS,
+    }) {
+        Ok(body) => body,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
+/// List the stored recovery wrappers (public metadata plus opaque ciphertext).
+/// Read-only and non-destructive, so it only requires an authenticated session.
+async fn list_recovery_wrappers(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Some(_session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let wrappers = match store.list() {
+        Ok(wrappers) => wrappers,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let body = match serde_json::to_vec(&RecoveryWrapperListResponse { wrappers }) {
+        Ok(body) => body,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
+/// Add or replace a recovery wrapper. Requires a valid proof-of-possession
+/// challenge (an existing trusted recovery factor).
+async fn add_recovery_wrapper(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body_bytes = match to_bytes(body, RECOVERY_WRAPPER_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: RecoveryWrapperUpsertRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    let record = match request.wrapper.into_record(now) {
+        Ok(record) => record,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    if !consume_recovery_proof(
+        &state,
+        now,
+        &session_id,
+        &request.challenge_id,
+        &request.proof_b64,
+    ) {
+        return generic_error(StatusCode::UNAUTHORIZED);
+    }
+    match store.upsert(record) {
+        Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(AuthError::CredentialConflict) => generic_error(StatusCode::CONFLICT),
+        Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Soft-revoke a recovery wrapper. Requires the same proof-of-possession as
+/// adding one, so a bare session cannot destroy a trusted credential.
+async fn revoke_recovery_wrapper(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body_bytes = match to_bytes(body, RECOVERY_WRAPPER_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: RecoveryRevokeRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    let Some(credential_id) = decode_recovery_credential_id(&request.credential_id_b64) else {
+        return generic_error(StatusCode::BAD_REQUEST);
+    };
+    if !consume_recovery_proof(
+        &state,
+        now,
+        &session_id,
+        &request.challenge_id,
+        &request.proof_b64,
+    ) {
+        return generic_error(StatusCode::UNAUTHORIZED);
+    }
+    match store.revoke(&credential_id, now) {
+        Ok(true) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Ok(false) => generic_error(StatusCode::NOT_FOUND),
+        Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Record a coarse last-used timestamp. Non-authoritative (a client can only
+/// report a wrapper it can name) and therefore only session-authenticated.
+async fn touch_recovery_wrapper(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(_session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body_bytes = match to_bytes(body, RECOVERY_WRAPPER_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: RecoveryTouchRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    let Some(credential_id) = decode_recovery_credential_id(&request.credential_id_b64) else {
+        return generic_error(StatusCode::BAD_REQUEST);
+    };
+    match store.touch(&credential_id, now) {
+        Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 const ARTIFACT_GRANT_COOKIE_NAME: &str = "__Host-evergreen_grant";
@@ -1281,6 +1693,34 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     Ok(bytes)
 }
 
+/// Read only the bounded artifact header (version + KID + encapsulated key) for
+/// the unauthenticated readiness probe. This never allocates or hashes the full
+/// ciphertext, so a probe cannot be used to amplify memory/CPU.
+fn load_workspace_artifact_header() -> Result<Vec<u8>, StatusCode> {
+    use std::io::Read;
+
+    let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    if path.is_empty() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let metadata = std::fs::metadata(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let header_len = crypto_envelope::ARTIFACT_HEADER_LEN as u64;
+    if !metadata.is_file()
+        || metadata.len() < header_len
+        || metadata.len() > MAX_ARTIFACT_BYTES as u64
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let file = std::fs::File::open(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut header = vec![0u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+    file.take(header_len)
+        .read_exact(&mut header)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(header)
+}
+
 async fn deliver_artifact(
     State(state): State<PrivateApiState>,
     headers: HeaderMap,
@@ -1349,7 +1789,7 @@ async fn deliver_artifact(
     // server cannot verify the recipient key, so a wrong key falls through to
     // the browser's fail-closed `decrypt_artifact`. It compares only public
     // metadata, so it is not a secret-validation oracle.
-    let manifest = match release::load_release_manifest_from_env() {
+    let manifest = match state.load_manifest().await {
         Ok(manifest) => manifest,
         Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
     };
@@ -4669,5 +5109,309 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["artifact"], false);
+    }
+
+    // ---- Passkey-bound recovery wrapper tests ----
+
+    fn recovery_state(
+        clock: Arc<FixedClock>,
+    ) -> (PrivateApiState, TestRegistrationClient, tempfile::TempDir) {
+        let (state, client) = test_state(clock);
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileRecoveryWrapperStore::open(directory.path().join("recovery.json")).unwrap();
+        (
+            state.with_recovery_store(Arc::new(store)),
+            client,
+            directory,
+        )
+    }
+
+    fn test_manifest(
+        artifact: &[u8],
+        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+    ) -> release::ReleaseManifest {
+        release::ReleaseManifest {
+            manifest_version: release::MANIFEST_VERSION,
+            release_id: "release-recovery-test".into(),
+            source_sha: "9a5a712".into(),
+            artifact: release::ManifestArtifact {
+                version: auth::ARTIFACT_VERSION,
+                kid_b64: base64_encode(&keypair.kid()),
+                sha256_hex: release::sha256_hex(artifact),
+                size: artifact.len() as u64,
+                package_format_version: release::PACKAGE_FORMAT_VERSION,
+            },
+            recipient: release::ManifestRecipient {
+                public_key_fingerprint_b64: release::public_key_fingerprint_b64(
+                    &keypair.public_key_bytes(),
+                ),
+            },
+            workspace_protocol: release::ManifestProtocol {
+                min: release::WORKSPACE_PROTOCOL_VERSION,
+                max: release::WORKSPACE_PROTOCOL_VERSION,
+            },
+            shell: None,
+        }
+    }
+
+    /// Inject a real sealed artifact and its matching immutable manifest into a
+    /// test state, so recovery tests are hermetic (no process-global env).
+    fn recovery_release_state(
+        state: PrivateApiState,
+        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+    ) -> PrivateApiState {
+        let package = pack_test_files(&[("index.html", b"ok")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let manifest = test_manifest(&artifact, keypair);
+        let artifact_copy = artifact.clone();
+        state
+            .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
+            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))))
+    }
+
+    async fn issue_recovery(state: &PrivateApiState, session_cookie: &str) -> (String, Vec<u8>) {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workspace/recovery/challenge")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "recovery challenge body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (
+            parsed["challenge_id"].as_str().unwrap().to_string(),
+            base64::decode::<97>(parsed["sealed_challenge_b64"].as_str().unwrap()).to_vec(),
+        )
+    }
+
+    fn wrapper_body(challenge_id: &str, proof_b64: &str) -> serde_json::Value {
+        serde_json::json!({
+            "challenge_id": challenge_id,
+            "proof_b64": proof_b64,
+            "wrapper": {
+                "credential_id_b64": base64_encode(&[0x11; 32]),
+                "label": "Test device",
+                "version": recovery::RECOVERY_WRAPPER_VERSION,
+                "algorithm": recovery::RECOVERY_ALGORITHM,
+                "key_source": recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1,
+                "salt_b64": base64_encode(&[0x22; recovery::RECOVERY_SALT_BYTES]),
+                "iv_b64": base64_encode(&[0x33; recovery::RECOVERY_IV_BYTES]),
+                "wrapped_root_key_b64": base64_encode(&[0x44; recovery::WRAPPED_ROOT_KEY_BYTES]),
+            }
+        })
+    }
+
+    async fn post_json(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        uri: &'static str,
+        body: serde_json::Value,
+    ) -> Response {
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.to_string())
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_wrapper_lifecycle_requires_proof_of_possession() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let keypair = test_keypair(0x91, 0x92);
+        let state = recovery_release_state(state, &keypair);
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+
+        // Add a wrapper using a valid proof of possession.
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let proof = base64_encode(&nonce);
+        let response = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery",
+            wrapper_body(&challenge_id, &proof),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The wrapper is listed (public metadata + opaque ciphertext only).
+        let listed = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/recovery")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = listed.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["wrappers"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["wrappers"][0]["key_source"], "unlock_secret_v1");
+        assert!(parsed["wrappers"][0]["wrapped_root_key_b64"].is_string());
+
+        // A wrong proof is rejected and consumes the challenge.
+        let (wrong_challenge_id, wrong_sealed) = issue_recovery(&state, &session_cookie).await;
+        let correct_nonce = crypto_envelope::decrypt_artifact(&keypair, &wrong_sealed).unwrap();
+        let wrong = base64_encode(&[0u8; recovery::RECOVERY_CHALLENGE_BYTES]);
+        let response = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery",
+            wrapper_body(&wrong_challenge_id, &wrong),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The consumed challenge cannot be replayed even with the correct nonce.
+        let replay = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery",
+            wrapper_body(&wrong_challenge_id, &base64_encode(&correct_nonce)),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        // Revoke needs a fresh proof.
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let revoke = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery/revoke",
+            serde_json::json!({
+                "challenge_id": challenge_id,
+                "proof_b64": base64_encode(&nonce),
+                "credential_id_b64": base64_encode(&[0x11; 32]),
+            }),
+        )
+        .await;
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn recovery_challenge_fails_closed() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let keypair = test_keypair(0x93, 0x94);
+
+        // No artifact/manifest configured: fail closed, never trust the session
+        // enrollment alone. Injected loaders keep this hermetic (no process env).
+        let unconfigured = state
+            .clone()
+            .with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)))
+            .with_manifest_loader(Arc::new(|| Ok(None)));
+        let missing = post_raw(
+            &unconfigured,
+            &session_cookie,
+            "/internal/workspace/recovery/challenge",
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Inject a real artifact + matching manifest and enroll the workspace key.
+        let state = recovery_release_state(state, &keypair);
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        assert_eq!(
+            challenge_id.len(),
+            recovery::RECOVERY_CHALLENGE_ID_BYTES * 2
+        );
+        assert_eq!(sealed.len(), 97);
+
+        // Unauthenticated callers are rejected before any check.
+        let anonymous = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workspace/recovery/challenge")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn post_raw(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        uri: &'static str,
+    ) -> Response {
+        router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_surface_is_closed_without_a_store() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        assert!(!state.recovery_enabled());
+        let response = post_raw(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery/challenge",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let listed = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/recovery")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

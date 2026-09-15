@@ -137,4 +137,33 @@ test.describe("shell artifact unlock", () => {
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
     await expect(page.getByText("Workspace locked.")).toBeVisible();
   });
+
+  test("offers no recovery-passkey control when the server reports none", async ({ page, request }) => {
+    const info = await unlockInfo(request);
+    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
+
+    await unlock(page, info);
+    // The test host does not configure the recovery wrapper store, so the shell
+    // must not advertise a passkey-recovery path it cannot complete. The offline
+    // recovery code remains the only credential.
+    await expect(
+      page.getByRole("button", { name: "Unlock with a recovery passkey" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("heading", { name: "Trusted recovery credentials" }),
+    ).toHaveCount(0);
+  });
+
+  test("descriptor failure offers a retry instead of a dead end", async ({ page }) => {
+    await page.route("**/internal/workspace/descriptor", (route) =>
+      route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "unavailable" }),
+      }),
+    );
+    await page.goto(`${SHELL_ORIGIN}/`);
+    await expect(page.getByRole("button", { name: "Retry release check" })).toBeVisible();
+    await expect(page.locator("#recovery-code")).toHaveCount(0);
+  });
 });

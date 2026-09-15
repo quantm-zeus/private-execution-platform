@@ -73,8 +73,8 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Decode canonical standard base64 with an exact expected length.
-pub(crate) fn decode_canonical_b64(input: &str, expected_len: usize) -> Option<Vec<u8>> {
+/// Decode canonical standard base64 without constraining the output length.
+pub(crate) fn decode_canonical_b64_variable(input: &str) -> Option<Vec<u8>> {
     if !input.is_ascii() {
         return None;
     }
@@ -82,7 +82,7 @@ pub(crate) fn decode_canonical_b64(input: &str, expected_len: usize) -> Option<V
     if bytes.len() % 4 != 0 {
         return None;
     }
-    let mut out = Vec::with_capacity(expected_len);
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     let mut pad = 0usize;
@@ -116,14 +116,17 @@ pub(crate) fn decode_canonical_b64(input: &str, expected_len: usize) -> Option<V
             out.push(((acc >> bits) & 0xff) as u8);
         }
     }
-    if out.len() != expected_len {
-        return None;
-    }
     // Reject non-canonical encodings (e.g. trailing bits set).
     if base64_encode(&out) != input {
         return None;
     }
     Some(out)
+}
+
+/// Decode canonical standard base64 with an exact expected length.
+pub(crate) fn decode_canonical_b64(input: &str, expected_len: usize) -> Option<Vec<u8>> {
+    let out = decode_canonical_b64_variable(input)?;
+    (out.len() == expected_len).then_some(out)
 }
 
 /// Minimal snapshot of the authenticated workspace enrollment needed by the
@@ -184,43 +187,7 @@ pub struct ManifestShell {
 impl ReleaseManifest {
     /// Validate that this manifest describes exactly these artifact bytes.
     pub fn validate_against(&self, artifact: &[u8]) -> Result<(), DescriptorError> {
-        if self.manifest_version != MANIFEST_VERSION {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if self.release_id.trim().is_empty() || self.source_sha.trim().is_empty() {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if self.release_id.len() > MAX_RELEASE_ID_BYTES
-            || self.source_sha.len() > MAX_SOURCE_SHA_BYTES
-            || self.artifact.kid_b64.len() > MAX_DIGEST_HEX_BYTES
-            || self.artifact.sha256_hex.len() > MAX_DIGEST_HEX_BYTES
-        {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if self.artifact.package_format_version != PACKAGE_FORMAT_VERSION {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if self.workspace_protocol.min > self.workspace_protocol.max
-            || self.workspace_protocol.min > WORKSPACE_PROTOCOL_VERSION
-            || self.workspace_protocol.max < WORKSPACE_PROTOCOL_VERSION
-        {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if decode_canonical_b64(&self.recipient.public_key_fingerprint_b64, 32).is_none() {
-            return Err(DescriptorError::ManifestInvalid);
-        }
-        if let Some(shell) = &self.shell {
-            // The release tool emits exactly 64 lowercase hex chars; require the
-            // same so a lax manifest cannot bind a differently-shaped digest.
-            if shell.asset_digest_hex.len() != 64
-                || !shell
-                    .asset_digest_hex
-                    .bytes()
-                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            {
-                return Err(DescriptorError::ManifestInvalid);
-            }
-        }
+        self.validate_shape()?;
 
         let envelope = ArtifactEnvelope::from_bytes(artifact)
             .map_err(|_| DescriptorError::ArtifactUnavailable)?;
@@ -247,21 +214,38 @@ impl ReleaseManifest {
 /// deployments keep working. A configured-but-broken manifest is an error and
 /// must not be silently ignored.
 pub fn load_release_manifest_from_env() -> Result<Option<ReleaseManifest>, DescriptorError> {
-    let path = match std::env::var(RELEASE_MANIFEST_ENV) {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
-    };
-    load_release_manifest_from(std::path::Path::new(&path)).map(Some)
+    match std::env::var(RELEASE_MANIFEST_ENV) {
+        Ok(value) if !value.trim().is_empty() => {
+            load_release_manifest_from(std::path::Path::new(value.trim())).map(Some)
+        }
+        // Present but blank is a misconfiguration, not "unset": fail closed
+        // rather than silently dropping the recipient-fingerprint binding.
+        Ok(_) => Err(DescriptorError::ManifestInvalid),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(DescriptorError::ManifestInvalid),
+    }
 }
 
 /// Read and parse a manifest from an explicit path, bounding the read. Exposed
 /// to tests without touching process-global environment state.
 fn load_release_manifest_from(path: &std::path::Path) -> Result<ReleaseManifest, DescriptorError> {
+    use std::io::Read;
+
     let metadata = std::fs::metadata(path).map_err(|_| DescriptorError::ManifestInvalid)?;
     if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
         return Err(DescriptorError::ManifestInvalid);
     }
-    let bytes = std::fs::read(path).map_err(|_| DescriptorError::ManifestInvalid)?;
+    // Bound the read with `take` as well as the metadata check, so a file that
+    // grows between the metadata call and the read cannot force an unbounded
+    // allocation.
+    let file = std::fs::File::open(path).map_err(|_| DescriptorError::ManifestInvalid)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DescriptorError::ManifestInvalid)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(DescriptorError::ManifestInvalid);
+    }
     serde_json::from_slice(&bytes).map_err(|_| DescriptorError::ManifestInvalid)
 }
 
@@ -302,6 +286,84 @@ pub fn preflight(
         }
     }
     UnlockCompatibility::Ok
+}
+
+/// Public artifact header fields parsed without copying the ciphertext. Used by
+/// the unauthenticated readiness probe so a health check never allocates,
+/// copies, or hashes the full artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactHeader {
+    pub version: u8,
+    pub kid: [u8; auth::WORKSPACE_KID_BYTES],
+}
+
+/// Parse exactly the bounded artifact header (`version || kid`).
+pub fn parse_artifact_header(header: &[u8]) -> Result<ArtifactHeader, DescriptorError> {
+    if header.len() < crypto_envelope::ARTIFACT_HEADER_LEN {
+        return Err(DescriptorError::ArtifactUnavailable);
+    }
+    let mut kid = [0u8; auth::WORKSPACE_KID_BYTES];
+    kid.copy_from_slice(&header[1..1 + auth::WORKSPACE_KID_BYTES]);
+    Ok(ArtifactHeader {
+        version: header[0],
+        kid,
+    })
+}
+
+impl ReleaseManifest {
+    /// Lightweight manifest/artifact-header consistency check for the readiness
+    /// probe: validates the manifest shape and the artifact version/KID without
+    /// reading or hashing the ciphertext. Full byte-level validation still runs
+    /// on the authenticated descriptor and before delivery.
+    pub fn validate_header_against(&self, header: &ArtifactHeader) -> Result<(), DescriptorError> {
+        self.validate_shape()?;
+        if header.version != self.artifact.version
+            || base64_encode(&header.kid) != self.artifact.kid_b64
+        {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        Ok(())
+    }
+
+    /// Validate the public, artifact-independent manifest fields.
+    fn validate_shape(&self) -> Result<(), DescriptorError> {
+        if self.manifest_version != MANIFEST_VERSION {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if self.release_id.trim().is_empty() || self.source_sha.trim().is_empty() {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if self.release_id.len() > MAX_RELEASE_ID_BYTES
+            || self.source_sha.len() > MAX_SOURCE_SHA_BYTES
+            || self.artifact.kid_b64.len() > MAX_DIGEST_HEX_BYTES
+            || self.artifact.sha256_hex.len() > MAX_DIGEST_HEX_BYTES
+        {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if self.artifact.package_format_version != PACKAGE_FORMAT_VERSION {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if self.workspace_protocol.min > self.workspace_protocol.max
+            || self.workspace_protocol.min > WORKSPACE_PROTOCOL_VERSION
+            || self.workspace_protocol.max < WORKSPACE_PROTOCOL_VERSION
+        {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if decode_canonical_b64(&self.recipient.public_key_fingerprint_b64, 32).is_none() {
+            return Err(DescriptorError::ManifestInvalid);
+        }
+        if let Some(shell) = &self.shell {
+            if shell.asset_digest_hex.len() != 64
+                || !shell
+                    .asset_digest_hex
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(DescriptorError::ManifestInvalid);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Public, authenticated artifact descriptor returned to the shell.

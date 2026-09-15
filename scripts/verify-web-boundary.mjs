@@ -795,6 +795,10 @@ try {
     "/internal/auth/session",
     "/internal/auth/verify",
     "/internal/workspace/descriptor",
+    "/internal/workspace/recovery",
+    "/internal/workspace/recovery/challenge",
+    "/internal/workspace/recovery/revoke",
+    "/internal/workspace/recovery/touch",
   ];
   const shellPrivatePaths = new Set();
   for (const path of await filesUnder(resolve("web/workspace-shell/src"))) {

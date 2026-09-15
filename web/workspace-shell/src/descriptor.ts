@@ -91,6 +91,9 @@ export function parseWorkspaceDescriptor(input: unknown): WorkspaceDescriptor {
   if (!Number.isInteger(protocol) || !Number.isInteger(artifactVersion)) {
     throw new DescriptorError("descriptor_malformed");
   }
+  if (!Number.isInteger(packageFormat)) {
+    throw new DescriptorError("descriptor_malformed");
+  }
   if (
     !Number.isInteger(minProtocol) ||
     !Number.isInteger(maxProtocol) ||
@@ -98,13 +101,29 @@ export function parseWorkspaceDescriptor(input: unknown): WorkspaceDescriptor {
   ) {
     throw new DescriptorError("descriptor_malformed");
   }
+  // The artifact binding (size + digest) is authenticated server metadata; a
+  // malformed value must be rejected, never silently downgraded to "skip the
+  // check". The production descriptor always carries both fields.
+  const artifactSize = input.artifact_size;
+  if (!Number.isInteger(artifactSize) || (artifactSize as number) < 0) {
+    throw new DescriptorError("descriptor_malformed");
+  }
+  const artifactDigest = input.artifact_sha256_hex;
+  if (
+    typeof artifactDigest !== "string" ||
+    !/^[0-9a-f]{64}$/.test(artifactDigest)
+  ) {
+    throw new DescriptorError("descriptor_malformed");
+  }
+  if (typeof kid !== "string" || kid.length === 0) {
+    throw new DescriptorError("descriptor_malformed");
+  }
   const descriptor: WorkspaceDescriptor = {
     protocol_version: protocol,
     artifact_version: artifactVersion,
     artifact_kid_b64: kid,
-    artifact_size: typeof input.artifact_size === "number" ? input.artifact_size : 0,
-    artifact_sha256_hex:
-      typeof input.artifact_sha256_hex === "string" ? input.artifact_sha256_hex : "",
+    artifact_size: artifactSize as number,
+    artifact_sha256_hex: artifactDigest,
     package_format_version: packageFormat,
     release_id: optionalString(input.release_id),
     source_sha: optionalString(input.source_sha),

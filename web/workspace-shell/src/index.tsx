@@ -13,6 +13,22 @@ import {
   type WorkspaceDescriptor,
 } from "./descriptor";
 import {
+  RecoveryClientError,
+  addRecoveryWrapper,
+  beginRecoveryProof,
+  fetchRecoveryWrappers,
+  fromBase64 as recoveryFromBase64,
+  revokeRecoveryWrapper,
+  touchRecoveryWrapper,
+  unwrapWithPrfOutput,
+  type RecoveryWrapperRecord,
+} from "./recovery-client";
+import {
+  generateRecoverySalt,
+  wrapRootKey,
+} from "./recovery-wrapping";
+import { authenticateWithPrf } from "./recovery-passkey";
+import {
   isUnlockError,
   recoveryFor,
   type UnlockRecovery,
@@ -64,6 +80,14 @@ function App() {
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [enrollSecret, setEnrollSecret] = createSignal("");
   const [isEnrolling, setIsEnrolling] = createSignal(false);
+  const [recoveryWrappers, setRecoveryWrappers] = createSignal<
+    RecoveryWrapperRecord[]
+  >([]);
+  const [recoveryAvailable, setRecoveryAvailable] = createSignal(false);
+  const [recoveryBusy, setRecoveryBusy] = createSignal(false);
+  const [recoveryMessage, setRecoveryMessage] = createSignal("");
+  const [deviceLabel, setDeviceLabel] = createSignal("This device");
+  const [addRecoveryCode, setAddRecoveryCode] = createSignal("");
   let frame: HTMLIFrameElement | undefined;
   let recoveryInput: HTMLInputElement | undefined;
   let alertRef: HTMLDivElement | undefined;
@@ -125,6 +149,19 @@ function App() {
     }
   };
 
+  const loadRecoveryWrappers = async () => {
+    try {
+      const wrappers = await fetchRecoveryWrappers();
+      setRecoveryWrappers(wrappers);
+      setRecoveryAvailable(true);
+    } catch {
+      // Passkey recovery is optional; a closed surface or transient failure
+      // leaves the mandatory offline recovery code as the only credential.
+      setRecoveryWrappers([]);
+      setRecoveryAvailable(false);
+    }
+  };
+
   const runAuthentication = async () => {
     setAuthState("authenticating");
     setAuthMessage("Waiting for your passkey...");
@@ -134,6 +171,7 @@ function App() {
       setAuthState("authenticated");
       setAuthMessage("Operator identity verified.");
       await loadDescriptor();
+      void loadRecoveryWrappers();
     } catch (error) {
       if (error instanceof PasskeyAuthError && error.code === "webauthn_unsupported") {
         setAuthState("unsupported");
@@ -156,6 +194,7 @@ function App() {
         setAuthState("authenticated");
         setAuthMessage("Existing operator session restored.");
         await loadDescriptor();
+        void loadRecoveryWrappers();
         return;
       }
     } catch {
@@ -294,6 +333,176 @@ function App() {
     } finally {
       setUnlockStage(null);
       setIsUnlocking(false);
+    }
+  };
+
+  /**
+   * New-device path: unwrap the workspace secret through a registered passkey
+   * (WebAuthn PRF) instead of typing the offline recovery code. Falls back to
+   * the code when the authenticator returns no PRF output.
+   */
+  const unlockWithRecoveryPasskey = async () => {
+    if (isUnlocking()) return;
+    const activeDescriptor = descriptor();
+    if (!activeDescriptor) {
+      setDescriptorError("The release descriptor is not available yet.");
+      return;
+    }
+    const wrappers = recoveryWrappers().filter(
+      (wrapper) => wrapper.revoked_at_ms === null,
+    );
+    if (wrappers.length === 0) {
+      setRecoveryMessage("No recovery passkey is registered for this workspace.");
+      return;
+    }
+    setIsUnlocking(true);
+    setUnlockFailure(null);
+    setRecoveryMessage("Waiting for your recovery passkey...");
+    setUnlockStage("U1_WASM");
+    try {
+      for (const wrapper of wrappers) {
+        let salt: Uint8Array;
+        try {
+          salt = recoveryFromBase64(wrapper.salt_b64);
+        } catch {
+          continue;
+        }
+        let prfOutput: Uint8Array | null = null;
+        let credentialIdB64 = "";
+        try {
+          const result = await authenticateWithPrf({
+            allowCredentialB64: wrapper.credential_id_b64,
+            prfSalt: salt,
+          });
+          prfOutput = result.prfOutput;
+          credentialIdB64 = result.credentialIdB64;
+        } catch {
+          continue;
+        }
+        if (!prfOutput) continue;
+        let secret: Uint8Array | null = null;
+        try {
+          secret = await unwrapWithPrfOutput(prfOutput, wrapper);
+        } catch {
+          continue;
+        } finally {
+          prfOutput.fill(0);
+        }
+        if (!secret) continue;
+        try {
+          const result = await defaultRuntime.unlock(secret, activeDescriptor, {
+            onStage: (stage) => setUnlockStage(stage),
+          });
+          setPayloadUrl(result.htmlUrl);
+          setIsUnlocked(true);
+          setStatus("Private workspace opened.");
+          setRecoveryMessage("");
+          void touchRecoveryWrapper(credentialIdB64);
+          return;
+        } catch (error) {
+          const failure = isUnlockError(error)
+            ? recoveryFor(error.stage, error.reason)
+            : recoveryFor("U7_BOOT", "unknown");
+          setUnlockFailure(failure);
+          setStatus("Workspace unlock failed.");
+          defaultRuntime.lock();
+          queueMicrotask(() => alertRef?.focus());
+          return;
+        } finally {
+          secret.fill(0);
+        }
+      }
+      setRecoveryMessage(
+        "No recovery passkey on this device. Enter your offline recovery code.",
+      );
+    } finally {
+      setUnlockStage(null);
+      setIsUnlocking(false);
+    }
+  };
+
+  /**
+   * Add the current passkey as a recovery credential. Adding requires an
+   * existing trusted recovery factor, so the offline recovery code is
+   * re-entered once to authorize the wrap; the code never leaves the browser.
+   */
+  const addRecoveryPasskey = async (e: Event) => {
+    e.preventDefault();
+    if (recoveryBusy()) return;
+    let raw = addRecoveryCode();
+    setAddRecoveryCode("");
+    let secret: Uint8Array;
+    try {
+      secret = fromBase64(raw.trim());
+    } catch {
+      secret = new Uint8Array(0);
+    } finally {
+      raw = "";
+    }
+    if (secret.length !== 32 || secret.every((byte) => byte === 0)) {
+      secret.fill(0);
+      setRecoveryMessage(
+        "Enter the 32-byte offline recovery code to authorize adding this passkey.",
+      );
+      return;
+    }
+    setRecoveryBusy(true);
+    setRecoveryMessage("Waiting for your passkey...");
+    let prfOutput: Uint8Array | null = null;
+    try {
+      const salt = generateRecoverySalt();
+      const assertion = await authenticateWithPrf({ prfSalt: salt });
+      prfOutput = assertion.prfOutput;
+      if (!prfOutput) {
+        setRecoveryMessage(
+          "This authenticator or browser does not support passkey recovery (WebAuthn PRF). Your offline recovery code remains the fallback.",
+        );
+        return;
+      }
+      const wrapped = await wrapRootKey(prfOutput, secret, salt);
+      const proof = await beginRecoveryProof((sealed) =>
+        defaultRuntime.decryptRecoveryChallenge(sealed),
+      );
+      await addRecoveryWrapper({
+        challengeId: proof.challengeId,
+        proofB64: proof.proofB64,
+        credentialIdB64: assertion.credentialIdB64,
+        label: deviceLabel().trim() || "Recovery passkey",
+        record: wrapped,
+      });
+      setRecoveryMessage("Recovery passkey added for this workspace.");
+      await loadRecoveryWrappers();
+    } catch (error) {
+      setRecoveryMessage(
+        error instanceof RecoveryClientError && error.code === "recovery_conflict"
+          ? "The workspace already has the maximum number of recovery credentials."
+          : "Could not add the recovery passkey.",
+      );
+    } finally {
+      if (prfOutput) prfOutput.fill(0);
+      secret.fill(0);
+      setRecoveryBusy(false);
+    }
+  };
+
+  const revokeWrapper = async (credentialIdB64: string) => {
+    if (recoveryBusy()) return;
+    setRecoveryBusy(true);
+    try {
+      const proof = await beginRecoveryProof((sealed) =>
+        defaultRuntime.decryptRecoveryChallenge(sealed),
+      );
+      await revokeRecoveryWrapper({
+        challengeId: proof.challengeId,
+        proofB64: proof.proofB64,
+        credentialIdB64,
+      });
+      setRecoveryMessage("Recovery credential revoked.");
+      await loadRecoveryWrappers();
+    } catch {
+      setRecoveryMessage("Could not revoke that recovery credential.");
+    } finally {
+      setRecoveryBusy(false);
     }
   };
 
@@ -550,6 +759,33 @@ function App() {
                 </button>
               </form>
 
+              <Show
+                when={recoveryWrappers().some(
+                  (wrapper) => wrapper.revoked_at_ms === null,
+                )}
+              >
+                <div class="recovery-passkey">
+                  <p class="panel__copy">
+                    A recovery passkey is registered for this workspace. Verify it
+                    to unwrap the release without typing the offline code.
+                  </p>
+                  <button
+                    type="button"
+                    class="button"
+                    onClick={unlockWithRecoveryPasskey}
+                    disabled={isUnlocking() || !cryptoReady()}
+                  >
+                    Unlock with a recovery passkey
+                  </button>
+                </div>
+              </Show>
+
+              <Show when={recoveryMessage()}>
+                <p class="panel__note" role="status">
+                  {recoveryMessage()}
+                </p>
+              </Show>
+
               <Show when={isUnlocking() || unlockStage()}>
                 <ol class="stages" aria-label="Unlock progress">
                   <For each={STAGES}>
@@ -605,6 +841,85 @@ function App() {
             class="workspace-frame"
           />
         </section>
+
+        <Show when={recoveryAvailable()}>
+          <section class="panel" aria-labelledby="devices-heading">
+            <h2 id="devices-heading" class="panel__heading">
+              Trusted recovery credentials
+            </h2>
+            <p class="panel__copy">
+              Each credential wraps this workspace's root key locally. Revoking a
+              credential never rotates the key; the offline recovery code always
+              remains a fallback.
+            </p>
+            <ul class="devices">
+              <For each={recoveryWrappers()}>
+                {(wrapper) => (
+                  <li class="devices__row">
+                    <span class="devices__label">{wrapper.label}</span>
+                    <span class="devices__meta">
+                      {wrapper.revoked_at_ms !== null
+                        ? "Revoked"
+                        : wrapper.last_used_at_ms !== null
+                          ? "Used recently"
+                          : "Not yet used"}
+                    </span>
+                    <Show when={wrapper.revoked_at_ms === null}>
+                      <button
+                        type="button"
+                        class="button"
+                        disabled={recoveryBusy()}
+                        onClick={() => revokeWrapper(wrapper.credential_id_b64)}
+                      >
+                        Revoke
+                      </button>
+                    </Show>
+                  </li>
+                )}
+              </For>
+            </ul>
+            <Show when={recoveryWrappers().length === 0}>
+              <p class="panel__note">No recovery passkey is registered yet.</p>
+            </Show>
+            <form class="form" onSubmit={addRecoveryPasskey}>
+              <label class="field" for="device-label">
+                <span class="field__label">Device label</span>
+                <input
+                  id="device-label"
+                  class="field__input"
+                  value={deviceLabel()}
+                  onInput={(event) => setDeviceLabel(event.currentTarget.value)}
+                  disabled={recoveryBusy()}
+                />
+              </label>
+              <label class="field" for="add-recovery-code">
+                <span class="field__label">
+                  Offline recovery code (authorizes adding this passkey)
+                </span>
+                <input
+                  id="add-recovery-code"
+                  class="field__input field__input--code"
+                  type="password"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  autocorrect="off"
+                  spellcheck={false}
+                  value={addRecoveryCode()}
+                  onInput={(event) => setAddRecoveryCode(event.currentTarget.value)}
+                  disabled={recoveryBusy()}
+                />
+              </label>
+              <button class="button" type="submit" disabled={recoveryBusy()}>
+                {recoveryBusy() ? "Working..." : "Add this passkey"}
+              </button>
+            </form>
+            <Show when={recoveryMessage()}>
+              <p class="panel__note" role="status">
+                {recoveryMessage()}
+              </p>
+            </Show>
+          </section>
+        </Show>
       </Show>
 
       <footer class="gateway__footer">

@@ -60,12 +60,23 @@ test("compatibility failures point at recovery, not blind retry", () => {
 
 test("unlock errors are generic and carry only a stage and reason", () => {
   const secret = "super-secret-recovery-code";
-  const error = new UnlockError("U5_ARTIFACT", "artifact_decrypt_failed");
-  assert.equal(error.message, "workspace unlock failed");
-  assert.ok(!error.message.includes(secret));
-  assert.equal(error.stage, "U5_ARTIFACT");
-  assert.equal(error.reason, "artifact_decrypt_failed");
-  assert.equal(error.name, "UnlockError");
+  // A foreign error whose message contains the secret must never leak through
+  // classification: exercise the real conversion path, not just the message of
+  // a freshly constructed error.
+  const classified = asUnlockError(
+    new Error(secret),
+    "U5_ARTIFACT",
+    "artifact_decrypt_failed",
+  );
+  assert.equal(classified.message, "workspace unlock failed");
+  assert.ok(!classified.message.includes(secret));
+  assert.equal(classified.stage, "U5_ARTIFACT");
+  assert.equal(classified.reason, "artifact_decrypt_failed");
+  assert.equal(classified.name, "UnlockError");
+
+  const direct = new UnlockError("U5_ARTIFACT", "artifact_decrypt_failed");
+  assert.equal(direct.message, "workspace unlock failed");
+  assert.ok(!direct.message.includes(secret));
 });
 
 test("foreign errors never leak their message through classification", () => {

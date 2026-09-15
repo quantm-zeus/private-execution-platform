@@ -24,6 +24,7 @@ pub const ARTIFACT_VERSION: u8 = 1;
 /// fails with VerifierUnavailable (HTTP 503) instead of growing memory.
 const MAX_LIVE_ARTIFACT_GRANTS: usize = 1024;
 const MAX_LIVE_WORKSPACE_ENROLLMENTS: usize = 1024;
+const MAX_LIVE_SESSIONS: usize = 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct WorkspacePublicKeyMetadata {
@@ -108,6 +109,14 @@ macro_rules! opaque_id {
 opaque_id!(SessionId);
 opaque_id!(ArtifactGrantId);
 
+/// Test-only opaque session id constructor, exposed to downstream crates that
+/// enable the `private-test-support` feature (the id generator itself stays
+/// private to the crate).
+#[cfg(any(test, feature = "private-test-support"))]
+pub fn __private_test_session_id() -> SessionId {
+    SessionId::random().expect("test session id entropy")
+}
+
 fn random_bytes<const N: usize>() -> Result<[u8; N], AuthError> {
     let mut bytes = [0u8; N];
     if getrandom::getrandom(&mut bytes).is_err() {
@@ -177,6 +186,7 @@ pub struct AuthState {
     /// without bound (MEDIUM-1 fix: bounded per-process grant budget).
     max_live_grants: usize,
     max_live_enrollments: usize,
+    max_live_sessions: usize,
 }
 
 impl AuthState {
@@ -198,10 +208,19 @@ impl AuthState {
             enrollments: HashMap::new(),
             max_live_grants: MAX_LIVE_ARTIFACT_GRANTS,
             max_live_enrollments: MAX_LIVE_WORKSPACE_ENROLLMENTS,
+            max_live_sessions: MAX_LIVE_SESSIONS,
         })
     }
 
     fn mint_session(&mut self, now_ms: i64) -> Result<AuthenticatedSession, AuthError> {
+        // Drop expired sessions first so a login loop over months cannot grow
+        // the authoritative session ledger for the process lifetime, then
+        // refuse beyond the bounded live-session budget.
+        self.sessions
+            .retain(|_, session| session.expires_at_ms > now_ms);
+        if self.sessions.len() >= self.max_live_sessions {
+            return Err(AuthError::VerifierUnavailable);
+        }
         let expires_at_ms = now_ms
             .checked_add(self.session_ttl_ms)
             .ok_or(AuthError::InvalidTtl)?;
@@ -258,6 +277,19 @@ impl AuthState {
             return Err(AuthError::SessionExpired);
         }
         Ok(session)
+    }
+
+    /// Test-only view of the live session ledger size.
+    #[cfg(test)]
+    fn live_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Test-only override of the bounded live-session budget, so the bound can
+    /// be exercised without minting thousands of real WebAuthn ceremonies.
+    #[cfg(test)]
+    fn set_max_live_sessions(&mut self, cap: usize) {
+        self.max_live_sessions = cap;
     }
 
     pub fn issue_artifact_grant(
@@ -472,6 +504,36 @@ mod tests {
     }
 
     #[test]
+    fn session_ledger_is_bounded_and_ttl_pruned() {
+        let mut s = state();
+        let first = s
+            .create_session_from_verified(genuine_verified().unwrap(), 1)
+            .unwrap();
+        assert_eq!(s.live_session_count(), 1);
+        // At t=202 the first session (expires 201) is pruned before the mint,
+        // so the ledger stays bounded across repeated logins.
+        let _second = s
+            .create_session_from_verified(genuine_verified().unwrap(), 202)
+            .unwrap();
+        assert_eq!(s.live_session_count(), 1);
+        assert_eq!(
+            s.validate_session(first.id(), 202),
+            Err(AuthError::SessionNotFound)
+        );
+
+        // The live-session budget refuses a further mint without growing.
+        let mut bounded = state();
+        bounded.set_max_live_sessions(1);
+        let _live = bounded
+            .create_session_from_verified(genuine_verified().unwrap(), 1)
+            .unwrap();
+        assert_eq!(
+            bounded.create_session_from_verified(genuine_verified().unwrap(), 1),
+            Err(AuthError::VerifierUnavailable)
+        );
+    }
+
+    #[test]
     fn grant_ledger_is_bounded_and_ttl_pruned() {
         let mut s = state();
         let verified = genuine_verified().unwrap();
@@ -577,6 +639,9 @@ mod tests {
     #[test]
     fn workspace_enrollment_ledger_is_bounded_and_pruned() {
         let mut s = state();
+        // The enrollment budget is larger than the session budget is allowed to
+        // bind here; keep the session cap from masking the enrollment cap.
+        s.set_max_live_sessions(MAX_LIVE_WORKSPACE_ENROLLMENTS + 1);
         let kid = [1u8; WORKSPACE_KID_BYTES];
         let pk = [2u8; WORKSPACE_PUBLIC_KEY_BYTES];
 

@@ -23,16 +23,29 @@ fn parse_bind_addr(value: &str) -> Result<SocketAddr, std::io::Error> {
     Ok(address)
 }
 
+/// Read an optional environment variable. A present-but-non-Unicode value is a
+/// misconfiguration that refuses startup instead of silently collapsing to
+/// "unset" (which could disable a required dependency behind a healthy probe).
+fn read_env(name: &str) -> Result<Option<String>, std::io::Error> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(std::io::Error::other(format!("{name} must be valid UTF-8")))
+        }
+    }
+}
+
 /// Strict boolean environment parse (`true`/`false`; unset uses `default`).
 /// Anything else refuses startup so a typo cannot flip a security default.
 fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
-    match std::env::var(name) {
-        Ok(value) if value == "true" => Ok(true),
-        Ok(value) if value == "false" => Ok(false),
-        Ok(_) => Err(std::io::Error::other(format!(
+    match read_env(name)? {
+        Some(value) if value == "true" => Ok(true),
+        Some(value) if value == "false" => Ok(false),
+        Some(_) => Err(std::io::Error::other(format!(
             "{name} must be true or false"
         ))),
-        Err(_) => Ok(default),
+        None => Ok(default),
     }
 }
 
@@ -96,12 +109,27 @@ fn resolve_relay_config(
 /// file; without it the private API keeps its fail-closed
 /// `authenticator: None` default (every auth route answers `503`).
 fn optional_passkey_store() -> Result<Option<Arc<dyn PasskeyCredentialStore>>, std::io::Error> {
-    let path = match std::env::var("PRIVATE_PASSKEY_STORE_PATH") {
-        Ok(value) if !value.is_empty() => value,
+    let path = match read_env("PRIVATE_PASSKEY_STORE_PATH")? {
+        Some(value) if !value.is_empty() => value,
         _ => return Ok(None),
     };
     let store = FilePasskeyCredentialStore::open(path)
         .map_err(|_| std::io::Error::other("passkey credential store invalid"))?;
+    Ok(Some(Arc::new(store)))
+}
+
+/// Optional durable passkey-bound recovery wrapper store. When
+/// `PRIVATE_RECOVERY_WRAPPER_STORE_PATH` is configured, the passkey recovery
+/// surface is enabled; without it every recovery route answers `503` and the
+/// shell keeps the offline recovery code as the only credential.
+fn optional_recovery_store(
+) -> Result<Option<Arc<dyn private_api::recovery::RecoveryWrapperStore>>, std::io::Error> {
+    let path = match read_env("PRIVATE_RECOVERY_WRAPPER_STORE_PATH")? {
+        Some(value) if !value.is_empty() => value,
+        _ => return Ok(None),
+    };
+    let store = private_api::recovery::FileRecoveryWrapperStore::open(path)
+        .map_err(|_| std::io::Error::other("recovery wrapper store invalid"))?;
     Ok(Some(Arc::new(store)))
 }
 
@@ -123,8 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // could not survive a restart), so a secret without a store refuses startup
     // rather than silently presenting a dead enrollment surface.
     let passkey_store = optional_passkey_store()?;
-    let enrollment_secret = std::env::var("PRIVATE_PASSKEY_ENROLL_SECRET")
-        .ok()
+    let enrollment_secret = read_env("PRIVATE_PASSKEY_ENROLL_SECRET")?
         .filter(|value| !value.is_empty())
         .map(Zeroizing::new);
     let allow_additional_credentials = strict_bool_env("PRIVATE_PASSKEY_ALLOW_ADDITIONAL", false)?;
@@ -144,6 +171,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| std::io::Error::other("private api passkey configuration invalid"))?,
         None => PrivateApiState::production(config)
             .map_err(|_| std::io::Error::other("private api configuration invalid"))?,
+    };
+    let state = match optional_recovery_store()? {
+        Some(store) => state.with_recovery_store(store),
+        None => state,
     };
 
     // TRADING_ENABLED is parsed strictly (`"true"`/`"false"`; unset disables) so
@@ -170,11 +201,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opaque_state = production.state;
 
     let relay_identity = resolve_relay_config(
-        std::env::var("PRIVATE_API_RELAY_BIND_ADDR").ok(),
-        std::env::var("PRIVATE_API_TLS_CERT").ok(),
-        std::env::var("PRIVATE_API_TLS_KEY").ok(),
-        std::env::var("PRIVATE_API_TLS_CA").ok(),
-        std::env::var("PRIVATE_API_EDGE_DNS").ok(),
+        read_env("PRIVATE_API_RELAY_BIND_ADDR")?,
+        read_env("PRIVATE_API_TLS_CERT")?,
+        read_env("PRIVATE_API_TLS_KEY")?,
+        read_env("PRIVATE_API_TLS_CA")?,
+        read_env("PRIVATE_API_EDGE_DNS")?,
     )?;
     let relay_required = relay_identity.is_some();
     let relay_ready = Arc::new(AtomicBool::new(false));
