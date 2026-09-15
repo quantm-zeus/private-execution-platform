@@ -2144,6 +2144,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
+name = "provider-benchmark"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chain-types",
+ "market-types",
+ "provider-broker",
+ "routing",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "provider-broker"
 version = "0.1.0"
 dependencies = [
