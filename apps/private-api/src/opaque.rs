@@ -81,6 +81,64 @@ impl CapabilitySet {
             wallet_limits: false,
         }
     }
+
+    /// The capability flag that gates a browser operation.
+    ///
+    /// BR-1 calls the advertised capabilities authoritative, so a `false` flag
+    /// must refuse the operation server-side, not merely hide the button. A
+    /// `None` return means the operation is not capability-gated (a generic read
+    /// such as `get_quote`, or an unknown op the dispatcher will reject). This
+    /// is a positive mapping: an operation only escapes the gate if it is
+    /// deliberately listed as ungated.
+    pub fn for_op(op: &str) -> Option<&'static str> {
+        let capabilities = match op {
+            "execute_market_order" => "execute",
+            "place_limit_order" | "cancel_order" | "get_orders" | "get_order" => "limits",
+            "preview_market_order" => "preview",
+            "get_quote" => "quotes",
+            "get_portfolio" | "get_balances" => "portfolio",
+            "start_twap" => "twap",
+            "submit_rfq" => "rfq",
+            "request_withdrawal" => "withdraw",
+            "get_wallet_limits" | "set_wallet_limits" => "wallet_limits",
+            "get_intelligence" => "intelligence",
+            "get_provider_health" => "intelligence",
+            "search_token" | "get_token" | "get_chart" => "market",
+            _ => return None,
+        };
+        Some(capabilities)
+    }
+
+    /// The boolean value for a capability name produced by [`Self::for_op`].
+    fn flag(&self, capability: &str) -> bool {
+        match capability {
+            "market" => self.market,
+            "realtime" => self.realtime,
+            "quotes" => self.quotes,
+            "preview" => self.preview,
+            "execute" => self.execute,
+            "limits" => self.limits,
+            "portfolio" => self.portfolio,
+            "intelligence" => self.intelligence,
+            "twitter" => self.twitter,
+            "gmgn" => self.gmgn,
+            "okx" => self.okx,
+            "twap" => self.twap,
+            "rfq" => self.rfq,
+            "withdraw" => self.withdraw,
+            "wallet_limits" => self.wallet_limits,
+            // An unknown capability name resolves to unavailable.
+            _ => false,
+        }
+    }
+
+    /// Whether the advertised set permits `op`.
+    pub fn permits(&self, op: &str) -> bool {
+        match Self::for_op(op) {
+            Some(capability) => self.flag(capability),
+            None => true,
+        }
+    }
 }
 
 /// Chain advertised in the bootstrap document (BR-11 native token is optional
@@ -504,6 +562,12 @@ impl OpaqueServiceState {
         self.stream_source.clone()
     }
 
+    /// The authoritative bootstrap provider (BR-1). Exposed for composition
+    /// tests and the production wiring that derives the advertised document.
+    pub fn bootstrap(&self) -> Arc<dyn BootstrapProvider> {
+        self.bootstrap.clone()
+    }
+
     /// Build a stream driver bound to this service's session registry, clock and
     /// injected realtime source.
     pub fn stream_driver(&self) -> StreamDriver {
@@ -533,7 +597,7 @@ impl OpaqueServiceState {
 
         // Authenticate and validate under the registry lock; the lock is released
         // before any await so a slow backend cannot block other sessions.
-        let plaintext = {
+        let (plaintext, session_expires_at_ms) = {
             let mut sessions = self
                 .sessions
                 .lock()
@@ -560,7 +624,12 @@ impl OpaqueServiceState {
                     }
                     _ => RelayFailure::Protocol,
                 })?;
-            plaintext
+            // BR-1/F5: the advertised session deadline must be the session's real
+            // deadline, not a fresh `now + ttl`. The client derives its mutation
+            // deadline from the advertised duration, so recomputing it on a
+            // re-bootstrap would let the client keep writing past the server's
+            // actual expiry (and get indeterminate 503s for every write).
+            (plaintext, session.expires_at_ms())
         };
         // BR-2: an authenticated `/v1/sync` asks the active stream connection for
         // a fresh snapshot at/after the client's high-water mark. The snapshot is
@@ -571,7 +640,7 @@ impl OpaqueServiceState {
                 .request_resync(kid, extract_from_seq_u64(&plaintext));
         }
         let response_bytes = self
-            .build_response(route, &envelope, &plaintext, now)
+            .build_response(route, &envelope, &plaintext, now, session_expires_at_ms)
             .await?;
 
         let mut sessions = self
@@ -591,6 +660,7 @@ impl OpaqueServiceState {
         envelope: &WireEnvelope,
         plaintext: &[u8],
         now: i64,
+        session_expires_at_ms: i64,
     ) -> Result<Vec<u8>, RelayFailure> {
         match route {
             OpaqueRoute::Bootstrap => {
@@ -599,12 +669,8 @@ impl OpaqueServiceState {
                 // that omitted it would emit an unusable (and replayable) success.
                 let request_id = extract_request_id(plaintext).ok_or(RelayFailure::Protocol)?;
                 let document = self.bootstrap.document();
-                let body = document.to_wire(
-                    &envelope.kid,
-                    now.saturating_add(self.session_ttl_ms),
-                    now,
-                    Some(&request_id),
-                );
+                let body =
+                    document.to_wire(&envelope.kid, session_expires_at_ms, now, Some(&request_id));
                 serde_json::to_vec(&body).map_err(|_| RelayFailure::Unavailable)
             }
             OpaqueRoute::Sync => {
@@ -635,6 +701,20 @@ impl OpaqueServiceState {
                                 "Trading is disabled by the global kill switch.",
                             ),
                         )
+                    } else if !self.capabilities().permits(&request.op) {
+                        // BR-1/F2: the advertised capability set is authoritative,
+                        // so a `false` flag must refuse the operation server-side.
+                        // Otherwise a crafted client could use any op the injected
+                        // dispatcher allows while the UI renders that capability
+                        // as unavailable (an executed trade with no visible
+                        // surface). Deny before the dispatcher runs.
+                        CommandResponse::denial(
+                            &request.request_id,
+                            CommandDenial::determinate(
+                                DenialCode::CapabilityMissing,
+                                "The requested capability is not available.",
+                            ),
+                        )
                     } else {
                         match self.dispatcher.dispatch_for_session(&kid, &request).await {
                             Ok(result) => CommandResponse::success(&request.request_id, result),
@@ -656,6 +736,11 @@ impl OpaqueServiceState {
         let document = self.bootstrap.document();
         document.trading_enabled && !document.kill_switch_enabled
     }
+
+    /// The advertised capability set that gates command dispatch (BR-1/F2).
+    fn capabilities(&self) -> CapabilitySet {
+        self.bootstrap.document().capabilities
+    }
 }
 
 impl std::fmt::Debug for OpaqueServiceState {
@@ -666,9 +751,15 @@ impl std::fmt::Debug for OpaqueServiceState {
     }
 }
 
-/// Reject cross-route envelope substitution: a bootstrap/sync plaintext
-/// replayed on `/v1/command` (or a command plaintext on a control route) must
-/// not be interpreted as the other route.
+/// Reject cross-route envelope substitution: a bootstrap/sync/stream-subscribe
+/// plaintext replayed on `/v1/command` (or a command plaintext on a control
+/// route) must not be interpreted as the other route.
+///
+/// This runs *before* the replay window advances, so a route-control plaintext
+/// replayed on the command route must be refused here — never dispatched and
+/// never allowed to burn a `Purpose::Command` sequence the honest client is
+/// about to use. The command check is therefore a positive allow-list of
+/// channel ops, not a denylist of the control ops we happen to know about.
 fn verify_route_op(route: OpaqueRoute, plaintext: &[u8]) -> Result<(), RelayFailure> {
     let value: Value = serde_json::from_slice(plaintext).map_err(|_| RelayFailure::Protocol)?;
     let op = value.get("op").and_then(Value::as_str);
@@ -682,9 +773,20 @@ fn verify_route_op(route: OpaqueRoute, plaintext: &[u8]) -> Result<(), RelayFail
             Some(_) => Err(RelayFailure::Protocol),
         },
         OpaqueRoute::Command => match op {
-            // Route-control operations never travel on the command channel.
-            Some("bootstrap") | Some("sync") => Err(RelayFailure::Protocol),
-            Some(_) => Ok(()),
+            // Route-control operations (`bootstrap`, `sync`, `subscribe`) never
+            // travel on the command channel. Refusing them here — before
+            // `accept_sequence` — closes the cross-purpose replay DoS where a
+            // captured stream `subscribe` envelope consumed a command sequence
+            // and the dispatcher's later `ForbiddenOperation` rejection could
+            // not undo it.
+            Some("bootstrap") | Some("sync") | Some("subscribe") => Err(RelayFailure::Protocol),
+            Some(op) => {
+                if session_transport::is_route_control_op(op) {
+                    Err(RelayFailure::Protocol)
+                } else {
+                    Ok(())
+                }
+            }
             None => Err(RelayFailure::Protocol),
         },
         OpaqueRoute::Blob => Ok(()),
@@ -784,6 +886,19 @@ mod tests {
             Arc::new(FailClosedDispatcher),
             Arc::new(FailClosedBootstrap),
         )
+    }
+
+    /// A bootstrap that advertises the read capabilities the dispatcher tests
+    /// exercise, with trading disabled and the kill switch engaged. BR-1/F2
+    /// enforces the advertised set, so a test that expects dispatch to run must
+    /// advertise the matching capability.
+    fn read_only_bootstrap() -> Arc<dyn BootstrapProvider> {
+        let mut document = BootstrapDocument::fail_closed();
+        document.capabilities.quotes = true;
+        document.capabilities.preview = true;
+        document.capabilities.market = true;
+        document.capabilities.portfolio = true;
+        Arc::new(StaticBootstrap::new(document))
     }
 
     fn state_with(
@@ -965,7 +1080,7 @@ mod tests {
                 calls: calls.clone(),
                 result: json!({"status": "ok"}),
             }),
-            Arc::new(FailClosedBootstrap),
+            read_only_bootstrap(),
         );
         let response = roundtrip(
             &state,
@@ -990,7 +1105,7 @@ mod tests {
                 calls: calls.clone(),
                 result: json!({"status": "ok"}),
             }),
-            Arc::new(FailClosedBootstrap),
+            read_only_bootstrap(),
         );
         // A captured bootstrap envelope at sequence 0 posted to /v1/command is a
         // route mismatch...
@@ -1018,6 +1133,53 @@ mod tests {
         let value: Value = serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(value["result"]["status"], "ok", "response: {value}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_subscribe_replayed_on_command_does_not_consume_the_sequence() {
+        // F4 regression: a captured `/v1/stream` subscribe envelope replayed on
+        // `/v1/command` must be refused *before* the replay window advances.
+        // Otherwise `accept_sequence(Purpose::Command)` burns the slot and the
+        // dispatcher's later ForbiddenOperation rejection cannot undo it, so an
+        // observer could pre-burn a run of the honest client's command sequences
+        // (one subscribe per reconnect) and wedge every write with a 503.
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            read_only_bootstrap(),
+        );
+        let captured = client
+            .seal_at(0, br#"{"op":"subscribe","from_seq":0,"request_id":"x"}"#)
+            .unwrap();
+        assert_eq!(
+            state
+                .relay_envelope(OpaqueRoute::Command, &captured.to_wire_bytes())
+                .await,
+            Err(RelayFailure::Protocol),
+            "a stream subscribe is a route-control op, not a command"
+        );
+        // The honest command at the same sequence is still accepted.
+        let honest = client
+            .seal_at(0, br#"{"op":"get_quote","payload":{},"request_id":"ok"}"#)
+            .unwrap();
+        let opened = state
+            .relay_envelope(OpaqueRoute::Command, &honest.to_wire_bytes())
+            .await
+            .expect("honest command must not be wedged");
+        let response = parse_wire_envelope(&opened).unwrap();
+        let plaintext = client.open(&response).unwrap();
+        let value: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(value["result"]["status"], "ok", "response: {value}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the replayed subscribe never reached the dispatcher"
+        );
     }
 
     #[tokio::test]
@@ -1060,6 +1222,63 @@ mod tests {
         assert_eq!(response["error"]["code"], "capability_missing");
         assert!(response.get("result").is_none(), "no false success");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "dispatcher never reached");
+    }
+
+    #[tokio::test]
+    async fn an_operation_is_denied_when_its_advertised_capability_is_false() {
+        // BR-1/F2: the advertised capability set is authoritative. A document
+        // that enables trading but advertises `execute=false` must refuse the
+        // operation server-side, otherwise a crafted client executes a trade the
+        // UI renders as unavailable.
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut document = BootstrapDocument::fail_closed();
+        document.trading_enabled = true;
+        document.kill_switch_enabled = false;
+        document.kill_switch_reason = None;
+        // Deliberately leave `execute` false while advertising `preview`.
+        document.capabilities.preview = true;
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(StaticBootstrap::new(document)),
+        );
+        let response = roundtrip(
+            &state,
+            &mut client,
+            OpaqueRoute::Command,
+            br#"{"op":"execute_market_order","payload":{},"request_id":"cap","idempotency_key":"k"}"#,
+        )
+        .await
+        .expect("sealed denial");
+        assert_eq!(response["request_id"], "cap");
+        assert_eq!(response["error"]["code"], "capability_missing");
+        assert!(response.get("result").is_none(), "no false success");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unavailable capability never reaches the dispatcher"
+        );
+        // A capability that *is* advertised still works.
+        // A capability that *is* advertised still works (at the next sequence).
+        let envelope = client
+            .seal_at(
+                1,
+                br#"{"op":"preview_market_order","payload":{},"request_id":"ok"}"#,
+            )
+            .unwrap();
+        let opened = state
+            .relay_envelope(OpaqueRoute::Command, &envelope.to_wire_bytes())
+            .await
+            .expect("advertised capability is served");
+        let sealed = parse_wire_envelope(&opened).unwrap();
+        let plaintext = client.open(&sealed).unwrap();
+        let allowed: Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(allowed["result"]["status"], "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

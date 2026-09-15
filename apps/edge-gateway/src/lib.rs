@@ -328,6 +328,7 @@ fn edge_response(error: EdgeError) -> Response {
 }
 
 pub mod private_relay;
+pub mod production;
 
 #[cfg(test)]
 mod tests {

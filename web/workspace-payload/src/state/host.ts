@@ -8,6 +8,24 @@ export interface HostLockMessage {
 
 export interface HostReadyMessage {
   readonly type: "evergreen:workspace-ready";
+  /**
+   * BR-5 handoff binding echoed back to the shell. The shell injects this token
+   * into the payload document; returning it proves the ping came from the
+   * document the shell instantiated (not a same-origin navigation).
+   */
+  readonly handoff: string;
+}
+
+/**
+ * Read the per-unlock handoff token the shell injected into this document.
+ * Absent (e.g. the payload loaded standalone in a test) is the empty string, so
+ * the shell simply withholds keys rather than delivering them unbound.
+ */
+export function readHandoffToken(): string {
+  if (typeof document === "undefined") return "";
+  const meta = document.querySelector('meta[name="evergreen-handoff"]');
+  const content = meta?.getAttribute("content");
+  return typeof content === "string" ? content : "";
 }
 
 export function postToHost(message: HostLockMessage | HostReadyMessage): void {
@@ -32,5 +50,5 @@ export function requestHostLock(): void {
 }
 
 export function announceWorkspaceReady(): void {
-  postToHost({ type: "evergreen:workspace-ready" });
+  postToHost({ type: "evergreen:workspace-ready", handoff: readHandoffToken() });
 }

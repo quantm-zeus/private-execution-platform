@@ -448,6 +448,15 @@ impl StreamDriver {
                 Err(_) => return false,
             };
             match sessions.get_mut(&kid) {
+                // BR-1/F5: an expired session must stop emitting rather than keep
+                // sealing frames past its deadline. Otherwise the client, whose
+                // mutation deadline derives from the now-authoritative bootstrap
+                // expiry, could still receive live-looking state after the server
+                // has stopped accepting commands.
+                Some(session) if session.is_expired(now) => {
+                    sessions.remove(&kid);
+                    return false;
+                }
                 Some(session) => session.seal_stream_frame(&frame.into_stream_frame(now)),
                 None => return false,
             }

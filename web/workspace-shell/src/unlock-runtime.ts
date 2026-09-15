@@ -221,6 +221,16 @@ export class WorkspaceUnlockRuntime {
    * the only durable copy as non-extractable CryptoKeys.
    */
   private currentSession: ShellSessionKeys | null = null;
+  /**
+   * BR-5 handoff binding token. Generated fresh per unlock, injected only into
+   * the decrypted payload document, and required back on the `workspace-ready`
+   * ping before keys are delivered. Without it the shell would hand live bearer
+   * keys to whatever same-origin document currently occupies the frame on an
+   * unauthenticated ping (the sandbox permits self-navigation).
+   */
+  private handoffToken: string | null = null;
+  /** True once keys have been delivered for the current unlock (one-shot). */
+  private handoffDelivered: boolean = false;
   private isUnlocked: boolean = false;
 
   constructor() {
@@ -244,6 +254,28 @@ export class WorkspaceUnlockRuntime {
    * its own sandboxed frame.
    */
   public sessionKeys(): ShellSessionKeys | null {
+    return this.currentSession;
+  }
+
+  /**
+   * One-shot, token-bound BR-5 key delivery.
+   *
+   * Returns the keys only when `token` matches the per-unlock token injected
+   * into the payload document, and only once. A same-origin document that
+   * navigated into the frame (or a repointed `frame.src`) cannot echo the token,
+   * so an unauthenticated `workspace-ready` ping can no longer harvest the live
+   * session keys. Returns `null` on a missing/mismatched token, before unlock,
+   * after lock, or on a repeat call.
+   */
+  public takeSessionKeysForHandoff(token: unknown): ShellSessionKeys | null {
+    if (this.currentSession === null || this.handoffToken === null) return null;
+    if (this.handoffDelivered) return null;
+    if (typeof token !== "string" || token.length === 0) return null;
+    // Constant-time-ish comparison is unnecessary here: the token is a
+    // same-document capability, not a network secret, and both operands are
+    // already known to the compared documents.
+    if (token !== this.handoffToken) return null;
+    this.handoffDelivered = true;
     return this.currentSession;
   }
 
@@ -408,7 +440,13 @@ export class WorkspaceUnlockRuntime {
       }
       this.currentPayloadFiles = unpackedFiles;
 
-      const htmlUrl = this.instantiatePayload(unpackedFiles);
+      // Fresh per-unlock handoff binding. Generated before the payload document
+      // is built so the token can be injected into it; the payload must echo the
+      // token on its ready ping before the shell releases any key.
+      this.handoffToken = generateHandoffToken();
+      this.handoffDelivered = false;
+
+      const htmlUrl = this.instantiatePayload(unpackedFiles, this.handoffToken);
       // Ownership transfers only after the payload is fully instantiated; any
       // earlier failure is reclaimed by the finally below.
       if (!sessionMaterial) {
@@ -447,7 +485,7 @@ export class WorkspaceUnlockRuntime {
     }
   }
 
-  private instantiatePayload(files: Map<string, Uint8Array>): string {
+  private instantiatePayload(files: Map<string, Uint8Array>, handoffToken: string): string {
     const decoder = new TextDecoder("utf-8");
     let indexHtml = "";
     if (files.has("index.html")) {
@@ -455,6 +493,13 @@ export class WorkspaceUnlockRuntime {
     } else {
       indexHtml = "<!doctype html><html><body><div id=\"root\"></div></body></html>";
     }
+
+    // BR-5 handoff binding: inject the per-unlock token into the payload document
+    // itself (same-document capability, never persisted, never in a URL). The
+    // payload echoes it on `workspace-ready`; a document the shell did not
+    // instantiate cannot produce it, so live keys cannot be harvested by a
+    // same-origin navigation.
+    indexHtml = injectHandoffToken(indexHtml, handoffToken);
 
     const assetNames = [...files.keys()].filter((name) => name !== "index.html");
     // Longest paths first, and only at token boundaries, so a short asset name
@@ -500,9 +545,48 @@ export class WorkspaceUnlockRuntime {
     // durable copies live only as non-extractable CryptoKeys inside the payload,
     // which is torn down with the iframe on lock.
     this.currentSession = null;
+    this.handoffToken = null;
+    this.handoffDelivered = false;
 
     this.isUnlocked = false;
   }
+}
+
+/**
+ * A cryptographically random per-unlock handoff token, or a fail-closed throw.
+ *
+ * This is a same-document capability, not a long-term secret, but a predictable
+ * value would let another same-origin document forge the ready ping, so a
+ * deployment without `crypto` must fail closed rather than fall back to
+ * `Math.random()`.
+ */
+function generateHandoffToken(): string {
+  const cryptoObj: Crypto | undefined = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    const bytes = new Uint8Array(32);
+    cryptoObj.getRandomValues(bytes);
+    return toBase64(bytes);
+  }
+  throw new Error("A secure handoff token could not be generated");
+}
+
+/**
+ * Inject the handoff token into the payload document as a `<meta>` element.
+ *
+ * The value is base64 (no HTML-special characters), and it is inserted after an
+ * existing `<head>`/`<html>` when present so it is available to the payload
+ * before any script runs. It is never placed in a URL, the DOM tree the user
+ * can select, or any storage.
+ */
+function injectHandoffToken(html: string, token: string): string {
+  const meta = `<meta name="evergreen-handoff" content="${token}">`;
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, (match) => `${match}${meta}`);
+  }
+  if (/<html[^>]*>/i.test(html)) {
+    return html.replace(/<html[^>]*>/i, (match) => `${match}<head>${meta}</head>`);
+  }
+  return `${meta}${html}`;
 }
 
 export const defaultRuntime = new WorkspaceUnlockRuntime();

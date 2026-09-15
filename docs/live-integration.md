@@ -39,10 +39,20 @@ the browser transport session:
    distinct from the ChaCha artifact-session keys.
 4. The shell retains the session only while unlocked, and posts
    `{type:"evergreen:session-key", kid, s2cKeyB64, c2sKeyB64}` to its own
-   sandboxed frame when the payload announces readiness. `lock()` drops the
-   reference.
+   sandboxed frame **only** after the payload echoes the per-unlock handoff token
+   the shell injected into the payload document (`<meta name="evergreen-handoff">`).
+   The delivery is one-shot per unlock: a same-origin document that navigated into
+   the frame (or a repointed `frame.src`) cannot produce the token, so an
+   unauthenticated `evergreen:workspace-ready` ping can no longer harvest live
+   keys. `lock()` drops both the key reference and the token.
 5. The payload imports the raw keys as **non-extractable** `CryptoKey`s
    (AES-GCM encrypt/decrypt) and zeroizes the base64/byte copies.
+
+The key epoch is retired server-side: each `ServerSession` is bound to the
+authenticated workspace `SessionId` and a fresh handoff for the same owner calls
+`SessionRegistry::retire_owner` before inserting the new `kid`. A `kid` issued
+before a lock (or an earlier unlock) therefore stops being accepted immediately
+rather than lingering until its TTL.
 
 No key is persisted. The payload keeps the browser-side byte copies in
 zeroizable buffers and drops them after import. On the Rust side
@@ -263,6 +273,51 @@ regression tests:
   keys through a `hostKey()` accessor and drops the reference on `dispose()`; the
   stream subscribe frame captures the `kid` once across its seal await.
 
+## Third adversarial review (independent verification of the landed lane)
+
+Three fresh-context reviewers audited the exact committed range independently.
+All CRITICAL/HIGH and relevant MEDIUM findings were fixed with regression tests:
+
+- **Idempotency key dropped on a maybe-committed write (HIGH).**
+  `BackendOutcome::Unavailable` is surfaced as `{code:"capability_missing",
+  retryable:true}`, but the web classified only `server` through `retryable`, so
+  a transient failure that may still have committed rotated the key and let the
+  next submission become a duplicate order. `isIndeterminateOutcome` now honours
+  an explicit `retryable:true` for *every* code; the tests that pinned the old
+  behavior were corrected and a retryable-freshness UNKNOWN test added.
+- **`place_limit_order` silently dropped every user safety cap (HIGH).** The
+  form collected `max_buy_tax_bps`/`max_sell_tax_bps`/`max_price_impact_bps`/
+  `max_slippage_bps`/`max_total_cost_usd`, but the translator neither forwarded
+  nor refused them, so the UI presented unenforced caps as applied.
+  `refuse_unenforceable_limit_caps` now makes a non-null cap a determinate
+  `protocol` denial (the market path's existing policy); explicit `null` still
+  means "no cap" and places.
+- **Cross-purpose replay burned a command sequence (MEDIUM).** A captured
+  `/v1/stream` `subscribe` envelope replayed on `/v1/command` passed the route
+  check and consumed `Purpose::Command` before the dispatcher rejected it,
+  letting an observer pre-burn the honest client's replay window. The command
+  route now uses a positive allow-list backed by the closed
+  `session_transport::is_route_control_op` set, and the check runs before
+  `accept_sequence`.
+- **Advertised capabilities were not enforced server-side (MEDIUM).** A document
+  could advertise `execute=false` while the dispatcher executed it. `CapabilitySet`
+  now maps each operation to its capability and `OpaqueServiceState` denies a
+  command whose flag is `false` before the dispatcher runs. Harnesses that
+  expected an operation to run now advertise the matching capability truthfully.
+- **Session expiry was not authoritative (MEDIUM).** Bootstrap recomputed
+  `now + ttl` on every request instead of advertising the registered session's
+  real deadline, so a re-bootstrap let the client believe the session outlived
+  the server's. `ServerSession::expires_at_ms()` is now advertised, and the
+  stream driver refuses to emit (and drops the session) once it expires.
+- **BR-5 key epoch was never retired (MEDIUM).** A `kid` issued before a lock
+  stayed accepted until its TTL, and a fresh handoff did not invalidate the old
+  epoch. `ServerSession` now carries an opaque owner binding (the authenticated
+  `SessionId`) and the handoff calls `SessionRegistry::retire_owner` before
+  inserting the new `kid`.
+- **Unbound key delivery (MEDIUM).** The shell handed live keys to any
+  same-origin document that sent `workspace-ready`. Delivery is now one-shot and
+  gated on a random per-unlock token injected into the payload document.
+
 ## Residuals (explicit)
 
 - **USD-notional amounts (Trading Core capability, not a private-layer bug)**: the
@@ -290,13 +345,31 @@ regression tests:
   `portfolio`, while the web views expect camelCase/top-level fields. The
   projection is not implemented yet; the surfaces stay non-fabricating but
   partially blank.
-- **Operator wiring**: the Trading Core composition (real `AgentBackend`,
-  authoritative capabilities, dynamic kill switch, real `StreamSource`,
-  `InstrumentRegistry` backed by market metadata, `WebContractBackend` for wallet
-  limits and reconciliation stores) is injected through `web_command_dispatcher`
-  but not wired by the binary; `FailClosed*` remain the defaults. The production
-  edge binary still serves `default_router()` (unavailable relays, no
-  authorization backend).
+- **Operator wiring (partially closed)**: the production binaries now compose
+  honestly instead of always serving the fail-closed stub:
+  - `apps/edge-gateway` builds its router from `production::router_from_env()`.
+    With `EDGE_TLS_CERT`/`EDGE_TLS_KEY`/`EDGE_TLS_CA`/`EDGE_PRIVATE_API_DNS`,
+    `EDGE_PRIVATE_API_ORIGIN` and `EDGE_ACCESS_ASSERTION_HEADER` all supplied it
+    installs the real `PrivateRelay` + `PrivateStreamRelay` over the pinned mTLS
+    channel; a partial configuration refuses startup, and no configuration keeps
+    `EdgeState::unavailable()` (every `/v1/*` is a `503`). The access-assertion
+    header is the operator-owned perimeter seam (Cloudflare Access or an
+    equivalent ingress proxy adds and strips it); the edge requires it to be
+    explicitly configured and never authorizes an unstamped request.
+  - `apps/private-api` parses `TRADING_ENABLED` strictly (`"true"`/`"false"`;
+    unset disables; anything else refuses startup) and derives the advertised
+    bootstrap document from *what is actually wired*. Enabling trading does not
+    advertise a capability whose backend is absent, and the kill switch stays
+    engaged until a mutating seam is injected.
+  - Still residual: the concrete Trading Core composition (real `AgentBackend`,
+    authoritative `AgentCapabilities`, `InstrumentRegistry` backed by market
+    metadata, `WebContractBackend` for wallet limits/reconciliation, real
+    `StreamSource`) is injected through `web_command_dispatcher` /
+    `production::OpaqueComposition` but not built by the binary. Wiring it needs
+    genuinely operator-owned inputs (owner/wallet/chain/risk limits, Privy
+    signing, chain adapters, live market data), so with none supplied the
+    `FailClosed*` defaults remain and every mutation is an authenticated
+    `capability_missing` denial — never a fabricated success.
 - **Accepted LOW hardening residuals (fresh-context adversarial review)**: the
   s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
   substitution today; the cross-route c2s DoS is now fixed by validating before

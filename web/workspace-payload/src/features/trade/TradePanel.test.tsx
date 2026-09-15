@@ -563,7 +563,9 @@ describe("TradePanel", () => {
           throw new WorkspaceError({
             code: "freshness",
             message: "Command rejected: state changed.",
-            retryable: true,
+            // Non-retryable: the backend proved no commit, so the write is
+            // determinate and the idempotency key rotates.
+            retryable: false,
           });
         }
         throw new Error(`unexpected op ${op}`);
@@ -587,6 +589,43 @@ describe("TradePanel", () => {
 
     expect(screen.getByText(/Command rejected: state changed/i)).toBeTruthy();
     expect(screen.queryByText(/Execution outcome unknown/i)).toBeNull();
+  });
+
+  it("treats a retryable freshness rejection as UNKNOWN (the write may have committed)", async () => {
+    // A transient backend failure can be surfaced under a freshness code while
+    // the order may still have reached the chain. Rotating the idempotency key
+    // here would let the next submission create a duplicate, so the outcome must
+    // stay indeterminate regardless of the code.
+    const client: CommandClient = {
+      async send<T>(op: string): Promise<T> {
+        if (op === "preview_market_order") return quote as unknown as T;
+        if (op === "execute_market_order") {
+          throw new WorkspaceError({
+            code: "freshness",
+            message: "Command backend is unavailable.",
+            retryable: true,
+          });
+        }
+        throw new Error(`unexpected op ${op}`);
+      },
+    };
+    const store = makeStore(client, true, true);
+    store.reload();
+    await flush();
+    render(() => (
+      <WorkspaceProvider store={store}>
+        <TradePanel />
+      </WorkspaceProvider>
+    ));
+
+    fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
+    await flush();
+
+    expect(screen.getByText(/Execution outcome unknown/i)).toBeTruthy();
   });
 
   it("keeps the UNKNOWN guard when a retry is rejected determinately", async () => {

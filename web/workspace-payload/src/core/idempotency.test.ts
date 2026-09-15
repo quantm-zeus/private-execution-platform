@@ -23,6 +23,16 @@ describe("isIndeterminateOutcome", () => {
   it("treats explicit backend rejections as determinate (retry is a new write)", () => {
     for (const code of ["auth", "capability_missing", "freshness"] as const) {
       expect(isIndeterminateOutcome(code)).toBe(false);
+      // An explicit non-retryable rejection is determinate too.
+      expect(isIndeterminateOutcome(code, false)).toBe(false);
+    }
+  });
+
+  it("honours an explicit retryable flag on any code (no duplicate write)", () => {
+    // A transient backend failure can be surfaced under a capability code while
+    // the write may still have committed, so `retryable:true` must keep the key.
+    for (const code of ["auth", "capability_missing", "freshness", "protocol", "server"] as const) {
+      expect(isIndeterminateOutcome(code, true)).toBe(true);
     }
   });
 });

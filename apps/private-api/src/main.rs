@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use private_api::opaque::{self, OpaqueServiceState};
+use private_api::opaque::{self};
 use private_api::relay;
 use private_api::{router, OpaqueSystemClock, PrivateApiConfig, PrivateApiState};
 use service_identity::ServiceIdentityConfig;
@@ -56,15 +56,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = PrivateApiState::production(config)
         .map_err(|_| std::io::Error::other("private api configuration invalid"))?;
 
-    // TRADING_ENABLED=false remains fail-closed: the encrypted command surface
-    // is built with no backend and an all-false capability document until the
-    // operator wires the Trading Core composition. Reads/previews stay denied.
-    let opaque_state = OpaqueServiceState::fail_closed(
-        state.sessions(),
-        Arc::new(OpaqueSystemClock),
-        session_ttl_ms,
-    )
-    .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
+    // TRADING_ENABLED is parsed strictly (`"true"`/`"false"`; unset disables) so
+    // a typo can never silently enable execution. The authoritative Trading Core
+    // backend, capabilities, instrument registry, web-contract backend and
+    // realtime stream source are operator-injected seams; with none wired the
+    // advertised document advertises no capability and the kill switch stays
+    // engaged, so every mutation is an authenticated `capability_missing`
+    // denial — never a fabricated success.
+    let gate = private_api::production::TradingGate::from_env()
+        .map_err(|_| std::io::Error::other("TRADING_ENABLED must be true or false"))?;
+    let production =
+        private_api::production::build_opaque(private_api::production::OpaqueComposition {
+            sessions: state.sessions(),
+            clock: Arc::new(OpaqueSystemClock),
+            session_ttl_ms,
+            gate,
+            dispatcher: None,
+            wired: private_api::production::WiredCapabilities::default(),
+            stream_source: None,
+            chains: Vec::new(),
+        })
+        .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
+    let opaque_state = production.state;
 
     let relay_bind = std::env::var("PRIVATE_API_RELAY_BIND_ADDR").unwrap_or_default();
     if !relay_bind.is_empty() {

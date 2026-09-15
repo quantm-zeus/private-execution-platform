@@ -572,6 +572,14 @@ async fn translate_place_limit_order(
         .get("expiry_ms")
         .and_then(Value::as_i64)
         .ok_or_else(|| protocol("expiry_ms is required"))?;
+    // The canonical place-limit command carries no per-order risk-cap fields, so
+    // a browser-set cap cannot be enforced by the Trading Core. Rendering the
+    // form as "capped" while dropping the value would present an unenforced
+    // safety control as accepted (the same policy the market path applies to
+    // `max_total_cost_usd`). Refuse a non-null cap instead of silently dropping
+    // it; the backend-configured wallet policy remains the authorization
+    // boundary.
+    refuse_unenforceable_limit_caps(payload)?;
 
     let in_meta = registry.resolve(&chain, &token_in).await?;
     let out_meta = registry.resolve(&chain, &token_out).await?;
@@ -1087,6 +1095,31 @@ fn protocol(message: impl Into<String>) -> CommandDenial {
     CommandDenial::determinate(DenialCode::Protocol, message)
 }
 
+/// Closed set of browser risk-cap fields the canonical limit command cannot
+/// enforce. A non-null value is a determinate refusal so the UI never presents
+/// an unenforced cap as applied.
+const UNENFORCEABLE_LIMIT_CAPS: [&str; 5] = [
+    "max_buy_tax_bps",
+    "max_sell_tax_bps",
+    "max_price_impact_bps",
+    "max_slippage_bps",
+    "max_total_cost_usd",
+];
+
+fn refuse_unenforceable_limit_caps(payload: &Value) -> Result<(), CommandDenial> {
+    for field in UNENFORCEABLE_LIMIT_CAPS {
+        match payload.get(field) {
+            None | Some(Value::Null) => {}
+            Some(_) => {
+                return Err(protocol(format!(
+                    "{field} is not enforceable by the canonical limit command; remove the cap."
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn indeterminate(message: impl Into<String>) -> CommandDenial {
     CommandDenial::indeterminate(DenialCode::Unknown, message)
 }
@@ -1493,7 +1526,6 @@ mod tests {
                     "amount_type": "stablecoin",
                     "amount": 25,
                     "limit_price": 0.5,
-                    "max_slippage_bps": 100,
                     "allow_partial_fill": true,
                     "expiry_ms": 9_999_999_999_999i64
                 }),
@@ -1510,6 +1542,74 @@ mod tests {
         );
         assert_eq!(sent["allow_partial_fill"], true);
         assert_eq!(sent["expires_at_ms"], 9_999_999_999_999i64);
+    }
+
+    #[tokio::test]
+    async fn place_limit_refuses_an_unenforceable_risk_cap() {
+        // The canonical limit command cannot carry a per-order risk cap, so a
+        // non-null cap must be a determinate refusal rather than a silently
+        // dropped safety control the form presents as applied.
+        let inner = CapturingDispatcher::new(json!({ "order_id": "ord-1" }));
+        let dispatcher = dispatcher(inner.clone());
+        for (field, value) in [
+            ("max_buy_tax_bps", json!(100)),
+            ("max_sell_tax_bps", json!(100)),
+            ("max_price_impact_bps", json!(50)),
+            ("max_slippage_bps", json!(50)),
+            ("max_total_cost_usd", json!(250)),
+        ] {
+            let mut payload = json!({
+                "chain": "base",
+                "token_in": "USDC",
+                "token_out": "TOKEN",
+                "side": "buy",
+                "order_type": "limit",
+                "amount_type": "stablecoin",
+                "amount": 25,
+                "limit_price": 0.5,
+                "allow_partial_fill": true,
+                "expiry_ms": 9_999_999_999_999i64
+            });
+            payload[field] = value;
+            let error = dispatcher
+                .dispatch(&request("place_limit_order", payload))
+                .await
+                .expect_err("unenforceable cap must be refused");
+            assert_eq!(error.code, "protocol", "{field} must be a protocol denial");
+            assert_eq!(
+                inner.count(),
+                0,
+                "{field} must never reach the Trading Core"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn place_limit_accepts_explicitly_null_caps() {
+        // An empty form field (null) means "no cap" and must still place.
+        let inner = CapturingDispatcher::new(json!({ "order_id": "ord-1" }));
+        let dispatcher = dispatcher(inner.clone());
+        dispatcher
+            .dispatch(&request(
+                "place_limit_order",
+                json!({
+                    "chain": "base",
+                    "token_in": "USDC",
+                    "token_out": "TOKEN",
+                    "side": "buy",
+                    "order_type": "limit",
+                    "amount_type": "stablecoin",
+                    "amount": 25,
+                    "limit_price": 0.5,
+                    "max_slippage_bps": null,
+                    "max_total_cost_usd": null,
+                    "allow_partial_fill": true,
+                    "expiry_ms": 9_999_999_999_999i64
+                }),
+            ))
+            .await
+            .expect("null caps are not a cap");
+        assert_eq!(inner.count(), 1);
     }
 
     #[tokio::test]

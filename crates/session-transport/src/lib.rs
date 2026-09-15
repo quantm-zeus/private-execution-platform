@@ -71,6 +71,20 @@ pub fn is_mutating_op(op: &str) -> bool {
             | "set_wallet_limits"
     )
 }
+
+/// Closed set of route-control operations.
+///
+/// These carry no trading semantics and are bound to a specific transport route
+/// (`bootstrap` -> `/v1/bootstrap`, `sync` -> `/v1/sync`, `subscribe` -> the
+/// `/v1/stream` WebSocket). They must never be accepted on the command route:
+/// a captured control envelope replayed there would otherwise consume a
+/// `Purpose::Command` sequence slot *before* the dispatcher rejects it as a
+/// forbidden operation, letting an observer pre-burn the honest client's
+/// replay window (fail-closed DoS). This is the authoritative list the
+/// private-api route check uses instead of a denylist of known names.
+pub fn is_route_control_op(op: &str) -> bool {
+    matches!(op, "bootstrap" | "sync" | "subscribe")
+}
 /// Replay window width in sequence numbers.
 const REPLAY_WINDOW: u64 = 64;
 
@@ -524,7 +538,19 @@ pub struct ServerSession {
     stream_sequence: u64,
     /// Highest authenticated `server_time_ms` emitted on the stream (BR-15).
     max_server_time_ms: Option<i64>,
+    /// Opaque owner binding (the authenticated workspace session id).
+    ///
+    /// BR-5 "authenticated key epoch": a fresh handoff for the same browser must
+    /// retire the previous epoch. Without an owner binding the registry cannot
+    /// tell which `kid`s belong to one browser, so a key captured before a lock
+    /// would keep an authenticated channel until its TTL. `None` means the
+    /// session is unowned (single-tenant/test embedding) and is never retired by
+    /// another session's handoff.
+    owner: Option<[u8; OWNER_BYTES]>,
 }
+
+/// Length of the opaque owner binding (the auth `SessionId` is 32 bytes).
+pub const OWNER_BYTES: usize = 32;
 
 impl fmt::Debug for ServerSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -558,7 +584,27 @@ impl ServerSession {
             expires_at_ms,
             stream_sequence: 0,
             max_server_time_ms: None,
+            owner: None,
         })
+    }
+
+    /// Build from the HPKE-exporter app keys, bound to an opaque owner (the
+    /// authenticated workspace session id). Used by the BR-5 handoff so a new
+    /// unlock can retire the previous epoch for that same owner.
+    pub fn new_owned(
+        kid: [u8; KID_BYTES],
+        keys: &AppDirectionKeys,
+        expires_at_ms: i64,
+        owner: [u8; OWNER_BYTES],
+    ) -> Result<Self, SessionError> {
+        let mut session = Self::new(kid, keys, expires_at_ms)?;
+        session.owner = Some(owner);
+        Ok(session)
+    }
+
+    /// The opaque owner binding, if any.
+    pub fn owner(&self) -> Option<&[u8; OWNER_BYTES]> {
+        self.owner.as_ref()
     }
 
     pub fn kid(&self) -> &str {
@@ -571,6 +617,17 @@ impl ServerSession {
 
     pub fn is_expired(&self, now_ms: i64) -> bool {
         now_ms >= self.expires_at_ms
+    }
+
+    /// Authoritative absolute session deadline (ms since epoch).
+    ///
+    /// BR-1 requires the bootstrap document to advertise the *real* session
+    /// expiry: the client derives its mutation deadline from the advertised
+    /// duration, so recomputing `now + ttl` on a re-bootstrap would let the
+    /// client believe the session outlives the server's actual deadline and
+    /// issue commands that come back as indeterminate 503s.
+    pub fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
     }
 
     /// Authenticate, decrypt and replay-check an inbound c2s envelope for the
@@ -801,6 +858,28 @@ impl SessionRegistry {
         let before = self.sessions.len();
         self.sessions
             .retain(|_, session| !session.is_expired(now_ms));
+        before - self.sessions.len()
+    }
+
+    /// Number of live sessions currently owned by `owner`.
+    pub fn len_for_owner(&self, owner: &[u8; OWNER_BYTES]) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.owner.as_ref() == Some(owner))
+            .count()
+    }
+
+    /// BR-5 authenticated key epoch: retire every live epoch for `owner`.
+    ///
+    /// Called when the same authenticated browser establishes a *fresh* handoff
+    /// (new `kid`). Without it a `kid` issued before a lock or an earlier unlock
+    /// would keep an authenticated command/stream channel until its TTL, so
+    /// "lock" and "rotate" would not actually terminate the old epoch. Returns
+    /// how many sessions were retired.
+    pub fn retire_owner(&mut self, owner: &[u8; OWNER_BYTES]) -> usize {
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|_, session| session.owner.as_ref() != Some(owner));
         before - self.sessions.len()
     }
 }
@@ -1192,6 +1271,33 @@ mod tests {
     }
 
     #[test]
+    fn fresh_handoff_retires_the_previous_epoch_for_the_same_owner() {
+        // BR-5 authenticated key epoch: rotating to a new kid must terminate the
+        // old one, and an unowned session must never be collateral damage.
+        let owner = [0x21u8; OWNER_BYTES];
+        let other_owner = [0x22u8; OWNER_BYTES];
+        let mut registry = SessionRegistry::new();
+        registry
+            .insert(ServerSession::new_owned([0x01; KID_BYTES], &keys(), 500, owner).unwrap())
+            .expect("first epoch");
+        registry
+            .insert(ServerSession::new_owned([0x02; KID_BYTES], &keys(), 500, other_owner).unwrap())
+            .expect("other owner");
+        registry
+            .insert(ServerSession::new([0x03; KID_BYTES], &keys(), 500).unwrap())
+            .expect("unowned");
+
+        assert_eq!(registry.len_for_owner(&owner), 1);
+        // A fresh handoff for the same owner retires only that owner's epoch.
+        assert_eq!(registry.retire_owner(&owner), 1);
+        assert_eq!(registry.len_for_owner(&owner), 0);
+        assert!(registry.get_mut(&[0x01; KID_BYTES]).is_none());
+        assert!(registry.get_mut(&[0x02; KID_BYTES]).is_some());
+        assert!(registry.get_mut(&[0x03; KID_BYTES]).is_some());
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
     fn debug_never_leaks_material() {
         let (server, client) = established();
         let text = format!("{server:?} {client:?}");
@@ -1356,6 +1462,27 @@ mod tests {
             "get_order",
         ] {
             assert!(!is_mutating_op(op), "{op} must stay available");
+        }
+    }
+
+    #[test]
+    fn route_control_op_set_is_closed_and_disjoint_from_writes() {
+        for op in ["bootstrap", "sync", "subscribe"] {
+            assert!(is_route_control_op(op), "{op} is route control");
+            // A control op is never a command write; the sets must not overlap or
+            // the command route's positive allow-list would leak a control op.
+            assert!(!is_mutating_op(op), "{op} must not be a write");
+        }
+        for op in [
+            "get_quote",
+            "execute_market_order",
+            "get_wallet_limits",
+            "set_wallet_limits",
+        ] {
+            assert!(
+                !is_route_control_op(op),
+                "{op} is a command, not route control"
+            );
         }
     }
 

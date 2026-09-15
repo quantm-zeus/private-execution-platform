@@ -18,31 +18,34 @@ function App() {
   // Same-document channel with the decrypted payload: the payload may request a
   // lock (destroy session keys + revoke blob URLs) and announce readiness.
   // Only messages originating from our own frame *and* our own origin are
-  // honoured: the sandbox permits self-navigation, so a navigated frame could
-  // still match `contentWindow` (BR-6 treats the payload as trusted code, but the
-  // origin check is cheap defense-in-depth).
+  // honoured, and the ready ping must echo the per-unlock handoff token the
+  // shell injected into the payload document: the sandbox permits
+  // self-navigation, so a navigated frame could still match `contentWindow`
+  // (BR-6 treats the payload as trusted code, but the binding is cheap
+  // defense-in-depth against harvesting live session keys).
   const onPayloadMessage = (event: MessageEvent) => {
     if (!frame || event.source !== frame.contentWindow) return;
     if (event.origin !== window.location.origin) return;
-    const data = event.data as { type?: unknown } | null;
+    const data = event.data as { type?: unknown; handoff?: unknown } | null;
     if (!data || typeof data !== "object") return;
     if (data.type === "evergreen:lock-request") {
       handleLock();
     } else if (data.type === "evergreen:workspace-ready") {
       setStatus("Workspace ready.");
-      deliverSessionKeys();
+      deliverSessionKeys(data.handoff);
     }
   };
 
   /**
    * BR-5 handoff: deliver the directional session keys to the sandboxed payload
-   * over the same-document channel only. The payload imports them as
+   * over the same-document channel only, once per unlock, and only to a document
+   * that echoed the per-unlock token. The payload imports them as
    * non-extractable CryptoKeys; they are never persisted or placed in the DOM.
    */
-  const deliverSessionKeys = () => {
+  const deliverSessionKeys = (handoff: unknown) => {
     const target = frame?.contentWindow;
     if (!target) return;
-    const keys = defaultRuntime.sessionKeys();
+    const keys = defaultRuntime.takeSessionKeysForHandoff(handoff);
     if (!keys) return;
     try {
       target.postMessage(

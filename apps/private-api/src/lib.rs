@@ -25,6 +25,7 @@ use axum::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod opaque;
+pub mod production;
 pub mod stream;
 pub mod web_contract;
 pub mod web_integration;
@@ -901,10 +902,12 @@ async fn deliver_artifact(
     // start encrypted bootstrap/command/sync once the shell hands the mirrored
     // initiator keys over. Nothing is persisted; expiry is bounded here.
     let session_expires_at_ms = now.saturating_add(state.config.session_ttl_ms);
-    let server_session = match session_transport::ServerSession::new(
+    let owner = *pending_grant.session_id.as_bytes();
+    let server_session = match session_transport::ServerSession::new_owned(
         session.kid(),
         session.app_keys(),
         session_expires_at_ms,
+        owner,
     ) {
         Ok(server_session) => server_session,
         Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
@@ -915,6 +918,12 @@ async fn deliver_artifact(
             Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
         };
         sessions.prune(now);
+        // BR-5 authenticated key epoch: a fresh handoff retires every previous
+        // epoch for this authenticated workspace session. Otherwise a `kid`
+        // issued before a lock (or an earlier unlock) would keep an
+        // authenticated command/stream channel until its TTL, so rotating to a
+        // new `kid` would not actually terminate the old epoch.
+        sessions.retire_owner(&owner);
         // Kids are fresh random values per grant, so a collision can only mean
         // an internal fault; never replace a live session.
         if sessions.insert(server_session).is_err() {

@@ -95,6 +95,15 @@ fn permissive_bootstrap() -> Arc<dyn BootstrapProvider> {
     document.trading_enabled = true;
     document.kill_switch_enabled = false;
     document.kill_switch_reason = None;
+    // BR-1/F2: the advertised capability set is authoritative and enforced
+    // server-side, so a harness that expects an operation to run must advertise
+    // the matching capability. Trading alone does not imply `execute`.
+    document.capabilities.execute = true;
+    document.capabilities.limits = true;
+    document.capabilities.preview = true;
+    document.capabilities.quotes = true;
+    document.capabilities.portfolio = true;
+    document.capabilities.wallet_limits = true;
     Arc::new(StaticBootstrap::new(document))
 }
 

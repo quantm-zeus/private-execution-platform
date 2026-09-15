@@ -18,8 +18,8 @@ use chain_types::ChainId;
 use edge_gateway::{AuthorizationBackend, EdgeError, EdgeState, OpaqueRelay, OpaqueRoute};
 use http_body_util::BodyExt;
 use private_api::opaque::{
-    BootstrapDocument, BootstrapProvider, FailClosedBootstrap, OpaqueClock,
-    OpaqueRoute as PrivateRoute, OpaqueServiceState, StaticBootstrap,
+    BootstrapDocument, BootstrapProvider, OpaqueClock, OpaqueRoute as PrivateRoute,
+    OpaqueServiceState, StaticBootstrap,
 };
 use private_api::{
     web_command_dispatcher, AgentBackend, AgentCapabilities, AgentChannel, AgentCommand,
@@ -186,9 +186,27 @@ fn harness(
         document.trading_enabled = true;
         document.kill_switch_enabled = false;
         document.kill_switch_reason = None;
+        // BR-1/F2: the advertised capability set is enforced server-side, so a
+        // trading-enabled composition must advertise each capability it expects
+        // to serve rather than relying on `trading_enabled` alone.
+        document.capabilities.execute = true;
+        document.capabilities.limits = true;
+        document.capabilities.preview = true;
+        document.capabilities.quotes = true;
+        document.capabilities.portfolio = true;
+        document.capabilities.wallet_limits = true;
         Arc::new(StaticBootstrap::new(document))
     } else {
-        Arc::new(FailClosedBootstrap)
+        // Trading is disabled: mutations stay denied, but the PRD requires
+        // read-only data to remain available, so the read capabilities the
+        // preview path needs are still advertised (BR-1/F2 enforces them
+        // server-side, so they must be truthful).
+        let mut document = BootstrapDocument::fail_closed();
+        document.capabilities.preview = true;
+        document.capabilities.quotes = true;
+        document.capabilities.portfolio = true;
+        // Deliberately NOT advertising `execute`/`limits`.
+        Arc::new(StaticBootstrap::new(document))
     };
     let opaque = OpaqueServiceState::new(
         sessions,
