@@ -30,6 +30,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
+use crate::benchmark::{
+    run_provider_benchmark_loop, ProviderBenchmarkLoop, ProviderBenchmarkRunReport,
+};
 use crate::composition::{
     run_reconcile_loop, system_now_ms, MarketReconcileLoop, MarketReconcileTarget,
     ReconcileRunReport, ReconcileSchedule, ReconcileTick, MIN_TICK_INTERVAL,
@@ -152,6 +155,23 @@ pub fn spawn_reconcile_loop<T: MarketReconcileTarget + 'static>(
     tokio::spawn(async move {
         let mut tick = ShutdownTick::new(interval, shutdown);
         run_reconcile_loop(&reconcile, &mut tick).await
+    })
+}
+
+/// Spawns the observational provider-benchmark loop until `shutdown` is set.
+///
+/// The returned handle resolves to the accumulated [`ProviderBenchmarkRunReport`]
+/// once the loop stops; setting the watch to `true` (or dropping the sender)
+/// stops it promptly. The loop is never on the execution path: it only evaluates
+/// provider quotes against a local basis and records the comparisons.
+pub fn spawn_provider_benchmark_loop(
+    benchmark: ProviderBenchmarkLoop,
+    interval: Duration,
+    shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<ProviderBenchmarkRunReport> {
+    tokio::spawn(async move {
+        let mut tick = ShutdownTick::new(interval, shutdown);
+        run_provider_benchmark_loop(&benchmark, &mut tick).await
     })
 }
 

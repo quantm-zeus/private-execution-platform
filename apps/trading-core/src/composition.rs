@@ -72,6 +72,11 @@ use mcp_server::{AgentBackend, BackendOutcome};
 use policy::{PolicyEngine, PolicyError, PolicyLimits, TradingGate};
 use privy::PreparedExecutionRef;
 use routing::GasEstimator;
+
+use crate::benchmark::{
+    BenchmarkRequestSource, NoopRouteComparisonRecordSink, ProviderBenchmarkLoop,
+    ProviderBenchmarkPort, RouteComparisonRecordSink, MAX_BENCHMARK_REQUESTS_PER_PASS,
+};
 use storage::{
     ComponentHealth, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot, OpaqueStore,
     StorageError,
@@ -306,6 +311,16 @@ pub struct TradingCoreSeams {
     pub market_execution: Option<Arc<dyn MarketExecutionPort>>,
     /// Full limit-orchestrator recovery, operator-injected.
     pub limit_recovery: Option<Arc<dyn LimitRecovery>>,
+    /// Observational provider-benchmark evaluator (P93).
+    ///
+    /// Defaults to absent. A loop is built only when **both** this port and a
+    /// [`Self::provider_benchmark_requests`] source are installed; the benchmark
+    /// loop is never on the execution path.
+    pub provider_benchmark: Option<Arc<dyn ProviderBenchmarkPort>>,
+    /// Sink for "our route vs provider route" records (defaults to a no-op).
+    pub provider_benchmark_sink: Option<Arc<dyn RouteComparisonRecordSink>>,
+    /// Source of the bounded benchmark requests evaluated each pass.
+    pub provider_benchmark_requests: Option<Arc<dyn BenchmarkRequestSource>>,
 }
 
 impl std::fmt::Debug for TradingCoreSeams {
@@ -318,6 +333,15 @@ impl std::fmt::Debug for TradingCoreSeams {
             .field("okx_quote_source", &self.okx_quote_source.is_some())
             .field("market_execution", &self.market_execution.is_some())
             .field("limit_recovery", &self.limit_recovery.is_some())
+            .field("provider_benchmark", &self.provider_benchmark.is_some())
+            .field(
+                "provider_benchmark_sink",
+                &self.provider_benchmark_sink.is_some(),
+            )
+            .field(
+                "provider_benchmark_requests",
+                &self.provider_benchmark_requests.is_some(),
+            )
             .finish()
     }
 }
@@ -989,6 +1013,7 @@ pub struct TradingCore<S: OpaqueStore> {
     config: CompositionConfig,
     trading_enabled_at_startup: bool,
     limit_recovery: Option<Arc<dyn LimitRecovery>>,
+    provider_benchmark: Option<ProviderBenchmarkLoop>,
 }
 
 impl<S: OpaqueStore> TradingCore<S> {
@@ -1014,6 +1039,9 @@ impl<S: OpaqueStore> TradingCore<S> {
             okx_quote_source,
             market_execution,
             limit_recovery,
+            provider_benchmark,
+            provider_benchmark_sink,
+            provider_benchmark_requests,
         } = seams;
 
         let durable = Arc::new(DurableLimitOrderStore::new(
@@ -1053,13 +1081,35 @@ impl<S: OpaqueStore> TradingCore<S> {
         });
         let backend = backend.with_market_execution(execution);
 
+        // The observational benchmark loop is built only when both an evaluator
+        // and a request source are installed. It is never on the execution path;
+        // an absent sink means records are discarded.
+        let provider_benchmark = match (provider_benchmark, provider_benchmark_requests) {
+            (Some(port), Some(source)) => Some(ProviderBenchmarkLoop::new(
+                port,
+                provider_benchmark_sink.unwrap_or_else(|| Arc::new(NoopRouteComparisonRecordSink)),
+                source,
+                MAX_BENCHMARK_REQUESTS_PER_PASS,
+            )),
+            _ => None,
+        };
+
         Self {
             backend: Arc::new(backend),
             registry: Arc::new(MarketAttemptRegistry::new()),
             config,
             trading_enabled_at_startup,
             limit_recovery,
+            provider_benchmark,
         }
+    }
+
+    /// The observational provider-benchmark loop, when one is installed.
+    ///
+    /// `None` means no evaluator and/or request source was injected, so there is
+    /// nothing to record. Driving the loop never affects execution.
+    pub fn provider_benchmark_loop(&self) -> Option<&ProviderBenchmarkLoop> {
+        self.provider_benchmark.as_ref()
     }
 
     /// The composed agent backend (unrecorded; wrap with
