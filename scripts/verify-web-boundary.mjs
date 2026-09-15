@@ -653,6 +653,7 @@ try {
   // 2f. Shell code & bundle contains no third-party network calls, analytics, or persistent storage
   const shellSourceFiles = [
     resolve("web/workspace-shell/src/index.tsx"),
+    resolve("web/workspace-shell/src/passkey-auth.ts"),
     resolve("web/workspace-shell/src/wasm-loader.ts"),
     resolve("web/workspace-shell/src/unlock-runtime.ts"),
     shellHtmlPath,
@@ -785,7 +786,11 @@ try {
   const SHELL_PRIVATE_PATHS = [
     "/internal/artifact",
     "/internal/artifact/grant",
+    "/internal/auth/challenge",
     "/internal/auth/enroll",
+    "/internal/auth/register/challenge",
+    "/internal/auth/register/verify",
+    "/internal/auth/verify",
   ];
   const shellPrivatePaths = new Set();
   for (const path of await filesUnder(resolve("web/workspace-shell/src"))) {

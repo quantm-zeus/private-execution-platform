@@ -3,7 +3,8 @@
 pub mod passkey;
 
 pub use webauthn_rs::prelude::{
-    AuthenticationResult, Passkey, PublicKeyCredential, RequestChallengeResponse,
+    AuthenticationResult, CreationChallengeResponse, Passkey, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Uuid,
 };
 
 use std::collections::HashMap;
@@ -386,6 +387,8 @@ pub enum AuthError {
     EnrollmentConflict,
     #[error("workspace enrollment not found")]
     EnrollmentNotFound,
+    #[error("passkey credential already registered")]
+    CredentialConflict,
 }
 
 #[cfg(test)]

@@ -9,10 +9,12 @@ use std::{
 };
 
 use auth::passkey::PasskeyCredentialStore;
-use auth::passkey::{AuthenticationAttempt, WebAuthnPasskeyAuthenticator};
+use auth::passkey::{
+    AuthenticationAttempt, PasskeyRegistrationAttempt, WebAuthnPasskeyAuthenticator,
+};
 use auth::{
-    ArtifactGrantId, AuthError, AuthState, AuthenticationResult, Passkey, PublicKeyCredential,
-    SessionId,
+    ArtifactGrantId, AuthError, AuthState, PublicKeyCredential, RegisterPublicKeyCredential,
+    SessionId, Uuid,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -24,11 +26,16 @@ use axum::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+use subtle::ConstantTimeEq;
+
 pub mod opaque;
+pub mod passkey_store;
 pub mod production;
 pub mod stream;
 pub mod web_contract;
 pub mod web_integration;
+
+pub use passkey_store::FilePasskeyCredentialStore;
 
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -81,6 +88,15 @@ pub fn web_command_dispatcher(
 
 pub const CHALLENGE_COOKIE_NAME: &str = "__Host-evergreen_challenge";
 pub const SESSION_COOKIE_NAME: &str = "__Host-evergreen_session";
+/// Single-use cookie binding an operator passkey-enrollment ceremony.
+pub const REGISTRATION_COOKIE_NAME: &str = "__Host-evergreen_register";
+/// Operator bootstrap header for passkey enrollment. The value is compared
+/// against `PRIVATE_PASSKEY_ENROLL_SECRET` in constant time.
+pub const ENROLLMENT_SECRET_HEADER: &str = "x-evergreen-enroll-secret";
+/// Minimum length of the operator enrollment secret. A weak bootstrap secret is
+/// a direct path to minting an attacker credential, so a short one refuses
+/// startup instead of being accepted.
+pub const MIN_ENROLLMENT_SECRET_LEN: usize = 32;
 pub const MAX_ASSERTION_BYTES: usize = 64 * 1024;
 pub const JSON_CONTENT_TYPE: &str = "application/json";
 const CONTENT_TYPE: &str = JSON_CONTENT_TYPE;
@@ -195,6 +211,13 @@ struct PendingAuthentication {
     expires_at_ms: i64,
 }
 
+/// A pending operator passkey-enrollment ceremony. Holds only the single-use
+/// WebAuthn registration challenge; never serialized, persisted or logged.
+struct PendingRegistration {
+    attempt: PasskeyRegistrationAttempt,
+    expires_at_ms: i64,
+}
+
 /// Bounded pending-challenge budget for the whole process (P0-7).
 ///
 /// The budget is deliberately GLOBAL, not per-request-header: private-api
@@ -214,12 +237,15 @@ const MAX_PENDING_CHALLENGES: usize = 32;
 #[derive(Default)]
 struct TransportState {
     pending: HashMap<TransportToken, PendingAuthentication>,
+    registrations: HashMap<TransportToken, PendingRegistration>,
     sessions: HashMap<TransportToken, (SessionId, i64)>,
     grants: HashMap<TransportToken, PendingArtifactGrant>,
 }
 impl TransportState {
     fn prune(&mut self, now_ms: i64) {
         self.pending
+            .retain(|_, pending| pending.expires_at_ms > now_ms);
+        self.registrations
             .retain(|_, pending| pending.expires_at_ms > now_ms);
         self.sessions.retain(|_, (_, expires)| *expires > now_ms);
         self.grants.retain(|_, grant| grant.expires_at_ms > now_ms);
@@ -239,6 +265,18 @@ pub struct PrivateApiState {
     /// Established browser transport sessions (BR-5 key epoch). Shared with the
     /// opaque command/bootstrap/sync service.
     sessions: Arc<Mutex<session_transport::SessionRegistry>>,
+    /// Operator bootstrap secret for passkey enrollment. `None` disables the
+    /// enrollment surface entirely (fail closed); the value is held only in a
+    /// self-zeroizing buffer.
+    enrollment_secret: Option<Arc<Zeroizing<String>>>,
+    /// Whether additional credentials may be enrolled once the store is no
+    /// longer empty. Defaults to `false`, so the operator secret is a one-time
+    /// bootstrap capability rather than a standing credential-mint.
+    allow_additional_credentials: bool,
+    /// Serializes the finish half of an enrollment ceremony with the
+    /// "is another credential allowed?" decision, so the one-time bootstrap
+    /// policy cannot be defeated by concurrent verifies.
+    enrollment_lock: Arc<Mutex<()>>,
 }
 
 impl PrivateApiState {
@@ -257,13 +295,40 @@ impl PrivateApiState {
             clock: Arc::new(SystemClock),
             artifact_loader: Arc::new(load_workspace_artifact),
             sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
+            enrollment_secret: None,
+            allow_additional_credentials: false,
+            enrollment_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    pub fn with_webauthn(config: PrivateApiConfig) -> Result<Self, PrivateApiError> {
-        let authenticator = build_authenticator(&config)?;
+    /// Production composition with a real, durable passkey credential store.
+    ///
+    /// This is the constructor the production binary uses when the operator has
+    /// configured a credential store. `authenticator` is built from the
+    /// configured RP id/origin and the injected store; `/internal/auth/challenge`
+    /// becomes available as soon as the store holds at least one credential, and
+    /// stays `503` while it is empty (fail closed). The enrollment surface is
+    /// only reachable when `enrollment_secret` is supplied.
+    pub fn production_with_passkeys(
+        config: PrivateApiConfig,
+        store: Arc<dyn PasskeyCredentialStore>,
+        enrollment_secret: Option<Zeroizing<String>>,
+        allow_additional_credentials: bool,
+    ) -> Result<Self, PrivateApiError> {
+        config.validate()?;
+        let enrollment_secret = match enrollment_secret {
+            Some(secret) if secret.is_empty() => None,
+            Some(secret) if secret.len() < MIN_ENROLLMENT_SECRET_LEN => {
+                return Err(PrivateApiError::InvalidConfiguration)
+            }
+            other => other.map(Arc::new),
+        };
+        let authenticator = WebAuthnPasskeyAuthenticator::new(&config.rp_id, &config.origin, store)
+            .map_err(PrivateApiError::Auth)?;
         let mut state = Self::production(config)?;
         state.authenticator = Some(Arc::new(authenticator));
+        state.enrollment_secret = enrollment_secret;
+        state.allow_additional_credentials = allow_additional_credentials;
         Ok(state)
     }
 
@@ -292,6 +357,9 @@ impl PrivateApiState {
             clock,
             artifact_loader: Arc::new(load_workspace_artifact),
             sessions: Arc::new(Mutex::new(session_transport::SessionRegistry::new())),
+            enrollment_secret: None,
+            allow_additional_credentials: false,
+            enrollment_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -302,36 +370,17 @@ impl PrivateApiState {
     }
 }
 
-struct ProductionPasskeyCredentialStore;
-
-impl PasskeyCredentialStore for ProductionPasskeyCredentialStore {
-    fn list_passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
-        Err(AuthError::VerifierUnavailable)
-    }
-
-    fn apply_authentication_result(&self, _: &AuthenticationResult) -> Result<(), AuthError> {
-        Err(AuthError::VerifierUnavailable)
-    }
-}
-
-fn build_authenticator(
-    config: &PrivateApiConfig,
-) -> Result<WebAuthnPasskeyAuthenticator, PrivateApiError> {
-    config.validate()?;
-    WebAuthnPasskeyAuthenticator::new(
-        &config.rp_id,
-        &config.origin,
-        Arc::new(ProductionPasskeyCredentialStore),
-    )
-    .map_err(PrivateApiError::Auth)
-}
-
 pub fn router(state: PrivateApiState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/internal/auth/challenge", post(issue_challenge))
         .route("/internal/auth/verify", post(verify_challenge))
         .route("/internal/auth/session", get(validate_session))
+        .route(
+            "/internal/auth/register/challenge",
+            post(issue_registration_challenge),
+        )
+        .route("/internal/auth/register/verify", post(verify_registration))
         .route(
             "/internal/auth/enroll",
             post(enroll_workspace_key).get(get_workspace_enrollment_handler),
@@ -508,6 +557,200 @@ async fn verify_challenge(
 
 fn append_challenge_clear(response: &mut Response) -> Result<(), PrivateApiError> {
     append_cookie(response, expired_cookie(CHALLENGE_COOKIE_NAME))
+}
+
+/// Bounded pending enrollment-ceremony budget. Enrollment is operator-gated, so
+/// this only bounds resource use if the bootstrap secret leaks; it is small and
+/// pruned by the challenge TTL.
+const MAX_PENDING_REGISTRATIONS: usize = 8;
+
+/// Resolve whether the request carries the configured operator enrollment
+/// secret. Returns `None` when enrollment is disabled (no secret configured),
+/// `Some(true)`/`Some(false)` otherwise. The comparison is constant time so a
+/// timing side channel cannot recover the secret byte by byte.
+fn enrollment_secret_matches(state: &PrivateApiState, headers: &HeaderMap) -> Option<bool> {
+    let secret = state.enrollment_secret.as_ref()?;
+    let presented = headers
+        .get(ENROLLMENT_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok());
+    match presented {
+        Some(presented) => Some(presented.as_bytes().ct_eq(secret.as_bytes()).into()),
+        None => Some(false),
+    }
+}
+
+/// Whether the enrollment surface may currently mint another credential.
+///
+/// A store failure is a backend condition (`Err`), not a policy conflict, so
+/// callers can answer `503` rather than `409`.
+fn enrollment_open(
+    state: &PrivateApiState,
+    authenticator: &WebAuthnPasskeyAuthenticator,
+) -> Result<bool, AuthError> {
+    match authenticator.has_credentials()? {
+        false => Ok(true),
+        true => Ok(state.allow_additional_credentials),
+    }
+}
+
+fn registration_cookie(token: &str, ttl_ms: i64) -> String {
+    secure_cookie(REGISTRATION_COOKIE_NAME, token, max_age_seconds(ttl_ms))
+}
+
+fn clear_registration(mut response: Response) -> Response {
+    let _ = append_cookie(&mut response, expired_cookie(REGISTRATION_COOKIE_NAME));
+    no_store(response)
+}
+
+/// Begin an operator passkey-enrollment ceremony (bootstrap path).
+///
+/// This endpoint is the *only* way a production credential store becomes
+/// non-empty. It is disabled unless `PRIVATE_PASSKEY_ENROLL_SECRET` is
+/// configured, requires the matching header, and — unless the operator opted in
+/// with `PRIVATE_PASSKEY_ALLOW_ADDITIONAL=true` — refuses once a credential
+/// exists, so the secret is a one-time bootstrap capability.
+async fn issue_registration_challenge(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(matches) = enrollment_secret_matches(&state, &headers) else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    if !matches {
+        return generic_error(StatusCode::UNAUTHORIZED);
+    }
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let authenticator = match state.authenticator.as_ref() {
+        Some(v) => v.clone(),
+        None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    match enrollment_open(&state, &authenticator) {
+        Ok(true) => {}
+        Ok(false) => return generic_error(StatusCode::CONFLICT),
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+    let (options, attempt) =
+        match authenticator.start_registration(Uuid::new_v4(), "owner", "Owner") {
+            Ok(v) => v,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+    let token = match random_transport_token() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let cookie = registration_cookie(token.as_str(), state.config.challenge_ttl_ms);
+    {
+        let mut transport = match state.transport.lock() {
+            Ok(v) => v,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        transport.prune(now);
+        if transport.registrations.len() >= MAX_PENDING_REGISTRATIONS {
+            return too_many_requests();
+        }
+        transport.registrations.insert(
+            token,
+            PendingRegistration {
+                attempt,
+                expires_at_ms: now.saturating_add(state.config.challenge_ttl_ms),
+            },
+        );
+    }
+    let body = match serde_json::to_vec(&options) {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let mut response =
+        no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response());
+    if set_cookie(&mut response, cookie).is_err() {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    response
+}
+
+/// Finish an operator passkey-enrollment ceremony and durably register the
+/// credential. The stored record is public WebAuthn material only; the response
+/// deliberately returns no credential id.
+async fn verify_registration(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(matches) = enrollment_secret_matches(&state, &headers) else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    if !matches {
+        return generic_error(StatusCode::UNAUTHORIZED);
+    }
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let authenticator = match state.authenticator.as_ref() {
+        Some(v) => v.clone(),
+        None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let challenge_token = match cookie_value(&headers, REGISTRATION_COOKIE_NAME) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return clear_registration(generic_error(StatusCode::UNAUTHORIZED)),
+    };
+    let body_bytes = match to_bytes(body, MAX_ASSERTION_BYTES).await {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let credential: RegisterPublicKeyCredential = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => return clear_registration(generic_error(StatusCode::BAD_REQUEST)),
+    };
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    // Hold the enrollment lock across the policy re-check and the durable
+    // registration (no `.await` inside) so N concurrent verifies of challenges
+    // minted while the store was empty cannot all pass the emptiness check and
+    // enroll N credentials under a one-time bootstrap policy.
+    let _enrollment_guard = match state.enrollment_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => return clear_registration(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    match enrollment_open(&state, &authenticator) {
+        Ok(true) => {}
+        Ok(false) => return clear_registration(generic_error(StatusCode::CONFLICT)),
+        Err(_) => return clear_registration(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    }
+    let pending = {
+        let mut transport = match state.transport.lock() {
+            Ok(v) => v,
+            Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        transport.prune(now);
+        transport.registrations.remove(challenge_token)
+    };
+    let Some(pending) = pending else {
+        return clear_registration(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    if pending.expires_at_ms <= now {
+        return clear_registration(generic_error(StatusCode::UNAUTHORIZED));
+    }
+    match authenticator.finish_registration(pending.attempt, &credential) {
+        Ok(_) => {
+            let mut response = no_store(StatusCode::NO_CONTENT.into_response());
+            if append_cookie(&mut response, expired_cookie(REGISTRATION_COOKIE_NAME)).is_err() {
+                return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            response
+        }
+        Err(AuthError::CredentialConflict) => {
+            clear_registration(generic_error(StatusCode::CONFLICT))
+        }
+        Err(AuthError::VerifierUnavailable | AuthError::EntropyUnavailable) => {
+            clear_registration(generic_error(StatusCode::SERVICE_UNAVAILABLE))
+        }
+        Err(_) => clear_registration(generic_error(StatusCode::UNAUTHORIZED)),
+    }
 }
 
 fn clear_grant(mut response: Response) -> Response {
@@ -1215,6 +1458,7 @@ pub mod relay;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auth::{AuthenticationResult, Passkey};
     use axum::http::Request;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -1462,6 +1706,267 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    const ENROLL_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn production_state_with_store(
+        path: &std::path::Path,
+        secret: Option<&str>,
+        allow_additional: bool,
+    ) -> PrivateApiState {
+        let store = Arc::new(FilePasskeyCredentialStore::open(path).unwrap());
+        PrivateApiState::production_with_passkeys(
+            config(),
+            store,
+            secret.map(|value| Zeroizing::new(value.to_string())),
+            allow_additional,
+        )
+        .unwrap()
+    }
+
+    /// Drive a real operator enrollment ceremony through the HTTP surface:
+    /// begin (operator secret) -> `navigator.credentials.create` equivalent ->
+    /// finish. Returns the terminal status.
+    async fn register_passkey_over_http(
+        app: &Router,
+        secret: &str,
+        client: &TestRegistrationClient,
+    ) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/register/challenge")
+                    .header(ENROLLMENT_SECRET_HEADER, secret)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        if status != StatusCode::OK {
+            return status;
+        }
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with(REGISTRATION_COOKIE_NAME));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let options: auth::CreationChallengeResponse = serde_json::from_slice(&body).unwrap();
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_registration(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let verify = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/register/verify")
+                    .header(ENROLLMENT_SECRET_HEADER, secret)
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        verify.status()
+    }
+
+    async fn authenticate_session_cookie(app: &Router, client: &TestRegistrationClient) -> String {
+        let (challenge_cookie, options) = begin(app.clone()).await;
+        let credential = {
+            let mut client = client.lock().unwrap();
+            client
+                .do_authentication(auth::passkey::__private_test_origin_url(), options)
+                .unwrap()
+        };
+        let verify = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/verify")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, challenge_cookie)
+                    .body(Body::from(serde_json::to_vec(&credential).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verify.status(), StatusCode::NO_CONTENT);
+        verify
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .find_map(|value| {
+                let cookie = value.to_str().ok()?;
+                cookie
+                    .starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                    .then(|| cookie.split(';').next().unwrap().to_string())
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn production_passkey_enrollment_unlocks_authenticated_internal_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passkeys.json");
+        let state = production_state_with_store(&path, Some(ENROLL_SECRET), false);
+        let app = router(state);
+        let client = std::sync::Mutex::new(auth::passkey::__private_test_client(true));
+
+        // Empty store: authentication is unavailable (fail closed) even though
+        // the authenticator is wired.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Enrollment requires the exact operator secret.
+        assert_eq!(
+            register_passkey_over_http(&app, "wrong-secret-wrong-secret-wrong!!", &client).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            register_passkey_over_http(&app, ENROLL_SECRET, &client).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(path.exists());
+
+        // The enrolled credential now authenticates through the real HTTP path.
+        let session_cookie = authenticate_session_cookie(&app, &client).await;
+        let session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/auth/session")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::NO_CONTENT);
+
+        // The authenticated session can reach the workspace enrollment and
+        // artifact grant routes the clear shell needs after unlock prerequisites.
+        let enroll = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::from(
+                        serde_json::json!({
+                            "version": 1,
+                            "kid": base64_encode(&[7u8; auth::WORKSPACE_KID_BYTES]),
+                            "public_key": base64_encode(&[9u8; auth::WORKSPACE_PUBLIC_KEY_BYTES]),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enroll.status(), StatusCode::OK);
+        let grant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact/grant")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::OK);
+
+        // One-time bootstrap: the secret no longer mints a second credential.
+        assert_eq!(
+            register_passkey_over_http(&app, ENROLL_SECRET, &client).await,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn production_passkey_enrollment_disabled_without_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passkeys.json");
+        let state = production_state_with_store(&path, None, false);
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/register/challenge")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn production_passkey_rejects_short_enrollment_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passkeys.json");
+        let store = Arc::new(FilePasskeyCredentialStore::open(&path).unwrap());
+        assert!(PrivateApiState::production_with_passkeys(
+            config(),
+            store,
+            Some(Zeroizing::new("too-short".to_string())),
+            false,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn production_passkey_store_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passkeys.json");
+        let client = std::sync::Mutex::new(auth::passkey::__private_test_client(true));
+        {
+            let state = production_state_with_store(&path, Some(ENROLL_SECRET), false);
+            let app = router(state);
+            assert_eq!(
+                register_passkey_over_http(&app, ENROLL_SECRET, &client).await,
+                StatusCode::NO_CONTENT
+            );
+            let _ = authenticate_session_cookie(&app, &client).await;
+        }
+        // A fresh process (new state + store loaded from disk) still accepts the
+        // same credential, so enrollment is genuinely durable.
+        let state = production_state_with_store(&path, Some(ENROLL_SECRET), false);
+        let app = router(state);
+        let _ = authenticate_session_cookie(&app, &client).await;
     }
 
     #[tokio::test]

@@ -3,6 +3,13 @@ import { createSignal, onMount, onCleanup, Show } from "solid-js";
 import "./style.css";
 import { loadWasm } from "./wasm-loader";
 import { defaultRuntime } from "./unlock-runtime";
+import {
+  authenticateWithPasskey,
+  enrollPasskey,
+  PasskeyAuthError,
+} from "./passkey-auth";
+
+type AuthState = "checking" | "authenticated" | "required" | "unsupported";
 
 function App() {
   const [status, setStatus] = createSignal(
@@ -13,6 +20,12 @@ function App() {
   const [isUnlocked, setIsUnlocked] = createSignal(false);
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [isProcessing, setIsProcessing] = createSignal(false);
+  const [authState, setAuthState] = createSignal<AuthState>("checking");
+  const [authMessage, setAuthMessage] = createSignal(
+    "Checking the operator session...",
+  );
+  const [enrollSecret, setEnrollSecret] = createSignal("");
+  const [isEnrolling, setIsEnrolling] = createSignal(false);
   let frame: HTMLIFrameElement | undefined;
 
   // Same-document channel with the decrypted payload: the payload may request a
@@ -63,6 +76,59 @@ function App() {
     }
   };
 
+  /**
+   * Establish the operator session with a WebAuthn passkey.
+   *
+   * The server session is an HttpOnly `__Host-` cookie; the shell never sees or
+   * stores it. On failure the workspace stays locked and the unlock path fails
+   * closed server-side. This is never a substitute for the server check.
+   */
+  const runAuthentication = async () => {
+    setAuthState("checking");
+    setAuthMessage("Authenticating with passkey...");
+    try {
+      await authenticateWithPasskey();
+      setAuthState("authenticated");
+      setAuthMessage("Operator session established.");
+    } catch (error) {
+      if (error instanceof PasskeyAuthError && error.code === "webauthn_unsupported") {
+        setAuthState("unsupported");
+        setAuthMessage("This browser does not support passkeys.");
+        return;
+      }
+      setAuthState("required");
+      setAuthMessage("Passkey authentication required.");
+    }
+  };
+
+  const handleEnroll = async (e: Event) => {
+    e.preventDefault();
+    if (isEnrolling()) return;
+    const secretValue = enrollSecret().trim();
+    if (!secretValue) {
+      setAuthMessage("Enrollment secret required.");
+      return;
+    }
+    setIsEnrolling(true);
+    setAuthMessage("Enrolling passkey...");
+    try {
+      await enrollPasskey(secretValue);
+      await runAuthentication();
+    } catch (error) {
+      setAuthMessage(
+        error instanceof PasskeyAuthError &&
+          error.code === "enrollment_unavailable"
+          ? "Passkey enrollment is unavailable."
+          : "Passkey enrollment failed.",
+      );
+    } finally {
+      // The operator secret must not survive the attempt, successful or not: a
+      // failed hint is retryable by retyping, never by leaving it in the DOM.
+      setEnrollSecret("");
+      setIsEnrolling(false);
+    }
+  };
+
   onMount(async () => {
     window.addEventListener("message", onPayloadMessage);
     try {
@@ -71,6 +137,7 @@ function App() {
     } catch {
       setStatus("Workspace unavailable.");
     }
+    await runAuthentication();
   });
 
   onCleanup(() => {
@@ -118,6 +185,38 @@ function App() {
     <main>
       <h1>Workspace</h1>
       <p id="status">{status()}</p>
+      <p id="auth-status" role="status">
+        {authMessage()}
+      </p>
+
+      <Show when={authState() !== "authenticated" && !isUnlocked()}>
+        <div id="auth-panel">
+          <button
+            type="button"
+            onClick={runAuthentication}
+            disabled={authState() === "checking" || authState() === "unsupported"}
+          >
+            {authState() === "checking" ? "Authenticating..." : "Authenticate with passkey"}
+          </button>
+          <form onSubmit={handleEnroll}>
+            <div>
+              <label for="enroll-secret">Enrollment Secret (operator bootstrap):</label>
+              <input
+                id="enroll-secret"
+                type="password"
+                autocomplete="off"
+                placeholder="Enter operator enrollment secret"
+                value={enrollSecret()}
+                onInput={(e) => setEnrollSecret(e.currentTarget.value)}
+                disabled={isEnrolling()}
+              />
+            </div>
+            <button type="submit" disabled={isEnrolling()}>
+              {isEnrolling() ? "Enrolling..." : "Enroll passkey"}
+            </button>
+          </form>
+        </div>
+      </Show>
 
       <Show
         when={isUnlocked()}
