@@ -9,6 +9,8 @@
 //!   real length, letting the caller split it.
 //! - **[`RotationPolicy`]** decides when an encrypted artifact should be rotated
 //!   from its age and use count.
+//! - **[`plan_rotations`]** turns that policy into a bounded, deterministic pass
+//!   over a caller-supplied set of artifacts, deferring the remainder.
 //!
 //! ## Boundaries
 //! - **No secrets, no crypto, no I/O.** These are pure policies; key material
@@ -23,7 +25,9 @@
 mod error;
 mod padding;
 mod rotation;
+mod scheduler;
 
 pub use error::PrivacyError;
 pub use padding::{PaddedFrame, PaddingPolicy};
 pub use rotation::{RotationConfig, RotationPolicy};
+pub use scheduler::{plan_rotations, ArtifactRotation, RotationPlan};
