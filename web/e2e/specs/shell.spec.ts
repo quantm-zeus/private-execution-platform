@@ -98,9 +98,10 @@ test.describe("shell artifact unlock", () => {
 
     // The published release fingerprint lets the shell reject the wrong code
     // locally, before any network call, with actionable recovery guidance.
-    await expect(
-      page.getByText(/does not match the published release|unlock failed/i),
-    ).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator(".notice__title")).toContainText(
+      /does not match the published release/i,
+      { timeout: 20_000 },
+    );
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
     await expect(page.locator("#recovery-code")).toHaveCount(1);
   });

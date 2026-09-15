@@ -791,3 +791,37 @@ readable) distinct from `/health` liveness. `apps/edge-gateway` refuses a
 non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
 validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
 bypass that, so the loopback deployment mitigation cannot be widened silently.
+
+## Post-review hardening (adversarial review of the unlock slice)
+
+Three fresh-context reviewers audited the uncommitted unlock/release slice. No
+CRITICAL/HIGH confidentiality or integrity break was found in the browser path;
+the valid findings were fixed with regression tests:
+
+- **Production-faithful unlock proof (P0-C).** `verify:web-boundary` now builds
+  an artifact with the production script `scripts/build-workspace-encrypted.mjs`
+  and runs the ignored Rust test
+  `production_build_script_artifact_loads_delivers_and_unpacks`, which reads
+  that exact file through the **real** `load_workspace_artifact` (no loader
+  override), drives the real `/internal/artifact` HPKE delivery, decrypts the
+  outer transport envelope, decrypts the inner artifact with the
+  production-derived workspace key and unpacks the production package. A
+  substituted-but-well-formed ciphertext is rejected at `U5_ARTIFACT` because the
+  shell now enforces the authenticated descriptor's `artifact_size` and
+  `artifact_sha256_hex` before the inner decrypt.
+- **Release headers.** `scripts/workspace-release.mjs` no longer overwrites the
+  shell `_headers`; it preserves the hardened `/*` rule (CSP, nosniff,
+  frame-deny, referrer policy) and appends the cache rules, and `publishRelease`
+  only treats an existing release as idempotent when both the artifact bytes and
+  the shipped-shell digest match. Release ids are validated as single directory
+  names and the manifest is cross-checked against its directory.
+- **Unlock secret lifetime.** The WASM-binding-returned app-key and decrypted
+  payload buffers are zeroized in place instead of being wrapped in a second
+  copy that would leave the first resident.
+- **Shell recovery paths.** A failed descriptor fetch offers a retry action; an
+  `enrollment_required` delivery response refetches the descriptor so the retry
+  re-enrolls rather than replaying a stale skip; the raw KID is no longer
+  rendered; stage progress marks completed steps.
+- **Readiness.** `/ready` bounds the artifact and manifest reads from metadata
+  before reading, runs artifact I/O on the blocking pool, and clears the relay
+  readiness flag on any task exit (not only `Err`).
