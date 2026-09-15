@@ -47,6 +47,7 @@ pub mod health;
 pub mod plan;
 pub mod relay;
 pub mod reservation;
+pub mod signing_health;
 pub mod state;
 
 pub use adapter::{
@@ -60,6 +61,7 @@ pub use plan::{
 };
 pub use relay::{ExecutionRelay, RelayExecutionInput};
 pub use reservation::InMemoryReservationStore;
+pub use signing_health::{SigningFailureBreaker, SigningHealth, SigningProbeGuard};
 pub use state::{
     AttemptReservationStore, ObservedFill, RelayOutcome, Reservation, SubmissionState,
 };

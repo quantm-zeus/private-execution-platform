@@ -23,6 +23,7 @@ members = [
     "crates/simulation",
     "crates/tax-engine",
     "crates/routing",
+    "crates/risk-engine",
     "crates/execution-preview",
     "crates/execution-relay",
     "crates/audit",
@@ -67,6 +68,7 @@ provider-broker = { path = "crates/provider-broker" }
 simulation = { path = "crates/simulation" }
 tax-engine = { path = "crates/tax-engine" }
 routing = { path = "crates/routing" }
+risk-engine = { path = "crates/risk-engine" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
 audit = { path = "crates/audit" }

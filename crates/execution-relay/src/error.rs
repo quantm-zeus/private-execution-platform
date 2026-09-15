@@ -15,6 +15,9 @@ pub enum RelayError {
     /// The chain health breaker is open or the adapter is unavailable.
     #[error("chain health unavailable")]
     ChainHealthUnavailable,
+    /// The signing-failure breaker is open; new execution is halted.
+    #[error("signing unavailable")]
+    SigningUnavailable,
     /// The signing boundary rejected or failed the request.
     #[error("signing failed")]
     SigningFailed,
