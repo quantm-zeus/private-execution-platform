@@ -51,6 +51,16 @@ export const DEFAULT_RECOVERY_TOUCH_URL = "/internal/workspace/recovery/touch";
 /** Upper bound mirroring the server's per-workspace wrapper budget. */
 const MAX_WRAPPERS = 32;
 
+/** The server-sealed proof-of-possession nonce is a fixed 32-byte value. */
+export const RECOVERY_CHALLENGE_BYTES = 32;
+
+/**
+ * The only wrapper key source this shell can unwrap. A record for an unknown
+ * source (e.g. a future random-root-key migration) is rejected rather than
+ * reinterpreted as the unlock secret.
+ */
+export const SUPPORTED_KEY_SOURCE = "unlock_secret_v1";
+
 export interface RecoveryClientOptions {
   fetchFn?: typeof fetch;
   listUrl?: string;
@@ -106,12 +116,16 @@ function parseWrapperRecord(value: unknown): RecoveryWrapperRecord {
   if (typeof createdAt !== "number" || !Number.isFinite(createdAt)) {
     throw new RecoveryClientError("recovery_malformed");
   }
+  const keySource = requireString(value.key_source, 64);
+  if (keySource !== SUPPORTED_KEY_SOURCE) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
   return {
     credential_id_b64: requireString(value.credential_id_b64, 2048),
     label: requireString(value.label, 64),
     version,
     algorithm: requireString(value.algorithm, 64),
-    key_source: requireString(value.key_source, 64),
+    key_source: keySource,
     salt_b64: requireString(value.salt_b64, 128),
     iv_b64: requireString(value.iv_b64, 64),
     wrapped_root_key_b64: requireString(value.wrapped_root_key_b64, 256),
@@ -248,7 +262,8 @@ export async function beginRecoveryProof(
   } catch {
     throw new RecoveryClientError("recovery_rejected");
   }
-  if (nonce.length === 0) {
+  if (nonce.length !== RECOVERY_CHALLENGE_BYTES) {
+    nonce.fill(0);
     throw new RecoveryClientError("recovery_rejected");
   }
   const proofB64 = toBase64(nonce);
@@ -284,7 +299,7 @@ export async function addRecoveryWrapper(
           label: input.label,
           version: input.record.version,
           algorithm: input.record.algorithm,
-          key_source: "unlock_secret_v1",
+          key_source: SUPPORTED_KEY_SOURCE,
           salt_b64: input.record.salt_b64,
           iv_b64: input.record.iv_b64,
           wrapped_root_key_b64: input.record.wrapped_root_key_b64,

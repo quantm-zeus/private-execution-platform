@@ -52,6 +52,9 @@ test("parseRecoveryWrappers accepts a valid list and rejects malformed input", (
     { wrappers: [{ ...VALID_RECORD, version: 2 }] },
     { wrappers: [{ ...VALID_RECORD, credential_id_b64: "" }] },
     { wrappers: [{ ...VALID_RECORD, created_at_ms: "soon" }] },
+    // An unknown key source must be rejected, never reinterpreted as the
+    // unlock secret by a future migration.
+    { wrappers: [{ ...VALID_RECORD, key_source: "root_key_v2" }] },
   ]) {
     assert.throws(
       () => parseRecoveryWrappers(bad),
@@ -128,6 +131,23 @@ test("beginRecoveryProof decrypts the sealed challenge and returns a proof", asy
     (error: unknown) =>
       error instanceof RecoveryClientError && error.code === "recovery_rejected",
   );
+});
+
+test("beginRecoveryProof rejects a challenge plaintext that is not 32 bytes", async () => {
+  for (const length of [0, 16, 64]) {
+    await assert.rejects(
+      beginRecoveryProof(() => new Uint8Array(length).fill(1), {
+        fetchFn: (async () =>
+          jsonResponse({
+            challenge_id: "a".repeat(32),
+            sealed_challenge_b64: toBase64(new Uint8Array(97).fill(9)),
+            expires_in_ms: 1000,
+          })) as unknown as typeof fetch,
+      }),
+      (error: unknown) =>
+        error instanceof RecoveryClientError && error.code === "recovery_rejected",
+    );
+  }
 });
 
 test("add/revoke/touch send the expected wire body", async () => {

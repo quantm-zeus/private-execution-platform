@@ -230,6 +230,19 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    // Same-origin axe bundle so the clear-shell security gateway can be audited
+    // at moderate-or-worse, not only the encrypted payload.
+    if (path === "/__test__/axe.min.js" && req.method === "GET") {
+      const data = await readFile(resolve(here, "node_modules/axe-core/axe.min.js"));
+      res.writeHead(200, {
+        "Content-Type": "text/javascript; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Length": data.length,
+      });
+      res.end(data);
+      return;
+    }
+
     if (path === "/internal/auth/enrollment-status" && req.method === "GET") {
       return json(res, 200, { enrollment_open: false });
     }

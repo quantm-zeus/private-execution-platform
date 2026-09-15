@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -85,6 +85,19 @@ test("manifest validation rejects every mismatch", () => {
   assert.throws(() =>
     validateReleaseManifest(
       { ...manifest, workspace_protocol: { min: 2, max: 3 } },
+      artifact,
+    ),
+  );
+  // Non-integer protocol fields must not slip through relational comparisons.
+  assert.throws(() =>
+    validateReleaseManifest(
+      { ...manifest, workspace_protocol: { min: {}, max: {} } },
+      artifact,
+    ),
+  );
+  assert.throws(() =>
+    validateReleaseManifest(
+      { ...manifest, workspace_protocol: { min: 0, max: 300 } },
       artifact,
     ),
   );
@@ -239,8 +252,50 @@ test("switching to an unpublished release refuses", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-switch-"));
   try {
     await assert.rejects(switchCurrent(root, "missing-release"));
+    // A canonical but absent id reaches the read and fails closed too.
+    await assert.rejects(switchCurrent(root, "abcdef012345-abcdef012345"));
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt existing release never leaks the staging directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-staging-leak-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-staging-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const artifact = fakeArtifact();
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact,
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    // Corrupt the published shell so the re-publish path throws while reading
+    // the existing release, after staging has already been written.
+    await writeFile(join(root, releaseId, SHELL_DIR, "index.html"), "tampered");
+    await assert.rejects(
+      publishRelease({
+        releasesRoot: root,
+        artifact,
+        publicKeyB64: PUBLIC_KEY_B64,
+        kidB64: KID_B64,
+        sourceSha: "9a5a712",
+        shellDir,
+      }),
+      /shell asset digest mismatch/,
+    );
+    const entries = await readdir(root);
+    assert.deepEqual(
+      entries.filter((name) => name.startsWith(".staging-")),
+      [],
+      "staging directory leaked on the existing-release error path",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
   }
 });
 

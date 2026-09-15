@@ -1128,6 +1128,29 @@ try {
   // also drives the real per-grant HPKE routes, the inner artifact decrypt and
   // the production package unpack.
   {
+    // Also write the immutable release manifest so the ignored test exercises
+    // the real manifest-vs-artifact and recipient-fingerprint preflight, not
+    // only version/KID compatibility.
+    const manifestPath = `${artifactPath}.fixture.manifest.json`;
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        manifest_version: 1,
+        release_id: "prod-build-script-fixture",
+        source_sha: "verify-web-boundary",
+        artifact: {
+          version: ARTIFACT_VERSION,
+          kid_b64: kid.toString("base64"),
+          sha256_hex: createHash("sha256").update(rawArtifact).digest("hex"),
+          size: rawArtifact.length,
+          package_format_version: 1,
+        },
+        recipient: {
+          public_key_fingerprint_b64: createHash("sha256").update(publicKey).digest("base64"),
+        },
+        workspace_protocol: { min: 1, max: 1 },
+      }),
+    );
     const fixturePath = `${artifactPath}.fixture.json`;
     await writeFile(
       fixturePath,
@@ -1135,6 +1158,7 @@ try {
         artifactPath,
         secretB64: unlockSecret.toString("base64"),
         kidB64: kid.toString("base64"),
+        manifestPath,
       }),
     );
     const result = spawnSync(
@@ -1153,6 +1177,7 @@ try {
       },
     );
     await rm(fixturePath, { force: true });
+    await rm(manifestPath, { force: true });
     if (result.error) {
       throw new Error(`production loader test could not run: ${result.error.message}`);
     }
@@ -1288,11 +1313,10 @@ try {
   await writeFile(truncFile, Buffer.alloc(64));
   const decryptTruncAttempt = spawnSync("cargo", [
     "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
-    "--unlock-secret-b64", unlockSecret.toString("base64"),
     "--kid-b64", kid.toString("base64"),
     "--input", truncFile,
     "--output", join(temp, "trunc-out.bin"),
-  ], { stdio: "pipe" });
+  ], { stdio: "pipe", env: { ...process.env, WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64") } });
   assertCliRejected(decryptTruncAttempt, "truncated artifact was unexpectedly accepted by decrypt-artifact");
 
   // 9j. Missing kid fails closed on seal-artifact CLI
@@ -1317,20 +1341,18 @@ try {
   // 9l. Missing kid fails closed on decrypt-artifact CLI
   const missingKidDecrypt = spawnSync("cargo", [
     "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
-    "--unlock-secret-b64", unlockSecret.toString("base64"),
     "--input", artifactPath,
     "--output", join(temp, "cli-out.bin"),
-  ], { stdio: "pipe" });
+  ], { stdio: "pipe", env: { ...process.env, WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64") } });
   assertCliRejected(missingKidDecrypt, "missing kid was unexpectedly accepted by decrypt-artifact CLI");
 
   // 9m. All-zero kid fails closed on decrypt-artifact CLI
   const zeroKidDecrypt = spawnSync("cargo", [
     "run", "--quiet", "-p", "crypto-envelope", "--bin", "decrypt-artifact", "--",
-    "--unlock-secret-b64", unlockSecret.toString("base64"),
     "--kid-b64", Buffer.alloc(16).toString("base64"),
     "--input", artifactPath,
     "--output", join(temp, "cli-out.bin"),
-  ], { stdio: "pipe" });
+  ], { stdio: "pipe", env: { ...process.env, WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64") } });
   assertCliRejected(zeroKidDecrypt, "all-zero kid was unexpectedly accepted by decrypt-artifact CLI");
 
   // =========================================================================

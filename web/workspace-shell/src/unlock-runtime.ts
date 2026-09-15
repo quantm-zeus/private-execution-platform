@@ -25,7 +25,7 @@ import {
   WORKSPACE_PROTOCOL_VERSION,
   type WorkspaceDescriptor,
 } from "./descriptor.ts";
-import { UnlockError, type UnlockStage } from "./unlock-stages.ts";
+import { UnlockError, asUnlockError, type UnlockStage } from "./unlock-stages.ts";
 
 export type { ShellSessionKeys } from "./handoff-gate.ts";
 
@@ -124,6 +124,40 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
     return out;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Derive the workspace public-key fingerprint for a candidate secret, using the
+ * audited WASM key path. Returns `null` when the KID is malformed, the secret is
+ * rejected, or WebCrypto is unavailable. The caller's `secret` is not mutated.
+ */
+export async function deriveWorkspaceFingerprint(
+  secret: Uint8Array,
+  kidB64: string,
+): Promise<string | null> {
+  let kidBytes: Uint8Array;
+  try {
+    kidBytes = fromBase64(kidB64);
+  } catch {
+    return null;
+  }
+  if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) return null;
+  if (secret.length !== 32 || secret.every((b) => b === 0)) return null;
+  let key: WasmWorkspaceKey;
+  try {
+    key = new WasmWorkspaceKey(new Uint8Array(secret), 1, kidBytes);
+  } catch {
+    return null;
+  }
+  try {
+    return await publicKeyFingerprintB64(new Uint8Array(key.public_key()));
+  } catch {
+    return null;
+  } finally {
+    try {
+      key.free();
+    } catch {}
   }
 }
 
@@ -409,7 +443,13 @@ export class WorkspaceUnlockRuntime {
         throw new UnlockError("U2_ENROLL", "invalid_secret");
       }
       secretBytes.fill(0);
-      const publicKeyBytes = new Uint8Array(workspaceKey.public_key());
+      let publicKeyBytes: Uint8Array;
+      try {
+        // A WASM fault here must still surface as a typed stage error.
+        publicKeyBytes = new Uint8Array(workspaceKey.public_key());
+      } catch {
+        throw new UnlockError("U1_WASM", "wasm_unavailable");
+      }
       const derivedFingerprint = await publicKeyFingerprintB64(publicKeyBytes);
       const kidB64 = toBase64(kidBytes);
 
@@ -598,9 +638,8 @@ export class WorkspaceUnlockRuntime {
           rawAppKeys.fill(0);
         }
       } catch (error) {
-        throw error instanceof UnlockError
-          ? error
-          : new UnlockError("U4_TRANSPORT", "transport_rejected");
+        // Classify without ever inspecting foreign exception text.
+        throw asUnlockError(error, "U4_TRANSPORT", "transport_rejected");
       } finally {
         initiator.free();
         initiator = null;

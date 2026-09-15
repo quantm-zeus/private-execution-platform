@@ -2304,6 +2304,33 @@ mod tests {
         }
     }
 
+    /// Restores a process environment variable on drop, so a panicking test
+    /// cannot leak mutated global env into other tests.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            EnvGuard { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn test_state(clock: Arc<FixedClock>) -> (PrivateApiState, TestRegistrationClient) {
         let (authenticator, client) = legacy_authenticator();
         let state =
@@ -4969,7 +4996,11 @@ mod tests {
     /// read by the real `load_workspace_artifact` (no loader override), wrapped
     /// by the real per-grant HPKE transport over the real routes, then decrypted
     /// with the matching production-derived workspace key and unpacked with the
-    /// production package layout.
+    /// production package layout. When the fixture also carries a release
+    /// manifest, the real manifest-vs-artifact byte validation and recipient
+    /// fingerprint are exercised on the matching path; the *rejection* path is
+    /// proven by `recovery_challenge_refuses_a_self_enrolled_foreign_key` and the
+    /// `release.rs` unit tests.
     ///
     /// Ignored by default because it needs a fixture produced by the Node build
     /// script; `scripts/verify-web-boundary.mjs` builds that fixture and runs
@@ -4987,6 +5018,10 @@ mod tests {
             .as_str()
             .expect("artifactPath")
             .to_string();
+        // Optional: when verify:web-boundary also writes a release manifest the
+        // test exercises the real manifest-vs-artifact/fingerprint preflight, not
+        // just version/KID compatibility.
+        let manifest_path = fixture["manifestPath"].as_str().map(str::to_string);
         let secret_bytes = release::decode_canonical_b64(
             fixture["secretB64"].as_str().expect("secretB64"),
             crypto_envelope::UNLOCK_SECRET_LEN,
@@ -5006,10 +5041,25 @@ mod tests {
         let expected_artifact = std::fs::read(&artifact_path).expect("artifact readable");
 
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        // Guards restore the process env on drop, so a panic cannot leak global
+        // state into other tests.
+        let _manifest_guard = manifest_path
+            .as_deref()
+            .map(|path| EnvGuard::set("WORKSPACE_RELEASE_MANIFEST", Some(path)));
         let (state, client) = test_state(clock);
+        if manifest_path.is_some() {
+            assert!(
+                state
+                    .load_manifest()
+                    .await
+                    .expect("manifest loader")
+                    .is_some(),
+                "the production fixture must exercise the manifest preflight"
+            );
+        }
 
-        let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
-        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &artifact_path);
+        let _artifact_guard =
+            EnvGuard::set("WORKSPACE_ARTIFACT_PATH", Some(artifact_path.as_str()));
         let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
             establish_session_and_grant(&state, &client).await;
         enroll_test_workspace(&state, &session_cookie, &keypair).await;
@@ -5033,10 +5083,6 @@ mod tests {
             .unwrap();
         let status = response.status();
         let delivered = response.into_body().collect().await.unwrap().to_bytes();
-        match previous {
-            Some(value) => std::env::set_var("WORKSPACE_ARTIFACT_PATH", value),
-            None => std::env::remove_var("WORKSPACE_ARTIFACT_PATH"),
-        }
 
         assert_eq!(status, StatusCode::OK, "real loader delivery must succeed");
         let envelope = crypto_envelope::Envelope {
@@ -5470,8 +5516,11 @@ mod tests {
         let released = test_keypair(0x95, 0x96);
         let state = recovery_release_state(state, &released);
 
-        // Enroll an attacker-chosen key whose secret the caller knows.
-        let attacker = test_keypair(0xA1, 0xA2);
+        // Enroll an attacker-chosen key whose secret the caller knows. The KID
+        // deliberately matches the released artifact so the request reaches — and
+        // must be rejected by — the recipient-fingerprint check, not the cheaper
+        // KID mismatch that would mask a regression in the fingerprint gate.
+        let attacker = test_keypair(0xA1, 0x96);
         enroll_test_workspace(&state, &session_cookie, &attacker).await;
 
         let response = post_raw(

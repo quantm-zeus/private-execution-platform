@@ -47,6 +47,12 @@ Implemented and composed (exact-SHA CI green):
   persistence and provider transports remain unwired.
 - Perimeter trust at the edge is header-presence only; cryptographic Cloudflare
   Access JWT validation is not implemented (loopback binding is the mitigation).
+- With no `WORKSPACE_RELEASE_MANIFEST` configured, the server has no trusted
+  recipient fingerprint, so delivery of a well-formed artifact to a mismatched
+  enrollment is only caught by the browser's fail-closed inner decrypt
+  (`U5_ARTIFACT`), not by the server preflight. Deployments must configure the
+  manifest; the release/operator steps do. The manifest also makes revoke/add
+  recovery authorization possible.
 - Cloudflare Access remains perimeter identity only and can never recover or
   decrypt a workspace.
 - `main` branch protection and required-status-check enforcement are an

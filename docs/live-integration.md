@@ -732,7 +732,11 @@ fingerprint. Failures return a bounded typed body `{ "code": ... }`:
 The check consumes only public metadata, so it is never an oracle for validating
 the unlock secret. It rejects the production class where the delivered artifact
 was sealed under a different KID than the browser enrolled, *before* any
-transport crypto runs.
+transport crypto runs. Without a configured release manifest the server has no
+trusted recipient fingerprint to compare, so a mismatched-but-well-formed
+enrollment is caught only by the browser's fail-closed inner decrypt
+(`U5_ARTIFACT`); operators should always publish a manifest (the release and
+deployment steps do), which is also what makes recovery authorization possible.
 
 Enrollment is idempotent for the *identical* binding: re-posting the same
 version/KID/public-key on the same session returns the existing metadata instead
@@ -805,10 +809,14 @@ the valid findings were fixed with regression tests:
   that exact file through the **real** `load_workspace_artifact` (no loader
   override), drives the real `/internal/artifact` HPKE delivery, decrypts the
   outer transport envelope, decrypts the inner artifact with the
-  production-derived workspace key and unpacks the production package. A
-  substituted-but-well-formed ciphertext is rejected at `U5_ARTIFACT` because the
-  shell now enforces the authenticated descriptor's `artifact_size` and
-  `artifact_sha256_hex` before the inner decrypt.
+  production-derived workspace key and unpacks the production package. The gate
+  also writes the immutable release manifest for those bytes, so the real
+  manifest-vs-artifact byte validation and recipient-fingerprint preflight run on
+  the matching path in the same request; the rejection path is proven by
+  `recovery_challenge_refuses_a_self_enrolled_foreign_key` and the `release.rs`
+  unit tests. A substituted-but-well-formed ciphertext is rejected at
+  `U5_ARTIFACT` because the shell now enforces the authenticated descriptor's
+  `artifact_size` and `artifact_sha256_hex` before the inner decrypt.
 - **Release headers.** `scripts/workspace-release.mjs` no longer overwrites the
   shell `_headers`; it preserves the hardened `/*` rule (CSP, nosniff,
   frame-deny, referrer policy) and appends the cache rules, and `publishRelease`

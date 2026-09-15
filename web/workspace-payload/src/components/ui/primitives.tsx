@@ -88,8 +88,19 @@ export const Field: Component<{
   </div>
 );
 
-export const ReasonNote: Component<{ tone?: Tone; children: JSX.Element }> = (props) => (
-  <p class={`reason-note reason-note--${props.tone ?? "warning"}`}>{props.children}</p>
+export const ReasonNote: Component<{
+  tone?: Tone;
+  /** When set, the note becomes a live region (UNKNOWN/reconcile outcomes). */
+  live?: "polite" | "assertive";
+  children: JSX.Element;
+}> = (props) => (
+  <p
+    class={`reason-note reason-note--${props.tone ?? "warning"}`}
+    role={props.live ? (props.live === "assertive" ? "alert" : "status") : undefined}
+    aria-live={props.live}
+  >
+    {props.children}
+  </p>
 );
 
 /** A row of key/value evidence used by economics and evidence surfaces. */

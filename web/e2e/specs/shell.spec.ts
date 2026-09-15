@@ -107,6 +107,21 @@ test.describe("shell artifact unlock", () => {
   });
 
   test("shows an explicit open action, never a KID field, and no passkey on mount", async ({ page }) => {
+    // Count WebAuthn ceremonies so an accidental auto-authentication on mount
+    // cannot hide behind a prompt the harness silently rejects.
+    await page.addInitScript(() => {
+      (window as unknown as { __passkeyCalls: number }).__passkeyCalls = 0;
+      const container = navigator.credentials as unknown as Record<string, unknown>;
+      if (!container) return;
+      for (const name of ["get", "create"] as const) {
+        const original = container[name];
+        if (typeof original !== "function") continue;
+        container[name] = function (this: unknown, ...args: unknown[]) {
+          (window as unknown as { __passkeyCalls: number }).__passkeyCalls += 1;
+          return (original as (...a: unknown[]) => unknown).apply(container, args);
+        };
+      }
+    });
     // Force a signed-out operator session for this page only.
     await page.route("**/internal/auth/session", (route) =>
       route.fulfill({ status: 401, body: "" }),
@@ -121,6 +136,51 @@ test.describe("shell artifact unlock", () => {
     await expect(page.locator("#kid")).toHaveCount(0);
     // The unlock form is not offered until the operator acts.
     await expect(page.locator("#recovery-code")).toHaveCount(0);
+    // Bootstrap enrollment stays hidden while the server reports it closed.
+    await expect(page.getByText("First-run passkey enrollment")).toHaveCount(0);
+    // No passkey pop-up on mount: exactly zero ceremonies until the user acts.
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __passkeyCalls: number }).__passkeyCalls,
+      ),
+    ).toBe(0);
+    // Positive control: the instrumentation really records a ceremony call, so
+    // the zero assertion above cannot pass vacuously.
+    await page.evaluate(() => {
+      try {
+        (navigator.credentials.get as unknown as (options?: unknown) => unknown)(undefined);
+      } catch {
+        // The platform rejects the invalid request; only the counter matters.
+      }
+    });
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __passkeyCalls: number }).__passkeyCalls,
+      ),
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  test("security gateway has no moderate-or-worse axe violations", async ({ page }) => {
+    await page.route("**/internal/auth/session", (route) =>
+      route.fulfill({ status: 401, body: "" }),
+    );
+    await page.goto(`${SHELL_ORIGIN}/`);
+    await expect(
+      page.getByRole("button", { name: "Open Private Workspace" }),
+    ).toBeVisible();
+    await page.addScriptTag({ url: "/__test__/axe.min.js" });
+    const violations = await page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (ctx: Document, opts: unknown) => Promise<{ violations: { id: string; impact: string; nodes: { target: string[] }[] }[] }> } }).axe;
+      const result = await axe.run(document, { resultTypes: ["violations"] });
+      return result.violations
+        .filter((violation) => ["moderate", "serious", "critical"].includes(violation.impact))
+        .map((violation) => ({
+          id: violation.id,
+          impact: violation.impact,
+          nodes: violation.nodes.map((node) => node.target),
+        }));
+    });
+    expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
   });
 
   test("honours a lock request from the decrypted payload", async ({ page, request }) => {

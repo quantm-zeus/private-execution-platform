@@ -1,4 +1,4 @@
-import { Show, type Component } from "solid-js";
+import { Show, createMemo, type Component } from "solid-js";
 import { formatAge, truncateAddress } from "../../core/format";
 import type { ConnectionStatus, InstrumentRef, KillSwitchState } from "../../core/types";
 import { ActionButton, Badge, type Tone } from "../ui/primitives";
@@ -30,8 +30,23 @@ export const WorkspaceHeader: Component<{
 }> = (props) => {
   const lastFrameAge = () =>
     props.connection.lastFrameAtMs === null ? null : Math.max(0, props.nowMs - props.connection.lastFrameAtMs);
+  // Security state is announced through a dedicated live region: the visible
+  // badges convey state with text and colour, but a screen-reader user in a
+  // panel would otherwise never hear the kill switch engage.
+  const securityAnnouncement = createMemo(() => {
+    if (props.killSwitch.enabled) {
+      return `Kill switch engaged. ${props.killSwitch.reason ?? "Trading is halted."}`;
+    }
+    if (!props.tradingEnabled) {
+      return "Trading is disabled. Controls fail closed.";
+    }
+    return "Trading is enabled.";
+  });
   return (
     <header class="ws-header">
+      <p class="sr-only" role="status" aria-live="polite" data-testid="security-announcer">
+        {securityAnnouncement()}
+      </p>
       <div class="ws-header__brand">
         <span class="ws-header__mark" aria-hidden="true">
           ◈

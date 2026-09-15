@@ -428,7 +428,7 @@ export const ExecutionPanel: Component = () => {
         <Show when={twapUnknown()}>
           {(unknown) => (
             <div class="panel-stack">
-              <ReasonNote tone="warning">
+              <ReasonNote tone="warning" live="assertive">
                 TWAP submission outcome UNKNOWN: {unknown().reason} The request may still have reached
                 the backend. Retrying the same request is idempotent; starting a different TWAP is
                 blocked until this is reconciled.
@@ -515,7 +515,7 @@ export const ExecutionPanel: Component = () => {
         <Show when={rfqUnknown()}>
           {(unknown) => (
             <div class="panel-stack">
-              <ReasonNote tone="warning">
+              <ReasonNote tone="warning" live="assertive">
                 RFQ outcome UNKNOWN: {unknown().reason} The request may still have reached the
                 backend. Retrying the same request is idempotent (same key); a different request is
                 blocked until this is reconciled.

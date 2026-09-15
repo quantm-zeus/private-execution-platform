@@ -1,7 +1,7 @@
 import { render } from "solid-js/web";
 import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
 import "./style.css";
-import { loadWasm, defaultRuntime, fromBase64 } from "./unlock-runtime";
+import { loadWasm, defaultRuntime, deriveWorkspaceFingerprint, fromBase64 } from "./unlock-runtime";
 import {
   authenticateWithPasskey,
   enrollPasskey,
@@ -59,6 +59,16 @@ const STAGES: { id: UnlockStage; label: string }[] = [
 function shortDigest(hex: string): string {
   if (!hex) return "unavailable";
   return hex.slice(0, 12).replace(/(.{4})(?=.)/g, "$1 ");
+}
+
+/** Textual status for one unlock stage, so progress is never color-only. */
+function stageStatusText(current: UnlockStage | null, id: UnlockStage): string {
+  if (current === null) return "";
+  const currentIndex = STAGES.findIndex((s) => s.id === current);
+  const index = STAGES.findIndex((s) => s.id === id);
+  if (index < currentIndex) return "complete";
+  if (index === currentIndex) return "in progress";
+  return "pending";
 }
 
 function App() {
@@ -312,6 +322,7 @@ function App() {
       setPayloadUrl(result.htmlUrl);
       setIsUnlocked(true);
       setStatus("Private workspace opened.");
+      queueMicrotask(() => document.getElementById("workspace-region")?.focus());
     } catch (error) {
       const failure = isUnlockError(error)
         ? recoveryFor(error.stage, error.reason)
@@ -359,6 +370,7 @@ function App() {
     setUnlockFailure(null);
     setRecoveryMessage("Waiting for your recovery passkey...");
     setUnlockStage("U1_WASM");
+    let lastFailure: UnlockRecovery | null = null;
     try {
       for (const wrapper of wrappers) {
         let salt: Uint8Array;
@@ -389,14 +401,23 @@ function App() {
           prfOutput.fill(0);
         }
         if (!secret) continue;
+        // The runtime copies the secret synchronously before its first await, so
+        // drop the caller's copy immediately instead of after the exchange.
+        let unlockPromise: ReturnType<typeof defaultRuntime.unlock>;
         try {
-          const result = await defaultRuntime.unlock(secret, activeDescriptor, {
+          unlockPromise = defaultRuntime.unlock(secret, activeDescriptor, {
             onStage: (stage) => setUnlockStage(stage),
           });
+        } finally {
+          secret.fill(0);
+        }
+        try {
+          const result = await unlockPromise;
           setPayloadUrl(result.htmlUrl);
           setIsUnlocked(true);
           setStatus("Private workspace opened.");
           setRecoveryMessage("");
+          queueMicrotask(() => document.getElementById("workspace-region")?.focus());
           // Best-effort "last used" metadata; requires proof of possession like
           // add/revoke, so it is issued as its own short-lived challenge.
           void beginRecoveryProof((sealed) =>
@@ -415,18 +436,35 @@ function App() {
           const failure = isUnlockError(error)
             ? recoveryFor(error.stage, error.reason)
             : recoveryFor("U7_BOOT", "unknown");
+          defaultRuntime.lock();
+          // A wrapper that unwraps to the wrong value fails as a workspace-key
+          // mismatch or an inner artifact decrypt failure. Only those are
+          // wrapper-specific; a protocol/descriptor incompatibility is release-
+          // wide, so retrying every wrapper would just re-prompt for the same
+          // deterministic error.
+          if (
+            isUnlockError(error) &&
+            (error.reason === "workspace_key_mismatch" ||
+              error.reason === "artifact_decrypt_failed")
+          ) {
+            lastFailure = failure;
+            continue;
+          }
           setUnlockFailure(failure);
           setStatus("Workspace unlock failed.");
-          defaultRuntime.lock();
           queueMicrotask(() => alertRef?.focus());
           return;
-        } finally {
-          secret.fill(0);
         }
       }
-      setRecoveryMessage(
-        "No recovery passkey on this device. Enter your offline recovery code.",
-      );
+      if (lastFailure) {
+        setUnlockFailure(lastFailure);
+        setStatus("Workspace unlock failed.");
+        queueMicrotask(() => alertRef?.focus());
+      } else {
+        setRecoveryMessage(
+          "No recovery passkey on this device. Enter your offline recovery code.",
+        );
+      }
     } finally {
       setUnlockStage(null);
       setIsUnlocking(false);
@@ -459,9 +497,35 @@ function App() {
       return;
     }
     setRecoveryBusy(true);
-    setRecoveryMessage("Waiting for your passkey...");
+    setRecoveryMessage("Verifying your recovery code...");
     let prfOutput: Uint8Array | null = null;
     try {
+      // Verify the re-entered code actually derives this workspace's key before
+      // wrapping it; otherwise a mistyped code would be stored as a trusted
+      // recovery credential that unwraps to the wrong value. Fail closed when no
+      // pinned fingerprint is available rather than storing an unverified wrap.
+      const activeDescriptor = descriptor();
+      const expectedFingerprint =
+        activeDescriptor?.expected_public_key_fingerprint_b64 ??
+        activeDescriptor?.enrolled_public_key_fingerprint_b64 ??
+        null;
+      if (!activeDescriptor || !expectedFingerprint) {
+        setRecoveryMessage(
+          "This workspace has no pinned release fingerprint, so a recovery passkey cannot be added. The offline recovery code remains the fallback.",
+        );
+        return;
+      }
+      const fingerprint = await deriveWorkspaceFingerprint(
+        secret,
+        activeDescriptor.artifact_kid_b64,
+      );
+      if (fingerprint === null || fingerprint !== expectedFingerprint) {
+        setRecoveryMessage(
+          "That recovery code does not match this workspace's active release.",
+        );
+        return;
+      }
+      setRecoveryMessage("Waiting for your passkey...");
       const salt = generateRecoverySalt();
       const assertion = await authenticateWithPrf({ prfSalt: salt });
       prfOutput = assertion.prfOutput;
@@ -527,6 +591,10 @@ function App() {
     setIsUnlocked(false);
     setUnlockFailure(null);
     setStatus("Workspace locked.");
+    // The lock control (and the payload frame) unmount, so return focus to the
+    // gateway heading; otherwise focus falls to <body> and keyboard users lose
+    // their place.
+    queueMicrotask(() => document.getElementById("open-heading")?.focus());
   };
 
   return (
@@ -624,10 +692,10 @@ function App() {
 
       <Show when={!isUnlocked()}>
         <section class="panel" aria-labelledby="open-heading">
-          <h2 id="open-heading" class="panel__heading">
+          <h2 id="open-heading" class="panel__heading" tabindex={-1}>
             Open the private workspace
           </h2>
-          <p class="panel__copy">
+          <p class="panel__copy" role="status" aria-live="polite">
             {authMessage()}
           </p>
           <div class="actions">
@@ -822,7 +890,7 @@ function App() {
                         <span class="stages__dot" aria-hidden="true" />
                         <span class="stages__label">{stage.label}</span>
                         <span class="stages__state">
-                          {unlockStage() === stage.id ? "in progress" : ""}
+                          {stageStatusText(unlockStage(), stage.id)}
                         </span>
                       </li>
                     )}
@@ -835,7 +903,7 @@ function App() {
       </Show>
 
       <Show when={isUnlocked()}>
-        <section class="workspace" aria-label="Private workspace">
+        <section class="workspace" id="workspace-region" tabindex={-1} aria-label="Private workspace">
           <div class="workspace__bar">
             <p class="workspace__state" role="status">
               Workspace open — decrypted in memory only.

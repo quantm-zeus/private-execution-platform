@@ -61,6 +61,23 @@ test.describe("trading wallet limits (W14)", () => {
     await expect(page.getByText(/relaxes a safety limit/i)).toBeVisible();
     await page.getByLabel("Limit change confirmation phrase").fill("CONFIRM LIMIT CHANGE");
     await expect(save).toBeEnabled();
+
+    // The relaxation confirmation is a security-critical surface: gate it at
+    // moderate-or-worse (WCAG 2.2 AA), not only serious/critical.
+    await page.addScriptTag({ url: "/__test__/axe.min.js" });
+    const confirmViolations = await page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (ctx: Document, opts: unknown) => Promise<{ violations: { id: string; impact: string; nodes: { target: string[] }[] }[] }> } }).axe;
+      const result = await axe.run(document, { resultTypes: ["violations"] });
+      return result.violations
+        .filter((violation) => ["moderate", "serious", "critical"].includes(violation.impact))
+        .map((violation) => ({
+          id: violation.id,
+          impact: violation.impact,
+          nodes: violation.nodes.map((node) => node.target),
+        }));
+    });
+    expect(confirmViolations, JSON.stringify(confirmViolations, null, 2)).toEqual([]);
+
     await save.click();
     await expect
       .poll(async () => {

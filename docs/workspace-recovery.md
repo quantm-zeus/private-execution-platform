@@ -49,10 +49,20 @@ protects; a future random-root-key migration must introduce a new value rather
 than reinterpret existing records. Integrity is provided by AES-GCM: the IV, the
 wrapped bytes and the salt are all authenticated (a tampered salt derives a
 different wrapping key and the tag check fails). The AAD is a constant domain
-string; the version/algorithm/key-source fields are additionally checked by
-explicit equality before any crypto, so a record cannot be silently
-reinterpreted under another scheme. The offline secret is HKDF-extracted before
-use, so it is never used as a raw AES key.
+string. `unwrapRootKey` additionally checks `version`/`algorithm` by explicit
+equality before any crypto, and `parseRecoveryWrappers` rejects any record whose
+`key_source` is not `unlock_secret_v1` (the server enforces the same value on
+write), so a record for another scheme fails closed instead of being handed to
+the unlock-secret unwrap. The offline secret is HKDF-extracted before use, so it
+is never used as a raw AES key.
+
+Adding a credential re-enters the offline recovery code. Before wrapping, the
+shell derives the workspace public-key fingerprint from that code with the
+audited WASM key path and compares it to the descriptor's pinned recipient
+fingerprint; a mistyped code is refused instead of being stored as a trusted
+credential that unwraps to the wrong value. The proof-of-possession challenge
+plaintext is required to be exactly 32 bytes, so the shell is not a decryption
+oracle for server-chosen blobs.
 
 ## Server storage
 

@@ -361,7 +361,7 @@ export const SecurityPanel: Component = () => {
           </ReasonNote>
         </Show>
         <Show when={submitUnknown()}>
-          <ReasonNote tone="danger">
+          <ReasonNote tone="danger" live="assertive">
             Withdrawal outcome UNKNOWN: the request may still have reached the backend. Do not
             rebuild this withdrawal with different details — retry the same review (idempotent) or
             verify the request before authorizing anything else.

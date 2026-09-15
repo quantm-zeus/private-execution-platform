@@ -21,13 +21,13 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   readlink,
   rename,
   rm,
   symlink,
-  writeFile,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +55,49 @@ export const PREVIOUS_LINK = "previous";
 
 function sha256Hex(data) {
   return createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * Write a file and fsync it before returning, so a subsequent atomic rename
+ * cannot expose a directory whose bytes are not yet durable after power loss.
+ */
+async function writeFileDurable(path, data, options = {}) {
+  const handle = await open(path, "w", options.mode ?? 0o644);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Best-effort directory fsync. Directory fsync is not supported on every
+ * platform/filesystem; the per-file fsync above is the important barrier.
+ */
+async function syncDirectory(path) {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    await handle.sync();
+  } catch {
+    // Not supported here; ignore.
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+/** Best-effort file fsync for copies made outside `writeFileDurable`. */
+async function syncFile(path) {
+  let handle;
+  try {
+    handle = await open(path, "r+");
+    await handle.sync();
+  } catch {
+    // Not every file/filsystem permits a sync; ignore.
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
 }
 
 function publicKeyFingerprintB64(publicKey) {
@@ -209,8 +252,12 @@ export function validateReleaseManifest(manifest, artifact) {
     throw new Error("invalid shell asset digest");
   }
   const protocol = manifest.workspace_protocol;
+  const validProtocolByte = (value) =>
+    Number.isInteger(value) && value >= 0 && value <= 255;
   if (
     !protocol ||
+    !validProtocolByte(protocol.min) ||
+    !validProtocolByte(protocol.max) ||
     protocol.min > protocol.max ||
     protocol.min > WORKSPACE_PROTOCOL_VERSION ||
     protocol.max < WORKSPACE_PROTOCOL_VERSION
@@ -255,7 +302,7 @@ export async function writeShellCacheHeaders(shellDir) {
     existing.trim().length > 0
       ? `${existing.trimEnd()}\n\n`
       : "/*\n  Cache-Control: no-store\n\n";
-  await writeFile(headersPath, `${base}${cacheRules}`, { mode: 0o644 });
+  await writeFileDurable(headersPath, `${base}${cacheRules}`, { mode: 0o644 });
 }
 
 async function linkTarget(linkPath) {
@@ -361,7 +408,7 @@ export async function publishRelease({
   await mkdir(staging, { recursive: true });
   let shippedShellDigest;
   try {
-    await writeFile(join(staging, ARTIFACT_FILE), artifact, { mode: 0o600 });
+    await writeFileDurable(join(staging, ARTIFACT_FILE), artifact, { mode: 0o600 });
     const stagedShell = join(staging, SHELL_DIR);
     await mkdir(stagedShell, { recursive: true });
     await copyTree(shellDir, stagedShell);
@@ -369,47 +416,58 @@ export async function publishRelease({
     // The manifest covers the shell as shipped (including _headers).
     shippedShellDigest = await digestDirectory(stagedShell);
     manifest.shell.asset_digest_hex = shippedShellDigest;
-    await writeFile(join(staging, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, {
-      mode: 0o644,
-    });
+    await writeFileDurable(
+      join(staging, MANIFEST_FILE),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      { mode: 0o644 },
+    );
     validateReleaseManifest(manifest, artifact);
+    await syncDirectory(staging);
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 
-  let exists = false;
+  // From here on the staging directory must never leak, even when an existing
+  // release cannot be read or the final rename fails. Wrap the whole tail in a
+  // try/finally that removes staging unless it became the release directory.
+  let published = false;
   try {
-    await lstat(releaseDir);
-    exists = true;
-  } catch (error) {
-    // Only a genuinely absent directory means "new release"; any other stat
-    // failure (EACCES/EIO) must not be treated as absent.
-    if (error?.code !== "ENOENT") {
-      await rm(staging, { recursive: true, force: true }).catch(() => {});
-      throw error;
+    let exists = false;
+    try {
+      await lstat(releaseDir);
+      exists = true;
+    } catch (error) {
+      // Only a genuinely absent directory means "new release"; any other stat
+      // failure (EACCES/EIO) must not be treated as absent.
+      if (error?.code !== "ENOENT") throw error;
     }
-  }
-  if (exists) {
-    // Re-publishing is idempotent only when the release is byte-identical:
-    // same artifact AND same shipped shell digest. The release id is derived
-    // from the artifact, so a shell-only change under the same source SHA must
-    // be refused rather than silently switching to the stale shell.
-    const existing = await readRelease(releasesRoot, releaseId);
-    await rm(staging, { recursive: true, force: true }).catch(() => {});
-    if (
-      !existing.artifact.equals(artifact) ||
-      existing.manifest.shell.asset_digest_hex !== shippedShellDigest
-    ) {
-      throw new Error("release already exists and is immutable");
+    if (exists) {
+      // Re-publishing is idempotent only when the release is byte-identical:
+      // same artifact AND same shipped shell digest. The release id is derived
+      // from the artifact, so a shell-only change under the same source SHA must
+      // be refused rather than silently switching to the stale shell.
+      const existing = await readRelease(releasesRoot, releaseId);
+      if (
+        !existing.artifact.equals(artifact) ||
+        existing.manifest.shell.asset_digest_hex !== shippedShellDigest
+      ) {
+        throw new Error("release already exists and is immutable");
+      }
+      await switchCurrent(releasesRoot, releaseId);
+      return { releaseId, manifest: existing.manifest };
     }
-    await switchCurrent(releasesRoot, releaseId);
-    return { releaseId, manifest: existing.manifest };
-  }
 
-  await rename(staging, releaseDir);
-  await switchCurrent(releasesRoot, releaseId);
-  return { releaseId, manifest };
+    await rename(staging, releaseDir);
+    published = true;
+    await syncDirectory(releasesRoot);
+    await switchCurrent(releasesRoot, releaseId);
+    return { releaseId, manifest };
+  } finally {
+    if (!published) {
+      await rm(staging, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 }
 
 async function copyTree(source, destination) {
@@ -421,9 +479,11 @@ async function copyTree(source, destination) {
     if (stat.isSymbolicLink()) throw new Error("symlinks are not allowed in a shell build");
     if (stat.isDirectory()) {
       await mkdir(to, { recursive: true });
+      await syncDirectory(to);
       await copyTree(from, to);
     } else if (stat.isFile()) {
       await copyFile(from, to);
+      await syncFile(to);
     } else {
       throw new Error("unsupported shell build entry");
     }

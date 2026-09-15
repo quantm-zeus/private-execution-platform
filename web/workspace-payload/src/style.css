@@ -76,9 +76,25 @@ code {
 
 .workspace {
   display: grid;
+  /* header | offline banner | body | status bar. The skip link is absolutely
+     positioned and is NOT a grid item, so the body and status bar are placed
+     explicitly; otherwise they shift up a row when the offline banner is
+     absent and the status bar takes the flexible track. */
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   height: 100%;
   min-height: 100%;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .skip-link {
@@ -164,6 +180,7 @@ code {
 .workspace__body {
   display: grid;
   grid-template-columns: 216px minmax(0, 1fr);
+  grid-row: 3;
   min-height: 0;
 }
 
@@ -901,6 +918,7 @@ select.input {
   font-size: 11px;
   color: var(--muted);
   flex-wrap: wrap;
+  grid-row: 4;
 }
 .status-bar__item {
   display: flex;
@@ -925,11 +943,17 @@ select.input {
 }
 
 @media (max-width: 760px) {
-  .workspace {
-    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-  }
   .workspace__body {
     grid-template-columns: minmax(0, 1fr);
+  }
+  /* WCAG 2.2 target size: primary touch controls reach 44x44 on small screens. */
+  .btn,
+  .chip-button,
+  .nav-item {
+    min-height: 44px;
+  }
+  .btn {
+    min-width: 44px;
   }
   .nav-rail {
     border-right: none;

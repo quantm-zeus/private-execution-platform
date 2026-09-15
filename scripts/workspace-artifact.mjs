@@ -87,21 +87,32 @@ function resolveBin(binName) {
   return { directPath, targetDir };
 }
 
-function runRustCli(binName, args) {
+function runRustCli(binName, args, env = process.env) {
   const { directPath } = resolveBin(binName);
-  let result = spawnSync(directPath, args, { stdio: "pipe" });
+  let result = spawnSync(directPath, args, { stdio: "pipe", env });
   if (result.status !== 0 && result.error?.code === "ENOENT") {
     // Fall back to cargo run
     result = spawnSync(
       "cargo",
       ["run", "--quiet", "-p", "crypto-envelope", "--bin", binName, "--", ...args],
-      { stdio: "pipe" },
+      { stdio: "pipe", env },
     );
   }
   if (result.status !== 0) {
     const err = result.stderr ? result.stderr.toString() : "cli failed";
     throw new Error(`${binName} failed: ${err}`);
   }
+}
+
+/**
+ * The unlock secret is passed through the environment, never argv: argv is
+ * world-readable via `ps`/`/proc/<pid>/cmdline` for the life of the process.
+ */
+function unlockSecretEnv(unlockSecret) {
+  return {
+    ...process.env,
+    WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
+  };
 }
 
 export function derivePublicKey(
@@ -122,20 +133,19 @@ export function derivePublicKey(
     throw new Error("all-zero workspace kid rejected");
   }
   const { directPath } = resolveBin("derive-public-key");
+  const env = unlockSecretEnv(unlockSecret);
   const args = [
-    "--unlock-secret-b64",
-    unlockSecret.toString("base64"),
     "--kid-b64",
     kid.toString("base64"),
     "--version",
     String(version),
   ];
-  let result = spawnSync(directPath, args, { stdio: "pipe" });
+  let result = spawnSync(directPath, args, { stdio: "pipe", env });
   if (result.status !== 0 && result.error?.code === "ENOENT") {
     result = spawnSync(
       "cargo",
       ["run", "--quiet", "-p", "crypto-envelope", "--bin", "derive-public-key", "--", ...args],
-      { stdio: "pipe" },
+      { stdio: "pipe", env },
     );
   }
   if (result.status !== 0) {
@@ -232,18 +242,20 @@ export async function decryptArtifact(
   const outPath = join(tempDir, "output.bin");
   try {
     await writeFile(inPath, artifact);
-    runRustCli("decrypt-artifact", [
-      "--unlock-secret-b64",
-      unlockSecret.toString("base64"),
-      "--kid-b64",
-      kid.toString("base64"),
-      "--version",
-      String(version),
-      "--input",
-      inPath,
-      "--output",
-      outPath,
-    ]);
+    runRustCli(
+      "decrypt-artifact",
+      [
+        "--kid-b64",
+        kid.toString("base64"),
+        "--version",
+        String(version),
+        "--input",
+        inPath,
+        "--output",
+        outPath,
+      ],
+      unlockSecretEnv(unlockSecret),
+    );
     const plaintext = await readFile(outPath);
     if (plaintext.length === 0 || plaintext.length > MAX_PACKAGE_BYTES) {
       throw new Error("invalid artifact package");
