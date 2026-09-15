@@ -495,6 +495,14 @@ were fixed:
   (for example the canonical snake_case `OrderSummary` or the nested
   `PortfolioSummary`) becomes a typed `protocol` error instead of a `ready`
   value that throws inside the renderer. No value is fabricated.
+- **One-shot panel reads wait for the authenticated channel.** The re-review
+  found that a panel mounted inside the BR-5 handoff window could consume its
+  one-shot request against the fail-closed command stub and latch a permanent
+  "capability missing". `WorkspaceStore.commandReady` is true only once the
+  encrypted command channel is installed (and false again on dispose/replacement);
+  the execution-progress read and the Limits/Portfolio/Intelligence/WalletLimits
+  auto-load effects gate on it, and the progress surface shows "awaiting the
+  authenticated command channel" instead of a false unqueried empty.
 
 The audits confirmed the core guarantees (AAD binds `kid`+`seq`, the response is
 bound to the request sequence, the `request_id` echo, per-purpose replay
