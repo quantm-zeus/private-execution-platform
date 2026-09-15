@@ -455,23 +455,27 @@ server.on("upgrade", (req, socket, head) => {
     sockets.add(ws);
     state.socketCount += 1;
     state.events.push({ type: "socket-open" });
-    ws.on("message", (data) => {
-      // The production opaque edge relays binary ciphertext only and closes on
-      // any inbound client frame; the worker must never send a cleartext control
-      // frame (it resyncs over POST /v1/sync). Record the violation and close,
-      // exactly like the real relay, so a regression fails the browser suite.
-      let message = null;
-      try {
-        message = JSON.parse(data.toString("utf8"));
-      } catch {
-        message = data.toString("utf8").slice(0, 200);
+    ws.on("message", (data, isBinary) => {
+      // The production opaque edge relays **binary** ciphertext and closes on
+      // any text frame. The worker sends exactly one binary AEAD `subscribe`
+      // frame per (re)connect (BR-2), so a binary frame is expected; a text
+      // control frame is the regression the browser suite fails on.
+      if (!isBinary) {
+        let message = null;
+        try {
+          message = JSON.parse(data.toString("utf8"));
+        } catch {
+          message = data.toString("utf8").slice(0, 200);
+        }
+        state.events.push({ type: "socket-text-frame", message });
+        try {
+          ws.close();
+        } catch {
+          // already closed
+        }
+        return;
       }
-      state.events.push({ type: "socket-message", message });
-      try {
-        ws.close();
-      } catch {
-        // already closed
-      }
+      state.events.push({ type: "socket-binary-frame" });
     });
     ws.on("close", () => {
       sockets.delete(ws);

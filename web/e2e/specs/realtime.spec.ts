@@ -45,9 +45,12 @@ test.describe("encrypted realtime workspace", () => {
     // The worker owns the socket/key; the main thread only renders.
     await expect(page.getByText("worker").first()).toBeVisible();
     // No cleartext control frame may ever be sent on the binary-only relay: the
-    // mock edge records (and would close on) any inbound message.
+    // mock edge records (and would close on) any text frame. The worker's one
+    // binary AEAD `subscribe` frame is expected and is not a text frame.
     const state = await serverState(request);
-    expect(state.events.filter((event) => (event as { type?: string }).type === "socket-message")).toHaveLength(0);
+    expect(
+      state.events.filter((event) => (event as { type?: string }).type === "socket-text-frame"),
+    ).toHaveLength(0);
   });
 
   test("rejects a replayed envelope without advancing or re-rendering", async ({ page, request }) => {
