@@ -39,8 +39,50 @@ pub const ACCESS_ASSERTION_HEADER_ENV: &str = "EDGE_ACCESS_ASSERTION_HEADER";
 /// requests — the exact opposite of the gate. Requiring a custom-header prefix
 /// (`cf-`/`x-`) makes that misconfiguration a startup error while still
 /// accepting the real perimeter seams (`cf-access-jwt-assertion`,
-/// `x-auth-request-*`, `x-forwarded-access-*`, …).
+/// `x-auth-request-*`, …).
 pub const ACCESS_ASSERTION_PREFIXES: [&str; 2] = ["x-", "cf-"];
+
+/// Exact forwarding/topology header names that are client-controllable and must
+/// never be accepted as the perimeter access assertion.
+///
+/// These carry request routing/topology data that a browser or generic proxy can
+/// set, so a deployment that named one as its assertion would authorize ordinary
+/// requests. The dedicated `cf-access-jwt-assertion`, the oauth2-proxy
+/// `x-auth-request-*` family, and the oauth2-proxy identity seam
+/// (`x-forwarded-access-token`/`-user`/`-email`/`-groups`) are intentionally not
+/// listed and stay accepted.
+pub const FORBIDDEN_ASSERTION_HEADERS: [&str; 16] = [
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-forwarded-prefix",
+    "x-real-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "cf-connecting-ip",
+    "cf-pseudo-ipv4",
+    "true-client-ip",
+    "forwarded",
+];
+
+/// Prefix families for topology headers that have multiple variants
+/// (`cf-connecting-ipv6`, `cf-ipcountry`, `cf-ipcity`, …). Deliberately narrow:
+/// it must not match the accepted oauth2-proxy `x-forwarded-access-token` family.
+pub const FORBIDDEN_ASSERTION_PREFIXES: [&str; 2] = ["cf-connecting-ip", "cf-ip"];
+
+/// Whether `name` (already lowercased by [`HeaderName`]) is a forwarding or
+/// proxy-metadata header that can never be the perimeter assertion.
+fn is_forbidden_assertion_header(name: &str) -> bool {
+    FORBIDDEN_ASSERTION_HEADERS.contains(&name)
+        || FORBIDDEN_ASSERTION_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
 
 /// Authorization backend that requires the configured access-assertion header.
 ///
@@ -77,6 +119,12 @@ impl HeaderAssertionAuthorization {
             .iter()
             .any(|prefix| header.as_str().starts_with(prefix))
         {
+            return Err(EdgeError::InvalidConfiguration);
+        }
+        // Forwarding/proxy metadata headers are also client-controllable, so an
+        // `x-`/`cf-` prefix alone is not enough: reject the known forwarding
+        // families before accepting the header as the perimeter assertion.
+        if is_forbidden_assertion_header(header.as_str()) {
             return Err(EdgeError::InvalidConfiguration);
         }
         Ok(Self { header })
@@ -310,8 +358,60 @@ mod tests {
         for name in [
             "cf-access-jwt-assertion",
             "x-auth-request-email",
-            "x-forwarded-access",
+            "x-auth-request-groups",
         ] {
+            assert!(
+                HeaderAssertionAuthorization::new(name).is_ok(),
+                "{name} is a valid perimeter assertion header"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarding_headers_can_never_be_the_assertion() {
+        // `x-`/`cf-` alone is not sufficient: these genuine routing/topology
+        // headers are client-controllable, so configuring one as the assertion
+        // must be a startup error rather than an authorize-everything gate.
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-prefix",
+            "x-real-ip",
+            "x-client-ip",
+            "x-cluster-client-ip",
+            "x-originating-ip",
+            "x-remote-ip",
+            "x-remote-addr",
+            "cf-connecting-ip",
+            "cf-connecting-ipv6",
+            "cf-pseudo-ipv4",
+            "cf-ipcountry",
+            "cf-ipcity",
+            "true-client-ip",
+        ] {
+            assert!(
+                HeaderAssertionAuthorization::new(name).is_err(),
+                "{name} must not be configurable as the access assertion"
+            );
+            assert!(is_forbidden_assertion_header(name), "{name}");
+        }
+        // The dedicated perimeter assertion and the oauth2-proxy identity seam
+        // are explicitly not forbidden, so they stay usable.
+        for name in [
+            "cf-access-jwt-assertion",
+            "x-auth-request-email",
+            "x-forwarded-access-token",
+            "x-forwarded-user",
+            "x-forwarded-email",
+            "x-forwarded-groups",
+        ] {
+            assert!(
+                !is_forbidden_assertion_header(name),
+                "{name} must stay accepted"
+            );
             assert!(
                 HeaderAssertionAuthorization::new(name).is_ok(),
                 "{name} is a valid perimeter assertion header"
@@ -461,14 +561,25 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
 
-        // A different header (for example a forwarding header a client can set)
-        // is not the configured assertion.
-        let mut wrong = HeaderMap::new();
-        wrong.insert(
-            HeaderName::from_static("x-forwarded-for"),
-            "203.0.113.7".parse().expect("value"),
-        );
-        assert_eq!(call(wrong).await.status(), StatusCode::UNAUTHORIZED);
+        // Forwarding headers a client or generic proxy can set never satisfy the
+        // configured perimeter assertion.
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "cf-connecting-ip",
+        ] {
+            let mut wrong = HeaderMap::new();
+            wrong.insert(
+                HeaderName::from_static(name),
+                "203.0.113.7".parse().expect("value"),
+            );
+            assert_eq!(
+                call(wrong).await.status(),
+                StatusCode::UNAUTHORIZED,
+                "{name} must not authorize"
+            );
+        }
 
         // The configured assertion alone authorizes; with no relay wired the
         // backend stays unavailable. This is exactly why a non-loopback bind is
@@ -480,6 +591,48 @@ mod tests {
             "forged-by-a-direct-origin-caller".parse().expect("value"),
         );
         assert_eq!(call(forged).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn an_intended_assertion_header_still_authorizes_at_the_router() {
+        let authorization =
+            Arc::new(HeaderAssertionAuthorization::new("x-auth-request-email").expect("config"));
+        let state = crate::EdgeState::new(
+            authorization,
+            Arc::new(crate::UnavailableRelay),
+            DEFAULT_MAX_OPAQUE_BODY_BYTES,
+        )
+        .expect("state");
+        let app = crate::router(state);
+
+        let request = |name: &'static str, value: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/bootstrap")
+                .header("content-type", "application/octet-stream")
+                .header(name, value)
+                .body(Body::from(vec![1u8, 2, 3]))
+                .expect("request")
+        };
+
+        // A forwarding header does not satisfy the configured assertion.
+        assert_eq!(
+            app.clone()
+                .oneshot(request("x-forwarded-for", "203.0.113.7"))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // The configured (intended) assertion header does; with no relay wired
+        // the backend is unavailable (503), proving authorization passed.
+        assert_eq!(
+            app.oneshot(request("x-auth-request-email", "op@example.test"))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

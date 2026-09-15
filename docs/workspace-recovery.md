@@ -2,8 +2,11 @@
 
 Status: **implemented additively.** The passkey-bound recovery flow (enroll,
 unwrap, revoke, device management) is wired end-to-end and the mandatory offline
-recovery code remains in place. No existing artifact is invalidated: recovery
-wraps the *existing* unlock secret, so the artifact, its KID and its
+recovery code remains in place. The clear shell requests the WebAuthn PRF
+extension at passkey enrollment, so a newly enrolled passkey can produce a PRF
+output; support is still verified at use time and an authenticator that returns
+no output falls back to the offline code. No existing artifact is invalidated:
+recovery wraps the *existing* unlock secret, so the artifact, its KID and its
 derivation are unchanged. A random-root-key migration remains a future,
 explicitly versioned step (see below).
 
@@ -48,10 +51,15 @@ The record carries `version = 1`, `algorithm = "HKDF-SHA256/AES-256-GCM"` and
 protects; a future random-root-key migration must introduce a new value rather
 than reinterpret existing records. Integrity is provided by AES-GCM: the IV, the
 wrapped bytes and the salt are all authenticated (a tampered salt derives a
-different wrapping key and the tag check fails). The AAD is a canonical domain
+different wrapping key and the tag check fails). The canonical AAD is a domain
 tuple `version | algorithm | key_source | credential_id`, so a rewritten record
 cannot be reassigned to another credential, downgraded to a different
 algorithm/key source, or spliced into a future scheme without breaking the tag.
+`unwrapRootKey` tries that credential-bound AAD first and then the pre-binding
+bare domain constant as a **legacy compatibility** path: earlier builds of this
+same unreleased branch wrote wrappers without a credential id, and the two AADs
+are distinct, so a credential-bound record cannot be downgraded (its tag only
+verifies under the bound AAD) while an older bare-AAD record still unwraps.
 `unwrapRootKey` additionally checks `version`/`algorithm`/`key_source` by explicit
 equality before any crypto, and `parseRecoveryWrappers` skips (never
 interprets) any record whose `key_source` is not `unlock_secret_v1` while
@@ -63,9 +71,12 @@ Adding a credential re-enters the offline recovery code. Before wrapping, the
 shell derives the workspace public-key fingerprint from that code with the
 audited WASM key path and compares it to the descriptor's pinned recipient
 fingerprint; a mistyped code is refused instead of being stored as a trusted
-credential that unwraps to the wrong value. The proof-of-possession challenge
-plaintext is required to be exactly 32 bytes, so the shell is not a decryption
-oracle for server-chosen blobs.
+credential that unwraps to the wrong value. The wrapper is created from a PRF
+assertion of the enrolled passkey; because the shell now requests the PRF
+extension at enrollment, passkeys registered by this build can produce that
+output, while an older or non-PRF authenticator falls back to the offline code.
+The proof-of-possession challenge plaintext is required to be exactly 32 bytes,
+so the shell is not a decryption oracle for server-chosen blobs.
 
 ## Server storage
 
@@ -132,8 +143,8 @@ Cloudflare Access ──► explicit "Open Private Workspace" ──► passkey 
         │
         ├─ synced, recovery-capable passkey with PRF ──► PRF output ──► unwrap secret transparently
         └─ otherwise ──► one offline recovery-code entry ──► unlock
-                              └─► offer "add this passkey" (a fresh passkey ceremony + PRF wrap,
-                                  authorized by the recovery code just entered)
+                              └─► offer "add this passkey" (PRF assertion of the enrolled
+                                  passkey, authorized by the recovery code just entered)
 ```
 
 ## Additive root-key migration (future, explicitly versioned)
@@ -157,9 +168,20 @@ A random workspace root key would be a *new* key source, not a reinterpretation:
 - List trusted credentials by label and last-used coarse bucket.
 - Add a recovery passkey (requires a trusted recovery factor).
 - Revoke a wrapper without rotating the secret.
-- Rotating the secret after suspected compromise is an operator step that
-  re-seals the artifact under a new KID and manifest, then re-wraps under every
-  remaining credential.
+- **Revocation is soft, not crypto-erasure.** It removes the record from the
+  active list so the shell can no longer unwrap with it, but the stored
+  ciphertext is retained and a copy of it plus the authenticator would still
+  unwrap. There is no in-product rotate/re-wrap endpoint; rotating the secret
+  after suspected compromise is an operator runbook step that generates a new
+  unlock secret, re-seals the artifact under a new KID and immutable manifest
+  (never reusing a KID across key sources) and re-wraps under every remaining
+  trusted credential. Roll back with the retained `previous` release if the
+  migration fails.
+- The wrapper store is **single-workspace**: one owner-only file behind
+  `PRIVATE_RECOVERY_WRAPPER_STORE_PATH`, and records carry no workspace/KID
+  field. A recovery flow for a second workspace/KID would need per-workspace
+  scoping; today a record from another release is rejected by the descriptor
+  fingerprint rather than used.
 
 ## Tests
 

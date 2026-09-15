@@ -64,24 +64,28 @@ fn resolve_relay_config(
     ca: Option<String>,
     dns: Option<String>,
 ) -> Result<Option<(String, ServiceIdentityConfig)>, std::io::Error> {
-    let present = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
-    let bind_present = present(&bind);
+    // "Supplied" is `is_some()`: a present-but-blank key is an attempted
+    // configuration (typically a typo), not an absent one, so it must take part
+    // in the all-or-none decision. A whitespace-only bind with no identity must
+    // therefore refuse startup rather than silently disabling the relay.
+    let any_supplied =
+        bind.is_some() || cert.is_some() || key.is_some() || ca.is_some() || dns.is_some();
+    if !any_supplied {
+        return Ok(None);
+    }
+    // The required identity *values* must additionally be non-blank to be
+    // usable; a supplied key with a blank value is still a misconfiguration.
     let identity = [
         cert.as_deref(),
         key.as_deref(),
         ca.as_deref(),
         dns.as_deref(),
     ];
-    let any_identity = identity
-        .iter()
-        .any(|value| value.is_some_and(|v| !v.trim().is_empty()));
-    if !bind_present && !any_identity {
-        return Ok(None);
-    }
     let all_identity = identity
         .iter()
         .all(|value| value.is_some_and(|v| !v.trim().is_empty()));
-    if !bind_present || !all_identity {
+    let bind_usable = bind.as_deref().is_some_and(|v| !v.trim().is_empty());
+    if !bind_usable || !all_identity {
         return Err(std::io::Error::other(
             "private relay configuration must supply PRIVATE_API_RELAY_BIND_ADDR, \
              PRIVATE_API_TLS_CERT, PRIVATE_API_TLS_KEY, PRIVATE_API_TLS_CA and \
@@ -304,6 +308,13 @@ mod tests {
             Some("edge.internal".into()),
         )
         .is_err());
+        // A whitespace-only bind address with no identity is a supplied (but
+        // unusable) relay configuration, not "unset": it must refuse startup
+        // rather than silently disabling the relay.
+        assert!(resolve_relay_config(Some("   ".into()), None, None, None, None).is_err());
+        assert!(resolve_relay_config(Some(String::new()), None, None, None, None).is_err());
+        // A whitespace-only identity value alone is supplied and incomplete too.
+        assert!(resolve_relay_config(None, Some("   ".into()), None, None, None).is_err());
     }
 
     #[test]

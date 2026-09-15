@@ -81,6 +81,33 @@ test("buildCreationOptions decodes user id and excludes credentials", () => {
   );
 });
 
+test("buildCreationOptions requests PRF at registration and preserves server extensions", () => {
+  const options = buildCreationOptions({
+    rp: { id: "evergreen.foresift.tech", name: "Evergreen" },
+    user: { id: "AQID", name: "owner", displayName: "Owner" },
+    challenge: "BwgJ",
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+    extensions: { credProps: true },
+  });
+  const extensions = options.extensions as
+    | { prf?: unknown; credProps?: unknown }
+    | undefined;
+  // The PRF extension is requested at registration so a later recovery
+  // assertion can evaluate it; an authenticator without support ignores it and
+  // enrollment still succeeds.
+  assert.deepEqual(extensions?.prf, {});
+  assert.equal(extensions?.credProps, true);
+
+  // With no server extensions, PRF is still requested.
+  const bare = buildCreationOptions({
+    rp: { id: "evergreen.foresift.tech" },
+    user: { id: "AQID", name: "owner", displayName: "Owner" },
+    challenge: "BwgJ",
+    pubKeyCredParams: [],
+  });
+  assert.deepEqual((bare.extensions as { prf?: unknown } | undefined)?.prf, {});
+});
+
 test("buildRequestOptions rejects a malformed challenge", () => {
   assert.throws(
     () => buildRequestOptions({ challenge: 42 }),

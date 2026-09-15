@@ -9,8 +9,12 @@
 // path, key, or ciphertext is propagated.
 
 import {
+  RECOVERY_IV_BYTES,
   RECOVERY_KEY_SOURCE,
+  RECOVERY_SALT_BYTES,
   RECOVERY_WRAPPER_VERSION,
+  RECOVERY_WRAPPED_ROOT_KEY_BYTES,
+  RECOVERY_WRAP_ALGORITHM,
   unwrapRootKey,
   type WrappedRootKey,
 } from "./recovery-wrapping.ts";
@@ -122,11 +126,34 @@ function parseWrapperRecord(value: unknown): RecoveryWrapperRecord {
   if (keySource !== SUPPORTED_KEY_SOURCE) {
     throw new RecoveryClientError("recovery_malformed");
   }
+  // A record for any other algorithm is not something this shell can unwrap, so
+  // it is skipped at parse rather than surfaced as a broken credential.
+  const algorithm = requireString(value.algorithm, 64);
+  if (algorithm !== RECOVERY_WRAP_ALGORITHM) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  // Validate decoded lengths here so a truncated or oversized field is rejected
+  // at parse (and the malformed record skipped) instead of surfacing later as an
+  // opaque unwrap failure that would look like a wrong PRF output.
+  const salt = fromBase64(requireString(value.salt_b64, 128));
+  if (salt.length !== RECOVERY_SALT_BYTES) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  const iv = fromBase64(requireString(value.iv_b64, 64));
+  if (iv.length !== RECOVERY_IV_BYTES) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  const wrappedRootKey = fromBase64(
+    requireString(value.wrapped_root_key_b64, 256),
+  );
+  if (wrappedRootKey.length !== RECOVERY_WRAPPED_ROOT_KEY_BYTES) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
   return {
     credential_id_b64: requireString(value.credential_id_b64, 2048),
     label: requireString(value.label, 64),
     version,
-    algorithm: requireString(value.algorithm, 64),
+    algorithm,
     key_source: keySource,
     salt_b64: requireString(value.salt_b64, 128),
     iv_b64: requireString(value.iv_b64, 64),

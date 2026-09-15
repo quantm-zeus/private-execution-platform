@@ -1,31 +1,100 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, readlink, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import {
+  chmod,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  readlink,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
+import { writeArtifactAtomically } from "./build-workspace-encrypted.mjs";
 import {
   ARTIFACT_FILE,
   CURRENT_LINK,
+  DEFAULT_PAYLOAD_DIR,
   MANIFEST_FILE,
   PREVIOUS_LINK,
+  RELEASE_LOCK_DIR,
+  RELEASE_LOCK_OWNER_FILE,
+  ReleaseLockTimeoutError,
   SHELL_DIR,
+  acquireReleaseLock,
+  buildAndPublishRelease,
   computeReleaseManifest,
   digestDirectory,
+  isDefaultPayloadDir,
   publishRelease,
   readRelease,
   releaseIdFor,
+  releaseReleaseLock,
   rollbackCurrent,
   switchCurrent,
   sweepStaleStaging,
   validateReleaseManifest,
+  withReleaseLock,
   writeShellCacheHeaders,
 } from "./workspace-release.mjs";
 
 const PUBLIC_KEY_B64 = Buffer.alloc(32, 7).toString("base64");
 const KID = Buffer.alloc(16, 3);
 const KID_B64 = KID.toString("base64");
+
+const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
+
+// The real shipped shell headers. Assertions must accept production verbatim
+// (including its full-strength CSP), never a shortened stand-in.
+const PRODUCTION_HEADERS_PATH = fileURLToPath(
+  new URL("../web/workspace-shell/public/_headers", import.meta.url),
+);
+const PRODUCTION_HEADERS = await readFile(PRODUCTION_HEADERS_PATH, "utf8");
+const PRODUCTION_CSP = (() => {
+  const match = /^\s*Content-Security-Policy:\s*(.+)$/im.exec(PRODUCTION_HEADERS);
+  assert.ok(match, "production _headers must declare a Content-Security-Policy");
+  return match[1].trim();
+})();
+const PARTIAL_HEADERS = ["/index.html", "  Cache-Control: no-store", ""].join("\n");
+
+/** Fail fast instead of hanging when a lock regression deadlocks a test. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out: ${label}`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** A pid that is guaranteed to be dead: a child we spawned and reaped. */
+async function spawnDeadPid() {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const pid = child.pid;
+  await once(child, "exit");
+  return pid;
+}
+
+/** Plant a pre-existing lock directory with the given owner stamp. */
+async function plantLock(root, owner) {
+  const lockPath = join(root, RELEASE_LOCK_DIR);
+  await mkdir(lockPath);
+  await writeFile(join(lockPath, RELEASE_LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`);
+  return lockPath;
+}
 
 function fakeArtifact() {
   // version(1) || kid(16) || encapped(32) || ciphertext tag(16)
@@ -112,7 +181,9 @@ test("manifest validation rejects every mismatch", () => {
 
 test("release ids are deterministic and stable", () => {
   const digest = "abcdef0123456789".repeat(4);
-  assert.equal(releaseIdFor("9a5a712deadbeef", digest), releaseIdFor("9a5a712deadbeef", digest));
+  // Exact expected id, not a self-comparison: source sha is lowered and cut to
+  // 12 hex chars, and the artifact digest contributes its first 12.
+  assert.equal(releaseIdFor("9a5a712deadbeef", digest), "9a5a712deadb-abcdef012345");
   assert.notEqual(releaseIdFor("9a5a712", digest), releaseIdFor("beef123", digest));
   assert.notEqual(
     releaseIdFor("9a5a712", digest),
@@ -128,17 +199,91 @@ test("directory digest changes with content and is path sensitive", async () => 
     await writeFile(join(root, "index.html"), "a");
     await writeFile(join(root, "assets", "app.js"), "b");
     const first = await digestDirectory(root);
+    // Baseline: hashing the unchanged tree is stable.
+    assert.equal(await digestDirectory(root), first);
+    // Identical bytes at a different path must change the digest.
+    await rename(join(root, "assets", "app.js"), join(root, "assets", "renamed.js"));
+    const renamed = await digestDirectory(root);
+    assert.notEqual(first, renamed);
+    // Restoring the original path must reproduce the original digest exactly.
+    await rename(join(root, "assets", "renamed.js"), join(root, "assets", "app.js"));
+    assert.equal(await digestDirectory(root), first);
+    // Adding a path must also change the digest.
+    await writeFile(join(root, "assets", "extra.js"), "");
+    const added = await digestDirectory(root);
+    assert.notEqual(added, first);
+    // A content change at the same path changes the digest.
     await writeFile(join(root, "assets", "app.js"), "c");
-    const second = await digestDirectory(root);
-    assert.notEqual(first, second);
+    const changed = await digestDirectory(root);
+    assert.notEqual(changed, added);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("shell cache headers preserve the hardened security headers", async () => {
+test("shell cache headers accept the shipped production _headers verbatim", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-headers-"));
   try {
+    await writeFile(join(root, "_headers"), PRODUCTION_HEADERS);
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    // The production CSP must survive byte-for-byte: the writer must accept the
+    // real shipped policy, not merely a shortened stand-in.
+    assert.ok(
+      headers.includes(`Content-Security-Policy: ${PRODUCTION_CSP}`),
+      "production CSP must be accepted and retained verbatim",
+    );
+    assert.match(headers, /X-Content-Type-Options: nosniff/);
+    assert.match(headers, /X-Frame-Options: DENY/);
+    assert.match(headers, /Referrer-Policy: no-referrer/);
+    // Cache rules are appended, not substituted for the security block.
+    assert.ok(headers.includes("/index.html\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(headers.includes("/\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(
+      headers.includes("/assets/*\n  Cache-Control: public, max-age=31536000, immutable"),
+    );
+    // The `/*` rule must precede the more specific overrides.
+    assert.ok(headers.indexOf("/*") < headers.indexOf("/index.html"));
+    // Re-running is idempotent: no duplicated cache rules.
+    await writeShellCacheHeaders(root);
+    const rerun = await readFile(join(root, "_headers"), "utf8");
+    assert.equal(rerun, headers);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shell cache headers synthesize the complete hardened block when none shipped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-synth-"));
+  try {
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    assert.match(headers, /^\/\*/m);
+    // The synthesized block must carry the full hardened header set, not just
+    // Cache-Control, and its CSP must equal the real shipped policy exactly.
+    assert.match(headers, /Cache-Control: no-store/);
+    assert.match(headers, /X-Content-Type-Options: nosniff/);
+    assert.match(headers, /X-Frame-Options: DENY/);
+    assert.match(headers, /Referrer-Policy: no-referrer/);
+    assert.ok(headers.includes(`Content-Security-Policy: ${PRODUCTION_CSP}`));
+    assert.ok(headers.includes("/index.html\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(headers.includes("/\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(
+      headers.includes("/assets/*\n  Cache-Control: public, max-age=31536000, immutable"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("shell cache headers refuse an existing _headers without the hardened /* rule", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-refuse-"));
+  try {
+    // Only a specific rule, no hardened wildcard: fail closed instead of
+    // appending cache rules to a shell that would lose its security headers.
+    await writeFile(join(root, "_headers"), PARTIAL_HEADERS);
+    await assert.rejects(writeShellCacheHeaders(root), /hardened \/\* rule/);
+    // A wildcard that is missing a hardened header is refused too.
     await writeFile(
       join(root, "_headers"),
       [
@@ -147,38 +292,158 @@ test("shell cache headers preserve the hardened security headers", async () => {
         "  X-Content-Type-Options: nosniff",
         "  X-Frame-Options: DENY",
         "  Referrer-Policy: no-referrer",
-        "  Content-Security-Policy: default-src 'self'",
         "",
       ].join("\n"),
     );
-    await writeShellCacheHeaders(root);
-    const headers = await readFile(join(root, "_headers"), "utf8");
-    // Hardening from the shell build must survive publication.
-    assert.match(headers, /^\/\*/m);
-    assert.match(headers, /Content-Security-Policy: default-src 'self'/);
-    assert.match(headers, /X-Content-Type-Options: nosniff/);
-    assert.match(headers, /X-Frame-Options: DENY/);
-    assert.match(headers, /Referrer-Policy: no-referrer/);
-    // Cache rules are appended, not substituted for the security block.
-    assert.match(headers, /\/index\.html[\s\S]*no-store, must-revalidate/);
-    assert.match(headers, /\/assets\/\*[\s\S]*immutable/);
-    // The `/*` rule must precede the more specific overrides.
-    assert.ok(headers.indexOf("/*") < headers.indexOf("/index.html"));
+    await assert.rejects(writeShellCacheHeaders(root), /missing hardened content-security-policy/);
+    // An empty file is not a hardened shell either.
+    await writeFile(join(root, "_headers"), "");
+    await assert.rejects(writeShellCacheHeaders(root), /hardened \/\* rule/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("shell cache headers synthesize a wildcard rule when none shipped", async () => {
-  const root = await mkdtemp(join(tmpdir(), "release-headers-synth-"));
+test("a second weaker /* rule cannot bypass the hardened header guard", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-dup-"));
   try {
-    await writeShellCacheHeaders(root);
-    const headers = await readFile(join(root, "_headers"), "utf8");
-    assert.match(headers, /^\/\*/m);
-    assert.match(headers, /\/index\.html[\s\S]*no-store/);
-    assert.match(headers, /\/assets\/\*[\s\S]*immutable/);
+    // First wildcard is hardened, second is weaker: checking only the first
+    // would let the weaker rule survive and un-harden the shell depending on
+    // host evaluation order.
+    await writeFile(
+      join(root, "_headers"),
+      `${PRODUCTION_HEADERS.trimEnd()}\n\n/*\n  Cache-Control: no-store\n`,
+    );
+    await assert.rejects(
+      writeShellCacheHeaders(root),
+      /missing hardened x-content-type-options/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a weakened or extended CSP is rejected", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-csp-"));
+  try {
+    const weakened = PRODUCTION_HEADERS.replace(
+      `Content-Security-Policy: ${PRODUCTION_CSP}`,
+      "Content-Security-Policy: default-src *",
+    );
+    assert.notEqual(weakened, PRODUCTION_HEADERS, "fixture must actually rewrite the CSP");
+    await writeFile(join(root, "_headers"), weakened);
+    await assert.rejects(
+      writeShellCacheHeaders(root),
+      /missing hardened content-security-policy/,
+    );
+
+    // A CSP that merely contains the hardened directives plus an extra source
+    // must not be accepted either: the required value is exact.
+    const extended = PRODUCTION_HEADERS.replace(
+      `Content-Security-Policy: ${PRODUCTION_CSP}`,
+      `Content-Security-Policy: ${PRODUCTION_CSP} script-src-elem *`,
+    );
+    await writeFile(join(root, "_headers"), extended);
+    await assert.rejects(
+      writeShellCacheHeaders(root),
+      /missing hardened content-security-policy/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a comment line cannot detach following headers from the /* rule", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-comment-"));
+  try {
+    // A column-0 comment between header lines used to become its own path rule,
+    // stealing every header after it away from `/*`.
+    const withComment = PRODUCTION_HEADERS.replace(
+      "  X-Content-Type-Options: nosniff\n",
+      "  X-Content-Type-Options: nosniff\n# operator note\n",
+    );
+    assert.notEqual(withComment, PRODUCTION_HEADERS, "fixture must inject a comment");
+    await writeFile(join(root, "_headers"), withComment);
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    assert.ok(
+      headers.includes(`Content-Security-Policy: ${PRODUCTION_CSP}`),
+      "headers after the comment must stay attached to the /* rule",
+    );
+    // The comment itself is preserved.
+    assert.ok(headers.includes("# operator note"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("managed-path blocks keep unrelated headers while cache rules are replaced", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-preserve-"));
+  try {
+    // A managed path carrying HSTS: only its Cache-Control line may be dropped.
+    await writeFile(
+      join(root, "_headers"),
+      [
+        PRODUCTION_HEADERS.trimEnd(),
+        "",
+        "/index.html",
+        "  Cache-Control: no-store, must-revalidate",
+        "  Strict-Transport-Security: max-age=63072000",
+        "",
+      ].join("\n"),
+    );
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    assert.ok(
+      headers.includes("Strict-Transport-Security: max-age=63072000"),
+      "HSTS must not be dropped with the cache block",
+    );
+    const indexBlocks = headers
+      .split("\n\n")
+      .filter((block) => block.split("\n")[0].trim() === "/index.html");
+    assert.equal(
+      indexBlocks.length,
+      2,
+      "preserved header block plus the canonical cache rule",
+    );
+    assert.ok(indexBlocks.some((block) => block.includes("Strict-Transport-Security")));
+    assert.ok(indexBlocks.some((block) => block.includes("must-revalidate")));
+    // No stale cache-control duplicated into the preserved block.
+    assert.equal(indexBlocks[0].includes("Cache-Control"), false);
+    // Re-running is idempotent.
+    await writeShellCacheHeaders(root);
+    const rerun = await readFile(join(root, "_headers"), "utf8");
+    assert.equal(rerun, headers);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rollback refuses with no previous and when current === previous", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-rollback-guard-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-rollback-guard-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    // Only a current release exists: nothing to roll back to.
+    await assert.rejects(rollbackCurrent(root), /no previous release/);
+    // Simulate the crash window: previous points at the same release as
+    // current. Rolling back would be a silent no-op and must be refused.
+    await symlink(releaseId, join(root, PREVIOUS_LINK));
+    await assert.rejects(rollbackCurrent(root), /same release/);
+    // The refusal must not have mutated either link.
+    assert.equal(await readlink(join(root, CURRENT_LINK)), releaseId);
+    assert.equal(await readlink(join(root, PREVIOUS_LINK)), releaseId);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
   }
 });
 
@@ -252,9 +517,14 @@ test("publish, switch and rollback are atomic and immutable", async () => {
 test("switching to an unpublished release refuses", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-switch-"));
   try {
-    await assert.rejects(switchCurrent(root, "missing-release"));
-    // A canonical but absent id reaches the read and fails closed too.
-    await assert.rejects(switchCurrent(root, "abcdef012345-abcdef012345"));
+    // A non-canonical id fails the shape check before any disk access.
+    await assert.rejects(switchCurrent(root, "missing-release"), /invalid release id/);
+    // A canonical-but-absent id reaches the read and fails closed with ENOENT,
+    // distinctly from the shape rejection above.
+    await assert.rejects(
+      switchCurrent(root, "abcdef012345-abcdef012345"),
+      (error) => error?.code === "ENOENT",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -461,6 +731,48 @@ test("a symlinked release directory or shell is refused", async () => {
   }
 });
 
+test("a symlinked or non-regular manifest/artifact is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-file-symlink-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-file-symlink-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    const releaseDir = join(root, releaseId);
+    await readRelease(root, releaseId);
+
+    // Symlinked artifact must not be followed.
+    const realArtifact = join(releaseDir, "artifact-real.bin");
+    await rename(join(releaseDir, ARTIFACT_FILE), realArtifact);
+    await symlink(realArtifact, join(releaseDir, ARTIFACT_FILE));
+    await assert.rejects(readRelease(root, releaseId), /artifact must be a real regular file/);
+    await rm(join(releaseDir, ARTIFACT_FILE), { force: true });
+    await rename(realArtifact, join(releaseDir, ARTIFACT_FILE));
+
+    // Symlinked manifest must not be followed.
+    const realManifest = join(releaseDir, "manifest-real.json");
+    await rename(join(releaseDir, MANIFEST_FILE), realManifest);
+    await symlink(realManifest, join(releaseDir, MANIFEST_FILE));
+    await assert.rejects(readRelease(root, releaseId), /manifest must be a real regular file/);
+    await rm(join(releaseDir, MANIFEST_FILE), { force: true });
+    await rename(realManifest, join(releaseDir, MANIFEST_FILE));
+
+    // A non-regular entry at the artifact path is refused too.
+    await rm(join(releaseDir, ARTIFACT_FILE));
+    await mkdir(join(releaseDir, ARTIFACT_FILE));
+    await assert.rejects(readRelease(root, releaseId), /artifact must be a real regular file/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
 test("stale staging directories are swept while fresh ones are kept", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-sweep-"));
   try {
@@ -510,5 +822,347 @@ test("republishing the same artifact under a different recipient key is refused"
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
+test("the default payload dir predicate only matches the canonical directory", () => {
+  assert.equal(isDefaultPayloadDir(DEFAULT_PAYLOAD_DIR), true);
+  assert.equal(isDefaultPayloadDir(resolve(DEFAULT_PAYLOAD_DIR)), true);
+  assert.equal(isDefaultPayloadDir(join(tmpdir(), "operator-custom-payload")), false);
+});
+
+test("buildAndPublishRelease cleanup removes only a requested payload dir", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-cleanup-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-cleanup-shell-"));
+  const cleaned = await mkdtemp(join(tmpdir(), "release-cleanup-on-"));
+  const untouched = await mkdtemp(join(tmpdir(), "release-cleanup-off-"));
+  const previousKey = process.env.WORKSPACE_PUBLIC_KEY_B64;
+  const previousKid = process.env.WORKSPACE_ARTIFACT_KID_B64;
+  const previousArtifactKey = process.env.WORKSPACE_ARTIFACT_KEY_B64;
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    // An exported forbidden key must never leak into a test process.
+    delete process.env.WORKSPACE_ARTIFACT_KEY_B64;
+    process.env.WORKSPACE_PUBLIC_KEY_B64 = PUBLIC_KEY_B64;
+    process.env.WORKSPACE_ARTIFACT_KID_B64 = KID_B64;
+
+    // Empty payload dirs fail packing before sealing, so this exercises the
+    // cleanup `finally` on the failure path without invoking the crypto CLI.
+    await assert.rejects(
+      buildAndPublishRelease({
+        releasesRoot: root,
+        shellDir,
+        payloadDir: cleaned,
+        sourceSha: "9a5a712",
+        cleanupPayload: true,
+      }),
+      /file count/,
+    );
+    await assert.rejects(lstat(cleaned), { code: "ENOENT" });
+
+    await assert.rejects(
+      buildAndPublishRelease({
+        releasesRoot: root,
+        shellDir,
+        payloadDir: untouched,
+        sourceSha: "9a5a712",
+        cleanupPayload: false,
+      }),
+      /file count/,
+    );
+    assert.ok((await lstat(untouched)).isDirectory());
+  } finally {
+    if (previousKey === undefined) delete process.env.WORKSPACE_PUBLIC_KEY_B64;
+    else process.env.WORKSPACE_PUBLIC_KEY_B64 = previousKey;
+    if (previousKid === undefined) delete process.env.WORKSPACE_ARTIFACT_KID_B64;
+    else process.env.WORKSPACE_ARTIFACT_KID_B64 = previousKid;
+    if (previousArtifactKey === undefined) delete process.env.WORKSPACE_ARTIFACT_KEY_B64;
+    else process.env.WORKSPACE_ARTIFACT_KEY_B64 = previousArtifactKey;
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+    await rm(cleaned, { recursive: true, force: true });
+    await rm(untouched, { recursive: true, force: true });
+  }
+});
+
+test("buildAndPublishRelease integrates build, switch, rollback and headers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-integration-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-integration-shell-"));
+  const payloadA = await mkdtemp(join(tmpdir(), "release-integration-payload-a-"));
+  const payloadB = await mkdtemp(join(tmpdir(), "release-integration-payload-b-"));
+  const previousKey = process.env.WORKSPACE_PUBLIC_KEY_B64;
+  const previousKid = process.env.WORKSPACE_ARTIFACT_KID_B64;
+  const previousArtifactKey = process.env.WORKSPACE_ARTIFACT_KEY_B64;
+  try {
+    // A temp shell build ships the real production _headers.
+    await writeFile(join(shellDir, "_headers"), PRODUCTION_HEADERS);
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    await mkdir(join(shellDir, "assets"));
+    await writeFile(join(shellDir, "assets", "index-abc.js"), "console.log(1)");
+    await writeFile(join(payloadA, "index.html"), "payload-a");
+    await writeFile(join(payloadB, "index.html"), "payload-b");
+
+    // Deterministic non-secret test key material: sealing only needs a valid
+    // 32-byte recipient key and 16-byte KID, never a real private key. Delete a
+    // forbidden exported key so it cannot fail the build under test.
+    delete process.env.WORKSPACE_ARTIFACT_KEY_B64;
+    process.env.WORKSPACE_PUBLIC_KEY_B64 = PUBLIC_KEY_B64;
+    process.env.WORKSPACE_ARTIFACT_KID_B64 = KID_B64;
+
+    const first = await buildAndPublishRelease({
+      releasesRoot: root,
+      shellDir,
+      payloadDir: payloadA,
+      sourceSha: "9a5a712",
+      cleanupPayload: true,
+    });
+    const { manifest: firstManifest } = await readRelease(root, first.releaseId);
+    assert.equal(firstManifest.release_id, first.releaseId);
+
+    const second = await buildAndPublishRelease({
+      releasesRoot: root,
+      shellDir,
+      payloadDir: payloadB,
+      sourceSha: "beef123",
+      cleanupPayload: true,
+    });
+    assert.notEqual(second.releaseId, first.releaseId);
+    assert.equal(await readlink(join(root, CURRENT_LINK)), second.releaseId);
+    assert.equal(await readlink(join(root, PREVIOUS_LINK)), first.releaseId);
+    await readRelease(root, second.releaseId);
+
+    const rolled = await rollbackCurrent(root);
+    assert.equal(rolled.from, second.releaseId);
+    assert.equal(rolled.to, first.releaseId);
+    assert.equal(await readlink(join(root, CURRENT_LINK)), first.releaseId);
+    assert.equal(await readlink(join(root, PREVIOUS_LINK)), second.releaseId);
+
+    // The shipped _headers carries both the hardened block and the exact cache
+    // rules the release writer emitted, with the production CSP verbatim.
+    const headers = await readFile(join(root, first.releaseId, SHELL_DIR, "_headers"), "utf8");
+    assert.match(headers, /^\/\*/m);
+    assert.match(headers, /Cache-Control: no-store/);
+    assert.match(headers, /X-Content-Type-Options: nosniff/);
+    assert.match(headers, /X-Frame-Options: DENY/);
+    assert.match(headers, /Referrer-Policy: no-referrer/);
+    assert.ok(headers.includes(`Content-Security-Policy: ${PRODUCTION_CSP}`));
+    assert.ok(headers.includes("/\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(headers.includes("/index.html\n  Cache-Control: no-store, must-revalidate"));
+    assert.ok(
+      headers.includes("/assets/*\n  Cache-Control: public, max-age=31536000, immutable"),
+    );
+
+    // cleanupPayload removed the plaintext build dirs on the success path.
+    await assert.rejects(lstat(payloadA), { code: "ENOENT" });
+    await assert.rejects(lstat(payloadB), { code: "ENOENT" });
+  } finally {
+    if (previousKey === undefined) delete process.env.WORKSPACE_PUBLIC_KEY_B64;
+    else process.env.WORKSPACE_PUBLIC_KEY_B64 = previousKey;
+    if (previousKid === undefined) delete process.env.WORKSPACE_ARTIFACT_KID_B64;
+    else process.env.WORKSPACE_ARTIFACT_KID_B64 = previousKid;
+    if (previousArtifactKey === undefined) delete process.env.WORKSPACE_ARTIFACT_KEY_B64;
+    else process.env.WORKSPACE_ARTIFACT_KEY_B64 = previousArtifactKey;
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+    await rm(payloadA, { recursive: true, force: true });
+    await rm(payloadB, { recursive: true, force: true });
+  }
+});
+
+test("a dead-PID lock owner is evicted promptly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-lock-dead-"));
+  try {
+    const deadPid = await spawnDeadPid();
+    const lockPath = await plantLock(root, {
+      pid: deadPid,
+      token: "dead-owner-token",
+      startedAtMs: Date.now(),
+    });
+    // staleMs is far in the future, so only PID liveness can prove this lock
+    // reclaimable: this is the prompt crash-recovery path.
+    const owner = await withTimeout(
+      acquireReleaseLock(lockPath, { timeoutMs: 2000, staleMs: 60 * 60 * 1000 }),
+      4000,
+      "dead-owner acquire",
+    );
+    assert.equal(owner.pid, process.pid);
+    await releaseReleaseLock(lockPath, owner);
+    await assert.rejects(lstat(lockPath), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a live foreign lock owner is never evicted and acquire times out typed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-lock-live-"));
+  try {
+    const foreignToken = "foreign-live-owner";
+    const lockPath = await plantLock(root, {
+      pid: process.pid, // this process is demonstrably alive
+      token: foreignToken,
+      startedAtMs: Date.now() - 10 * 60 * 1000,
+    });
+    // staleMs is tiny, yet an alive owner must survive age-based eviction.
+    await assert.rejects(
+      acquireReleaseLock(lockPath, { timeoutMs: 150, staleMs: 1 }),
+      (error) =>
+        error instanceof ReleaseLockTimeoutError && error.code === "RELEASE_LOCK_TIMEOUT",
+    );
+    const owner = JSON.parse(await readFile(join(lockPath, RELEASE_LOCK_OWNER_FILE), "utf8"));
+    assert.equal(owner.token, foreignToken);
+    // Releasing with a non-matching token must also leave the live lock alone.
+    await releaseReleaseLock(lockPath, { token: "not-the-owner" });
+    assert.equal((await lstat(lockPath)).isDirectory(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a lock is removed only by its owner token", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-lock-token-"));
+  try {
+    const lockPath = join(root, RELEASE_LOCK_DIR);
+    const owner = await acquireReleaseLock(lockPath, { timeoutMs: 1000, staleMs: 1000 });
+    // A stale frame holding a different token must not delete this live lock.
+    await releaseReleaseLock(lockPath, { token: "someone-else" });
+    assert.ok((await lstat(lockPath)).isDirectory(), "mismatched token must not release");
+    await releaseReleaseLock(lockPath, owner);
+    await assert.rejects(lstat(lockPath), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the same-key re-entrant acquisition does not deadlock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-lock-reentrant-"));
+  try {
+    const result = await withTimeout(
+      withReleaseLock(root, () => withReleaseLock(root, () => 42)),
+      4000,
+      "same-key re-entrancy",
+    );
+    assert.equal(result, 42);
+    await assert.rejects(lstat(join(root, RELEASE_LOCK_DIR)), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("two concurrent same-root callers never overlap", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-lock-concurrent-"));
+  try {
+    let active = 0;
+    let maxActive = 0;
+    const run = () =>
+      withReleaseLock(root, async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 30));
+        active -= 1;
+      });
+    await withTimeout(Promise.all([run(), run(), run()]), 6000, "same-root concurrency");
+    assert.equal(maxActive, 1, "same-root lock holders must not overlap");
+    await assert.rejects(lstat(join(root, RELEASE_LOCK_DIR)), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("nested cross-root acquisition A -> B -> A does not deadlock", async () => {
+  const rootA = await mkdtemp(join(tmpdir(), "release-lock-a-"));
+  const rootB = await mkdtemp(join(tmpdir(), "release-lock-b-"));
+  try {
+    const result = await withTimeout(
+      withReleaseLock(rootA, () =>
+        withReleaseLock(rootB, () => withReleaseLock(rootA, () => "aba")),
+      ),
+      4000,
+      "cross-root re-entrancy",
+    );
+    assert.equal(result, "aba");
+    await assert.rejects(lstat(join(rootA, RELEASE_LOCK_DIR)), { code: "ENOENT" });
+    await assert.rejects(lstat(join(rootB, RELEASE_LOCK_DIR)), { code: "ENOENT" });
+  } finally {
+    await rm(rootA, { recursive: true, force: true });
+    await rm(rootB, { recursive: true, force: true });
+  }
+});
+
+test("writeArtifactAtomically sweeps only stale leftover temp files", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "artifact-sweep-"));
+  try {
+    const destination = join(dir, "blob.bin");
+    const stale = join(dir, ".blob.bin.999.1111.deadbeef.tmp");
+    const fresh = join(dir, ".blob.bin.999.2222.cafebabe.tmp");
+    await writeFile(stale, "leftover");
+    await writeFile(fresh, "in-flight");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(stale, twoHoursAgo, twoHoursAgo);
+
+    await writeArtifactAtomically(destination, Buffer.from("sealed-bytes"));
+
+    await assert.rejects(lstat(stale), { code: "ENOENT" });
+    assert.ok((await lstat(fresh)).isFile(), "fresh temp must be preserved");
+    assert.deepEqual(await readFile(destination), Buffer.from("sealed-bytes"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeArtifactAtomically replaces the artifact only with verified bytes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "artifact-atomic-"));
+  try {
+    const destination = join(dir, "blob.bin");
+    await writeFile(destination, "old-bytes");
+    const artifact = Buffer.from("new-sealed-bytes");
+    await writeArtifactAtomically(destination, artifact);
+    assert.deepEqual(await readFile(destination), artifact);
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name.endsWith(".tmp")),
+      [],
+      "temp artifact leaked",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeArtifactAtomically never removes the destination on failure", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "artifact-atomic-fail-"));
+  try {
+    // A non-empty directory at the destination makes the final rename fail
+    // after the temp file was written and verified.
+    const blocked = join(dir, "blocked");
+    await mkdir(blocked);
+    await writeFile(join(blocked, "keep"), "keep");
+    await assert.rejects(writeArtifactAtomically(blocked, Buffer.from("replacement")));
+    assert.deepEqual(await readdir(blocked), ["keep"]);
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name.endsWith(".tmp")),
+      [],
+      "temp artifact leaked on failure",
+    );
+
+    // A read-only directory prevents the temp file from being created at all;
+    // the pre-existing destination must still survive. Root bypasses directory
+    // permissions, so this assertion only holds for an unprivileged runner.
+    const destination = join(dir, "blob.bin");
+    await writeFile(destination, "old-bytes");
+    if (!IS_ROOT) {
+      await chmod(dir, 0o500);
+      let rejected = false;
+      try {
+        await writeArtifactAtomically(destination, Buffer.from("replacement"));
+      } catch {
+        rejected = true;
+      } finally {
+        await chmod(dir, 0o700);
+      }
+      assert.equal(rejected, true);
+    }
+    assert.equal(await readFile(destination, "utf8"), "old-bytes");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

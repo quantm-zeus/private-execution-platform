@@ -58,6 +58,15 @@ test("compatibility failures point at recovery, not blind retry", () => {
   assert.equal(expired.action, "resume_authentication");
 });
 
+test("an invalid recovery code offers re-entry, not a generic retry", () => {
+  const recovery = recoveryFor("U2_ENROLL", "invalid_secret");
+  assert.equal(recovery.action, "reenter_recovery");
+  assert.equal(recovery.severity, "error");
+  assert.match(recovery.title, /not valid/i);
+  assert.match(recovery.detail, /32-byte offline recovery code/i);
+  assert.equal(recovery.stageLabel, "Workspace identity");
+});
+
 test("unlock errors are generic and carry only a stage and reason", () => {
   const secret = "super-secret-recovery-code";
   // A foreign error whose message contains the secret must never leak through

@@ -655,8 +655,13 @@ try {
   const shellSourceFiles = [
     resolve("web/workspace-shell/src/index.tsx"),
     resolve("web/workspace-shell/src/passkey-auth.ts"),
-    resolve("web/workspace-shell/src/wasm-loader.ts"),
+    resolve("web/workspace-shell/src/descriptor.ts"),
+    resolve("web/workspace-shell/src/unlock-stages.ts"),
     resolve("web/workspace-shell/src/unlock-runtime.ts"),
+    resolve("web/workspace-shell/src/handoff-gate.ts"),
+    resolve("web/workspace-shell/src/recovery-wrapping.ts"),
+    resolve("web/workspace-shell/src/recovery-passkey.ts"),
+    resolve("web/workspace-shell/src/recovery-client.ts"),
     shellHtmlPath,
     shellHeadersPath,
   ];

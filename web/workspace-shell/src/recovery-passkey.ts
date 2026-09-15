@@ -144,20 +144,28 @@ export async function authenticateWithPrf(
   const credentialIdB64 = toBase64(new Uint8Array(publicKeyCredential.rawId));
   const prfOutput = extractPrfOutput(assertion);
 
+  // Any failure after the PRF output exists must zeroize it before throwing:
+  // the caller only receives the buffer on success, and a rejected ceremony
+  // must not leave key material resident for the lifetime of the page.
   let response: Response;
   try {
-    response = await fetchImpl(options.verifyUrl ?? DEFAULT_VERIFY_URL, {
-      method: "POST",
-      credentials: "same-origin",
-      redirect: "error",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(serializeAssertion(publicKeyCredential)),
-    });
-  } catch {
-    throw new PasskeyAuthError("verification_rejected");
-  }
-  if (!response.ok) {
-    throw new PasskeyAuthError("verification_rejected", response.status);
+    try {
+      response = await fetchImpl(options.verifyUrl ?? DEFAULT_VERIFY_URL, {
+        method: "POST",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(serializeAssertion(publicKeyCredential)),
+      });
+    } catch {
+      throw new PasskeyAuthError("verification_rejected");
+    }
+    if (!response.ok) {
+      throw new PasskeyAuthError("verification_rejected", response.status);
+    }
+  } catch (error) {
+    prfOutput?.fill(0);
+    throw error;
   }
   return { credentialIdB64, prfOutput };
 }

@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-import { WorkspaceUnlockRuntime } from "./unlock-runtime.ts";
+import { WorkspaceUnlockRuntime, loadWasm, toBase64 } from "./unlock-runtime.ts";
 import { isUnlockError, type UnlockReason, type UnlockStage } from "./unlock-stages.ts";
 import type { WorkspaceDescriptor } from "./descriptor.ts";
+
+// A real KID (16 non-zero bytes) so the runtime reaches the network boundary.
+const VALID_KID_B64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
+const WASM_BYTES = readFileSync(
+  fileURLToPath(new URL("./wasm/crypto-envelope-wasm_bg.wasm", import.meta.url)),
+);
 
 function descriptor(overrides: Partial<WorkspaceDescriptor> = {}): WorkspaceDescriptor {
   return {
@@ -129,4 +137,120 @@ test("a WASM loader failure is classified as U1", async () => {
     assert.ok(isUnlockError(error));
     assert.ok(!error.message.includes("secret-path"));
   }
+});
+
+function netDescriptor(): WorkspaceDescriptor {
+  return descriptor({ artifact_kid_b64: VALID_KID_B64 });
+}
+
+function grantResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      grant_id: "grant",
+      kid: toBase64(new Uint8Array(16).fill(3)),
+      recipient_public_key: toBase64(new Uint8Array(32).fill(9)),
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+test("every unlock POST is same-origin and uses redirect:error", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const runtime = new WorkspaceUnlockRuntime();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchFn = (async (url: string, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    const target = String(url);
+    if (target.includes("/artifact/grant")) return grantResponse();
+    if (target === "/internal/artifact") {
+      return new Response(new Uint8Array(64), { status: 200 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  await expectStage(
+    () => runtime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn }),
+    "U4_TRANSPORT",
+    "transport_rejected",
+  );
+
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    ["/internal/auth/enroll", "/internal/artifact/grant", "/internal/artifact"],
+  );
+  for (const call of calls) {
+    assert.equal(call.init.redirect, "error", `${call.url} must use redirect:error`);
+    assert.equal(call.init.credentials, "same-origin");
+    assert.equal(call.init.method, "POST");
+  }
+  // A failed transport decrypt must not leave key material or blob URLs around.
+  assert.equal(runtime.unlocked, false);
+  assert.equal(runtime.getActiveUrlCount(), 0);
+});
+
+test("an expired session on grant maps to U2/session_expired", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const runtime = new WorkspaceUnlockRuntime();
+  const fetchFn = (async (url: string) => {
+    if (String(url).includes("/artifact/grant")) {
+      return new Response(null, { status: 401 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  await expectStage(
+    () => runtime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn }),
+    "U2_ENROLL",
+    "session_expired",
+  );
+});
+
+test("an expired session on deliver maps to U2/session_expired", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const runtime = new WorkspaceUnlockRuntime();
+  const fetchFn = (async (url: string) => {
+    const target = String(url);
+    if (target.includes("/artifact/grant")) return grantResponse();
+    if (target === "/internal/artifact") {
+      return new Response(null, { status: 401 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  await expectStage(
+    () => runtime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn }),
+    "U2_ENROLL",
+    "session_expired",
+  );
+});
+
+test("a 403 on grant or deliver stays a generic rejection, not session expiry", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const grantRuntime = new WorkspaceUnlockRuntime();
+  const grantFetch = (async (url: string) => {
+    if (String(url).includes("/artifact/grant")) {
+      return new Response(null, { status: 403 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+  await expectStage(
+    () => grantRuntime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn: grantFetch }),
+    "U3_GRANT",
+    "grant_rejected",
+  );
+
+  const deliverRuntime = new WorkspaceUnlockRuntime();
+  const deliverFetch = (async (url: string) => {
+    const target = String(url);
+    if (target.includes("/artifact/grant")) return grantResponse();
+    if (target === "/internal/artifact") {
+      return new Response(null, { status: 403 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+  await expectStage(
+    () => deliverRuntime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn: deliverFetch }),
+    "U4_TRANSPORT",
+    "transport_rejected",
+  );
 });

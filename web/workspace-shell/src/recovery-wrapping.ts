@@ -35,6 +35,11 @@ export const RECOVERY_KEY_SOURCE = "unlock_secret_v1";
 export const RECOVERY_SALT_BYTES = 32;
 export const RECOVERY_IV_BYTES = 12;
 export const ROOT_KEY_BYTES = 32;
+/** AES-256-GCM authentication tag appended to the wrapped root key. */
+export const RECOVERY_GCM_TAG_BYTES = 16;
+/** Exact decoded length of `wrapped_root_key_b64`: root key plus GCM tag. */
+export const RECOVERY_WRAPPED_ROOT_KEY_BYTES =
+  ROOT_KEY_BYTES + RECOVERY_GCM_TAG_BYTES;
 
 export class RecoveryWrappingError extends Error {
   readonly code:
@@ -86,6 +91,21 @@ function subtleCrypto(): SubtleCrypto {
   return subtle;
 }
 
+/**
+ * Cryptographically secure random bytes, or a typed fail-closed error. The
+ * WebCrypto source is checked rather than assumed, so a locked-down browser
+ * cannot silently produce a zero/non-random key or salt.
+ */
+function randomBytes(length: number): Uint8Array {
+  const cryptoObj = globalThis.crypto;
+  if (!cryptoObj || typeof cryptoObj.getRandomValues !== "function") {
+    throw new RecoveryWrappingError("crypto_unavailable");
+  }
+  const bytes = new Uint8Array(length);
+  cryptoObj.getRandomValues(bytes);
+  return bytes;
+}
+
 function toBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
@@ -101,16 +121,12 @@ function fromBase64(value: string): Uint8Array {
 
 /** Generate a fresh random workspace root key (never persisted in plaintext). */
 export function generateWorkspaceRootKey(): Uint8Array {
-  const key = new Uint8Array(ROOT_KEY_BYTES);
-  globalThis.crypto.getRandomValues(key);
-  return key;
+  return randomBytes(ROOT_KEY_BYTES);
 }
 
 /** Generate a random per-wrapper HKDF salt. */
 export function generateRecoverySalt(): Uint8Array {
-  const salt = new Uint8Array(RECOVERY_SALT_BYTES);
-  globalThis.crypto.getRandomValues(salt);
-  return salt;
+  return randomBytes(RECOVERY_SALT_BYTES);
 }
 
 /**
@@ -180,8 +196,7 @@ export async function wrapRootKey(
   requireRootKey(rootKey);
   if (salt.length !== RECOVERY_SALT_BYTES) throw new RecoveryWrappingError("invalid_record");
   const wrappingKey = await deriveRecoveryWrappingKey(ikm, salt, info);
-  const iv = new Uint8Array(RECOVERY_IV_BYTES);
-  globalThis.crypto.getRandomValues(iv);
+  const iv = randomBytes(RECOVERY_IV_BYTES);
   const recordBase = {
     version: RECOVERY_WRAPPER_VERSION,
     algorithm: RECOVERY_WRAP_ALGORITHM,
@@ -204,7 +219,13 @@ export async function wrapRootKey(
   };
 }
 
-/** Unwrap a root key; throws `unwrap_failed` on any wrong key or tamper. */
+/**
+ * Unwrap a root key. Accepts the credential-bound AAD first and the bare
+ * pre-binding domain constant second (legacy compatibility). Throws
+ * `unwrap_failed` on any wrong key or authentication failure, and
+ * `invalid_root_key` when an AAD authenticates but the plaintext is not a valid
+ * 32-byte non-zero root key.
+ */
 export async function unwrapRootKey(
   ikm: Uint8Array,
   record: WrappedRootKey,
@@ -234,17 +255,18 @@ export async function unwrapRootKey(
   }
   const wrappingKey = await deriveRecoveryWrappingKey(ikm, salt, info);
   // Try the credential-bound AAD first, then the bare pre-binding domain
-  // constant. The fallback keeps a wrapper written by an earlier build
-  // unwrappable instead of silently invalidating it; it cannot downgrade a bound
-  // record, because the two AADs are distinct and a tag only verifies under the
-  // exact AAD it was created with.
+  // constant. Intermediate branch builds wrote the bare AAD, so the fallback
+  // keeps those wrappers readable rather than orphaning them. It cannot
+  // downgrade a bound record: the two AADs are distinct, so a tag created under
+  // the bound AAD fails under the bare one (and vice versa).
   const candidateAads = [
     recoveryAadContext(record, credentialIdB64),
     encoder.encode(RECOVERY_AAD),
   ];
   for (const additionalData of candidateAads) {
+    let plaintext: ArrayBuffer;
     try {
-      const plaintext = await subtleCrypto().decrypt(
+      plaintext = await subtleCrypto().decrypt(
         {
           name: "AES-GCM",
           iv: iv as unknown as BufferSource,
@@ -253,12 +275,17 @@ export async function unwrapRootKey(
         wrappingKey,
         ciphertext as unknown as BufferSource,
       );
-      const rootKey = new Uint8Array(plaintext);
-      requireRootKey(rootKey);
-      return rootKey;
     } catch {
-      // Try the next candidate AAD.
+      // Authentication failed under this AAD; try the next candidate.
+      continue;
     }
+    // A successful GCM decrypt whose plaintext is not a valid root key (wrong
+    // length or all-zero) is a degenerate record, not an authentication
+    // failure. Surface `invalid_root_key` instead of falling through to
+    // `unwrap_failed`, so it is not masked.
+    const rootKey = new Uint8Array(plaintext);
+    requireRootKey(rootKey);
+    return rootKey;
   }
   throw new RecoveryWrappingError("unwrap_failed");
 }
@@ -283,13 +310,17 @@ export async function unwrapWithRecoverySecret(
 }
 
 /**
- * Passkey-bound wrapper. Returns `null` when the authenticator did not produce a
- * PRF output, so the caller falls back to the offline recovery code instead of
- * treating an ordinary assertion signature as key material.
+ * Passkey-bound wrapper. `credentialIdB64` is required and bound into the AEAD
+ * tag, exactly as the production credential-bound records are, so these helpers
+ * interoperate with records written by the unlock path. Returns `null` when the
+ * authenticator did not produce a PRF output, so the caller falls back to the
+ * offline recovery code instead of treating an ordinary assertion signature as
+ * key material.
  */
 export async function wrapWithPrf(
   rootKey: Uint8Array,
   credential: unknown,
+  credentialIdB64: string,
   salt: Uint8Array = generateRecoverySalt(),
 ): Promise<WrappedRootKey | null> {
   const prf = extractPrfOutput(credential);
@@ -297,7 +328,7 @@ export async function wrapWithPrf(
   try {
     // `deriveRecoveryWrappingKey` imports the PRF bytes into WebCrypto before
     // the async boundary returns, so the local copy can be zeroized here.
-    return await wrapRootKey(prf, rootKey, salt);
+    return await wrapRootKey(prf, rootKey, salt, undefined, credentialIdB64);
   } finally {
     prf.fill(0);
   }
@@ -306,11 +337,12 @@ export async function wrapWithPrf(
 export async function unwrapWithPrf(
   record: WrappedRootKey,
   credential: unknown,
+  credentialIdB64: string,
 ): Promise<Uint8Array | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
   try {
-    return await unwrapRootKey(prf, record);
+    return await unwrapRootKey(prf, record, undefined, credentialIdB64);
   } finally {
     prf.fill(0);
   }

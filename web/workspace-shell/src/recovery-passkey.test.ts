@@ -67,6 +67,51 @@ test("a credential without PRF yields null output, never a signature fallback", 
   assert.equal(result.credentialIdB64, toBase64(new Uint8Array(32).fill(0x11)));
 });
 
+test("authenticateWithPrf zeroizes its PRF copy on verify failure but not on success", async () => {
+  const prf = new Uint8Array(32).fill(0x77);
+  const credentials = {
+    get: async () => credential(prf),
+  } as unknown as CredentialsContainer;
+  const successFetch = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+  const failingFetch = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+
+  // `extractPrfOutput` copies the authenticator bytes, so the zeroization
+  // happens on that internal copy. Observe it at the buffer API boundary
+  // without exporting key material.
+  const originalFill = Uint8Array.prototype.fill;
+  let zeroized = 0;
+  Uint8Array.prototype.fill = function (
+    this: Uint8Array,
+    value: number,
+    start?: number,
+    end?: number,
+  ): Uint8Array {
+    if (value === 0 && this.length === 32 && this[0] === 0x77) zeroized += 1;
+    return originalFill.call(this, value, start, end);
+  } as typeof Uint8Array.prototype.fill;
+
+  try {
+    const ok = await authenticateWithPrf({ credentials, fetchFn: successFetch });
+    assert.deepEqual(ok.prfOutput, new Uint8Array(32).fill(0x77));
+    assert.equal(zeroized, 0, "success hands the PRF output to the caller unzeroized");
+
+    await assert.rejects(
+      authenticateWithPrf({ credentials, fetchFn: failingFetch }),
+      (error: unknown) =>
+        error instanceof PasskeyAuthError && error.code === "verification_rejected",
+    );
+    assert.equal(zeroized, 1, "a failed verify must zeroize the PRF copy");
+  } finally {
+    Uint8Array.prototype.fill = originalFill;
+  }
+});
+
 test("authenticateWithPrf fails closed on unsupported, malformed and rejected paths", async () => {
   const fetchFn = (async () => challengeResponse()) as unknown as typeof fetch;
 

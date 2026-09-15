@@ -134,6 +134,16 @@ export function recoveryFor(
           severity: "warning",
         };
       }
+      if (reason === "invalid_secret") {
+        return {
+          stageLabel,
+          title: "The recovery code is not valid.",
+          detail:
+            "Re-enter the 32-byte offline recovery code exactly as printed, or unlock with a recovery passkey. Nothing was sent to the server.",
+          action: "reenter_recovery",
+          severity: "error",
+        };
+      }
       return {
         stageLabel,
         title: "The workspace key could not be bound to this session.",

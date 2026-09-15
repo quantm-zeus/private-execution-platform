@@ -508,6 +508,7 @@ export class WorkspaceUnlockRuntime {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "same-origin",
+            redirect: "error",
             body: JSON.stringify({
               version: 1,
               kid: kidB64,
@@ -536,12 +537,19 @@ export class WorkspaceUnlockRuntime {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
+          redirect: "error",
           body: "",
         });
       } catch {
         throw new UnlockError("U3_GRANT", "grant_rejected");
       }
       if (!grantResponse.ok) {
+        // 401 is the only expired-session signal the private API emits. Any
+        // other status (including a 403 from an intermediary/WAF) is a generic
+        // grant rejection, not a re-authentication prompt.
+        if (grantResponse.status === 401) {
+          throw new UnlockError("U2_ENROLL", "session_expired");
+        }
         throw new UnlockError("U3_GRANT", "grant_rejected");
       }
       let grantData: {
@@ -588,6 +596,7 @@ export class WorkspaceUnlockRuntime {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
+          redirect: "error",
           body: JSON.stringify({
             grant_id: grantData.grant_id,
             kid: grantData.kid,
@@ -598,6 +607,11 @@ export class WorkspaceUnlockRuntime {
         throw new UnlockError("U4_TRANSPORT", "transport_rejected");
       }
       if (!deliverResponse.ok) {
+        // 401 is the only expired-session signal the private API emits; a 403
+        // (e.g. an intermediary/WAF denial) stays a generic transport rejection.
+        if (deliverResponse.status === 401) {
+          throw new UnlockError("U2_ENROLL", "session_expired");
+        }
         if (deliverResponse.status === 409) {
           const code = await readErrorCode(deliverResponse);
           if (code === "artifact_incompatible") {
@@ -649,14 +663,20 @@ export class WorkspaceUnlockRuntime {
         // Classify without ever inspecting foreign exception text.
         throw asUnlockError(error, "U4_TRANSPORT", "transport_rejected");
       } finally {
-        initiator.free();
+        // Guarded like the outer free: a throwing wasm free must never replace
+        // the typed UnlockError already in flight.
+        try {
+          initiator.free();
+        } catch {}
         initiator = null;
       }
 
       // U5: verify the authenticated descriptor's size/digest binding before the
       // inner decrypt, so a substituted-but-well-formed artifact is rejected here
       // rather than silently trusted. Missing fields (legacy descriptor) skip
-      // the local check and rely on the server preflight.
+      // the local check and rely on the server preflight. The stage is announced
+      // first so the ledger reflects U5 even when this check throws.
+      onStage("U5_ARTIFACT");
       if (descriptor.artifact_size > 0 && sealedArtifactBytes.length !== descriptor.artifact_size) {
         throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
       }
@@ -668,7 +688,6 @@ export class WorkspaceUnlockRuntime {
       }
 
       // U5: decrypt the inner workspace artifact with the in-memory key.
-      onStage("U5_ARTIFACT");
       let decryptedPayloadBytes: Uint8Array;
       try {
         decryptedPayloadBytes = workspaceKey.decrypt_artifact(sealedArtifactBytes);

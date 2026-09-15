@@ -1,6 +1,10 @@
 use std::net::SocketAddr;
 
 /// Strict boolean environment parse (`true`/`false`; unset uses `default`).
+///
+/// A present-but-non-Unicode value is a misconfiguration that refuses startup,
+/// matching `private-api`'s `read_env`: collapsing it to the default could
+/// silently flip a security-relevant flag.
 fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
     match std::env::var(name) {
         Ok(value) if value == "true" => Ok(true),
@@ -8,7 +12,10 @@ fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
         Ok(_) => Err(std::io::Error::other(format!(
             "{name} must be true or false"
         ))),
-        Err(_) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(std::io::Error::other(format!("{name} must be valid UTF-8")))
+        }
     }
 }
 
@@ -81,6 +88,19 @@ mod tests {
         std::env::set_var(name, "true");
         assert!(strict_bool_env(name, false).unwrap());
         std::env::set_var(name, "1");
+        assert!(strict_bool_env(name, false).is_err());
+        std::env::remove_var(name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_bool_env_refuses_non_unicode_instead_of_defaulting() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = "EDGE_ACCESS_JWT_VALIDATION_NON_UNICODE_TEST";
+        std::env::remove_var(name);
+        std::env::set_var(name, std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        assert!(strict_bool_env(name, true).is_err());
         assert!(strict_bool_env(name, false).is_err());
         std::env::remove_var(name);
     }

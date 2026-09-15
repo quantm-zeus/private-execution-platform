@@ -16,7 +16,8 @@
 // format version, and the workspace protocol range. The private-API validates
 // the same manifest against the artifact bytes before it will deliver anything.
 
-import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomBytes } from "node:crypto";
 import {
   copyFile,
   lstat,
@@ -32,6 +33,7 @@ import {
   symlink,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -54,6 +56,10 @@ export const ARTIFACT_FILE = "workspace.artifact";
 export const SHELL_DIR = "shell";
 export const CURRENT_LINK = "current";
 export const PREVIOUS_LINK = "previous";
+/** Canonical plaintext payload directory; the only path `build` may clean up. */
+export const DEFAULT_PAYLOAD_DIR = "web/workspace-payload/dist";
+/** Advisory lock directory created inside the releases root. */
+export const RELEASE_LOCK_DIR = ".release.lock";
 
 function sha256Hex(data) {
   return createHash("sha256").update(data).digest("hex");
@@ -99,6 +105,214 @@ async function syncFile(path) {
     // Not every file/filsystem permits a sync; ignore.
   } finally {
     if (handle) await handle.close().catch(() => {});
+  }
+}
+
+export const RELEASE_LOCK_OWNER_FILE = "owner.json";
+/**
+ * Bounded acquire timeout. Chosen to be >= {@link RELEASE_LOCK_STALE_MS} so a
+ * single invocation can recover from an unreadable owner stamp. Prompt
+ * recovery does not depend on the timeout: a lock whose recorded pid is dead is
+ * evicted immediately via `process.kill(pid, 0)`.
+ */
+export const RELEASE_LOCK_TIMEOUT_MS = 6 * 60 * 1000;
+export const RELEASE_LOCK_STALE_MS = 5 * 60 * 1000;
+const RELEASE_LOCK_POLL_MS = 20;
+
+/** Typed acquire failure: the lock is held by a live owner, not broken. */
+export class ReleaseLockTimeoutError extends Error {
+  constructor(message = "timed out acquiring release lock") {
+    super(message);
+    this.name = "ReleaseLockTimeoutError";
+    this.code = "RELEASE_LOCK_TIMEOUT";
+  }
+}
+
+// In-process serialization per resolved releases root, so two async callers in
+// the same process cannot both believe they hold the on-disk lock.
+const releaseLockTails = new Map();
+// AsyncLocalStorage makes the lock re-entrant within a single call chain: a
+// nested acquisition reuses the lock the outer frame already holds instead of
+// deadlocking on it.
+const releaseLockContext = new AsyncLocalStorage();
+
+function randomToken() {
+  return randomBytes(16).toString("hex");
+}
+
+/** True only while a live process still owns `pid` (EPERM means alive). */
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function readLockOwner(lockPath) {
+  try {
+    const parsed = JSON.parse(await readFile(join(lockPath, RELEASE_LOCK_OWNER_FILE), "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch {
+    // Missing, unreadable, or unparseable ownership is unknown, never "ours".
+    return null;
+  }
+}
+
+async function writeLockOwner(lockPath, owner) {
+  await writeFileDurable(
+    join(lockPath, RELEASE_LOCK_OWNER_FILE),
+    `${JSON.stringify(owner)}\n`,
+    { mode: 0o644 },
+  );
+}
+
+/**
+ * Move a contended lock aside and delete it. Renaming first means the loser of
+ * an eviction race only ever touches its own unique tombstone, and re-checking
+ * the moved owner prevents eviction from deleting a newer live lock that was
+ * created between the staleness check and the rename.
+ */
+async function evictLock(lockPath) {
+  const tombstone = `${lockPath}.${process.pid}.${Date.now()}.${randomToken()}.tombstone`;
+  try {
+    await rename(lockPath, tombstone);
+  } catch (error) {
+    if (error?.code === "ENOENT") return; // another contender already evicted it
+    throw error;
+  }
+  const moved = await readLockOwner(tombstone);
+  if (moved && Number.isInteger(moved.pid) && isProcessAlive(moved.pid)) {
+    // A live owner appeared in the race window; restore it rather than delete it.
+    await rename(tombstone, lockPath).catch(async () => {
+      await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+    });
+    return;
+  }
+  await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+}
+
+/**
+ * Acquire the advisory lock directory, writing an owner stamp (`pid`, random
+ * `token`, `startedAtMs`) inside it. On contention the lock is evicted only
+ * when it is provably dead (recorded pid no longer exists) or, for an
+ * unreadable owner stamp, older than `staleMs`. A lock whose pid is alive is
+ * never evicted, so a slow or suspended holder cannot be displaced.
+ */
+export async function acquireReleaseLock(
+  lockPath,
+  { timeoutMs = RELEASE_LOCK_TIMEOUT_MS, staleMs = RELEASE_LOCK_STALE_MS } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  const owner = { pid: process.pid, token: randomToken(), startedAtMs: Date.now() };
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      try {
+        await writeLockOwner(lockPath, owner);
+      } catch (error) {
+        // Never leave behind a lock we cannot prove is ours.
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        throw error;
+      }
+      return owner;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+    let evict = false;
+    try {
+      const stat = await lstat(lockPath);
+      if (!stat.isDirectory()) {
+        evict = true;
+      } else {
+        const existing = await readLockOwner(lockPath);
+        if (existing && Number.isInteger(existing.pid)) {
+          // PID liveness gives prompt crash recovery; an alive owner is never
+          // evicted no matter how old its stamp is.
+          evict = !isProcessAlive(existing.pid);
+        } else if (Date.now() - stat.mtimeMs > staleMs) {
+          // Only an unreadable owner stamp may age out, and only past the bound.
+          evict = true;
+        }
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (evict) {
+      await evictLock(lockPath);
+      continue;
+    }
+    if (Date.now() >= deadline) throw new ReleaseLockTimeoutError();
+    await delay(RELEASE_LOCK_POLL_MS);
+  }
+}
+
+/**
+ * Release a lock only while this holder still owns it. Renaming to a unique
+ * tombstone first and re-checking the token inside it stops an evicted holder
+ * from deleting a newer holder's lock that appeared in the meantime.
+ */
+export async function releaseReleaseLock(lockPath, owner) {
+  const token = owner?.token;
+  if (typeof token !== "string" || token.length === 0) return;
+  if ((await readLockOwner(lockPath))?.token !== token) return;
+  const tombstone = `${lockPath}.${process.pid}.${Date.now()}.${randomToken()}.tombstone`;
+  try {
+    await rename(lockPath, tombstone);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw error;
+  }
+  if ((await readLockOwner(tombstone))?.token === token) {
+    await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+    return;
+  }
+  // We moved someone else's re-created lock; restore it rather than delete it.
+  await rename(tombstone, lockPath).catch(async () => {
+    await rm(tombstone, { recursive: true, force: true }).catch(() => {});
+  });
+}
+
+/**
+ * Run `fn` while holding the per-releases-root advisory lock: an atomically
+ * created directory inside the releases root, with a bounded acquire timeout
+ * and an owner-stamped crash-recovery guard. Re-entrant within one async call
+ * chain, and serialized in-process per root.
+ */
+export async function withReleaseLock(releasesRoot, fn) {
+  const key = resolve(releasesRoot);
+  const held = releaseLockContext.getStore();
+  if (held?.has(key)) return fn();
+
+  const prior = releaseLockTails.get(key) ?? Promise.resolve();
+  let unlock;
+  const gate = new Promise((releaseGate) => {
+    unlock = releaseGate;
+  });
+  const chained = prior.then(() => gate);
+  releaseLockTails.set(key, chained);
+  await prior;
+
+  const lockPath = join(key, RELEASE_LOCK_DIR);
+  let owner = null;
+  try {
+    // The releases root must exist before the lock directory can be created.
+    await mkdir(key, { recursive: true });
+    owner = await acquireReleaseLock(lockPath, {
+      timeoutMs: RELEASE_LOCK_TIMEOUT_MS,
+      staleMs: RELEASE_LOCK_STALE_MS,
+    });
+    // Extend, do not replace, the held-key set so a nested cross-root chain
+    // (A -> B -> A) still sees A as re-entrant.
+    return await releaseLockContext.run(new Map([...(held ?? []), [key, 1]]), () => fn());
+  } finally {
+    if (owner) await releaseReleaseLock(lockPath, owner).catch(() => {});
+    unlock();
+    if (releaseLockTails.get(key) === chained) releaseLockTails.delete(key);
   }
 }
 
@@ -283,34 +497,149 @@ export function validateReleaseManifest(manifest, artifact) {
   return manifest;
 }
 
+export const HARDENED_CSP =
+  "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; style-src 'self' blob:; " +
+  "img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; frame-src blob:; " +
+  "worker-src 'self' blob: data:; object-src 'none'; base-uri 'none'; form-action 'self'; " +
+  "frame-ancestors 'none'";
+
+// Same hardened header set as web/workspace-shell/public/_headers.
+const HARDENED_WILDCARD_BLOCK = [
+  "/*",
+  "  Cache-Control: no-store",
+  "  X-Content-Type-Options: nosniff",
+  "  X-Frame-Options: DENY",
+  "  Referrer-Policy: no-referrer",
+  `  Content-Security-Policy: ${HARDENED_CSP}`,
+].join("\n");
+
+/** Paths whose cache policy the release writer owns end-to-end. */
+const MANAGED_CACHE_PATHS = ["/", "/index.html", "/assets/*"];
+
+const SHELL_CACHE_RULES = [
+  "/",
+  "  Cache-Control: no-store, must-revalidate",
+  "",
+  "/index.html",
+  "  Cache-Control: no-store, must-revalidate",
+  "",
+  "/assets/*",
+  "  Cache-Control: public, max-age=31536000, immutable",
+].join("\n");
+
+const REQUIRED_WILDCARD_HEADERS = [
+  [
+    "cache-control",
+    (value) => value.split(",").some((part) => part.trim().toLowerCase() === "no-store"),
+  ],
+  ["x-content-type-options", (value) => value.trim().toLowerCase() === "nosniff"],
+  ["x-frame-options", (value) => value.trim().toUpperCase() === "DENY"],
+  ["referrer-policy", (value) => value.trim().toLowerCase() === "no-referrer"],
+  // Exact match modulo surrounding whitespace: rejects `default-src *` and any
+  // other weakened policy instead of merely probing for a directive name.
+  ["content-security-policy", (value) => value.trim() === HARDENED_CSP],
+];
+
+/** Parse `_headers`-style text into ordered `{ path, headers }` rules. */
+function parseHeaderRules(text) {
+  const rules = [];
+  let current = null;
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+$/, "");
+    const trimmed = line.trim();
+    // Blank lines and `#` comments never create a rule and never detach the
+    // headers that follow: a column-0 comment must not become a path that
+    // steals the subsequent header lines.
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (/^\s/.test(line)) {
+      const match = /^\s+([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+      if (current && match) current.headers.set(match[1].toLowerCase(), match[2].trim());
+      continue;
+    }
+    current = { path: trimmed, headers: new Map() };
+    rules.push(current);
+  }
+  return rules;
+}
+
+/** Split raw `_headers` text into blank-line-separated rule blocks. */
+function splitHeaderBlocks(text) {
+  const blocks = [];
+  let current = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if (line.trim() === "") {
+      if (current.length > 0) blocks.push(current);
+      current = [];
+      continue;
+    }
+    current.push(line);
+  }
+  if (current.length > 0) blocks.push(current);
+  return blocks;
+}
+
+/**
+ * Throw unless the `_headers` text has at least one `/*` rule and *every* `/*`
+ * rule carries the complete hardened header set. Checking only the first would
+ * let a later weaker wildcard survive publication.
+ */
+function assertHardenedWildcard(text) {
+  const wildcards = parseHeaderRules(text).filter((rule) => rule.path === "/*");
+  if (wildcards.length === 0) {
+    throw new Error("shell _headers is missing the hardened /* rule");
+  }
+  for (const wildcard of wildcards) {
+    for (const [name, acceptable] of REQUIRED_WILDCARD_HEADERS) {
+      const value = wildcard.headers.get(name);
+      if (!value || !acceptable(value)) {
+        throw new Error(`shell _headers /* rule is missing hardened ${name}`);
+      }
+    }
+  }
+}
+
+/**
+ * Drop only the managed paths' `Cache-Control` header lines, preserving every
+ * other header (HSTS and friends) in their blocks so re-running stays
+ * idempotent without discarding unrelated hardening. A managed path left with
+ * no other headers is dropped; its canonical rule is re-appended after.
+ */
+function withoutCacheRules(text) {
+  const blocks = splitHeaderBlocks(text).flatMap((block) => {
+    if (!MANAGED_CACHE_PATHS.includes(block[0].trim())) return [block];
+    const kept = block.filter(
+      (line, index) => index === 0 || !/^\s+cache-control\s*:/i.test(line),
+    );
+    return kept.length > 1 ? [kept] : [];
+  });
+  return blocks.map((block) => block.join("\n")).join("\n\n");
+}
+
 /**
  * Add cache rules to the shell `_headers` **without dropping the hardened
  * security headers** the shell build ships. HTML revalidates, hashed assets are
- * immutable; the existing `/*` rule (CSP, nosniff, frame-deny, referrer policy,
+ * immutable; the hardened `/*` rule (CSP, nosniff, frame-deny, referrer policy,
  * no-store) is preserved because a release must never weaken the clear shell
- * that hosts the recovery-code input.
+ * that hosts the recovery-code input. An existing `_headers` that lacks the
+ * hardened `/*` rule is refused rather than silently patched, and an absent
+ * `_headers` gets the complete hardened block, never a bare Cache-Control.
  */
 export async function writeShellCacheHeaders(shellDir) {
   const headersPath = join(shellDir, "_headers");
-  let existing = "";
+  let existing = null;
   try {
     existing = await readFile(headersPath, "utf8");
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const cacheRules = [
-    "/index.html",
-    "  Cache-Control: no-store, must-revalidate",
-    "",
-    "/assets/*",
-    "  Cache-Control: public, max-age=31536000, immutable",
-    "",
-  ].join("\n");
-  const base =
-    existing.trim().length > 0
-      ? `${existing.trimEnd()}\n\n`
-      : "/*\n  Cache-Control: no-store\n\n";
-  await writeFileDurable(headersPath, `${base}${cacheRules}`, { mode: 0o644 });
+  let base = HARDENED_WILDCARD_BLOCK;
+  if (existing !== null) {
+    assertHardenedWildcard(existing);
+    base = withoutCacheRules(existing).trim() || HARDENED_WILDCARD_BLOCK;
+  }
+  await writeFileDurable(headersPath, `${base.trimEnd()}\n\n${SHELL_CACHE_RULES}\n`, {
+    mode: 0o644,
+  });
 }
 
 async function linkTarget(linkPath) {
@@ -330,8 +659,17 @@ async function atomicSymlink(linkPath, target) {
   await syncDirectory(parent);
 }
 
-/** Atomically point `current` at an existing validated release. */
+/**
+ * Atomically point `current` at an existing validated release under the
+ * releases-root advisory lock.
+ */
 export async function switchCurrent(releasesRoot, releaseId) {
+  const id = assertReleaseId(releaseId);
+  await withReleaseLock(releasesRoot, () => switchCurrentLocked(releasesRoot, id));
+  return id;
+}
+
+async function switchCurrentLocked(releasesRoot, releaseId) {
   const id = assertReleaseId(releaseId);
   const releaseDir = join(releasesRoot, id);
   // A release is only switchable after its manifest, artifact bytes and shell
@@ -348,19 +686,32 @@ export async function switchCurrent(releasesRoot, releaseId) {
 }
 
 /**
- * Swap `current` and `previous` for rollback. Each symlink replacement is
- * atomic; the pair is not a single atomic operation, so a crash between the two
- * renames leaves `current` and `previous` pointing at the same valid release
- * (never a missing or half-written one).
+ * Swap `current` and `previous` for rollback, under the advisory lock. Each
+ * symlink replacement is atomic; the pair is not a single atomic operation, so
+ * a crash between the two renames leaves `current` and `previous` pointing at
+ * the same valid release (never a missing or half-written one).
  */
 export async function rollbackCurrent(releasesRoot) {
+  return withReleaseLock(releasesRoot, () => rollbackCurrentLocked(releasesRoot));
+}
+
+async function rollbackCurrentLocked(releasesRoot) {
   const currentPath = join(releasesRoot, CURRENT_LINK);
   const previousPath = join(releasesRoot, PREVIOUS_LINK);
   const current = await linkTarget(currentPath);
   const previous = await linkTarget(previousPath);
   if (!previous) throw new Error("no previous release to roll back to");
+  if (!current) throw new Error("no current release to roll back from");
+  // The crash window between the two renames can leave both links on the same
+  // release; rolling back would be a silent no-op, so refuse explicitly.
+  if (current === previous) {
+    throw new Error("current and previous are the same release; nothing to roll back");
+  }
+  // Both targets are attacker-influencable link contents: validate each as a
+  // real, fully-checked release before touching either symlink.
+  await readRelease(releasesRoot, current);
   await readRelease(releasesRoot, previous);
-  await atomicSymlink(previousPath, current ?? previous);
+  await atomicSymlink(previousPath, current);
   await atomicSymlink(currentPath, previous);
   return { from: current, to: previous };
 }
@@ -388,8 +739,20 @@ export async function readRelease(releasesRoot, releaseId) {
   if (shellStat.isSymbolicLink() || !shellStat.isDirectory()) {
     throw new Error("release shell must be a real directory");
   }
-  const manifest = JSON.parse(await readFile(join(releaseDir, MANIFEST_FILE), "utf8"));
-  const artifact = await readFile(join(releaseDir, ARTIFACT_FILE));
+  // The manifest and artifact must be real regular files: a symlink (or any
+  // non-regular entry) planted at either name must never be followed.
+  const manifestPath = join(releaseDir, MANIFEST_FILE);
+  const artifactPath = join(releaseDir, ARTIFACT_FILE);
+  const manifestStat = await lstat(manifestPath);
+  if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) {
+    throw new Error("release manifest must be a real regular file");
+  }
+  const artifactStat = await lstat(artifactPath);
+  if (artifactStat.isSymbolicLink() || !artifactStat.isFile()) {
+    throw new Error("release artifact must be a real regular file");
+  }
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const artifact = await readFile(artifactPath);
   validateReleaseManifest(manifest, artifact);
   // The manifest must describe *this* directory, not merely a self-consistent
   // release elsewhere: reject a renamed/copied directory whose identity differs.
@@ -497,49 +860,53 @@ export async function publishRelease({
   }
 
   // From here on the staging directory must never leak, even when an existing
-  // release cannot be read or the final rename fails. Wrap the whole tail in a
-  // try/finally that removes staging unless it became the release directory.
-  let published = false;
-  try {
-    let exists = false;
+  // release cannot be read or the final rename fails. The existence check,
+  // rename and switch happen under the releases-root lock; an existing release
+  // is revalidated and switched through the internal unlocked switch so the
+  // lock is acquired exactly once (no self-deadlock).
+  return withReleaseLock(releasesRoot, async () => {
+    let published = false;
     try {
-      await lstat(releaseDir);
-      exists = true;
-    } catch (error) {
-      // Only a genuinely absent directory means "new release"; any other stat
-      // failure (EACCES/EIO) must not be treated as absent.
-      if (error?.code !== "ENOENT") throw error;
-    }
-    if (exists) {
-      // Re-publishing is idempotent only when the release is byte-identical:
-      // same artifact AND same shipped shell digest. The release id is derived
-      // from the artifact, so a shell-only change under the same source SHA must
-      // be refused rather than silently switching to the stale shell.
-      const existing = await readRelease(releasesRoot, releaseId);
-      if (
-        !existing.artifact.equals(artifact) ||
-        existing.manifest.shell.asset_digest_hex !== shippedShellDigest ||
-        existing.manifest.source_sha !== manifest.source_sha ||
-        existing.manifest.artifact.kid_b64 !== manifest.artifact.kid_b64 ||
-        existing.manifest.recipient.public_key_fingerprint_b64 !==
-          manifest.recipient.public_key_fingerprint_b64
-      ) {
-        throw new Error("release already exists and is immutable");
+      let exists = false;
+      try {
+        await lstat(releaseDir);
+        exists = true;
+      } catch (error) {
+        // Only a genuinely absent directory means "new release"; any other stat
+        // failure (EACCES/EIO) must not be treated as absent.
+        if (error?.code !== "ENOENT") throw error;
       }
-      await switchCurrent(releasesRoot, releaseId);
-      return { releaseId, manifest: existing.manifest };
-    }
+      if (exists) {
+        // Re-publishing is idempotent only when the release is byte-identical:
+        // same artifact AND same shipped shell digest. The release id is derived
+        // from the artifact, so a shell-only change under the same source SHA must
+        // be refused rather than silently switching to the stale shell.
+        const existing = await readRelease(releasesRoot, releaseId);
+        if (
+          !existing.artifact.equals(artifact) ||
+          existing.manifest.shell.asset_digest_hex !== shippedShellDigest ||
+          existing.manifest.source_sha !== manifest.source_sha ||
+          existing.manifest.artifact.kid_b64 !== manifest.artifact.kid_b64 ||
+          existing.manifest.recipient.public_key_fingerprint_b64 !==
+            manifest.recipient.public_key_fingerprint_b64
+        ) {
+          throw new Error("release already exists and is immutable");
+        }
+        await switchCurrentLocked(releasesRoot, releaseId);
+        return { releaseId, manifest: existing.manifest };
+      }
 
-    await rename(staging, releaseDir);
-    published = true;
-    await syncDirectory(releasesRoot);
-    await switchCurrent(releasesRoot, releaseId);
-    return { releaseId, manifest };
-  } finally {
-    if (!published) {
-      await rm(staging, { recursive: true, force: true }).catch(() => {});
+      await rename(staging, releaseDir);
+      published = true;
+      await syncDirectory(releasesRoot);
+      await switchCurrentLocked(releasesRoot, releaseId);
+      return { releaseId, manifest };
+    } finally {
+      if (!published) {
+        await rm(staging, { recursive: true, force: true }).catch(() => {});
+      }
     }
-  }
+  });
 }
 
 async function copyTree(source, destination) {
@@ -563,31 +930,50 @@ async function copyTree(source, destination) {
   }
 }
 
+/**
+ * True only for the canonical plaintext payload directory. The plaintext build
+ * directory may be cleaned up after sealing, but never an operator-supplied
+ * custom path.
+ */
+export function isDefaultPayloadDir(payloadDir) {
+  return resolve(payloadDir) === resolve(DEFAULT_PAYLOAD_DIR);
+}
+
 /** Build (seal) and publish a release from the environment configuration. */
 export async function buildAndPublishRelease({
   releasesRoot,
   shellDir,
   payloadDir,
   sourceSha,
+  cleanupPayload = false,
 }) {
-  if (process.env.WORKSPACE_ARTIFACT_KEY_B64) {
-    throw new Error(
-      "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; release sealing requires canonical WORKSPACE_PUBLIC_KEY_B64",
-    );
+  try {
+    if (process.env.WORKSPACE_ARTIFACT_KEY_B64) {
+      throw new Error(
+        "WORKSPACE_ARTIFACT_KEY_B64 is forbidden; release sealing requires canonical WORKSPACE_PUBLIC_KEY_B64",
+      );
+    }
+    const publicKey = artifactPublicKeyFromEnv();
+    const kid = artifactKidFromEnv();
+    const packed = await packDirectory(payloadDir);
+    const artifact = await sealPackage(packed, publicKey, kid, ARTIFACT_VERSION);
+    await mkdir(releasesRoot, { recursive: true });
+    return await publishRelease({
+      releasesRoot,
+      artifact,
+      publicKeyB64: publicKey.toString("base64"),
+      kidB64: kid.toString("base64"),
+      sourceSha,
+      shellDir,
+    });
+  } finally {
+    // The plaintext payload must not linger after sealing, on success or
+    // failure. Only done when the caller explicitly opts in (the CLI does so
+    // only for the canonical default directory).
+    if (cleanupPayload) {
+      await rm(payloadDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
-  const publicKey = artifactPublicKeyFromEnv();
-  const kid = artifactKidFromEnv();
-  const packed = await packDirectory(payloadDir);
-  const artifact = await sealPackage(packed, publicKey, kid, ARTIFACT_VERSION);
-  await mkdir(releasesRoot, { recursive: true });
-  return publishRelease({
-    releasesRoot,
-    artifact,
-    publicKeyB64: publicKey.toString("base64"),
-    kidB64: kid.toString("base64"),
-    sourceSha,
-    shellDir,
-  });
 }
 
 /* c8 ignore start */
@@ -611,12 +997,16 @@ async function main() {
   } else if (command === "build") {
     const sourceSha = args.get("source-sha") ?? process.env.GITHUB_SHA ?? "unknown";
     const shellDir = resolve(args.get("shell") ?? "web/workspace-shell/dist");
-    const payloadDir = resolve(args.get("payload") ?? "web/workspace-payload/dist");
+    const payloadDir = resolve(args.get("payload") ?? DEFAULT_PAYLOAD_DIR);
+    // Clean up the plaintext payload only for the canonical default directory;
+    // an operator-supplied custom path is never deleted.
+    const cleanupPayload = isDefaultPayloadDir(payloadDir);
     const { releaseId, manifest } = await buildAndPublishRelease({
       releasesRoot,
       shellDir,
       payloadDir,
       sourceSha,
+      cleanupPayload,
     });
     console.log(`published ${releaseId} (${manifest.artifact.sha256_hex.slice(0, 12)})`);
     console.log(`manifest: ${join(releasesRoot, releaseId, MANIFEST_FILE)}`);

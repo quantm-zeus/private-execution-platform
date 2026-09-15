@@ -582,9 +582,16 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     // configured manifest, then compare the public version/KID binding. The full
     // byte-level manifest digest is enforced on the authenticated descriptor and
     // before delivery, so the unauthenticated probe stays cheap.
+    //
+    // `manifest_configured` is reported separately: without an immutable release
+    // manifest the preflight enforces only version/KID and cannot compare the
+    // recipient fingerprint, so operators can see that weaker (still
+    // fail-closed) mode from the readiness response.
+    let manifest_result = state.load_manifest().await;
+    let manifest_configured = !matches!(&manifest_result, Ok(None));
     let (artifact_ok, manifest_ok) = match state.load_artifact_header().await {
         Ok(header) => match release::parse_artifact_header(&header) {
-            Ok(parsed) => match state.load_manifest().await {
+            Ok(parsed) => match &manifest_result {
                 Ok(Some(manifest)) => (true, manifest.validate_header_against(&parsed).is_ok()),
                 Ok(None) => (true, true),
                 Err(_) => (true, false),
@@ -614,6 +621,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
         relay_ok && artifact_ok && manifest_ok && dispatcher_ok && passkey_store_ok && recovery_ok;
     let body = serde_json::json!({
         "ready": ready,
+        "manifest_configured": manifest_configured,
         "checks": {
             "relay": relay_ok,
             "artifact": artifact_ok,
@@ -1734,12 +1742,28 @@ async fn issue_artifact_grant(
     response
 }
 
+/// Read at most `max + 1` bytes from `reader`.
+///
+/// The extra sentinel byte lets the caller distinguish "at the bound" from "over
+/// the bound" without ever reading an unbounded amount, so a file that grows
+/// between its metadata check and its read cannot force an over-limit
+/// allocation. Mirrors the bounded read in `release::load_release_manifest_from`.
+fn read_bounded_bytes(reader: impl std::io::Read, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    reader.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Loads the sealed workspace artifact, if configured and readable. Absence is a
 /// fail-closed 503 at delivery time, never an error surfaced to logs with content.
 ///
-/// The size is bounded from metadata *before* the read so a misconfigured path
-/// (or a hostile local writer) cannot force an unbounded allocation. The read
-/// itself runs on the blocking pool via `PrivateApiState::load_artifact`.
+/// The size is bounded from metadata *before* the read, and the read itself is
+/// capped at `MAX_ARTIFACT_BYTES + 1`, so a misconfigured path (or a hostile
+/// local writer, or a file that grows after the metadata call) cannot force an
+/// over-limit allocation. The read itself runs on the blocking pool via
+/// `PrivateApiState::load_artifact`.
 fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1751,7 +1775,9 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let bytes = std::fs::read(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let file = std::fs::File::open(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let bytes = read_bounded_bytes(file, MAX_ARTIFACT_BYTES)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1906,6 +1932,14 @@ async fn deliver_artifact(
     // initiator keys over. Nothing is persisted; expiry is bounded here.
     let session_expires_at_ms = now.saturating_add(state.config.session_ttl_ms);
     let owner = *pending_grant.session_id.as_bytes();
+    // Seal the artifact *before* touching the key-epoch registry. A seal failure
+    // must not retire the previous epoch or register a half-established session:
+    // the caller gets a fail-closed 503 and the prior authenticated session keeps
+    // working until it is legitimately replaced.
+    let envelope = match session.seal(1, &artifact) {
+        Ok(envelope) => envelope,
+        Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
     let server_session = match session_transport::ServerSession::new_owned(
         session.kid(),
         session.app_keys(),
@@ -1933,10 +1967,6 @@ async fn deliver_artifact(
             return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE));
         }
     }
-    let envelope = match session.seal(1, &artifact) {
-        Ok(envelope) => envelope,
-        Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
-    };
     let response_body = encode_envelope(&envelope);
     let mut response = no_store(
         (
@@ -5019,6 +5049,22 @@ mod tests {
         assert_eq!(directory, Err(StatusCode::SERVICE_UNAVAILABLE));
     }
 
+    /// The bounded read is capped at `max + 1` bytes even when the underlying
+    /// reader yields more. This is the seam that closes the
+    /// grow-between-metadata-and-read allocation hazard: the extra sentinel byte
+    /// makes an over-limit file detectable without an unbounded read.
+    #[test]
+    fn bounded_artifact_read_is_capped_at_the_limit() {
+        let over = read_bounded_bytes(std::io::Cursor::new(vec![0xabu8; 64]), 16).unwrap();
+        assert_eq!(over.len(), 17, "reads exactly one past the bound");
+        let at = read_bounded_bytes(std::io::Cursor::new(vec![0xabu8; 16]), 16).unwrap();
+        assert_eq!(at.len(), 16);
+        let under = read_bounded_bytes(std::io::Cursor::new(vec![0xabu8; 3]), 16).unwrap();
+        assert_eq!(under.len(), 3);
+        let empty = read_bounded_bytes(std::io::Cursor::new(Vec::<u8>::new()), 16).unwrap();
+        assert!(empty.is_empty());
+    }
+
     /// P0-C production-faithful test: the artifact bytes are produced by the
     /// real production build script (`scripts/build-workspace-encrypted.mjs`),
     /// read by the real `load_workspace_artifact` (no loader override), wrapped
@@ -5167,7 +5213,11 @@ mod tests {
         )
         .unwrap();
         let artifact_copy = artifact.clone();
-        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+        // Pin the manifest loader so `manifest_configured` is not racy against
+        // other tests that mutate `WORKSPACE_RELEASE_MANIFEST`.
+        let state = state
+            .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
+            .with_manifest_loader(Arc::new(|| Ok(None)));
 
         let get = |app: Router, path: &'static str| async move {
             app.oneshot(
@@ -5192,6 +5242,22 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], true);
         assert_eq!(parsed["checks"]["relay"], true);
+        // No immutable release manifest is configured, so the response says so
+        // explicitly: the preflight is in the weaker version/KID-only mode.
+        assert_eq!(parsed["manifest_configured"], false);
+
+        // A configured manifest that matches the artifact header flips the flag
+        // and keeps readiness healthy.
+        let manifest = test_manifest(&artifact, &keypair);
+        let configured = state
+            .clone()
+            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))));
+        let ready = get(router(configured), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["manifest_configured"], true);
+        assert_eq!(parsed["checks"]["release_manifest"], true);
 
         // Relay required but not yet bound: not ready, while liveness stays 200.
         let relay_flag = Arc::new(AtomicBool::new(false));

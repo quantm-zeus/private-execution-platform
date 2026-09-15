@@ -880,3 +880,74 @@ The confirmed findings were fixed with regression tests:
   withdrawal confirmation and shell security gateway are axe-gated at
   moderate-or-worse; and the shell has a positive control that bootstrap
   enrollment controls appear when the server reports enrollment open.
+
+## Third adversarial review pass (release-remediation hardening)
+
+Four fresh-context reviewers independently re-audited the browser auth/unlock,
+Rust preflight/relay/ingress, release tooling, and WebAuthn-PRF recovery slices
+against the current tree. No CRITICAL break was found. The confirmed findings
+were fixed with regression tests:
+
+- **Artifact build atomicity (HIGH).** `scripts/build-workspace-encrypted.mjs`
+  now seals to a same-directory temporary file (mode 0600), fsyncs it, re-reads
+  and verifies exact length and SHA-256, then atomically renames over
+  `web/workspace-artifact/blob.bin`. A failed or aborted rebuild removes only the
+  temp file; it can no longer delete or truncate the previously published
+  artifact (the negative build tests deliberately abort the script).
+- **Clear-shell header integrity (HIGH).** `writeShellCacheHeaders` fails
+  closed: a shipped `_headers` that lacks a hardened `/*` rule (`no-store`,
+  `nosniff`, `DENY`, `no-referrer`, CSP with `default-src`) is refused, and a
+  missing `_headers` gets the complete hardened block rather than only
+  `Cache-Control`. Explicit `/` and `/index.html` `no-store, must-revalidate`
+  and `/assets/*` immutable rules are emitted, and re-running is idempotent.
+- **PRF at enrollment (HIGH, functional).** The clear shell requests the
+  WebAuthn PRF extension in `buildCreationOptions`, so a passkey enrolled by this
+  build can produce the PRF output the recovery wrapper needs. Support is still
+  verified at use time: an authenticator that returns no output falls back to the
+  mandatory offline recovery code, and a normal assertion signature is never used
+  as key material.
+- **Release publication interlock.** `current`/`previous` switching, rollback and
+  the publish decision tail run under a per-releases-root advisory lock (atomic
+  `mkdir`, bounded acquire, stale-age guard, re-entrant). `rollbackCurrent`
+  refuses a missing/identical target instead of reporting a no-op rollback, and
+  `readRelease` rejects symlinked or non-regular `manifest.json`/`workspace.artifact`
+  entries. The CLI removes the default plaintext payload build after sealing;
+  an operator-supplied `--payload` path is never deleted.
+- **Unlock diagnostics and secret lifetime.** Invalid recovery codes now map to
+  `U2_ENROLL/invalid_secret` with re-entry guidance; the three unlock POSTs set
+  `redirect: "error"`; `onStage("U5_ARTIFACT")` is emitted before the
+  descriptor size/digest checks; a `401` on grant/deliver maps to
+  `session_expired` so the UI offers re-authentication (a `403` stays a generic
+  rejection, since the private API only uses `401` for session expiry); the inner
+  WASM `initiator.free()` is guarded; and the unlock stage list is announced
+  through a `role="status"` wrapper (not on the `<ol>`, which axe rejects). The
+  release fingerprint block is a labelled `<section>` rather than a named generic
+  `<div>`.
+- **Recovery hardening.** The credential-bound AAD is preferred and the
+  pre-binding bare domain constant is retained as a documented legacy
+  compatibility path (earlier builds of this unreleased branch wrote unbound
+  wrappers; the two AADs are distinct so a bound record cannot be downgraded).
+  `wrapWithPrf`/`unwrapWithPrf` now require the credential id;
+  `parseWrapperRecord` validates the algorithm and decoded salt/IV/ciphertext
+  lengths; the PRF copy is zeroized on a failed verification; a successful
+  decrypt with degenerate plaintext surfaces `invalid_root_key`; and the random
+  generators throw a typed `crypto_unavailable`.
+- **Readiness and ingress.** `load_workspace_artifact` reads through a
+  `take(MAX+1)` bound (no over-limit allocation if the file grows between the
+  metadata check and the read); relay "supplied" is `is_some()` so a
+  whitespace-only bind refuses startup; `deliver_artifact` seals before mutating
+  the transport-session registry; edge authorization rejects genuine
+  forwarding/topology headers (`x-forwarded-for/-proto/-host/-port`, `x-real-ip`,
+  `cf-connecting-ip`, …) while still accepting the dedicated assertion header and
+  the oauth2-proxy identity headers (`x-forwarded-access-token/-user/-email/-groups`);
+  `strict_bool_env` refuses a non-Unicode setting instead of defaulting; and
+  `/ready` reports `manifest_configured` so operators can see the weaker
+  no-manifest mode.
+- **Non-text contrast (WCAG 2.2 AA 1.4.11).** Interactive `.button` and
+  `.field__input` boundaries use a dedicated `--line-interactive` token
+  (≈4.5:1) instead of the lower-contrast divider color.
+- **Cross-browser E2E.** The Playwright suite adds a Firefox project; the shell
+  mocks `navigator.credentials` and reports an existing operator session, so the
+  production-faithful unlock host and every payload surface run in a second
+  engine as well as Chromium.
+

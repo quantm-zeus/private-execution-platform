@@ -74,6 +74,38 @@ test("parseRecoveryWrappers rejects malformed containers and skips bad records",
   );
 });
 
+test("parseRecoveryWrappers skips records with a wrong algorithm or decoded lengths", () => {
+  const badAlgorithm = { ...VALID_RECORD, algorithm: "plain" };
+  const shortSalt = {
+    ...VALID_RECORD,
+    salt_b64: toBase64(new Uint8Array(16).fill(2)),
+  };
+  const shortIv = {
+    ...VALID_RECORD,
+    iv_b64: toBase64(new Uint8Array(8).fill(3)),
+  };
+  const shortCiphertext = {
+    ...VALID_RECORD,
+    wrapped_root_key_b64: toBase64(new Uint8Array(32).fill(4)),
+  };
+  const parsed = parseRecoveryWrappers({
+    wrappers: [
+      badAlgorithm,
+      shortSalt,
+      shortIv,
+      shortCiphertext,
+      VALID_RECORD,
+    ],
+  });
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].label, "Laptop");
+  // All malformed records are dropped, never thrown.
+  assert.deepEqual(
+    parseRecoveryWrappers({ wrappers: [badAlgorithm, shortSalt, shortIv, shortCiphertext] }),
+    [],
+  );
+});
+
 test("fetchRecoveryWrappers classifies auth, conflict and network failures", async () => {
   const ok = await fetchRecoveryWrappers({
     fetchFn: (async () =>

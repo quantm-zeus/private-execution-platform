@@ -32,5 +32,13 @@ export default defineConfig({
       timeout: 60_000,
     },
   ],
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  // Chromium is the reference engine (the audited HPKE/WASM unlock path and the
+  // WebAuthn ceremony harness). Firefox is a second, independent engine for the
+  // non-WebAuthn portions: the shell mocks `navigator.credentials` and reports an
+  // existing operator session, so the production-faithful unlock host and every
+  // payload surface run against a different layout/runtime engine.
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "firefox", use: { ...devices["Desktop Firefox"] } },
+  ],
 });

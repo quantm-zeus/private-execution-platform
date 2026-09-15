@@ -25,10 +25,12 @@ Implemented and composed (exact-SHA CI green):
 - Production-faithful unlock proof: `verify:web-boundary` builds an artifact with
   the production build script and drives it through the real private-api loader,
   real HPKE delivery, inner decrypt and production package unpack.
-- Passkey-bound recovery wrappers (WebAuthn PRF only), proof-of-possession
-  authorization for add/revoke, and trusted-credential management UI. The
-  high-entropy offline recovery code stays a mandatory fallback and no existing
-  artifact is invalidated. See `docs/workspace-recovery.md`.
+- Passkey-bound recovery wrappers (WebAuthn PRF only, requested at enrollment and
+  verified at use), proof-of-possession authorization for add/revoke, and
+  trusted-credential management UI. The high-entropy offline recovery code stays
+  a mandatory fallback and no existing artifact is invalidated. Revocation is
+  soft (it deactivates the wrapper, not the stored ciphertext); rotating the
+  secret is an operator re-seal runbook. See `docs/workspace-recovery.md`.
 - Dependency readiness distinct from liveness, strict all-or-none relay
   configuration, and an edge-gateway refusal to bind a non-loopback address
   while perimeter assertion trust is presence-only.

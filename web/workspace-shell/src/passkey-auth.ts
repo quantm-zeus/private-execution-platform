@@ -207,9 +207,20 @@ export function buildCreationOptions(
     options.authenticatorSelection =
       source.authenticatorSelection as AuthenticatorSelectionCriteria;
   }
-  if (source.extensions && typeof source.extensions === "object") {
-    options.extensions = source.extensions as AuthenticationExtensionsClientInputs;
-  }
+  // Request the WebAuthn PRF extension at registration so a later recovery
+  // assertion can evaluate it (`prf: {}` enables it without evaluating). Any
+  // server-provided extensions are preserved. An authenticator without PRF
+  // support simply ignores the extension, so enrollment still succeeds; the
+  // offline recovery code stays mandatory. The DOM typings for this build do
+  // not declare `prf`, so the merged value is cast.
+  const serverExtensions =
+    source.extensions && typeof source.extensions === "object"
+      ? (source.extensions as Record<string, unknown>)
+      : {};
+  options.extensions = {
+    ...serverExtensions,
+    prf: {},
+  } as unknown as AuthenticationExtensionsClientInputs;
   return options;
 }
 

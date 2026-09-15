@@ -31,10 +31,12 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:web
       - run: pnpm test:shell
-      # Release/tooling gate: immutable manifest + atomic publish/rollback and
-      # hardened shell cache headers. Also runs the production-faithful unlock
-      # proof (real private-api loader + production-build-script artifact).
+      # Release/tooling unit gate: immutable manifest, atomic publish/rollback
+      # and hardened shell cache headers.
       - run: node --test scripts/workspace-release.test.mjs
+      # The production-faithful unlock proof (real private-api loader +
+      # production-build-script artifact through the real HPKE routes) runs
+      # inside verify:web-boundary, not the unit test above.
       - run: pnpm verify:web-boundary
   web-e2e:
     runs-on: ubuntu-latest
@@ -53,5 +55,10 @@ jobs:
       - run: pnpm build:workspace-shell
       # Audited HPKE responder + artifact tooling used by the shell-unlock spec.
       - run: cargo build -p crypto-envelope --bins --example test-session-host
-      - run: pnpm --filter @evergreen/e2e exec playwright install --with-deps chromium
+      # Chromium is the reference engine (audited HPKE/WASM unlock path and the
+      # WebAuthn harness). Firefox independently re-runs every surface in a
+      # second layout/runtime engine; the shell mocks navigator.credentials and
+      # reports an existing operator session, so the production-faithful unlock
+      # host is exercised under both.
+      - run: pnpm --filter @evergreen/e2e exec playwright install --with-deps chromium firefox
       - run: pnpm --filter @evergreen/e2e exec playwright test

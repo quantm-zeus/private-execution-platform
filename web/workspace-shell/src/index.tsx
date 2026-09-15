@@ -767,7 +767,13 @@ function App() {
                 the only unlock credential.
               </p>
 
-              <div class="fingerprint" aria-label="Active release">
+              <section
+                class="fingerprint"
+                aria-labelledby="release-fingerprint-heading"
+              >
+                <h3 id="release-fingerprint-heading" class="sr-only">
+                  Active release
+                </h3>
                 <div class="fingerprint__row">
                   <span class="fingerprint__key">Release</span>
                   <span class="fingerprint__value">
@@ -807,7 +813,7 @@ function App() {
                     </div>
                   </dl>
                 </details>
-              </div>
+              </section>
 
               <form class="form" onSubmit={handleUnlock}>
                 <label class="field" for="recovery-code">
@@ -870,32 +876,37 @@ function App() {
               </Show>
 
               <Show when={isUnlocking() || unlockStage()}>
-                <ol class="stages" aria-label="Unlock progress">
-                  <For each={STAGES}>
-                    {(stage) => (
-                      <li
-                        class="stages__item"
-                        classList={{
-                          "stages__item--done":
-                            unlockStage() !== null &&
-                            STAGES.findIndex((s) => s.id === stage.id) <
-                              STAGES.findIndex((s) => s.id === unlockStage()),
-                          "stages__item--active": unlockStage() === stage.id,
-                          "stages__item--pending":
-                            unlockStage() !== null &&
-                            STAGES.findIndex((s) => s.id === stage.id) >
-                              STAGES.findIndex((s) => s.id === unlockStage()),
-                        }}
-                      >
-                        <span class="stages__dot" aria-hidden="true" />
-                        <span class="stages__label">{stage.label}</span>
-                        <span class="stages__state">
-                          {stageStatusText(unlockStage(), stage.id)}
-                        </span>
-                      </li>
-                    )}
-                  </For>
-                </ol>
+                {/* The live region wraps the list so stage changes are
+                    announced; putting role="status" on the <ol> itself would
+                    strip its list semantics and break axe. */}
+                <div role="status" aria-live="polite">
+                  <ol class="stages" aria-label="Unlock progress">
+                    <For each={STAGES}>
+                      {(stage) => (
+                        <li
+                          class="stages__item"
+                          classList={{
+                            "stages__item--done":
+                              unlockStage() !== null &&
+                              STAGES.findIndex((s) => s.id === stage.id) <
+                                STAGES.findIndex((s) => s.id === unlockStage()),
+                            "stages__item--active": unlockStage() === stage.id,
+                            "stages__item--pending":
+                              unlockStage() !== null &&
+                              STAGES.findIndex((s) => s.id === stage.id) >
+                                STAGES.findIndex((s) => s.id === unlockStage()),
+                          }}
+                        >
+                          <span class="stages__dot" aria-hidden="true" />
+                          <span class="stages__label">{stage.label}</span>
+                          <span class="stages__state">
+                            {stageStatusText(unlockStage(), stage.id)}
+                          </span>
+                        </li>
+                      )}
+                    </For>
+                  </ol>
+                </div>
               </Show>
             </section>
           )}
