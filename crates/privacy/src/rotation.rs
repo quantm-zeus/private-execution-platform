@@ -13,7 +13,8 @@ pub struct RotationConfig {
     pub max_age_ms: i64,
     /// Maximum uses before rotation.
     pub max_uses: u64,
-    /// Nominal rotation window (used to schedule the next rotation).
+    /// Nominal rotation window (a scheduling hint; the rotation scheduler uses
+    /// `max_age_ms` as the exact due deadline).
     pub window_ms: i64,
 }
 
