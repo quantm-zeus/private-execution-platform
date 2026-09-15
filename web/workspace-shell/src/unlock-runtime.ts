@@ -15,6 +15,9 @@ import init, {
   WasmOffer,
   WasmWorkspaceKey,
 } from "./wasm/crypto-envelope-wasm.js";
+import { HandoffGate, type ShellSessionKeys } from "./handoff-gate.ts";
+
+export type { ShellSessionKeys } from "./handoff-gate.ts";
 
 let wasmReady: Promise<unknown> | undefined;
 
@@ -196,13 +199,6 @@ export interface UnlockResult {
   cleanup: () => void;
 }
 
-/** BR-5 session material handed to the payload over the same-document channel. */
-export interface ShellSessionKeys {
-  readonly kid: string;
-  readonly s2cKeyB64: string;
-  readonly c2sKeyB64: string;
-}
-
 export interface UnlockOptions {
   enrollUrl?: string;
   grantUrl?: string;
@@ -215,22 +211,13 @@ export class WorkspaceUnlockRuntime {
   private currentKey: WasmWorkspaceKey | null = null;
   private currentPayloadFiles: Map<string, Uint8Array> | null = null;
   /**
-   * BR-5 transport session keys, derived from the same authenticated HPKE
-   * exchange that decrypts the artifact. Held only while unlocked; `lock()`
-   * drops the reference so it can be garbage-collected, and the payload owns
-   * the only durable copy as non-extractable CryptoKeys.
+   * BR-5 handoff gate. Holds the transport session keys derived from the same
+   * authenticated HPKE exchange that decrypts the artifact, and decides the
+   * one-shot, token-bound delivery to the payload. `lock()` disarms it so no
+   * reference survives, and the payload owns the only durable copy as
+   * non-extractable CryptoKeys.
    */
-  private currentSession: ShellSessionKeys | null = null;
-  /**
-   * BR-5 handoff binding token. Generated fresh per unlock, injected only into
-   * the decrypted payload document, and required back on the `workspace-ready`
-   * ping before keys are delivered. Without it the shell would hand live bearer
-   * keys to whatever same-origin document currently occupies the frame on an
-   * unauthenticated ping (the sandbox permits self-navigation).
-   */
-  private handoffToken: string | null = null;
-  /** True once keys have been delivered for the current unlock (one-shot). */
-  private handoffDelivered: boolean = false;
+  private handoff = new HandoffGate();
   private isUnlocked: boolean = false;
 
   constructor() {
@@ -262,15 +249,7 @@ export class WorkspaceUnlockRuntime {
    * keys is through this token-and-one-shot gate.
    */
   public takeSessionKeysForHandoff(token: unknown): ShellSessionKeys | null {
-    if (this.currentSession === null || this.handoffToken === null) return null;
-    if (this.handoffDelivered) return null;
-    if (typeof token !== "string" || token.length === 0) return null;
-    // Constant-time-ish comparison is unnecessary here: the token is a
-    // same-document capability, not a network secret, and both operands are
-    // already known to the compared documents.
-    if (token !== this.handoffToken) return null;
-    this.handoffDelivered = true;
-    return this.currentSession;
+    return this.handoff.take(token);
   }
 
   /**
@@ -453,17 +432,16 @@ export class WorkspaceUnlockRuntime {
       // Fresh per-unlock handoff binding. Generated before the payload document
       // is built so the token can be injected into it; the payload must echo the
       // token on its ready ping before the shell releases any key.
-      this.handoffToken = generateHandoffToken();
-      this.handoffDelivered = false;
+      const handoffToken = generateHandoffToken();
 
-      const htmlUrl = this.instantiatePayload(unpackedFiles, this.handoffToken);
+      const htmlUrl = this.instantiatePayload(unpackedFiles, handoffToken);
       // Ownership transfers only after the payload is fully instantiated; any
       // earlier failure is reclaimed by the finally below.
       if (!sessionMaterial) {
         throw new Error("Session key handoff unavailable");
       }
       this.currentKey = workspaceKey;
-      this.currentSession = sessionMaterial;
+      this.handoff.arm(sessionMaterial, handoffToken);
       workspaceKey = null;
       unlocked = true;
       this.isUnlocked = true;
@@ -554,9 +532,7 @@ export class WorkspaceUnlockRuntime {
     // Drop the BR-5 handoff material. Strings cannot be zeroized in JS; the
     // durable copies live only as non-extractable CryptoKeys inside the payload,
     // which is torn down with the iframe on lock.
-    this.currentSession = null;
-    this.handoffToken = null;
-    this.handoffDelivered = false;
+    this.handoff.disarm();
 
     this.isUnlocked = false;
   }

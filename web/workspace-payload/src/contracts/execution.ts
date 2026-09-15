@@ -2,6 +2,8 @@
 // TradeIntent and the execution-preview `NetDelta` (docs/PRD.md lines 18–34, 49).
 // The displayed raw quote is informational; `netOutput` is execution truth.
 
+import { workspaceError } from "../core/errors";
+
 export type TradeSide = "buy" | "sell";
 export type AmountType = "usd" | "stablecoin" | "token";
 export type OrderType = "market" | "limit" | "twap" | "rfq";
@@ -232,4 +234,60 @@ export interface WithdrawalReview {
   readonly destination: string;
   readonly feeUsd: number | null;
   readonly requiresStepUp: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validate a `get_orders` success document before the renderer consumes it.
+ *
+ * The private API is authoritative for the shape. A document the client cannot
+ * render (for example the canonical snake_case `OrderSummary` before the web
+ * projection exists) must become a typed protocol error, never a `ready` state
+ * whose value throws inside the renderer. This is deliberately strict: it
+ * checks exactly the fields the order list reads, so an unknown shape fails
+ * closed instead of producing a partial or fabricated view.
+ */
+export function parseOrdersResponse(value: unknown): { readonly orders: readonly LimitOrderView[] } {
+  if (!isRecord(value) || !Array.isArray(value.orders)) {
+    throw workspaceError("protocol", "Malformed order list.");
+  }
+  for (const order of value.orders) {
+    if (!isRecord(order)) throw workspaceError("protocol", "Malformed order entry.");
+    if (typeof order.orderId !== "string" || order.orderId.length === 0) {
+      throw workspaceError("protocol", "Order is missing an id.");
+    }
+    if (typeof order.state !== "string" || order.state.length === 0) {
+      throw workspaceError("protocol", "Order is missing a state.");
+    }
+    if (!isRecord(order.intent) || typeof order.intent.side !== "string") {
+      throw workspaceError("protocol", "Order is missing its intent.");
+    }
+    if (!Array.isArray(order.fills)) {
+      throw workspaceError("protocol", "Order is missing its fills.");
+    }
+  }
+  return value as unknown as { readonly orders: readonly LimitOrderView[] };
+}
+
+/**
+ * Validate a `get_portfolio` success document before the renderer consumes it.
+ *
+ * Same rationale as {@link parseOrdersResponse}: the canonical document nests
+ * the summary under `portfolio` with `{asset, amount}` balances, which the
+ * portfolio view cannot render, so it must surface as a typed protocol error
+ * rather than a `ready` value that throws on `balances`.
+ */
+export function parsePortfolioView(value: unknown): PortfolioView {
+  if (!isRecord(value) || !Array.isArray(value.balances)) {
+    throw workspaceError("protocol", "Malformed portfolio document.");
+  }
+  for (const balance of value.balances) {
+    if (!isRecord(balance) || typeof balance.amount !== "string") {
+      throw workspaceError("protocol", "Malformed balance entry.");
+    }
+  }
+  return value as unknown as PortfolioView;
 }

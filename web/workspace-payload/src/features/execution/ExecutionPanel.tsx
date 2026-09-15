@@ -45,7 +45,6 @@ export const ExecutionPanel: Component = () => {
   const [twapState, setTwapState] = createSignal<ExecutionProgress | null>(null);
   const [twapError, setTwapError] = createSignal<WorkspaceErrorShape | null>(null);
   const progress = createCommandResource<ExecutionProgress>(ws.command, "get_execution_progress", {
-    capability: "twap",
     ttlMs: 5_000,
   });
   const rfq = createCommandResource<RfqView>(ws.command, "submit_rfq", {
@@ -55,10 +54,14 @@ export const ExecutionPanel: Component = () => {
 
   const twapDenial = createMemo(() => ws.mutationDenial("twap"));
   const rfqDenial = createMemo(() => ws.mutationDenial("rfq"));
-  const progressDenial = createMemo(() => ws.capabilityDenial("twap"));
+  // `get_execution_progress` is an ungated owner-scoped reconciliation read
+  // (BR-9): the server serves it even when `twap` is not advertised, so the
+  // client must not hide it behind `twap` or an UNKNOWN execution could never
+  // be reconciled. The read stays fail-closed server-side.
+  const progressDenial = (): null => null;
 
-  // Load the current execution progress once the capability is authoritatively
-  // confirmed; otherwise the surface shows an unqueried "no execution running".
+  // Load the current execution progress immediately; the ungated reconcile read
+  // is always safe to attempt and the surface treats a failure as an error.
   let progressRequested = false;
   createEffect(() => {
     if (progressDenial() === null && !progressRequested) {

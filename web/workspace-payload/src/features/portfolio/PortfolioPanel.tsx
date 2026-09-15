@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, type JSX } from "solid-js";
 import { formatAge, formatClock, formatUsd, truncateAddress } from "../../core/format";
 import type { AlertView, PortfolioView } from "../../contracts/execution";
+import { parsePortfolioView } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
 import { useWorkspace } from "../../state/session";
 import {
@@ -47,6 +48,9 @@ export default function PortfolioPanel(): JSX.Element {
     capability: "portfolio",
     ttlMs: BALANCE_TTL_MS,
     clock: () => ws.nowMs(),
+    // Reject an unrenderable success document as a typed error instead of
+    // marking it `ready` and throwing on `balances` (F3).
+    validate: parsePortfolioView,
   });
   const alerts = createCommandResource<AlertsResponse>(command, "get_alerts", {
     capability: "intelligence",

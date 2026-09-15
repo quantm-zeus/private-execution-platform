@@ -14,6 +14,7 @@ import type {
   OrderState,
   TradeSide,
 } from "../../contracts/execution";
+import { parseOrdersResponse } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
 import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/idempotency";
 import { useWorkspace } from "../../state/session";
@@ -138,6 +139,9 @@ export default function LimitsPanel(): JSX.Element {
   const orders = createCommandResource<OrdersResponse>(command, "get_orders", {
     capability: "limits",
     clock: () => ws.nowMs(),
+    // Reject an unrenderable success document as a typed error instead of
+    // marking it `ready` and throwing inside the order list (F2).
+    validate: parseOrdersResponse,
   });
   const readDenial = createMemo(() => ws.capabilityDenial("limits"));
   const mutationDenial = createMemo(() => ws.mutationDenial("limits"));

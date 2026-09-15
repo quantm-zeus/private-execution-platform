@@ -462,3 +462,96 @@ and relevant MEDIUM findings were fixed with regression tests:
   are created in a workspace-local export repo (`<worktree>/.export`) that shares
   object alternates with the main clone and pushes to `origin`. The branch and
   draft PR are real; the worktree's own git index is untouched.
+
+## Fifth review pass (post-main merge) — audit-driven hardening
+
+The branch was merged with the then-current `origin/main` (P91–P93: artifact
+rotation scheduler, OKX provider benchmark, observational benchmark loop) and
+re-verified: `cargo fmt --check`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace`, `pnpm typecheck`, the payload suite
+(385 tests) and `verify:web-boundary` are green on the merged tree. Three
+fresh-context read-only audits (transport/BR-5/BR-7/BR-1, web-contract/BR-9..15,
+end-to-end coverage) were run against the exact committed tree. Valid findings
+were fixed:
+
+- **BR-5 handoff gate is now a pure, tested module.**
+  `web/workspace-shell/src/handoff-gate.ts` owns the one-shot, token-bound
+  delivery decision, and `verify:web-boundary` asserts every branch against a
+  live unlocked runtime: unarmed, missing/empty/non-string/wrong token, exact
+  token once, repeat refused, re-arm retires the old token, and `lock()` refuses
+  everything. This closes the last priority-1 security control that had no
+  automated regression coverage.
+- **Payload ready/token echo is tested.** `state/host.test.ts` pins
+  `announceWorkspaceReady` to the exact `{type, handoff}` message at the known
+  origin (never `*`), the empty token when no meta is injected, and no post when
+  unframed.
+- **Client/server capability labels aligned (F4).** Discover gates
+  `search_token`/`get_token` on the server's `market` capability, and the
+  execution-progress reconcile read is no longer hidden behind `twap` (the
+  server leaves it ungated so an UNKNOWN execution stays reconcilable).
+- **Unrenderable orders/portfolio successes fail closed (F2/F3).**
+  `parseOrdersResponse`/`parsePortfolioView` run through the new
+  `createCommandResource({validate})` hook, so a document the view cannot render
+  (for example the canonical snake_case `OrderSummary` or the nested
+  `PortfolioSummary`) becomes a typed `protocol` error instead of a `ready`
+  value that throws inside the renderer. No value is fabricated.
+
+The audits confirmed the core guarantees (AAD binds `kid`+`seq`, the response is
+bound to the request sequence, the `request_id` echo, per-purpose replay
+windows, decrypt-before-accept, the authoritative kill switch/capabilities,
+binary-only WebSocket frames, and consistent 1 MiB/720 KiB bounds) and
+re-stated the residuals below. Findings that are genuinely operator-owned or
+need a canonical-vocabulary/Trading-Core change remain residuals rather than
+being worked around:
+
+- **Orders/portfolio projection (F2/F3, canonical gap).** The web views need
+  camelCase `LimitOrderView`/`PortfolioView` (intent, fills, createdAt/updatedAt,
+  walletRef/equityUsd/slot/sourceAgeMs). The canonical `OrderSummary`/
+  `PortfolioSummary` do not carry the intent, the fill list or the timestamps, so
+  a faithful projection needs additive canonical fields. Until then the client
+  fails closed with a typed protocol error (never a crash, never fabrication).
+- **Client-reference reconcile (F9).** The server already exposes the ungated
+  `get_order_by_client_id`/`get_withdrawal_by_request_id`/
+  `get_execution_progress` reads, but the UI never sends a stable
+  `client_order_id`/`client_request_id` on writes and reconciles only by a known
+  `order_id`. Wiring the client ids and the UNKNOWN lookup is a web-flow change
+  that belongs with the Trading Core wiring.
+- **Advertised-vs-backed capabilities (F5/audit[4]).** `document_for` derives the
+  document from `WiredCapabilities`; an operator that advertises
+  `twap`/`rfq`/`withdraw`/`intelligence` without the matching
+  `WebContractBackend` handler gets a determinate `capability_missing` (never a
+  false success). A `serves(op)` probe on the seams would make the advertisement
+  authoritative.
+- **Shipped binary composition (F1/F10, operator-owned).** `main.rs` still passes
+  `dispatcher: None`, so the binary serves the fail-closed default; the concrete
+  Trading Core read/trade backend, `WebContractBackend`, `InstrumentRegistry`,
+  `StreamSource` and chains need operator inputs (owner/wallet/chain/risk limits,
+  Privy signing, live market data). The read ports for
+  `search_token`/`get_token`/`get_intelligence`/`get_chart` are likewise
+  unwired.
+- **Web defaults the server refuses (F6/F7/F8).** A blank limit expiry and the
+  default `usd` amount type are determinate server refusals (no canonical USD
+  price; the canonical expiry is a required `i64`), and per-order risk caps are
+  unenforceable by the canonical command. These need Trading Core support or a
+  web-default change; they stay typed, non-fabricating denials.
+- **Edge perimeter assertion (audit[2]).** The edge requires a configured custom
+  assertion header but only checks its presence; the operator-owned perimeter is
+  expected to add and strip it. Verifying a JWT/HMAC needs operator verification
+  material and is left to the perimeter.
+- **Server-side revoke on lock (audit[3]).** Client `lock()` drops the keys
+  locally; the server epoch is TTL-bounded (15 min) and retired on the next
+  handoff, but a lock does not by itself revoke the `kid`. An authenticated
+  revoke route is a new protocol surface.
+- **Origin topology (audit[1]).** The unlocked payload posts to first-party
+  `/v1/*` on the shell origin and the shell's own `/internal/*` enrollment calls
+  share that origin, so production must serve the shell and reverse-proxy
+  `/internal/*` to private-api and `/v1/*` to the edge on one origin
+  (`verify:web-boundary` and the e2e host do exactly that). `/internal/*`
+  neutral-family renaming stays the BR-16 residual.
+- **Full-stack / production-relay test gaps (audit G1/G6/G7/G10).** The strongest
+  in-repo E2E drives the real edge HTTP route + the real composed dispatcher + an
+  injected Trading Core seam in-process; the pinned-mTLS test drives the real
+  relay against a fail-closed dispatcher; the browser e2e drives the real payload
+  against a Node AEAD mock. A single cross-process test that wires the real mTLS
+  relay to the injected core (and a `wasm-pack test --node` assertion of the WASM
+  `app_session_keys()` orientation) is still missing.

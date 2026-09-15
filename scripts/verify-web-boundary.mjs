@@ -1291,6 +1291,7 @@ try {
     fromBase64,
     loadWasm: loadShellWasm,
   } = await import("../web/workspace-shell/src/unlock-runtime.ts");
+  const { HandoffGate } = await import("../web/workspace-shell/src/handoff-gate.ts");
 
   // 10a. Audited WASM loads and binds
   await loadShellWasm();
@@ -1548,6 +1549,50 @@ try {
     throw new Error("mounted file count does not match payload build");
   }
 
+  // 10f. BR-5 handoff gate: one-shot, token-bound, and disarmed by lock().
+  //
+  // This is the control that stops a same-origin document which navigated into
+  // the frame from harvesting live session keys with a forged ready ping. It is
+  // pure logic, so exercise every branch directly rather than only through the
+  // full unlock.
+  {
+    const session = { kid: "kid-test", s2cKeyB64: "s2c-test", c2sKeyB64: "c2s-test" };
+    const gate = new HandoffGate();
+    // Unarmed: nothing is ever released, not even the right-looking token.
+    for (const candidate of [undefined, null, "", "token-1", 0, {}]) {
+      if (gate.take(candidate) !== null) throw new Error("unarmed handoff gate released keys");
+    }
+    gate.arm(session, "token-1");
+    // Missing, empty, non-string and wrong tokens are all refused.
+    for (const bad of [undefined, null, "", 0, {}, "token-2"]) {
+      if (gate.take(bad) !== null) {
+        throw new Error(`handoff gate accepted a bad token: ${String(bad)}`);
+      }
+    }
+    // The exact token releases the armed session exactly once.
+    if (gate.take("token-1") !== session) throw new Error("handoff gate did not release the armed session");
+    if (gate.take("token-1") !== null) throw new Error("handoff gate released twice");
+    // Re-arming for the next unlock retires the previous token and resets the
+    // one-shot state.
+    gate.arm(session, "token-2");
+    if (gate.take("token-1") !== null) throw new Error("handoff gate accepted a retired token");
+    if (gate.take("token-2") !== session) throw new Error("re-armed handoff gate did not release");
+    // Disarming refuses everything until the next arm.
+    gate.disarm();
+    for (const bad of ["token-2", "token-1", undefined, ""]) {
+      if (gate.take(bad) !== null) throw new Error("disarmed handoff gate released keys");
+    }
+    // The live runtime delegates to the same gate: after a real unlock a
+    // missing or wrong token yields nothing, so a forged ready ping cannot
+    // harvest keys.
+    if (runtime.takeSessionKeysForHandoff(undefined) !== null) {
+      throw new Error("runtime released keys without a handoff token");
+    }
+    if (runtime.takeSessionKeysForHandoff("not-the-token") !== null) {
+      throw new Error("runtime released keys for a wrong handoff token");
+    }
+  }
+
   // Verify server received ONLY public metadata (never secret, private key, or content key)
   if (serverReceivedEnrollment.length < 1) {
     throw new Error("expected at least one enrollment request");
@@ -1566,6 +1611,11 @@ try {
   runtime.lock();
   if (runtime.unlocked) throw new Error("runtime should be locked after lock()");
   if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime active URLs not revoked after lock()");
+  // Lock disarms the handoff gate: even a token that would have been valid
+  // before lock cannot release keys afterwards.
+  if (runtime.takeSessionKeysForHandoff("token-1") !== null) {
+    throw new Error("runtime released keys after lock()");
+  }
 
   // 10h. Negative runtime unlock tests fail closed with no secret leakage
   // Wrong unlock secret
