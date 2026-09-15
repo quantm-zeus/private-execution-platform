@@ -1,41 +1,75 @@
 import { render } from "solid-js/web";
-import { createSignal, onMount, onCleanup, Show } from "solid-js";
+import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
 import "./style.css";
-import { loadWasm } from "./wasm-loader";
-import { defaultRuntime } from "./unlock-runtime";
+import { loadWasm, defaultRuntime, fromBase64 } from "./unlock-runtime";
 import {
   authenticateWithPasskey,
   enrollPasskey,
   PasskeyAuthError,
 } from "./passkey-auth";
+import {
+  fetchWorkspaceDescriptor,
+  DescriptorError,
+  type WorkspaceDescriptor,
+} from "./descriptor";
+import {
+  isUnlockError,
+  recoveryFor,
+  type UnlockRecovery,
+  type UnlockStage,
+} from "./unlock-stages";
 
-type AuthState = "checking" | "authenticated" | "required" | "unsupported";
+type AuthState =
+  | "checking"
+  | "signed_out"
+  | "authenticating"
+  | "authenticated"
+  | "unsupported";
+
+const ENROLLMENT_STATUS_URL = "/internal/auth/enrollment-status";
+const SESSION_URL = "/internal/auth/session";
+
+/** Ordered unlock stages, shown as an auditable security ledger. */
+const STAGES: { id: UnlockStage; label: string }[] = [
+  { id: "U1_WASM", label: "Crypto module" },
+  { id: "U2_ENROLL", label: "Workspace identity" },
+  { id: "U3_GRANT", label: "Artifact access" },
+  { id: "U4_TRANSPORT", label: "Encrypted session" },
+  { id: "U5_ARTIFACT", label: "Release compatibility" },
+  { id: "U6_PACKAGE", label: "Release package" },
+  { id: "U7_BOOT", label: "Workspace start" },
+];
+
+function shortDigest(hex: string): string {
+  if (!hex) return "unavailable";
+  return hex.slice(0, 12).replace(/(.{4})(?=.)/g, "$1 ");
+}
 
 function App() {
-  const [status, setStatus] = createSignal(
-    "Private workspace bootstrap initialized.",
-  );
-  const [secret, setSecret] = createSignal("");
-  const [kid, setKid] = createSignal("");
-  const [isUnlocked, setIsUnlocked] = createSignal(false);
-  const [payloadUrl, setPayloadUrl] = createSignal("");
-  const [isProcessing, setIsProcessing] = createSignal(false);
+  const [status, setStatus] = createSignal("Security gateway ready.");
   const [authState, setAuthState] = createSignal<AuthState>("checking");
   const [authMessage, setAuthMessage] = createSignal(
-    "Checking the operator session...",
+    "Checking whether an operator session already exists...",
   );
+  const [enrollmentOpen, setEnrollmentOpen] = createSignal(false);
+  const [descriptor, setDescriptor] = createSignal<WorkspaceDescriptor | null>(null);
+  const [descriptorError, setDescriptorError] = createSignal("");
+  const [recoveryCode, setRecoveryCode] = createSignal("");
+  const [unlockStage, setUnlockStage] = createSignal<UnlockStage | null>(null);
+  const [unlockFailure, setUnlockFailure] = createSignal<UnlockRecovery | null>(null);
+  const [isUnlocking, setIsUnlocking] = createSignal(false);
+  const [cryptoReady, setCryptoReady] = createSignal(false);
+  const [isUnlocked, setIsUnlocked] = createSignal(false);
+  const [payloadUrl, setPayloadUrl] = createSignal("");
   const [enrollSecret, setEnrollSecret] = createSignal("");
   const [isEnrolling, setIsEnrolling] = createSignal(false);
   let frame: HTMLIFrameElement | undefined;
+  let recoveryInput: HTMLInputElement | undefined;
+  let alertRef: HTMLDivElement | undefined;
 
-  // Same-document channel with the decrypted payload: the payload may request a
-  // lock (destroy session keys + revoke blob URLs) and announce readiness.
-  // Only messages originating from our own frame *and* our own origin are
-  // honoured, and the ready ping must echo the per-unlock handoff token the
-  // shell injected into the payload document: the sandbox permits
-  // self-navigation, so a navigated frame could still match `contentWindow`
-  // (BR-6 treats the payload as trusted code, but the binding is cheap
-  // defense-in-depth against harvesting live session keys).
+  // Same-document channel with the decrypted payload. Only messages from our
+  // own frame and origin are honoured, and the ready ping must echo the
+  // per-unlock handoff token injected into the payload document.
   const onPayloadMessage = (event: MessageEvent) => {
     if (!frame || event.source !== frame.contentWindow) return;
     if (event.origin !== window.location.origin) return;
@@ -44,17 +78,11 @@ function App() {
     if (data.type === "evergreen:lock-request") {
       handleLock();
     } else if (data.type === "evergreen:workspace-ready") {
-      setStatus("Workspace ready.");
+      setStatus("Private workspace ready.");
       deliverSessionKeys(data.handoff);
     }
   };
 
-  /**
-   * BR-5 handoff: deliver the directional session keys to the sandboxed payload
-   * over the same-document channel only, once per unlock, and only to a document
-   * that echoed the per-unlock token. The payload imports them as
-   * non-extractable CryptoKeys; they are never persisted or placed in the DOM.
-   */
   const deliverSessionKeys = (handoff: unknown) => {
     const target = frame?.contentWindow;
     if (!target) return;
@@ -71,40 +99,88 @@ function App() {
         window.location.origin,
       );
     } catch {
-      // Best effort. Without the handoff the payload stays explicitly offline
-      // rather than falling back to any cleartext transport.
+      // Best effort. Without the handoff the payload stays explicitly offline.
     }
   };
 
-  /**
-   * Establish the operator session with a WebAuthn passkey.
-   *
-   * The server session is an HttpOnly `__Host-` cookie; the shell never sees or
-   * stores it. On failure the workspace stays locked and the unlock path fails
-   * closed server-side. This is never a substitute for the server check.
-   */
+  const loadDescriptor = async () => {
+    setDescriptorError("");
+    setDescriptor(null);
+    try {
+      const value = await fetchWorkspaceDescriptor();
+      setDescriptor(value);
+    } catch (error) {
+      if (error instanceof DescriptorError && error.code === "descriptor_unauthorized") {
+        setAuthState("signed_out");
+        setAuthMessage("Operator session required. Open the private workspace to verify your passkey.");
+        return;
+      }
+      setDescriptorError(
+        "The server did not publish a usable workspace release descriptor. Retry, or contact the operator.",
+      );
+    }
+  };
+
   const runAuthentication = async () => {
-    setAuthState("checking");
-    setAuthMessage("Authenticating with passkey...");
+    setAuthState("authenticating");
+    setAuthMessage("Waiting for your passkey...");
+    setUnlockFailure(null);
     try {
       await authenticateWithPasskey();
       setAuthState("authenticated");
-      setAuthMessage("Operator session established.");
+      setAuthMessage("Operator identity verified.");
+      await loadDescriptor();
     } catch (error) {
       if (error instanceof PasskeyAuthError && error.code === "webauthn_unsupported") {
         setAuthState("unsupported");
         setAuthMessage("This browser does not support passkeys.");
         return;
       }
-      setAuthState("required");
-      setAuthMessage("Passkey authentication required.");
+      setAuthState("signed_out");
+      setAuthMessage("Passkey verification did not complete. Try again when ready.");
+    }
+  };
+
+  const checkExistingSession = async () => {
+    try {
+      const response = await fetch(SESSION_URL, {
+        method: "GET",
+        credentials: "same-origin",
+        redirect: "error",
+      });
+      if (response.status === 204) {
+        setAuthState("authenticated");
+        setAuthMessage("Existing operator session restored.");
+        await loadDescriptor();
+        return;
+      }
+    } catch {
+      // Fall through to the signed-out gateway.
+    }
+    setAuthState("signed_out");
+    setAuthMessage("Verify your passkey to open the private workspace.");
+  };
+
+  const loadEnrollmentStatus = async () => {
+    try {
+      const response = await fetch(ENROLLMENT_STATUS_URL, {
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) return;
+      const body = (await response.json()) as { enrollment_open?: unknown };
+      setEnrollmentOpen(body.enrollment_open === true);
+    } catch {
+      setEnrollmentOpen(false);
     }
   };
 
   const handleEnroll = async (e: Event) => {
     e.preventDefault();
     if (isEnrolling()) return;
-    const secretValue = enrollSecret().trim();
+    const secretValue = enrollSecret();
+    setEnrollSecret("");
     if (!secretValue) {
       setAuthMessage("Enrollment secret required.");
       return;
@@ -116,15 +192,11 @@ function App() {
       await runAuthentication();
     } catch (error) {
       setAuthMessage(
-        error instanceof PasskeyAuthError &&
-          error.code === "enrollment_unavailable"
-          ? "Passkey enrollment is unavailable."
+        error instanceof PasskeyAuthError && error.code === "enrollment_unavailable"
+          ? "Passkey enrollment is not open."
           : "Passkey enrollment failed.",
       );
     } finally {
-      // The operator secret must not survive the attempt, successful or not: a
-      // failed hint is retryable by retyping, never by leaving it in the DOM.
-      setEnrollSecret("");
       setIsEnrolling(false);
     }
   };
@@ -133,11 +205,13 @@ function App() {
     window.addEventListener("message", onPayloadMessage);
     try {
       await loadWasm();
-      setStatus("Workspace crypto boundary ready.");
+      setCryptoReady(true);
+      setStatus("Crypto boundary ready.");
     } catch {
-      setStatus("Workspace unavailable.");
+      setStatus("Crypto boundary unavailable in this browser.");
     }
-    await runAuthentication();
+    await loadEnrollmentStatus();
+    await checkExistingSession();
   });
 
   onCleanup(() => {
@@ -147,30 +221,65 @@ function App() {
 
   const handleUnlock = async (e: Event) => {
     e.preventDefault();
-    if (isProcessing()) return;
-
-    const secretValue = secret().trim();
-    const kidValue = kid().trim();
-
-    if (!secretValue || !kidValue) {
-      setStatus("Unlock secret and Key ID required.");
+    if (isUnlocking()) return;
+    const activeDescriptor = descriptor();
+    if (!activeDescriptor) {
+      setDescriptorError("The release descriptor is not available yet.");
       return;
     }
 
-    setIsProcessing(true);
-    setStatus("Unlocking workspace in memory...");
+    // Read the recovery code, then clear the reactive signal *and* the DOM
+    // input before the first network await. JavaScript strings cannot be
+    // zeroized, so this is best-effort: the reference is dropped right after
+    // decoding and only zeroizable bytes cross the async boundary below.
+    let raw = recoveryCode();
+    setRecoveryCode("");
+    if (recoveryInput) recoveryInput.value = "";
+
+    let secretBytes: Uint8Array;
+    try {
+      secretBytes = fromBase64(raw.trim());
+    } catch {
+      setUnlockFailure(recoveryFor("U2_ENROLL", "invalid_secret"));
+      return;
+    } finally {
+      raw = "";
+    }
+    if (secretBytes.length !== 32 || secretBytes.every((b) => b === 0)) {
+      secretBytes.fill(0);
+      setUnlockFailure(recoveryFor("U2_ENROLL", "invalid_secret"));
+      return;
+    }
+
+    setIsUnlocking(true);
+    setUnlockFailure(null);
+    setUnlockStage("U1_WASM");
+    setStatus("Decrypting the private workspace in memory...");
+
+    // The runtime copies the secret synchronously before its first await, so the
+    // caller's plaintext buffer is dropped immediately instead of surviving the
+    // whole network exchange.
+    const unlockPromise = defaultRuntime.unlock(secretBytes, activeDescriptor, {
+      onStage: (stage) => setUnlockStage(stage),
+    });
+    secretBytes.fill(0);
 
     try {
-      const result = await defaultRuntime.unlock(secretValue, kidValue);
+      const result = await unlockPromise;
       setPayloadUrl(result.htmlUrl);
       setIsUnlocked(true);
-      setStatus("Workspace unlocked.");
-    } catch {
+      setStatus("Private workspace opened.");
+    } catch (error) {
+      const failure = isUnlockError(error)
+        ? recoveryFor(error.stage, error.reason)
+        : recoveryFor("U7_BOOT", "unknown");
+      setUnlockFailure(failure);
       setStatus("Workspace unlock failed.");
       defaultRuntime.lock();
+      queueMicrotask(() => alertRef?.focus());
     } finally {
-      setSecret("");
-      setIsProcessing(false);
+      setUnlockStage(null);
+      setIsUnlocking(false);
     }
   };
 
@@ -178,113 +287,309 @@ function App() {
     defaultRuntime.lock();
     setPayloadUrl("");
     setIsUnlocked(false);
+    setUnlockFailure(null);
     setStatus("Workspace locked.");
   };
 
   return (
-    <main>
-      <h1>Workspace</h1>
-      <p id="status">{status()}</p>
-      <p id="auth-status" role="status">
-        {authMessage()}
+    <main class="gateway">
+      <header class="gateway__masthead">
+        <p class="gateway__wordmark">Evergreen</p>
+        <h1 class="gateway__title">Private Workspace Gateway</h1>
+        <p class="gateway__lede">
+          Three independent checks stand between this browser and the private
+          trading workspace: the network perimeter, your passkey, and the local
+          decryption of the sealed release.
+        </p>
+      </header>
+
+      <ol class="ledger" aria-label="Security verification steps">
+        <li class="ledger__item ledger__item--done">
+          <span class="ledger__marker" aria-hidden="true">1</span>
+          <span class="ledger__body">
+            <span class="ledger__label">Perimeter</span>
+            <span class="ledger__value">Cloudflare Access</span>
+          </span>
+        </li>
+        <li
+          class="ledger__item"
+          classList={{
+            "ledger__item--done": authState() === "authenticated",
+            "ledger__item--active":
+              authState() === "checking" || authState() === "authenticating",
+          }}
+        >
+          <span class="ledger__marker" aria-hidden="true">2</span>
+          <span class="ledger__body">
+            <span class="ledger__label">Operator</span>
+            <span class="ledger__value">
+              {authState() === "authenticated" ? "Passkey verified" : "Passkey pending"}
+            </span>
+          </span>
+        </li>
+        <li
+          class="ledger__item"
+          classList={{
+            "ledger__item--done": isUnlocked(),
+            "ledger__item--active": isUnlocking(),
+          }}
+        >
+          <span class="ledger__marker" aria-hidden="true">3</span>
+          <span class="ledger__body">
+            <span class="ledger__label">Workspace</span>
+            <span class="ledger__value">
+              {isUnlocked() ? "Decrypted locally" : "Sealed"}
+            </span>
+          </span>
+        </li>
+      </ol>
+
+      <p id="status" class="gateway__status" role="status" aria-live="polite">
+        {status()}
       </p>
 
-      <Show when={authState() !== "authenticated" && !isUnlocked()}>
-        <div id="auth-panel">
-          <button
-            type="button"
-            onClick={runAuthentication}
-            disabled={authState() === "checking" || authState() === "unsupported"}
+      <Show when={unlockFailure()}>
+        {(failure) => (
+          <div
+            class="notice"
+            classList={{
+              "notice--error": failure().severity === "error",
+              "notice--warning": failure().severity === "warning",
+            }}
+            role="alert"
+            tabindex={-1}
+            ref={(element) => {
+              alertRef = element;
+            }}
           >
-            {authState() === "checking" ? "Authenticating..." : "Authenticate with passkey"}
-          </button>
-          <form onSubmit={handleEnroll}>
-            <div>
-              <label for="enroll-secret">Enrollment Secret (operator bootstrap):</label>
-              <input
-                id="enroll-secret"
-                type="password"
-                autocomplete="off"
-                placeholder="Enter operator enrollment secret"
-                value={enrollSecret()}
-                onInput={(e) => setEnrollSecret(e.currentTarget.value)}
-                disabled={isEnrolling()}
-              />
-            </div>
-            <button type="submit" disabled={isEnrolling()}>
-              {isEnrolling() ? "Enrolling..." : "Enroll passkey"}
-            </button>
-          </form>
+            <p class="notice__stage">{failure().stageLabel}</p>
+            <p class="notice__title">{failure().title}</p>
+            <p class="notice__detail">{failure().detail}</p>
+          </div>
+        )}
+      </Show>
+
+      <Show when={descriptorError()}>
+        <div class="notice notice--error" role="alert">
+          <p class="notice__title">Release descriptor unavailable</p>
+          <p class="notice__detail">{descriptorError()}</p>
         </div>
       </Show>
 
-      <Show
-        when={isUnlocked()}
-        fallback={
-          <form onSubmit={handleUnlock}>
-            <div>
-              <label for="unlock-secret">Unlock Secret (32-byte base64):</label>
-              <input
-                id="unlock-secret"
-                type="password"
-                autocomplete="off"
-                placeholder="Enter 32-byte unlock secret"
-                value={secret()}
-                onInput={(e) => setSecret(e.currentTarget.value)}
-                disabled={isProcessing()}
-              />
-            </div>
-            <div>
-              <label for="unlock-kid">Key ID (16-byte base64):</label>
-              <input
-                id="unlock-kid"
-                type="text"
-                autocomplete="off"
-                placeholder="Enter 16-byte Key ID"
-                value={kid()}
-                onInput={(e) => setKid(e.currentTarget.value)}
-                disabled={isProcessing()}
-              />
-            </div>
-            <button type="submit" disabled={isProcessing()}>
-              {isProcessing() ? "Unlocking..." : "Unlock Workspace"}
+      <Show when={!isUnlocked()}>
+        <section class="panel" aria-labelledby="open-heading">
+          <h2 id="open-heading" class="panel__heading">
+            Open the private workspace
+          </h2>
+          <p class="panel__copy">
+            {authMessage()}
+          </p>
+          <div class="actions">
+            <Show
+              when={authState() === "authenticated"}
+              fallback={
+                <button
+                  type="button"
+                  class="button button--primary"
+                  onClick={runAuthentication}
+                  disabled={
+                    authState() === "authenticating" ||
+                    authState() === "unsupported" ||
+                    authState() === "checking"
+                  }
+                >
+                  {authState() === "authenticating"
+                    ? "Verifying passkey..."
+                    : "Open Private Workspace"}
+                </button>
+              }
+            >
+              <p id="auth-status" class="panel__verified" role="status">
+                Operator session established. Release metadata loaded automatically.
+              </p>
+            </Show>
+          </div>
+
+          <Show when={enrollmentOpen()}>
+            <details class="advanced">
+              <summary>First-run passkey enrollment</summary>
+              <form class="form" onSubmit={handleEnroll}>
+                <label class="field" for="enroll-secret">
+                  <span class="field__label">Operator enrollment secret</span>
+                  <input
+                    id="enroll-secret"
+                    class="field__input"
+                    type="password"
+                    autocomplete="off"
+                    spellcheck={false}
+                    value={enrollSecret()}
+                    onInput={(e) => setEnrollSecret(e.currentTarget.value)}
+                    disabled={isEnrolling()}
+                  />
+                </label>
+                <button class="button" type="submit" disabled={isEnrolling()}>
+                  {isEnrolling() ? "Enrolling..." : "Enroll passkey"}
+                </button>
+              </form>
+            </details>
+          </Show>
+        </section>
+
+        <Show when={authState() === "authenticated" && descriptor()}>
+          {(active) => (
+            <section class="panel" aria-labelledby="unlock-heading">
+              <h2 id="unlock-heading" class="panel__heading">
+                Unlock the sealed release
+              </h2>
+              <p class="panel__copy">
+                Enter your high-entropy offline recovery code. It is decoded to
+                bytes locally, cleared from this form before any network call,
+                and never sent to the server.
+              </p>
+              <p class="panel__note">
+                Passkey-bound recovery is offered only once this workspace
+                publishes a wrapped root key and your authenticator verifies
+                WebAuthn PRF support. Until then the offline recovery code is
+                the only unlock credential.
+              </p>
+
+              <div class="fingerprint" aria-label="Active release">
+                <div class="fingerprint__row">
+                  <span class="fingerprint__key">Release</span>
+                  <span class="fingerprint__value">
+                    {active().release_id ?? "unversioned"}
+                  </span>
+                </div>
+                <div class="fingerprint__row">
+                  <span class="fingerprint__key">Artifact digest</span>
+                  <span class="fingerprint__value fingerprint__value--mono">
+                    {shortDigest(active().artifact_sha256_hex)}
+                  </span>
+                </div>
+                <div class="fingerprint__row">
+                  <span class="fingerprint__key">Key binding</span>
+                  <span class="fingerprint__value">
+                    {active().expected_public_key_fingerprint_b64
+                      ? "Pinned to this release"
+                      : "Not pinned (legacy)"}
+                  </span>
+                </div>
+                <details class="advanced">
+                  <summary>Protocol metadata</summary>
+                  <dl class="meta">
+                    <div class="meta__row">
+                      <dt>Artifact version</dt>
+                      <dd>{active().artifact_version}</dd>
+                    </div>
+                    <div class="meta__row">
+                      <dt>Package format</dt>
+                      <dd>{active().package_format_version}</dd>
+                    </div>
+                    <div class="meta__row">
+                      <dt>Artifact key ID</dt>
+                      <dd class="meta__mono">{active().artifact_kid_b64}</dd>
+                    </div>
+                    <div class="meta__row">
+                      <dt>Workspace protocol</dt>
+                      <dd>
+                        {active().min_shell_protocol}–{active().max_shell_protocol}
+                      </dd>
+                    </div>
+                  </dl>
+                </details>
+              </div>
+
+              <form class="form" onSubmit={handleUnlock}>
+                <label class="field" for="recovery-code">
+                  <span class="field__label">Offline recovery code</span>
+                  <input
+                    id="recovery-code"
+                    class="field__input field__input--code"
+                    type="password"
+                    autocomplete="off"
+                    autocapitalize="off"
+                    autocorrect="off"
+                    spellcheck={false}
+                    placeholder="32-byte base64 recovery code"
+                    value={recoveryCode()}
+                    onInput={(e) => setRecoveryCode(e.currentTarget.value)}
+                    disabled={isUnlocking()}
+                    ref={(element) => {
+                      recoveryInput = element;
+                    }}
+                  />
+                </label>
+                <button
+                  class="button button--primary"
+                  type="submit"
+                  disabled={isUnlocking() || !cryptoReady()}
+                >
+                  {!cryptoReady()
+                    ? "Preparing crypto..."
+                    : isUnlocking()
+                      ? "Unlocking..."
+                      : "Unlock Workspace"}
+                </button>
+              </form>
+
+              <Show when={isUnlocking() || unlockStage()}>
+                <ol class="stages" aria-label="Unlock progress">
+                  <For each={STAGES}>
+                    {(stage) => (
+                      <li
+                        class="stages__item"
+                        classList={{
+                          "stages__item--active": unlockStage() === stage.id,
+                          "stages__item--pending":
+                            STAGES.findIndex((s) => s.id === stage.id) <
+                            STAGES.findIndex((s) => s.id === unlockStage()),
+                        }}
+                      >
+                        <span class="stages__dot" aria-hidden="true" />
+                        <span class="stages__label">{stage.label}</span>
+                        <span class="stages__state">
+                          {unlockStage() === stage.id ? "in progress" : ""}
+                        </span>
+                      </li>
+                    )}
+                  </For>
+                </ol>
+              </Show>
+            </section>
+          )}
+        </Show>
+      </Show>
+
+      <Show when={isUnlocked()}>
+        <section class="workspace" aria-label="Private workspace">
+          <div class="workspace__bar">
+            <p class="workspace__state" role="status">
+              Workspace open — decrypted in memory only.
+            </p>
+            <button type="button" class="button" onClick={handleLock}>
+              Lock Workspace
             </button>
-          </form>
-        }
-      >
-        <div>
-          <button type="button" onClick={handleLock}>
-            Lock Workspace
-          </button>
+          </div>
           <iframe
             id="workspace-frame"
             ref={(element) => {
               frame = element;
             }}
             src={payloadUrl()}
-            // The payload document has to be fetchable only until the frame has
-            // loaded it. Revoking the document blob URL on load keeps the loaded
-            // document and its subresource URLs live, but closes the same-origin
-            // path where a navigated frame reads `frame.src` and re-fetches the
-            // payload to harvest the injected handoff token.
             onLoad={() => defaultRuntime.releaseDocumentUrl(payloadUrl())}
-            title="Workspace Frame"
-            // allow-same-origin is required: the decrypted payload document is
-            // instantiated from blob: URLs created by this document, and a
-            // sandboxed opaque origin cannot load blob: subresources (Chromium
-            // "Not allowed to load local resource"). Navigation, popups, modals,
-            // forms and downloads stay denied.
-            //
-            // CAVEAT (BR-6): with `allow-same-origin` this sandbox is an
-            // isolation WARNING, not a containment boundary — a same-origin
-            // document can remove its own sandbox. Do not treat it as a security
-            // control; the payload is trusted code. Real containment requires
-            // serving the payload from a distinct origin.
+            title="Private trading workspace"
             sandbox="allow-scripts allow-same-origin"
             class="workspace-frame"
           />
-        </div>
+        </section>
       </Show>
+
+      <footer class="gateway__footer">
+        <p>
+          The perimeter and your passkey prove identity. Only the local recovery
+          code decrypts the release; it never leaves this browser.
+        </p>
+      </footer>
     </main>
   );
 }

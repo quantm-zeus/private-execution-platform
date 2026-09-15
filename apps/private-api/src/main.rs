@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use auth::passkey::PasskeyCredentialStore;
@@ -35,27 +36,59 @@ fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
     }
 }
 
-/// Optional internal mTLS relay identity. All four values must be present to
-/// enable the encrypted relay; otherwise the private API serves only its
-/// HTTP auth/artifact boundary and the edge stays fail-closed.
-fn optional_relay_identity() -> Option<ServiceIdentityConfig> {
-    let cert_chain_path = std::env::var("PRIVATE_API_TLS_CERT").ok()?;
-    let private_key_path = std::env::var("PRIVATE_API_TLS_KEY").ok()?;
-    let ca_path = std::env::var("PRIVATE_API_TLS_CA").ok()?;
-    let expected_peer_dns = std::env::var("PRIVATE_API_EDGE_DNS").ok()?;
-    if cert_chain_path.is_empty()
-        || private_key_path.is_empty()
-        || ca_path.is_empty()
-        || expected_peer_dns.is_empty()
-    {
-        return None;
+/// Strict all-or-none relay configuration.
+///
+/// The relay is optional: with none of the five variables supplied it stays
+/// disabled and the HTTP boundary serves alone. But once an operator supplies
+/// *any* of the relay bind address or the four identity values, the whole set
+/// must be present and non-empty, otherwise startup refuses. A partial set can
+/// no longer silently degrade a deployment into a process that looks healthy
+/// while its opaque transport never listens.
+fn resolve_relay_config(
+    bind: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    ca: Option<String>,
+    dns: Option<String>,
+) -> Result<Option<(String, ServiceIdentityConfig)>, std::io::Error> {
+    let present = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let bind_present = present(&bind);
+    let identity = [
+        cert.as_deref(),
+        key.as_deref(),
+        ca.as_deref(),
+        dns.as_deref(),
+    ];
+    let any_identity = identity
+        .iter()
+        .any(|value| value.is_some_and(|v| !v.trim().is_empty()));
+    if !bind_present && !any_identity {
+        return Ok(None);
     }
-    Some(ServiceIdentityConfig {
-        cert_chain_path: cert_chain_path.into(),
-        private_key_path: private_key_path.into(),
-        ca_path: ca_path.into(),
-        expected_peer_dns,
-    })
+    let all_identity = identity
+        .iter()
+        .all(|value| value.is_some_and(|v| !v.trim().is_empty()));
+    if !bind_present || !all_identity {
+        return Err(std::io::Error::other(
+            "private relay configuration must supply PRIVATE_API_RELAY_BIND_ADDR, \
+             PRIVATE_API_TLS_CERT, PRIVATE_API_TLS_KEY, PRIVATE_API_TLS_CA and \
+             PRIVATE_API_EDGE_DNS together",
+        ));
+    }
+    let bind = bind.expect("checked present");
+    let cert = cert.expect("checked present");
+    let key = key.expect("checked present");
+    let ca = ca.expect("checked present");
+    let dns = dns.expect("checked present");
+    Ok(Some((
+        bind,
+        ServiceIdentityConfig {
+            cert_chain_path: cert.into(),
+            private_key_path: key.into(),
+            ca_path: ca.into(),
+            expected_peer_dns: dns,
+        },
+    )))
 }
 
 /// Optional durable passkey credential store. When `PRIVATE_PASSKEY_STORE_PATH`
@@ -136,21 +169,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
     let opaque_state = production.state;
 
-    let relay_bind = std::env::var("PRIVATE_API_RELAY_BIND_ADDR").unwrap_or_default();
-    if !relay_bind.is_empty() {
-        if let Some(identity) = optional_relay_identity() {
-            let relay_address = parse_bind_addr(&relay_bind)?;
-            let tls = relay::server_tls_config(&identity)
-                .map_err(|_| std::io::Error::other("relay identity invalid"))?;
-            let relay_router = opaque::relay_tls_router_with(opaque_state, tls)
-                .map_err(|_| std::io::Error::other("relay TLS configuration invalid"))?;
-            tokio::spawn(async move {
-                // A failed relay listener must not take down the HTTP boundary;
-                // the edge already fails closed when the relay is unreachable.
-                let _ = relay_router.serve(relay_address).await;
-            });
-        }
+    let relay_identity = resolve_relay_config(
+        std::env::var("PRIVATE_API_RELAY_BIND_ADDR").ok(),
+        std::env::var("PRIVATE_API_TLS_CERT").ok(),
+        std::env::var("PRIVATE_API_TLS_KEY").ok(),
+        std::env::var("PRIVATE_API_TLS_CA").ok(),
+        std::env::var("PRIVATE_API_EDGE_DNS").ok(),
+    )?;
+    let relay_required = relay_identity.is_some();
+    let relay_ready = Arc::new(AtomicBool::new(false));
+    if let Some((relay_bind, identity)) = relay_identity {
+        let relay_address = parse_bind_addr(&relay_bind)?;
+        let tls = relay::server_tls_config(&identity)
+            .map_err(|_| std::io::Error::other("relay identity invalid"))?;
+        let relay_router = opaque::relay_tls_router_with(opaque_state, tls)
+            .map_err(|_| std::io::Error::other("relay TLS configuration invalid"))?;
+        // Bind before spawning so a bad address or taken port is a startup
+        // error rather than a hidden degraded process. Readiness flips true only
+        // once the listener exists, and back to false if serving dies.
+        let listener = tokio::net::TcpListener::bind(relay_address).await?;
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let ready_flag = relay_ready.clone();
+        tokio::spawn(async move {
+            ready_flag.store(true, Ordering::SeqCst);
+            if relay_router.serve_with_incoming(incoming).await.is_err() {
+                ready_flag.store(false, Ordering::SeqCst);
+            }
+        });
     }
+    let state = state.with_relay_readiness(relay_required, relay_ready);
 
     let bind =
         std::env::var("PRIVATE_API_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
@@ -170,6 +217,54 @@ mod tests {
         assert!(parse_bind_addr("[::1]:8081").is_ok());
         assert!(parse_bind_addr("0.0.0.0:8081").is_err());
         assert!(parse_bind_addr("192.0.2.1:8081").is_err());
+    }
+
+    #[test]
+    fn relay_configuration_is_strict_all_or_none() {
+        // Nothing supplied: the relay stays disabled and the HTTP boundary serves.
+        assert_eq!(
+            resolve_relay_config(None, None, None, None, None).unwrap(),
+            None
+        );
+        // A complete set resolves.
+        let (bind, identity) = resolve_relay_config(
+            Some("127.0.0.1:8443".into()),
+            Some("cert.pem".into()),
+            Some("key.pem".into()),
+            Some("ca.pem".into()),
+            Some("edge.internal".into()),
+        )
+        .unwrap()
+        .expect("complete relay config");
+        assert_eq!(bind, "127.0.0.1:8443");
+        assert_eq!(identity.expected_peer_dns, "edge.internal");
+        // A supplied bind with incomplete identity must refuse startup.
+        assert!(resolve_relay_config(
+            Some("127.0.0.1:8443".into()),
+            Some("cert.pem".into()),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        // An identity without a bind address must refuse startup.
+        assert!(resolve_relay_config(
+            None,
+            Some("cert.pem".into()),
+            Some("key.pem".into()),
+            Some("ca.pem".into()),
+            Some("edge.internal".into()),
+        )
+        .is_err());
+        // Present-but-blank values count as supplied and therefore incomplete.
+        assert!(resolve_relay_config(
+            Some("127.0.0.1:8443".into()),
+            Some("   ".into()),
+            Some("key.pem".into()),
+            Some("ca.pem".into()),
+            Some("edge.internal".into()),
+        )
+        .is_err());
     }
 
     #[test]

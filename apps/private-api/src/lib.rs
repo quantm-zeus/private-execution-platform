@@ -4,7 +4,10 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -31,11 +34,16 @@ use subtle::ConstantTimeEq;
 pub mod opaque;
 pub mod passkey_store;
 pub mod production;
+pub mod release;
 pub mod stream;
 pub mod web_contract;
 pub mod web_integration;
 
 pub use passkey_store::FilePasskeyCredentialStore;
+pub use release::{
+    ArtifactDescriptor, DescriptorError, EnrollmentSnapshot, ReleaseManifest, UnlockCompatibility,
+    RELEASE_MANIFEST_ENV, WORKSPACE_PROTOCOL_VERSION,
+};
 
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -277,6 +285,11 @@ pub struct PrivateApiState {
     /// "is another credential allowed?" decision, so the one-time bootstrap
     /// policy cannot be defeated by concurrent verifies.
     enrollment_lock: Arc<Mutex<()>>,
+    /// Whether the opaque relay is a required dependency of this process, and
+    /// the live ready flag set once its listener is bound. Kept separate from
+    /// liveness so a process with a dead relay is not reported healthy.
+    relay_required: bool,
+    relay_ready: Arc<AtomicBool>,
 }
 
 impl PrivateApiState {
@@ -298,6 +311,8 @@ impl PrivateApiState {
             enrollment_secret: None,
             allow_additional_credentials: false,
             enrollment_lock: Arc::new(Mutex::new(())),
+            relay_required: false,
+            relay_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -337,6 +352,35 @@ impl PrivateApiState {
         self.sessions.clone()
     }
 
+    /// Whether the operator bootstrap enrollment surface is actually open.
+    ///
+    /// True only when a bootstrap secret is configured *and* either additional
+    /// credentials are explicitly allowed or the durable store is still empty.
+    /// A store error is a fail-closed `false`, so the shell never renders
+    /// bootstrap controls against a store it cannot read.
+    pub fn enrollment_open(&self) -> bool {
+        if self.enrollment_secret.is_none() {
+            return false;
+        }
+        if self.allow_additional_credentials {
+            return true;
+        }
+        match self.authenticator.as_ref() {
+            Some(authenticator) => matches!(authenticator.has_credentials(), Ok(false)),
+            None => false,
+        }
+    }
+
+    /// Attach the opaque relay's readiness contract. `required` records that the
+    /// process was configured to serve the relay; `ready` is set once the
+    /// listener is actually bound, so `/ready` can fail while `/health` stays
+    /// live rather than reporting a degraded process as healthy.
+    pub fn with_relay_readiness(mut self, required: bool, ready: Arc<AtomicBool>) -> Self {
+        self.relay_required = required;
+        self.relay_ready = ready;
+        self
+    }
+
     #[cfg(test)]
     fn with_test_dependencies(
         config: PrivateApiConfig,
@@ -360,6 +404,8 @@ impl PrivateApiState {
             enrollment_secret: None,
             allow_additional_credentials: false,
             enrollment_lock: Arc::new(Mutex::new(())),
+            relay_required: false,
+            relay_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -373,7 +419,9 @@ impl PrivateApiState {
 pub fn router(state: PrivateApiState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/internal/auth/challenge", post(issue_challenge))
+        .route("/internal/auth/enrollment-status", get(enrollment_status))
         .route("/internal/auth/verify", post(verify_challenge))
         .route("/internal/auth/session", get(validate_session))
         .route(
@@ -389,6 +437,10 @@ pub fn router(state: PrivateApiState) -> Router {
             "/internal/workspace/enroll",
             post(enroll_workspace_key).get(get_workspace_enrollment_handler),
         )
+        .route(
+            "/internal/workspace/descriptor",
+            get(get_workspace_descriptor_handler),
+        )
         .route("/internal/artifact/grant", post(issue_artifact_grant))
         .route("/internal/artifact", post(deliver_artifact))
         .layer(DefaultBodyLimit::max(
@@ -401,6 +453,64 @@ pub fn router(state: PrivateApiState) -> Router {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+/// Dependency readiness, distinct from liveness. A process that is running but
+/// whose required opaque relay never bound, whose artifact/release manifest is
+/// unreadable or incompatible, or whose passkey store cannot be read is NOT
+/// ready. Reports a generic per-dependency boolean map and nothing else.
+async fn readiness(State(state): State<PrivateApiState>) -> Response {
+    let relay_ok = if state.relay_required {
+        state.relay_ready.load(Ordering::SeqCst)
+    } else {
+        true
+    };
+    let (artifact_ok, manifest_ok) = match (state.artifact_loader)() {
+        Ok(artifact) => {
+            // Cheap structural check: a malformed artifact is not ready even
+            // when no manifest is configured, without hashing the whole file.
+            let header_ok = crypto_envelope::ArtifactEnvelope::from_bytes(&artifact).is_ok();
+            match release::load_release_manifest_from_env() {
+                Ok(Some(manifest)) => (
+                    header_ok,
+                    header_ok && manifest.validate_against(&artifact).is_ok(),
+                ),
+                Ok(None) => (header_ok, true),
+                Err(_) => (header_ok, false),
+            }
+        }
+        Err(_) => (false, false),
+    };
+    let passkey_store_ok = match state.authenticator.as_ref() {
+        Some(authenticator) => authenticator.has_credentials().is_ok(),
+        None => true,
+    };
+    let ready = relay_ok && artifact_ok && manifest_ok && passkey_store_ok;
+    let body = serde_json::json!({
+        "ready": ready,
+        "checks": {
+            "relay": relay_ok,
+            "artifact": artifact_ok,
+            "release_manifest": manifest_ok,
+            "passkey_store": passkey_store_ok,
+        }
+    })
+    .to_string();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    no_store((status, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
+/// Unauthenticated, non-secret bootstrap probe: tells the clear shell whether
+/// first-run passkey enrollment is actually open, so it can hide bootstrap
+/// controls instead of inviting a dead ceremony. It exposes a single boolean
+/// and nothing about the credential store's contents.
+async fn enrollment_status(State(state): State<PrivateApiState>) -> Response {
+    let body = serde_json::json!({ "enrollment_open": state.enrollment_open() }).to_string();
+    no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
 }
 
 async fn issue_challenge(State(state): State<PrivateApiState>) -> Response {
@@ -930,6 +1040,91 @@ async fn get_workspace_enrollment_handler(
     }
 }
 
+/// Result of looking up the session's workspace enrollment. Kept distinct from
+/// "not enrolled" so an internal/auth failure is never reported as a policy
+/// state the client could retry by re-entering a code.
+enum EnrollmentLookup {
+    Enrolled(EnrollmentSnapshot),
+    NotEnrolled,
+    Unavailable,
+}
+
+/// Owned snapshot of the session's workspace enrollment. The auth lock is
+/// released before the caller does any artifact I/O.
+fn enrollment_snapshot(
+    state: &PrivateApiState,
+    session_id: &SessionId,
+    now: i64,
+) -> EnrollmentLookup {
+    let Ok(auth) = state.auth.lock() else {
+        return EnrollmentLookup::Unavailable;
+    };
+    match auth.get_workspace_enrollment(session_id, now) {
+        Ok(metadata) => EnrollmentLookup::Enrolled(EnrollmentSnapshot {
+            version: metadata.version(),
+            kid: *metadata.kid(),
+            public_key: *metadata.public_key(),
+        }),
+        Err(AuthError::EnrollmentNotFound) => EnrollmentLookup::NotEnrolled,
+        Err(_) => EnrollmentLookup::Unavailable,
+    }
+}
+
+/// Privacy-safe typed error: a generic machine code the shell can map to a
+/// recovery stage, with no exception text, path, key, ciphertext, or secret.
+fn typed_error(status: StatusCode, code: &'static str) -> Response {
+    no_store(
+        (
+            status,
+            [(header::CONTENT_TYPE, CONTENT_TYPE)],
+            serde_json::json!({ "code": code }).to_string(),
+        )
+            .into_response(),
+    )
+}
+
+/// Authenticated artifact/release descriptor. Exposes only public metadata:
+/// artifact version, KID, release id, digests, expected recipient public-key
+/// fingerprint, and protocol compatibility. The shell uses the KID to derive
+/// the workspace key automatically, so a normal user never types a KID.
+async fn get_workspace_descriptor_handler(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let artifact = match (state.artifact_loader)() {
+        Ok(artifact) => artifact,
+        Err(status) => return generic_error(status),
+    };
+    let manifest = match release::load_release_manifest_from_env() {
+        Ok(manifest) => manifest,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let descriptor = match release::describe(&artifact, manifest.as_ref()) {
+        Ok(descriptor) => descriptor,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let enrollment = match enrollment_snapshot(&state, &session_id, now) {
+        EnrollmentLookup::Enrolled(snapshot) => Some(snapshot),
+        EnrollmentLookup::NotEnrolled => None,
+        EnrollmentLookup::Unavailable => {
+            return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+        }
+    };
+    let descriptor = descriptor.with_enrollment(enrollment.as_ref());
+    let body = match serde_json::to_vec(&descriptor) {
+        Ok(body) => body,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
 const ARTIFACT_GRANT_COOKIE_NAME: &str = "__Host-evergreen_grant";
 const MAX_OFFER_BYTES: usize = 4096;
 /// Envelope overhead for a delivered artifact: kid (16) + nonce (12) + sequence (8).
@@ -1120,6 +1315,32 @@ async fn deliver_artifact(
     };
     if artifact.len() > MAX_ARTIFACT_BYTES.saturating_sub(ENVELOPE_OVERHEAD_BYTES) {
         return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    // Compatibility preflight (F1/F7/F10): never wrap and deliver an artifact
+    // that cannot be decrypted by the workspace enrollment bound to this
+    // session, and never serve a release whose manifest does not describe these
+    // exact bytes. This rejects the production KID/stale-artifact class of
+    // failure before any transport crypto runs, and it compares only public
+    // metadata so it is not a secret-validation oracle.
+    let manifest = match release::load_release_manifest_from_env() {
+        Ok(manifest) => manifest,
+        Err(_) => return clear_grant(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+    };
+    let enrollment = match enrollment_snapshot(&state, &pending_grant.session_id, now) {
+        EnrollmentLookup::Enrolled(snapshot) => Some(snapshot),
+        EnrollmentLookup::NotEnrolled => None,
+        EnrollmentLookup::Unavailable => {
+            return clear_grant(clear_session(generic_error(StatusCode::UNAUTHORIZED)));
+        }
+    };
+    match release::preflight(&artifact, enrollment.as_ref(), manifest.as_ref()) {
+        release::UnlockCompatibility::Ok => {}
+        release::UnlockCompatibility::EnrollmentRequired => {
+            return clear_grant(typed_error(StatusCode::CONFLICT, "enrollment_required"));
+        }
+        release::UnlockCompatibility::ArtifactIncompatible => {
+            return clear_grant(typed_error(StatusCode::CONFLICT, "artifact_incompatible"));
+        }
     }
     let encapsulated = match decode_encapsulated_key(&request) {
         Ok(encapsulated) => encapsulated,
@@ -1325,7 +1546,7 @@ fn too_many_requests() -> Response {
     )
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -2864,6 +3085,79 @@ mod tests {
 
     // ---- P0-4 artifact delivery tests ----
 
+    /// Derive a deterministic workspace keypair for artifact tests.
+    fn test_keypair(secret_byte: u8, kid_byte: u8) -> crypto_envelope::WorkspaceUnlockKeyPair {
+        let secret = [secret_byte; crypto_envelope::UNLOCK_SECRET_LEN];
+        let kid = [kid_byte; auth::WORKSPACE_KID_BYTES];
+        crypto_envelope::derive_workspace_keypair(&secret, auth::ARTIFACT_VERSION, &kid).unwrap()
+    }
+
+    /// Pack files in the exact custom package format the shell unpacks
+    /// (`u32 count || {u16 pathLen, u32 dataLen, path, data}*`). This is the
+    /// production package layout, so a test that seals this is exercising the
+    /// same stage-6 bytes the browser will receive.
+    fn pack_test_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(files.len() as u32).to_be_bytes());
+        for (path, data) in files {
+            out.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// Mirror of the browser package unpack so a test can prove stage 6
+    /// (`unpackPackageFromMemory`) succeeds on the delivered bytes.
+    fn unpack_test_package(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        assert!(bytes.len() >= 4);
+        let count = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut offset = 4usize;
+        let mut files = Vec::with_capacity(count);
+        for _ in 0..count {
+            let path_len =
+                u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            let data_len =
+                u32::from_be_bytes(bytes[offset + 2..offset + 6].try_into().unwrap()) as usize;
+            offset += 6;
+            let path =
+                String::from_utf8(bytes[offset..offset + path_len].to_vec()).expect("utf8 path");
+            offset += path_len;
+            let data = bytes[offset..offset + data_len].to_vec();
+            offset += data_len;
+            files.push((path, data));
+        }
+        assert_eq!(offset, bytes.len(), "package must be exactly consumed");
+        files
+    }
+
+    /// Authenticated workspace enrollment for a test session.
+    async fn enroll_test_workspace(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+    ) {
+        let body = serde_json::json!({
+            "version": auth::ARTIFACT_VERSION,
+            "kid": base64_encode(&keypair.kid()),
+            "public_key": base64_encode(&keypair.public_key_bytes()),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/workspace/enroll")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, session_cookie.to_string())
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// Full ceremony helper: verify -> session cookie -> grant cookie + grant id.
     /// Builds the client-side initiator half against the server's published
     /// per-grant offer (base64 kid + recipient public key).
@@ -3054,7 +3348,22 @@ mod tests {
         let (state, client) = test_state(clock);
         let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
             establish_session_and_grant(&state, &client).await;
-        let artifact_bytes = vec![0xABu8; 4096];
+        // Production-shaped artifact: a custom package sealed to the workspace
+        // public key the session enrolls, so the compatibility preflight passes
+        // and stage-6 unpack can be asserted on the delivered bytes.
+        let keypair = test_keypair(0x5a, 0x6b);
+        let package = pack_test_files(&[
+            ("index.html", b"<main>workspace</main>"),
+            ("assets/app.js", b"console.log(1)"),
+        ]);
+        let artifact_bytes = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
         let artifact_copy = artifact_bytes.clone();
         let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
 
@@ -3117,15 +3426,32 @@ mod tests {
         };
         let plaintext = initiator.receive(&envelope).unwrap();
         assert_eq!(plaintext, artifact_bytes);
+        let decrypted = crypto_envelope::decrypt_artifact(&keypair, &plaintext).unwrap();
+        let files = unpack_test_package(&decrypted);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "index.html");
+        assert_eq!(files[0].1, b"<main>workspace</main>");
+        assert_eq!(files[1].0, "assets/app.js");
     }
 
     #[tokio::test]
     async fn artifact_grant_is_single_use_and_session_bound() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let (state, client) = test_state(clock);
-        let state = state.with_artifact_loader(Arc::new(|| Ok(b"opaque-ciphertext".to_vec())));
+        let keypair = test_keypair(0x11, 0x22);
+        let package = pack_test_files(&[("index.html", b"workspace")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
         let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
             establish_session_and_grant(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
 
         let (encapsulated, _initiator) = establish_initiator(&server_kid, &server_pk);
         let body = serde_json::json!({
@@ -3472,7 +3798,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp1.status(), StatusCode::OK);
 
-        // Duplicate enrollment on same session rejected with 409 Conflict
+        // Re-enrolling the identical binding is idempotent (page reload or a
+        // lock/unlock cycle in the same session), so a second unlock is not
+        // rejected with 409.
         let resp2 = router(state.clone())
             .oneshot(
                 Request::builder()
@@ -3485,7 +3813,12 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp2.status(), StatusCode::CONFLICT);
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let resp2_body = resp2.into_body().collect().await.unwrap().to_bytes();
+        let parsed: WorkspaceEnrollmentResponse = serde_json::from_slice(&resp2_body).unwrap();
+        assert!(parsed.enrolled);
+        assert_eq!(parsed.kid, base64_encode(&kid));
+        assert_eq!(parsed.public_key, base64_encode(&pk));
 
         // Conflicting enrollment (different public key) on same session also rejected with 409 Conflict
         let conflict_body = serde_json::json!({
@@ -3834,5 +4167,325 @@ mod tests {
         let last_byte = tampered_artifact.len() - 1;
         tampered_artifact[last_byte] ^= 0x01;
         assert!(crypto_envelope::decrypt_artifact(&keypair, &tampered_artifact).is_err());
+    }
+
+    // ---- F1/F7/F10 compatibility preflight + descriptor tests ----
+
+    async fn deliver_artifact_request(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        grant_cookie: &str,
+        grant_id: &str,
+        server_kid: &str,
+        server_pk: &str,
+    ) -> (StatusCode, axum::body::Bytes) {
+        let (encapsulated, _initiator) = establish_initiator(server_kid, server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_rejects_kid_mismatch_before_transport() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        // Enrollment uses kid A; the artifact on disk was sealed under kid B.
+        // This is the production class of failure: delivery must be rejected
+        // with a typed code before any outer HPKE wrapping happens.
+        let enrolled = test_keypair(0x5a, 0x01);
+        let sealed_under = test_keypair(0x5a, 0x02);
+        let package = pack_test_files(&[("index.html", b"workspace")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &sealed_under.public_key(),
+            auth::ARTIFACT_VERSION,
+            &sealed_under.kid(),
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &enrolled).await;
+
+        let (status, body) = deliver_artifact_request(
+            &state,
+            &session_cookie,
+            &grant_cookie,
+            &grant_id,
+            &server_kid,
+            &server_pk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["code"], "artifact_incompatible");
+        assert!(body.len() < 4096, "error body must be bounded");
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_requires_an_enrollment() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let keypair = test_keypair(0x5a, 0x03);
+        let package = pack_test_files(&[("index.html", b"workspace")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        // Deliberately skip enrollment.
+        let (status, body) = deliver_artifact_request(
+            &state,
+            &session_cookie,
+            &grant_cookie,
+            &grant_id,
+            &server_kid,
+            &server_pk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["code"], "enrollment_required");
+    }
+
+    #[tokio::test]
+    async fn workspace_descriptor_exposes_only_public_release_metadata() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let keypair = test_keypair(0x5a, 0x04);
+        let package = pack_test_files(&[("index.html", b"workspace")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+        let session_cookie = establish_authenticated_session(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/descriptor")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let descriptor: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(descriptor["protocol_version"], 1);
+        assert_eq!(descriptor["artifact_version"], auth::ARTIFACT_VERSION);
+        assert_eq!(
+            descriptor["artifact_kid_b64"],
+            base64_encode(&keypair.kid())
+        );
+        assert_eq!(descriptor["package_format_version"], 1);
+        assert_eq!(descriptor["enrolled"], true);
+        // The descriptor must never carry ciphertext, paths or secrets.
+        assert!(descriptor.get("artifact_bytes").is_none());
+        assert!(descriptor.get("path").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_descriptor_requires_authentication() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/descriptor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Production-faithful loader test: the artifact is read from
+    /// `WORKSPACE_ARTIFACT_PATH` by the real `load_workspace_artifact`, wrapped
+    /// in the real transport HPKE envelope over the real routes, then decrypted
+    /// and unpacked with the production package layout.
+    #[tokio::test]
+    async fn production_artifact_loader_delivers_and_unpacks_a_real_package() {
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        // No loader override: `test_state` keeps the real `load_workspace_artifact`.
+        let (state, client) = test_state(clock);
+        let keypair = test_keypair(0x77, 0x88);
+        let package = pack_test_files(&[
+            (
+                "index.html",
+                b"<!doctype html><html><body>boot</body></html>",
+            ),
+            ("assets/index-abc.js", b"export const boot = true;"),
+        ]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir.path().join("workspace.artifact");
+        std::fs::write(&artifact_path, &artifact).unwrap();
+
+        let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &artifact_path);
+
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+
+        // Re-run the client HPKE establishment so the response can be opened.
+        let (encapsulated, mut initiator) = establish_initiator(&server_kid, &server_pk);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "kid": server_kid,
+            "encapsulated_key": base64(&encapsulated.0),
+        });
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/artifact")
+                    .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+                    .header(header::COOKIE, format!("{session_cookie}; {grant_cookie}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let delivered = response.into_body().collect().await.unwrap().to_bytes();
+
+        // Restore the environment before asserting so a failure cannot leak the
+        // test path into sibling tests.
+        match previous {
+            Some(value) => std::env::set_var("WORKSPACE_ARTIFACT_PATH", value),
+            None => std::env::remove_var("WORKSPACE_ARTIFACT_PATH"),
+        }
+
+        assert_eq!(status, StatusCode::OK);
+        let envelope = crypto_envelope::Envelope {
+            kid: delivered[..16].try_into().unwrap(),
+            nonce: delivered[16..28].try_into().unwrap(),
+            sequence: u64::from_be_bytes(delivered[28..36].try_into().unwrap()),
+            ciphertext: delivered[36..].to_vec(),
+        };
+        let delivered_artifact = initiator.receive(&envelope).unwrap();
+        assert_eq!(delivered_artifact, artifact);
+        let decrypted = crypto_envelope::decrypt_artifact(&keypair, &delivered_artifact).unwrap();
+        assert_eq!(decrypted, package);
+        let files = unpack_test_package(&decrypted);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "index.html");
+        assert!(files[0].1.starts_with(b"<!doctype html>"));
+        assert_eq!(files[1].0, "assets/index-abc.js");
+    }
+
+    // ---- F5 relay readiness tests ----
+
+    #[tokio::test]
+    async fn readiness_separates_liveness_from_dependency_health() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, _client) = test_state(clock);
+        let keypair = test_keypair(0x91, 0x92);
+        let package = pack_test_files(&[("index.html", b"ok")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &keypair.public_key(),
+            auth::ARTIFACT_VERSION,
+            &keypair.kid(),
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+
+        let get = |app: Router, path: &'static str| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // Liveness is unconditional; readiness reflects dependencies.
+        assert_eq!(
+            get(router(state.clone()), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(router(state.clone()), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], true);
+        assert_eq!(parsed["checks"]["relay"], true);
+
+        // Relay required but not yet bound: not ready, while liveness stays 200.
+        let relay_flag = Arc::new(AtomicBool::new(false));
+        let degraded = state.clone().with_relay_readiness(true, relay_flag.clone());
+        assert_eq!(
+            get(router(degraded), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(
+            router(state.clone().with_relay_readiness(true, relay_flag)),
+            "/ready",
+        )
+        .await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Artifact unavailable: not ready.
+        let broken = state
+            .clone()
+            .with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)));
+        assert_eq!(
+            get(router(broken), "/ready").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

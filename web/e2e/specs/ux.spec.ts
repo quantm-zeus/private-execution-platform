@@ -67,6 +67,34 @@ test.describe("accessibility", () => {
     }
     expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
   });
+
+  // Security and confirmation surfaces gate at moderate-or-worse: a moderate
+  // accessibility defect on a kill-switch/recovery control is release-relevant
+  // even when it is not "serious".
+  test("security view has no moderate-or-worse axe violations", async ({ page, request }) => {
+    await bootLive(page, request);
+    await page.addScriptTag({ url: "/__test__/axe.min.js" });
+    await page.locator('button[data-view="security"]').click();
+    await page.waitForTimeout(60);
+    const violations = await page.evaluate(async () => {
+      const axe = (window as unknown as { axe: { run: (ctx: Document, opts: unknown) => Promise<{ violations: { id: string; impact: string; nodes: { target: string[]; failureSummary?: string; html: string }[] }[] }> } }).axe;
+      const result = await axe.run(document, { resultTypes: ["violations"] });
+      return result.violations.map((violation) => ({
+        id: violation.id,
+        impact: violation.impact,
+        nodes: violation.nodes.length,
+        samples: violation.nodes.slice(0, 3).map((node) => ({
+          target: node.target,
+          html: node.html,
+          summary: node.failureSummary,
+        })),
+      }));
+    });
+    const moderate = violations.filter((violation) =>
+      ["moderate", "serious", "critical"].includes(violation.impact),
+    );
+    expect(moderate, JSON.stringify(moderate, null, 2)).toEqual([]);
+  });
 });
 
 test.describe("performance budgets (local harness)", () => {

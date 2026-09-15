@@ -2008,6 +2008,7 @@ dependencies = [
  "serde_json",
  "service-identity",
  "session-transport",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
  "tokio",

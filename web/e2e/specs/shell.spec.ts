@@ -40,8 +40,10 @@ test.beforeAll(async () => {
 
 async function unlock(page: import("@playwright/test").Page, info: { secretB64?: string; kidB64?: string }) {
   await page.goto(`${SHELL_ORIGIN}/`);
-  await page.locator("#unlock-secret").fill(info.secretB64!);
-  await page.locator("#unlock-kid").fill(info.kidB64!);
+  // The host reports an existing operator session, so the descriptor loads
+  // automatically and only the offline recovery code is required. The KID is
+  // never typed: it comes from the authenticated descriptor.
+  await page.locator("#recovery-code").fill(info.secretB64!);
   await page.getByRole("button", { name: "Unlock Workspace" }).click();
   // The payload may announce readiness and overwrite the status text, so wait for
   // the instantiated frame itself rather than a transient status string.
@@ -91,14 +93,33 @@ test.describe("shell artifact unlock", () => {
     test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
 
     await page.goto(`${SHELL_ORIGIN}/`);
-    await page.locator("#unlock-secret").fill(Buffer.alloc(32, 9).toString("base64"));
-    await page.locator("#unlock-kid").fill(info.kidB64!);
+    await page.locator("#recovery-code").fill(Buffer.alloc(32, 9).toString("base64"));
     await page.getByRole("button", { name: "Unlock Workspace" }).click();
 
-    await expect(page.getByText(/unlock failed|workspace unavailable/i)).toBeVisible({
-      timeout: 20_000,
-    });
+    // The published release fingerprint lets the shell reject the wrong code
+    // locally, before any network call, with actionable recovery guidance.
+    await expect(
+      page.getByText(/does not match the published release|unlock failed/i),
+    ).toBeVisible({ timeout: 20_000 });
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
+    await expect(page.locator("#recovery-code")).toHaveCount(1);
+  });
+
+  test("shows an explicit open action, never a KID field, and no passkey on mount", async ({ page }) => {
+    // Force a signed-out operator session for this page only.
+    await page.route("**/internal/auth/session", (route) =>
+      route.fulfill({ status: 401, body: "" }),
+    );
+    await page.goto(`${SHELL_ORIGIN}/`);
+
+    await expect(
+      page.getByRole("button", { name: "Open Private Workspace" }),
+    ).toBeVisible();
+    // No manual Key ID anywhere in the normal flow.
+    await expect(page.locator("#unlock-kid")).toHaveCount(0);
+    await expect(page.locator("#kid")).toHaveCount(0);
+    // The unlock form is not offered until the operator acts.
+    await expect(page.locator("#recovery-code")).toHaveCount(0);
   });
 
   test("honours a lock request from the decrypted payload", async ({ page, request }) => {

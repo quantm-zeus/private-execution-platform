@@ -663,9 +663,12 @@ client. It converts the server's `RequestChallengeResponse` /
 the same-origin `/internal/auth/verify` / `/internal/auth/register/verify`
 routes. It uses `credentials: "same-origin"` (the perimeter session and the
 `__Host-` cookies depend on it), persists nothing, and never logs or interpolates
-credential material or the enrollment secret. `index.tsx` runs the
-authentication on mount and offers the operator enrollment form; the session is
-an HttpOnly cookie the shell cannot read.
+credential material or the enrollment secret. `index.tsx` never triggers a
+passkey ceremony on mount: it probes `GET /internal/auth/session` and
+`GET /internal/auth/enrollment-status`, and only the explicit **Open Private
+Workspace** action starts WebAuthn. Bootstrap enrollment controls render only
+when the server reports `enrollment_open: true`. The session is an HttpOnly
+cookie the shell cannot read.
 
 Because every request is same-origin, the operator's single-origin gateway
 (`127.0.0.1:8090`: `/internal/*` → private-api, `/v1/*` → edge, requiring
@@ -691,3 +694,100 @@ navigation, and `connect-src 'self'` already permits it.
 - `scripts/verify-web-boundary.mjs`: the shell first-party path allowlist now
   includes the audited `/internal/auth/{challenge,verify}` and
   `/internal/auth/register/{challenge,verify}` routes.
+
+## Workspace unlock contract (descriptor, compatibility, immutable release)
+
+The unlock path no longer requires a manual Key ID and no longer collapses every
+failure into one message.
+
+### Authenticated artifact descriptor
+
+`GET /internal/workspace/descriptor` (authenticated session required) returns only
+public release metadata: `protocol_version`, `artifact_version`,
+`artifact_kid_b64`, `artifact_size`, `artifact_sha256_hex`,
+`package_format_version`, `release_id`, `source_sha`,
+`expected_public_key_fingerprint_b64` (when a release manifest is configured),
+the workspace protocol range, and the current session's enrollment state. A
+normal user never types a KID: the shell discovers it from the descriptor,
+derives the workspace key locally, and compares its SHA-256 public-key
+fingerprint with the published value before the first network call.
+
+`GET /internal/auth/enrollment-status` is an unauthenticated, non-secret probe
+returning `{ "enrollment_open": bool }`. It is true only when a bootstrap secret
+is configured and either additional credentials are explicitly allowed or the
+durable store is still empty. A store read error is a fail-closed `false`.
+
+### Compatibility preflight before delivery
+
+`POST /internal/artifact` now refuses to wrap and deliver an artifact that cannot
+be decrypted by the session's published workspace enrollment. It parses the
+bounded artifact header and compares it with the session enrollment
+(version/KID) and, when a manifest is configured, the recipient public-key
+fingerprint. Failures return a bounded typed body `{ "code": ... }`:
+
+- `409 enrollment_required` — the session has not published a workspace key.
+- `409 artifact_incompatible` — KID/version/fingerprint mismatch or a release
+  manifest that does not describe these exact bytes.
+
+The check consumes only public metadata, so it is never an oracle for validating
+the unlock secret. It rejects the production class where the delivered artifact
+was sealed under a different KID than the browser enrolled, *before* any
+transport crypto runs.
+
+Enrollment is idempotent for the *identical* binding: re-posting the same
+version/KID/public-key on the same session returns the existing metadata instead
+of `409`, so a page reload or a lock/unlock cycle within one session is not
+rejected. A different binding for the same session still conflicts. The shell
+also skips the enroll request when the descriptor already reports a matching
+enrollment.
+
+### Immutable release manifest and atomic publication
+
+`scripts/workspace-release.mjs` builds `releases/<release-id>/` containing
+`manifest.json`, `workspace.artifact` (0600) and `shell/`, validates the whole
+directory, then atomically renames the `current` symlink onto it. The previous
+target is retained as `previous`, so `rollback` is a second atomic rename and a
+released directory is never rewritten. `manifest.json` binds the source SHA,
+artifact version/KID/size/SHA-256, recipient public-key fingerprint, package
+format version, workspace protocol range and shell asset digest.
+`validate`/`readRelease` recompute the shell tree digest and compare it with
+`manifest.shell.asset_digest_hex`, and `switchCurrent` validates a release before
+pointing `current` at it, so a tampered shell tree is refused even though the
+private API never serves the shell itself.
+
+`apps/private-api/src/release.rs` reads `WORKSPACE_RELEASE_MANIFEST` on every
+request (no in-process cache) and validates it against the exact artifact bytes
+read from `WORKSPACE_ARTIFACT_PATH`. Shell HTML is served `no-store,
+must-revalidate`; hashed assets under `/assets/*` may be `public,
+max-age=31536000, immutable` (`_headers` is written into the release).
+
+```
+node scripts/workspace-release.mjs build    --root /var/lib/evergreen/releases
+node scripts/workspace-release.mjs validate --root /var/lib/evergreen/releases
+node scripts/workspace-release.mjs current  --root /var/lib/evergreen/releases
+node scripts/workspace-release.mjs rollback --root /var/lib/evergreen/releases
+```
+
+### Privacy-safe unlock stages
+
+`web/workspace-shell/src/unlock-stages.ts` classifies every failure as exactly
+one stage — `U1_WASM`, `U2_ENROLL`, `U3_GRANT`, `U4_TRANSPORT`, `U5_ARTIFACT`,
+`U6_PACKAGE`, `U7_BOOT` — plus a small machine reason. `UnlockError` carries only
+the stage/reason and a fixed generic message; caught exception text, secrets,
+KIDs, paths and ciphertext are never propagated. `index.tsx` clears the recovery
+code input and its reactive signal before the first network await, decodes to a
+`Uint8Array` in the shortest possible scope, and passes bytes (not a retained
+string) into `WorkspaceUnlockRuntime.unlock`. JavaScript string zeroization
+remains best-effort; the byte copy is zeroized in a `finally`.
+
+### Relay readiness and bind guards
+
+`apps/private-api` relay configuration is strict all-or-none: supplying
+`PRIVATE_API_RELAY_BIND_ADDR` with an incomplete identity (or any identity value
+without a bind) refuses startup. The relay listener is bound before it is
+spawned, so a bad address is a startup error, and `/ready` reports dependency
+readiness (relay bound, artifact readable, manifest valid, passkey store
+readable) distinct from `/health` liveness. `apps/edge-gateway` refuses a
+non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
+validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
+bypass that, so the loopback deployment mitigation cannot be widened silently.

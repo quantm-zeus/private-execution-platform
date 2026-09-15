@@ -3,10 +3,15 @@
 // Invariants:
 // - Audited WASM only: derives workspace public key in WASM memory, uses
 //   WasmInitiatorSession for transport decrypt and WasmWorkspaceKey for artifact decrypt.
-// - Ephemeral: unlock secret is zeroized immediately after key derivation in WASM.
+// - Ephemeral: the unlock secret is passed as bytes and zeroized immediately
+//   after key derivation in WASM. Callers must not hand over a retained string.
 // - No persistence: zero usage of client-side persistent storage, browser databases,
 //   cache storage, or document cookies.
-// - No leakage: no secrets, keys, or plaintext interpolated into errors or logged.
+// - No leakage: every stage failure is a typed UnlockError carrying only a
+//   stage and reason. No secret, key, KID, path, ciphertext, or exception text
+//   is interpolated into an error or logged.
+// - Compatibility: the artifact KID and expected recipient fingerprint come
+//   from the authenticated descriptor, never from user input.
 // - Memory-only payload: unpacks payload archive in memory, instantiates via Blob URLs.
 // - Cleanup: revokes all Blob URLs and scrubs RAM references on lock/unload/error.
 
@@ -16,6 +21,11 @@ import init, {
   WasmWorkspaceKey,
 } from "./wasm/crypto-envelope-wasm.js";
 import { HandoffGate, type ShellSessionKeys } from "./handoff-gate.ts";
+import {
+  WORKSPACE_PROTOCOL_VERSION,
+  type WorkspaceDescriptor,
+} from "./descriptor.ts";
+import { UnlockError, type UnlockStage } from "./unlock-stages.ts";
 
 export type { ShellSessionKeys } from "./handoff-gate.ts";
 
@@ -27,7 +37,6 @@ export function loadWasm(moduleOrPath?: unknown): Promise<unknown> {
   }
   return wasmReady;
 }
-
 
 const BASE64_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -79,6 +88,27 @@ export function fromBase64(str: string): Uint8Array {
     }
   }
   return out;
+}
+
+/**
+ * SHA-256 fingerprint of a workspace public key, standard base64.
+ *
+ * Matches the server's `public_key_fingerprint_b64`. Returns `null` when
+ * WebCrypto is unavailable so a missing digest API can never silently accept a
+ * mismatched key: the caller only uses this for an *additional* local
+ * preflight, and the server independently enforces the same check.
+ */
+export async function publicKeyFingerprintB64(
+  publicKey: Uint8Array,
+): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || typeof subtle.digest !== "function") return null;
+  try {
+    const digest = await subtle.digest("SHA-256", publicKey as unknown as BufferSource);
+    return toBase64(new Uint8Array(digest));
+  } catch {
+    return null;
+  }
 }
 
 export function unpackPackageFromMemory(
@@ -204,6 +234,37 @@ export interface UnlockOptions {
   grantUrl?: string;
   deliverUrl?: string;
   fetchFn?: typeof fetch;
+  /** Progress callback: receives each stage as it begins. */
+  onStage?: (stage: UnlockStage) => void;
+  /**
+   * Test seam for the audited WASM loader. Production never sets this; it lets
+   * a focused test prove a loader failure is classified as U1_WASM without
+   * weakening the real boundary.
+   */
+  wasmLoader?: () => Promise<unknown>;
+}
+
+/** Read a typed `{ code }` error body without ever throwing or leaking it. */
+async function readErrorCode(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.json()) as { code?: unknown };
+    return typeof body?.code === "string" ? body.code : null;
+  } catch {
+    return null;
+  }
+}
+
+function artifactKidBytes(descriptor: WorkspaceDescriptor): Uint8Array {
+  let kidBytes: Uint8Array;
+  try {
+    kidBytes = fromBase64(descriptor.artifact_kid_b64);
+  } catch {
+    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
+  }
+  if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) {
+    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
+  }
+  return kidBytes;
 }
 
 export class WorkspaceUnlockRuntime {
@@ -239,14 +300,8 @@ export class WorkspaceUnlockRuntime {
    * One-shot, token-bound BR-5 key delivery.
    *
    * Returns the keys only when `token` matches the per-unlock token injected
-   * into the payload document, and only once. A document that navigated into the
-   * frame (or a repointed `frame.src`) cannot echo the token, so an
-   * unauthenticated `workspace-ready` ping can no longer harvest the live
-   * session keys. Returns `null` on a missing/mismatched token, before unlock,
-   * after lock, or on a repeat call.
-   *
-   * There is deliberately no unguarded key accessor: the only way to obtain the
-   * keys is through this token-and-one-shot gate.
+   * into the payload document, and only once. There is deliberately no
+   * unguarded key accessor.
    */
   public takeSessionKeysForHandoff(token: unknown): ShellSessionKeys | null {
     return this.handoff.take(token);
@@ -254,13 +309,6 @@ export class WorkspaceUnlockRuntime {
 
   /**
    * Revoke the payload *document* blob URL once the frame has loaded it.
-   *
-   * The loaded document stays live in the frame and its subresource blob URLs
-   * remain valid, but the document URL is no longer fetchable. That closes the
-   * same-origin path where a document that navigated into the frame reads
-   * `frame.src` from the parent and re-fetches the still-live document blob to
-   * harvest the injected handoff token. The token itself is never the boundary;
-   * this removes the copy an attacker could otherwise read.
    */
   public releaseDocumentUrl(url: string): void {
     if (!url) return;
@@ -268,177 +316,300 @@ export class WorkspaceUnlockRuntime {
     this.activeUrls.delete(url);
   }
 
+  /**
+   * Unlock the workspace.
+   *
+   * `secretInput` is a 32-byte byte array; the caller clears the DOM input and
+   * its reactive signal before calling. Only bytes cross the async boundary and
+   * this method copies them, so the caller's buffer is never zeroized. The KID
+   * and expected fingerprint come from the authenticated descriptor, never from
+   * user input. Every failure throws a typed `UnlockError`.
+   */
   public async unlock(
-    secretInput: string | Uint8Array,
-    kidInput: string | Uint8Array,
+    secretInput: Uint8Array,
+    descriptor: WorkspaceDescriptor,
     options: UnlockOptions = {},
   ): Promise<UnlockResult> {
     this.lock();
 
-    await loadWasm();
-
+    const onStage = options.onStage ?? (() => {});
+    // Copy so zeroization never mutates a caller-owned buffer.
+    const secretBytes = new Uint8Array(secretInput);
     const fetchImpl = options.fetchFn || fetch;
     const enrollEndpoint = options.enrollUrl || "/internal/auth/enroll";
     const grantEndpoint = options.grantUrl || "/internal/artifact/grant";
     const deliverEndpoint = options.deliverUrl || "/internal/artifact";
-
-    const secretBytes =
-      typeof secretInput === "string"
-        ? fromBase64(secretInput)
-        : new Uint8Array(secretInput);
-    if (secretBytes.length !== 32 || secretBytes.every((b) => b === 0)) {
-      secretBytes.fill(0);
-      throw new Error("Invalid unlock secret: must be 32 non-zero bytes");
-    }
-
-    // Parse the kid inside a guard that zeroizes the already-derived secret if
-    // the kid encoding is malformed, so a throw cannot leave it resident.
-    let kidBytes: Uint8Array;
-    try {
-      kidBytes =
-        typeof kidInput === "string"
-          ? fromBase64(kidInput)
-          : new Uint8Array(kidInput);
-    } catch (error) {
-      secretBytes.fill(0);
-      throw error;
-    }
-    if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) {
-      secretBytes.fill(0);
-      throw new Error("Invalid key ID: must be 16 non-zero bytes");
-    }
 
     let workspaceKey: WasmWorkspaceKey | null = null;
     let initiator: WasmInitiatorSession | null = null;
     let unlocked = false;
 
     try {
-      const version = 1;
-      workspaceKey = new WasmWorkspaceKey(secretBytes, version, kidBytes);
-      // The raw secret is only needed to derive the workspace key in WASM;
-      // zero it immediately rather than leaving it in the JS heap across the
-      // network fetches, HPKE decrypt and payload instantiation below.
+      if (secretBytes.length !== 32 || secretBytes.every((b) => b === 0)) {
+        throw new UnlockError("U2_ENROLL", "invalid_secret");
+      }
+      if (
+        descriptor.artifact_version !== 1 ||
+        descriptor.package_format_version !== 1
+      ) {
+        throw new UnlockError("U5_ARTIFACT", "protocol_incompatible");
+      }
+      if (
+        WORKSPACE_PROTOCOL_VERSION < descriptor.min_shell_protocol ||
+        WORKSPACE_PROTOCOL_VERSION > descriptor.max_shell_protocol
+      ) {
+        throw new UnlockError("U5_ARTIFACT", "protocol_incompatible");
+      }
+      const kidBytes = artifactKidBytes(descriptor);
+
+      // U1: audited WASM boundary. Not a network await, but still classified.
+      onStage("U1_WASM");
+      try {
+        await (options.wasmLoader ?? loadWasm)();
+      } catch {
+        throw new UnlockError("U1_WASM", "wasm_unavailable");
+      }
+
+      // U2: derive the workspace key and zero the raw secret bytes immediately.
+      // The copy is made synchronously before the (memoized) WASM await above;
+      // the caller also clears its own buffer, and only bytes ever cross this
+      // path.
+      onStage("U2_ENROLL");
+      try {
+        workspaceKey = new WasmWorkspaceKey(secretBytes, 1, kidBytes);
+      } catch {
+        throw new UnlockError("U2_ENROLL", "invalid_secret");
+      }
       secretBytes.fill(0);
       const publicKeyBytes = new Uint8Array(workspaceKey.public_key());
+      const derivedFingerprint = await publicKeyFingerprintB64(publicKeyBytes);
+      const kidB64 = toBase64(kidBytes);
 
-      // 1. Authenticated workspace public key enrollment
-      const enrollResponse = await fetchImpl(enrollEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: JSON.stringify({
-          version: 1,
-          kid: toBase64(kidBytes),
-          public_key: toBase64(publicKeyBytes),
-        }),
-      });
-      if (!enrollResponse.ok) {
-        throw new Error("Workspace enrollment rejected");
+      // Local release-fingerprint preflight: if the server published the
+      // expected recipient fingerprint, a mismatch means the recovery code is
+      // for a different release. Checked before the first network await so a
+      // wrong-key enrollment never leaves the browser when a release manifest
+      // is configured.
+      if (
+        descriptor.expected_public_key_fingerprint_b64 &&
+        derivedFingerprint !== null &&
+        derivedFingerprint !== descriptor.expected_public_key_fingerprint_b64
+      ) {
+        throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
+      }
+      // The session-enrollment fingerprint covers the no-manifest path: it is
+      // derived server-side from the key already bound to this session, so a
+      // different recovery code is rejected before it can enroll a wrong key.
+      if (
+        descriptor.enrolled &&
+        descriptor.enrolled_public_key_fingerprint_b64 &&
+        derivedFingerprint !== null &&
+        derivedFingerprint !== descriptor.enrolled_public_key_fingerprint_b64
+      ) {
+        throw new UnlockError("U5_ARTIFACT", "workspace_key_mismatch");
       }
 
-      // 2. Artifact grant request (P0-4a HPKE offer)
-      const grantResponse = await fetchImpl(grantEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: "",
-      });
+      // U2: bind the workspace key to the session. A page reload or a
+      // lock/unlock cycle reuses the same authenticated session and derives the
+      // same key, so the descriptor's enrollment lets the identical binding be
+      // skipped. The server also treats an identical re-enrollment as
+      // idempotent, so a stale pre-unlock descriptor cannot cause a spurious
+      // 409 on the second unlock.
+      const alreadyEnrolled =
+        descriptor.enrolled &&
+        descriptor.enrolled_kid_b64 === kidB64 &&
+        (derivedFingerprint === null ||
+          !descriptor.enrolled_public_key_fingerprint_b64 ||
+          derivedFingerprint === descriptor.enrolled_public_key_fingerprint_b64);
+
+      if (!alreadyEnrolled) {
+        let enrollResponse: Response;
+        try {
+          enrollResponse = await fetchImpl(enrollEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            body: JSON.stringify({
+              version: 1,
+              kid: kidB64,
+              public_key: toBase64(publicKeyBytes),
+            }),
+          });
+        } catch {
+          throw new UnlockError("U2_ENROLL", "enrollment_rejected");
+        }
+        if (!enrollResponse.ok) {
+          if (enrollResponse.status === 401 || enrollResponse.status === 403) {
+            throw new UnlockError("U2_ENROLL", "session_expired");
+          }
+          if (enrollResponse.status === 409) {
+            throw new UnlockError("U2_ENROLL", "enrollment_conflict");
+          }
+          throw new UnlockError("U2_ENROLL", "enrollment_rejected");
+        }
+      }
+
+      // U3: artifact grant request (P0-4a HPKE offer).
+      onStage("U3_GRANT");
+      let grantResponse: Response;
+      try {
+        grantResponse = await fetchImpl(grantEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: "",
+        });
+      } catch {
+        throw new UnlockError("U3_GRANT", "grant_rejected");
+      }
       if (!grantResponse.ok) {
-        throw new Error("Artifact grant request failed");
+        throw new UnlockError("U3_GRANT", "grant_rejected");
       }
-      const grantData = await grantResponse.json();
+      let grantData: {
+        grant_id?: unknown;
+        kid?: unknown;
+        recipient_public_key?: unknown;
+      };
+      try {
+        grantData = await grantResponse.json();
+      } catch {
+        throw new UnlockError("U3_GRANT", "grant_invalid");
+      }
       if (
         !grantData ||
-        !grantData.grant_id ||
-        !grantData.kid ||
-        !grantData.recipient_public_key
+        typeof grantData.grant_id !== "string" ||
+        typeof grantData.kid !== "string" ||
+        typeof grantData.recipient_public_key !== "string"
       ) {
-        throw new Error("Malformed artifact grant response");
+        throw new UnlockError("U3_GRANT", "grant_invalid");
       }
 
-      // 3. Establish session with server offer
-      const grantKid = fromBase64(grantData.kid);
-      const grantPk = fromBase64(grantData.recipient_public_key);
-      let offer: WasmOffer | null = null;
+      // U3: establish the client half of the HPKE exchange.
+      let encapsulatedKey: Uint8Array;
       try {
-        offer = new WasmOffer(grantKid, grantPk);
-        initiator = WasmInitiatorSession.establish(offer);
-      } finally {
-        if (offer) offer.free();
+        const grantKid = fromBase64(grantData.kid);
+        const grantPk = fromBase64(grantData.recipient_public_key);
+        let offer: WasmOffer | null = null;
+        try {
+          offer = new WasmOffer(grantKid, grantPk);
+          initiator = WasmInitiatorSession.establish(offer);
+        } finally {
+          if (offer) offer.free();
+        }
+        encapsulatedKey = new Uint8Array(initiator.encapsulated_key());
+      } catch {
+        throw new UnlockError("U3_GRANT", "grant_invalid");
       }
 
-      const encapsulatedKey = initiator.encapsulated_key();
-
-      // 4. Retrieve artifact ciphertext
-      const deliverResponse = await fetchImpl(deliverEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-        body: JSON.stringify({
-          grant_id: grantData.grant_id,
-          kid: grantData.kid,
-          encapsulated_key: toBase64(new Uint8Array(encapsulatedKey)),
-        }),
-      });
+      // U4: retrieve artifact ciphertext.
+      onStage("U4_TRANSPORT");
+      let deliverResponse: Response;
+      try {
+        deliverResponse = await fetchImpl(deliverEndpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            grant_id: grantData.grant_id,
+            kid: grantData.kid,
+            encapsulated_key: toBase64(encapsulatedKey),
+          }),
+        });
+      } catch {
+        throw new UnlockError("U4_TRANSPORT", "transport_rejected");
+      }
       if (!deliverResponse.ok) {
-        throw new Error("Artifact ciphertext delivery failed");
+        if (deliverResponse.status === 409) {
+          const code = await readErrorCode(deliverResponse);
+          if (code === "artifact_incompatible") {
+            throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+          }
+          if (code === "enrollment_required") {
+            throw new UnlockError("U2_ENROLL", "enrollment_required");
+          }
+        }
+        throw new UnlockError("U4_TRANSPORT", "transport_rejected");
+      }
+      let sessionEnvelopeWire: Uint8Array;
+      try {
+        sessionEnvelopeWire = new Uint8Array(await deliverResponse.arrayBuffer());
+      } catch {
+        throw new UnlockError("U4_TRANSPORT", "transport_rejected");
       }
 
-      const sessionEnvelopeWire = new Uint8Array(await deliverResponse.arrayBuffer());
-
-      // 5. Decrypt transport envelope in WASM, extract the BR-5 directional app
-      //    session keys, then drop the transport session. The keys are only
-      //    needed for the same-document handoff to the payload; they are never
-      //    persisted.
+      // U4: decrypt the transport envelope in WASM and extract the BR-5
+      // directional app session keys, then drop the transport session.
       let sealedArtifactBytes: Uint8Array;
       let sessionMaterial: ShellSessionKeys | null = null;
       try {
         sealedArtifactBytes = new Uint8Array(initiator.decrypt(sessionEnvelopeWire));
         const rawAppKeys = new Uint8Array(initiator.app_session_keys());
-        const rawKid = new Uint8Array(initiator.kid());
         try {
-          if (rawAppKeys.length !== 64 || rawKid.length !== 16) {
-            throw new Error("Session key material was malformed");
+          const rawKid = new Uint8Array(initiator.kid());
+          try {
+            if (rawAppKeys.length !== 64 || rawKid.length !== 16) {
+              throw new UnlockError("U4_TRANSPORT", "transport_rejected");
+            }
+            sessionMaterial = {
+              kid: toBase64(rawKid),
+              // app_session_keys() returns c2s(32) || s2c(32).
+              c2sKeyB64: toBase64(rawAppKeys.subarray(0, 32)),
+              s2cKeyB64: toBase64(rawAppKeys.subarray(32, 64)),
+            };
+          } finally {
+            rawKid.fill(0);
           }
-          sessionMaterial = {
-            kid: toBase64(rawKid),
-            // app_session_keys() returns c2s(32) || s2c(32).
-            c2sKeyB64: toBase64(rawAppKeys.subarray(0, 32)),
-            s2cKeyB64: toBase64(rawAppKeys.subarray(32, 64)),
-          };
         } finally {
+          // Zeroized even if initiator.kid() throws, so the 64-byte app-key
+          // material never outlives this scope.
           rawAppKeys.fill(0);
-          rawKid.fill(0);
         }
+      } catch (error) {
+        throw error instanceof UnlockError
+          ? error
+          : new UnlockError("U4_TRANSPORT", "transport_rejected");
       } finally {
         initiator.free();
         initiator = null;
       }
 
-      // 6. Decrypt workspace artifact with WasmWorkspaceKey in memory
-      const decryptedPayloadBytes = new Uint8Array(
-        workspaceKey.decrypt_artifact(sealedArtifactBytes),
-      );
+      // U5: decrypt the inner workspace artifact with the in-memory key.
+      onStage("U5_ARTIFACT");
+      let decryptedPayloadBytes: Uint8Array;
+      try {
+        decryptedPayloadBytes = new Uint8Array(
+          workspaceKey.decrypt_artifact(sealedArtifactBytes),
+        );
+      } catch {
+        throw new UnlockError("U5_ARTIFACT", "artifact_decrypt_failed");
+      }
 
-      // 7. Unpack in memory and zero decrypted payload
+      // U6: unpack the custom package in memory and zero the decrypted payload.
+      onStage("U6_PACKAGE");
       let unpackedFiles: Map<string, Uint8Array>;
       try {
-        unpackedFiles = unpackPackageFromMemory(decryptedPayloadBytes);
-      } finally {
-        decryptedPayloadBytes.fill(0);
+        try {
+          unpackedFiles = unpackPackageFromMemory(decryptedPayloadBytes);
+        } finally {
+          decryptedPayloadBytes.fill(0);
+        }
+      } catch {
+        throw new UnlockError("U6_PACKAGE", "package_invalid");
       }
       this.currentPayloadFiles = unpackedFiles;
 
-      // Fresh per-unlock handoff binding. Generated before the payload document
-      // is built so the token can be injected into it; the payload must echo the
-      // token on its ready ping before the shell releases any key.
-      const handoffToken = generateHandoffToken();
-
-      const htmlUrl = this.instantiatePayload(unpackedFiles, handoffToken);
-      // Ownership transfers only after the payload is fully instantiated; any
-      // earlier failure is reclaimed by the finally below.
+      // U7: instantiate the payload document and arm the one-shot handoff.
+      onStage("U7_BOOT");
+      let handoffToken: string;
+      let htmlUrl: string;
+      try {
+        handoffToken = generateHandoffToken();
+        htmlUrl = this.instantiatePayload(unpackedFiles, handoffToken);
+      } catch {
+        throw new UnlockError("U7_BOOT", "boot_failed");
+      }
       if (!sessionMaterial) {
-        throw new Error("Session key handoff unavailable");
+        throw new UnlockError("U7_BOOT", "handoff_unavailable");
       }
       this.currentKey = workspaceKey;
       this.handoff.arm(sessionMaterial, handoffToken);
@@ -453,16 +624,15 @@ export class WorkspaceUnlockRuntime {
       };
     } finally {
       secretBytes.fill(0);
-      kidBytes.fill(0);
       if (initiator) {
         try {
           initiator.free();
         } catch {}
       }
       if (!unlocked) {
-        // A thrown fetch/decrypt/instantiate must never leave the WASM key or the
-        // decrypted payload resident: lock() revokes blob URLs and zeroizes the
-        // unpacked files, then free the workspace key exactly once.
+        // A thrown fetch/decrypt/instantiate must never leave the WASM key or
+        // the decrypted payload resident: lock() revokes blob URLs and zeroizes
+        // the unpacked files, then free the workspace key exactly once.
         this.lock();
         if (workspaceKey) {
           try {
@@ -482,11 +652,6 @@ export class WorkspaceUnlockRuntime {
       indexHtml = "<!doctype html><html><body><div id=\"root\"></div></body></html>";
     }
 
-    // BR-5 handoff binding: inject the per-unlock token into the payload document
-    // itself (same-document capability, never persisted, never in a URL). The
-    // payload echoes it on `workspace-ready`; the shell revokes the document
-    // blob URL once the frame has loaded it, so a same-origin document that
-    // navigated into the frame cannot re-fetch the payload to read the token.
     indexHtml = injectHandoffToken(indexHtml, handoffToken);
 
     const assetNames = [...files.keys()].filter((name) => name !== "index.html");
@@ -540,11 +705,6 @@ export class WorkspaceUnlockRuntime {
 
 /**
  * A cryptographically random per-unlock handoff token, or a fail-closed throw.
- *
- * This is a same-document capability, not a long-term secret, but a predictable
- * value would let another same-origin document forge the ready ping, so a
- * deployment without `crypto` must fail closed rather than fall back to
- * `Math.random()`.
  */
 function generateHandoffToken(): string {
   const cryptoObj: Crypto | undefined = globalThis.crypto;
@@ -558,14 +718,6 @@ function generateHandoffToken(): string {
 
 /**
  * Inject the handoff token into the payload document as a `<meta>` element.
- *
- * The value is base64 (no HTML-special characters), and it is inserted
- * immediately after the document's `<head>` opening tag (creating a `<head>`
- * after `<html>` or the doctype when the build output has none), so it is
- * available to the payload before any script runs. The tag patterns require a
- * tag boundary (`<head>`/`<head ...>`, never `<header>`). It is never placed in
- * a URL or any storage; it lives in the document DOM by design and the document
- * blob URL is revoked once the frame has loaded it.
  */
 function injectHandoffToken(html: string, token: string): string {
   const meta = `<meta name="evergreen-handoff" content="${token}">`;
@@ -581,8 +733,6 @@ function injectHandoffToken(html: string, token: string): string {
   }
   const doctype = /<!doctype[^>]*>/i.exec(html);
   if (doctype) {
-    // After the doctype (not before) so the injected markup cannot force quirks
-    // mode.
     const at = doctype.index + doctype[0].length;
     return html.slice(0, at) + `<head>${meta}</head>` + html.slice(at);
   }

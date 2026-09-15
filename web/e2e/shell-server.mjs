@@ -11,7 +11,7 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { extname, join, normalize, resolve, sep } from "node:path";
@@ -149,6 +149,8 @@ let ready = false;
 let prepareError = null;
 let secrets = null;
 let sealedArtifactPath = null;
+let descriptor = null;
+let enrolledKidB64 = null;
 let grant = null;
 const host = new SessionHost();
 
@@ -161,6 +163,27 @@ async function prepare() {
   sealedArtifactPath = join(resolve(process.env.TMPDIR ?? "/tmp"), `e2e-shell-artifact-${process.pid}.bin`);
   await writeFile(sealedArtifactPath, artifact, { mode: 0o600 });
   secrets = { secretB64: secret.toString("base64"), kidB64: kid.toString("base64") };
+  // Authenticated descriptor: the KID is discovered from the server, never
+  // typed by the user, and the expected fingerprint lets the shell reject the
+  // wrong recovery code before any network call.
+  descriptor = {
+    protocol_version: 1,
+    artifact_version: 1,
+    artifact_kid_b64: kid.toString("base64"),
+    artifact_size: artifact.length,
+    artifact_sha256_hex: createHash("sha256").update(artifact).digest("hex"),
+    package_format_version: 1,
+    release_id: "e2e-release",
+    source_sha: "e2e",
+    expected_public_key_fingerprint_b64: createHash("sha256")
+      .update(publicKey)
+      .digest("base64"),
+    min_shell_protocol: 1,
+    max_shell_protocol: 1,
+    enrolled: false,
+    enrolled_kid_b64: null,
+    enrolled_public_key_fingerprint_b64: null,
+  };
   host.start();
   ready = true;
 }
@@ -207,11 +230,44 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (path === "/internal/auth/enrollment-status" && req.method === "GET") {
+      return json(res, 200, { enrollment_open: false });
+    }
+
+    if (path === "/internal/auth/session" && req.method === "GET") {
+      // The E2E host models an already-established operator session so the
+      // unlock boundary can be exercised without a virtual authenticator.
+      // WebAuthn itself is covered by the private-api Rust tests.
+      res.writeHead(204, { "Cache-Control": "no-store" });
+      res.end();
+      return;
+    }
+
+    if (path === "/internal/workspace/descriptor" && req.method === "GET") {
+      if (!ready || !descriptor) return json(res, 503, { error: "not ready" });
+      if (enrolledKidB64) {
+        return json(res, 200, {
+          ...descriptor,
+          enrolled: true,
+          enrolled_kid_b64: enrolledKidB64,
+          enrolled_public_key_fingerprint_b64:
+            descriptor.expected_public_key_fingerprint_b64,
+        });
+      }
+      return json(res, 200, descriptor);
+    }
+
     if (path === "/internal/auth/enroll" && req.method === "POST") {
       const body = await readBody(req);
       if (typeof body.public_key !== "string" || typeof body.kid !== "string") {
         return json(res, 400, { error: "malformed enrollment" });
       }
+      // Model the real server: an identical binding is idempotent, a different
+      // binding for the same session conflicts.
+      if (enrolledKidB64 !== null && enrolledKidB64 !== body.kid) {
+        return json(res, 409, { code: "enrollment_conflict" });
+      }
+      enrolledKidB64 = body.kid;
       return json(res, 200, { ok: true });
     }
 

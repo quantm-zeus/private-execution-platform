@@ -11,6 +11,7 @@ import {
   ARTIFACT_VERSION,
   derivePublicKey,
   packDirectory,
+  sealPackage,
   unpackPackage,
   artifactPublicKeyFromEnv,
   artifactKidFromEnv,
@@ -788,9 +789,12 @@ try {
     "/internal/artifact/grant",
     "/internal/auth/challenge",
     "/internal/auth/enroll",
+    "/internal/auth/enrollment-status",
     "/internal/auth/register/challenge",
     "/internal/auth/register/verify",
+    "/internal/auth/session",
     "/internal/auth/verify",
+    "/internal/workspace/descriptor",
   ];
   const shellPrivatePaths = new Set();
   for (const path of await filesUnder(resolve("web/workspace-shell/src"))) {
@@ -1297,6 +1301,7 @@ try {
     loadWasm: loadShellWasm,
   } = await import("../web/workspace-shell/src/unlock-runtime.ts");
   const { HandoffGate } = await import("../web/workspace-shell/src/handoff-gate.ts");
+  const { UnlockError } = await import("../web/workspace-shell/src/unlock-stages.ts");
   // Capture the fresh per-unlock token the real runtime arms so the live
   // assertions below use the actual injected value. The first arm is the live
   // unlock; the standalone gate checks later re-arm their own instances.
@@ -1305,6 +1310,26 @@ try {
   HandoffGate.prototype.arm = function (sessionKeys, token) {
     capturedHandoffTokens.push(token);
     return handoffArmOriginal.call(this, sessionKeys, token);
+  };
+
+  // The authenticated descriptor supplies the artifact KID and the expected
+  // recipient public-key fingerprint; a normal user never types a KID.
+  const expectedFingerprint = createHash("sha256").update(publicKey).digest("base64");
+  const descriptor = {
+    protocol_version: 1,
+    artifact_version: ARTIFACT_VERSION,
+    artifact_kid_b64: kid.toString("base64"),
+    artifact_size: 0,
+    artifact_sha256_hex: "",
+    package_format_version: 1,
+    release_id: "release-test",
+    source_sha: "test-sha",
+    expected_public_key_fingerprint_b64: expectedFingerprint,
+    min_shell_protocol: 1,
+    max_shell_protocol: 1,
+    enrolled: false,
+    enrolled_kid_b64: null,
+    enrolled_public_key_fingerprint_b64: null,
   };
 
   // 10a. Audited WASM loads and binds
@@ -1548,8 +1573,8 @@ try {
   };
 
   const unlockResult = await runtime.unlock(
-    unlockSecret.toString("base64"),
-    kid.toString("base64"),
+    unlockSecret,
+    descriptor,
     {
       fetchFn: mockFetch,
     },
@@ -1639,13 +1664,42 @@ try {
   if (runtime.unlocked) throw new Error("runtime should be locked after lock()");
   if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime active URLs not revoked after lock()");
 
+  // 10g-bis. A second unlock in the same authenticated session must not
+  // re-enroll: the descriptor reports the existing binding, so a reload or a
+  // lock/unlock cycle cannot hit the server's enrollment conflict (409).
+  {
+    let enrollHits = 0;
+    const enrolledDescriptor = {
+      ...descriptor,
+      enrolled: true,
+      enrolled_kid_b64: kid.toString("base64"),
+      enrolled_public_key_fingerprint_b64: expectedFingerprint,
+    };
+    const second = await runtime.unlock(unlockSecret, enrolledDescriptor, {
+      fetchFn: async (url, init = {}) => {
+        if (String(url).includes("/enroll")) {
+          enrollHits += 1;
+          return { ok: false, status: 409 };
+        }
+        return mockFetch(url, init);
+      },
+    });
+    if (enrollHits !== 0) {
+      throw new Error("second unlock in the same session re-enrolled an already-enrolled key");
+    }
+    if (!second.htmlUrl.startsWith("blob:")) {
+      throw new Error("second unlock did not instantiate the payload");
+    }
+    runtime.lock();
+  }
+
   // 10h. Negative runtime unlock tests fail closed with no secret leakage
   // Wrong unlock secret
   let unlockFailed = false;
   try {
     await runtime.unlock(
-      wrongSecret.toString("base64"),
-      kid.toString("base64"),
+      wrongSecret,
+      descriptor,
       {
         fetchFn: mockFetch,
       },
@@ -1655,23 +1709,29 @@ try {
     if (String(e).includes(wrongSecret.toString("base64"))) {
       throw new Error("unlock error leaked secret");
     }
+    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
+      throw new Error(`wrong secret must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime unlock accepted wrong secret");
   if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
   if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime should have 0 URLs on failure");
 
-  // Wrong kid
+  // Wrong kid (descriptor carries a stale/mismatched KID)
   unlockFailed = false;
   try {
     await runtime.unlock(
-      unlockSecret.toString("base64"),
-      Buffer.from(wrongKid).toString("base64"),
+      unlockSecret,
+      { ...descriptor, artifact_kid_b64: Buffer.from(wrongKid).toString("base64") },
       {
         fetchFn: mockFetch,
       },
     );
-  } catch {
+  } catch (e) {
     unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
+      throw new Error(`wrong kid must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime unlock accepted wrong kid");
   if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
@@ -1680,12 +1740,15 @@ try {
   unlockFailed = false;
   try {
     await runtime.unlock(
-      Buffer.alloc(32).toString("base64"),
-      kid.toString("base64"),
+      Buffer.alloc(32),
+      descriptor,
       { fetchFn: mockFetch },
     );
-  } catch {
+  } catch (e) {
     unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U2_ENROLL") {
+      throw new Error(`all-zero secret must fail as U2_ENROLL, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime accepted all-zero secret");
 
@@ -1693,12 +1756,15 @@ try {
   unlockFailed = false;
   try {
     await runtime.unlock(
-      unlockSecret.toString("base64"),
-      Buffer.alloc(16).toString("base64"),
+      unlockSecret,
+      { ...descriptor, artifact_kid_b64: Buffer.alloc(16).toString("base64") },
       { fetchFn: mockFetch },
     );
-  } catch {
+  } catch (e) {
     unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
+      throw new Error(`all-zero kid must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime accepted all-zero kid");
 
@@ -1706,8 +1772,8 @@ try {
   unlockFailed = false;
   try {
     await runtime.unlock(
-      unlockSecret.toString("base64"),
-      kid.toString("base64"),
+      unlockSecret,
+      descriptor,
       {
         fetchFn: async (url) => {
           if (url.includes("enroll")) return { ok: false, status: 500 };
@@ -1715,8 +1781,11 @@ try {
         },
       },
     );
-  } catch {
+  } catch (e) {
     unlockFailed = true;
+    if (!(e instanceof UnlockError) || e.stage !== "U2_ENROLL") {
+      throw new Error(`enroll 500 must fail as U2_ENROLL, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime succeeded when server enrollment failed");
   if (runtime.unlocked) throw new Error("runtime should remain locked on server error");
@@ -1728,8 +1797,8 @@ try {
   unlockFailed = false;
   try {
     await runtime.unlock(
-      unlockSecret.toString("base64"),
-      kid.toString("base64"),
+      unlockSecret,
+      descriptor,
       {
         fetchFn: async (url, init = {}) => {
           const parsed = new URL(url, "https://localhost:8081");
@@ -1754,6 +1823,9 @@ try {
     if (String(e).includes(unlockSecret.toString("base64"))) {
       throw new Error("409 enrollment conflict error leaked unlock secret in error message");
     }
+    if (!(e instanceof UnlockError) || e.stage !== "U2_ENROLL") {
+      throw new Error(`409 enroll must fail as U2_ENROLL, got ${e?.stage ?? e}`);
+    }
   }
   if (!unlockFailed) throw new Error("runtime succeeded when server enrollment returned 409 Conflict");
   if (grantAttemptedOn409) throw new Error("runtime attempted artifact grant after 409 enrollment conflict");
@@ -1766,6 +1838,165 @@ try {
         throw new Error(`409 enrollment payload leaked forbidden secret field: ${forbidden}`);
       }
     }
+  }
+
+  // 10i. Typed stage failures for every remaining stage (U1, U3, U4, U5
+  // incompatible, U6, U7) so each stage has a focused assertion.
+  async function expectUnlockStage(stage, run, reason) {
+    try {
+      await run();
+    } catch (error) {
+      if (!(error instanceof UnlockError)) {
+        throw new Error(`expected UnlockError for ${stage}, got ${error}`);
+      }
+      if (error.stage !== stage) {
+        throw new Error(`expected stage ${stage}, got ${error.stage}`);
+      }
+      if (reason && error.reason !== reason) {
+        throw new Error(`expected reason ${reason}, got ${error.reason}`);
+      }
+      return;
+    }
+    throw new Error(`expected unlock to fail with ${stage}`);
+  }
+
+  // U1: injected WASM loader failure.
+  await expectUnlockStage(
+    "U1_WASM",
+    () =>
+      runtime.unlock(unlockSecret, descriptor, {
+        wasmLoader: async () => {
+          throw new Error("wasm unavailable");
+        },
+        fetchFn: mockFetch,
+      }),
+    "wasm_unavailable",
+  );
+
+  // U3: artifact grant rejected by the server.
+  await expectUnlockStage(
+    "U3_GRANT",
+    () =>
+      runtime.unlock(unlockSecret, descriptor, {
+        fetchFn: async (url) => {
+          const parsed = new URL(url, "https://localhost:8081");
+          if (parsed.pathname.includes("enroll")) return { ok: true, status: 200 };
+          if (parsed.pathname.includes("grant")) return { ok: false, status: 500 };
+          return { ok: false, status: 500 };
+        },
+      }),
+    "grant_rejected",
+  );
+
+  // U4: artifact ciphertext delivery rejected.
+  await expectUnlockStage(
+    "U4_TRANSPORT",
+    () =>
+      runtime.unlock(unlockSecret, descriptor, {
+        fetchFn: async (url) => {
+          const parsed = new URL(url, "https://localhost:8081");
+          if (parsed.pathname.includes("enroll")) return { ok: true, status: 200 };
+          if (parsed.pathname.includes("grant")) {
+            const offer = await getBrokerOffer();
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                grant_id: "u4-grant",
+                kid: offer.offerKid,
+                recipient_public_key: offer.offerPk,
+              }),
+            };
+          }
+          return { ok: false, status: 500 };
+        },
+      }),
+    "transport_rejected",
+  );
+
+  // U5: server-side compatibility rejection (KID/fingerprint mismatch).
+  await expectUnlockStage(
+    "U5_ARTIFACT",
+    () =>
+      runtime.unlock(unlockSecret, descriptor, {
+        fetchFn: async (url) => {
+          const parsed = new URL(url, "https://localhost:8081");
+          if (parsed.pathname.includes("enroll")) return { ok: true, status: 200 };
+          if (parsed.pathname.includes("grant")) {
+            const offer = await getBrokerOffer();
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                grant_id: "u5-grant",
+                kid: offer.offerKid,
+                recipient_public_key: offer.offerPk,
+              }),
+            };
+          }
+          return { ok: false, status: 409, json: async () => ({ code: "artifact_incompatible" }) };
+        },
+      }),
+    "artifact_incompatible",
+  );
+
+  // U6: the decrypted payload is not a valid workspace package. The inner
+  // artifact must be sealed to the workspace key first, otherwise the failure
+  // would correctly classify as U5 (artifact decrypt), not U6 (package unpack).
+  const notPackagePath = join(temp, "not-a-package.bin");
+  const notPackageArtifact = await sealPackage(
+    Buffer.from("this is not a workspace package"),
+    publicKey,
+    kid,
+    ARTIFACT_VERSION,
+  );
+  await writeFile(notPackagePath, notPackageArtifact);
+  await expectUnlockStage(
+    "U6_PACKAGE",
+    () =>
+      runtime.unlock(unlockSecret, descriptor, {
+        fetchFn: async (url, init = {}) => {
+          const parsed = new URL(url, "https://localhost:8081");
+          if (parsed.pathname.includes("enroll")) return { ok: true, status: 200 };
+          if (parsed.pathname.includes("grant")) {
+            const offer = await getBrokerOffer();
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                grant_id: "u6-grant",
+                kid: offer.offerKid,
+                recipient_public_key: offer.offerPk,
+              }),
+            };
+          }
+          const body = JSON.parse(init.body || "{}");
+          await sealBrokerEnvelope(body.encapsulated_key, notPackagePath, tempEnvelopePath);
+          const data = await readFile(tempEnvelopePath);
+          return {
+            ok: true,
+            status: 200,
+            arrayBuffer: async () =>
+              data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+          };
+        },
+      }),
+    "package_invalid",
+  );
+
+  // U7: payload instantiation fails (object URL creation unavailable).
+  const originalCreateObjectURL = URL.createObjectURL;
+  URL.createObjectURL = () => {
+    throw new Error("object urls unavailable");
+  };
+  try {
+    await expectUnlockStage(
+      "U7_BOOT",
+      () => runtime.unlock(unlockSecret, descriptor, { fetchFn: mockFetch }),
+      "boot_failed",
+    );
+  } finally {
+    URL.createObjectURL = originalCreateObjectURL;
   }
 
   // Shutdown broker

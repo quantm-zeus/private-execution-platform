@@ -321,7 +321,19 @@ impl AuthState {
         if kid.iter().all(|&b| b == 0) || public_key.iter().all(|&b| b == 0) {
             return Err(AuthError::InvalidInput);
         }
-        if self.enrollments.contains_key(session_id) {
+        // Idempotent re-enrollment of the *identical* binding. A page reload or
+        // a lock/unlock cycle within the same authenticated session re-posts
+        // the same derived workspace public key; rejecting it with a conflict
+        // would deterministically break the second unlock. A *different*
+        // version/kid/public-key binding for the same session still conflicts,
+        // so this is not a way to replace a bound key.
+        if let Some(existing) = self.enrollments.get(session_id) {
+            if existing.version == version
+                && existing.kid == kid
+                && existing.public_key == public_key
+            {
+                return Ok(existing.clone());
+            }
             return Err(AuthError::EnrollmentConflict);
         }
         self.enrollments.retain(|sid, _| {
@@ -497,11 +509,14 @@ mod tests {
         let fetched = s.get_workspace_enrollment(session.id(), 15).unwrap();
         assert_eq!(fetched, &meta);
 
-        // Duplicate enrollment with identical key fails closed with Conflict
-        assert_eq!(
-            s.enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, public_key, 20),
-            Err(AuthError::EnrollmentConflict)
-        );
+        // Re-enrolling the identical binding is idempotent: a reload or a
+        // lock/unlock cycle in the same session must not fail. The original
+        // enrollment time is preserved and no duplicate is created.
+        let again = s
+            .enroll_workspace_public_key(session.id(), ARTIFACT_VERSION, kid, public_key, 20)
+            .unwrap();
+        assert_eq!(again, meta);
+        assert_eq!(again.enrolled_at_ms(), 10);
 
         // Conflicting enrollment with different key fails closed with Conflict
         let other_pk = [3u8; WORKSPACE_PUBLIC_KEY_BYTES];

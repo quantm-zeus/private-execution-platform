@@ -24,6 +24,7 @@ rpc-contracts.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 service-identity.workspace = true
+sha2 = "0.11"
 session-transport.workspace = true
 subtle = "2"
 tokio = { workspace = true, features = ["sync"] }
