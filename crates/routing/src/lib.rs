@@ -259,7 +259,14 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
         };
         // Depth is defined only for a single direct CLMM/Bin hop. A computation
         // failure degrades that candidate's depth key to `None`; it never drops
-        // the candidate or aborts the search.
+        // the candidate or aborts the search. The profiled size is the exact
+        // first-hop input (post sell tax), matching the hop the impact models.
+        let depth_amount = quote
+            .plan
+            .legs
+            .first()
+            .map(|leg| leg.amount_in)
+            .unwrap_or(req.amount_in);
         let depth_rank = if depth_enabled && path.legs.len() == 1 {
             path.legs.first().and_then(|leg| {
                 req.descriptors.get(leg.descriptor_index).and_then(|desc| {
@@ -268,7 +275,7 @@ pub fn plan_single_path(req: &RouteRequest<'_>) -> Result<RoutingDecision, Routi
                         | market_types::PoolKindState::Bin(_) => depth::depth_rank(
                             &desc.envelope.state,
                             &leg.token_in,
-                            req.amount_in,
+                            depth_amount,
                             req.depth_targets,
                         )
                         .ok(),

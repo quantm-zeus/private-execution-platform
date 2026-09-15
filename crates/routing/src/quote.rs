@@ -441,6 +441,8 @@ fn simulate_hop(
                 // fails closed instead of trusting the caller override.
                 depth::bin_impact_bps(
                     pool.bin_step,
+                    pool.decimals_0,
+                    pool.decimals_1,
                     pool.active_bin_id,
                     quote.resulting_active_bin_id,
                 )

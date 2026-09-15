@@ -6,7 +6,9 @@
 mod common;
 
 use common::*;
-use market_types::{AtomicAmount, Bps, ClmmPoolState, ClmmTick, PoolKindState};
+use market_types::{
+    AtomicAmount, BinPoolState, Bps, ClmmPoolState, ClmmTick, LiquidityBin, PoolKindState,
+};
 use routing::{depth_at_bps, depth_rank, plan_single_path, RoutingError, DEPTH_TARGETS_BPS};
 use simulation::{simulate_clmm_exact_input, ClmmExactInputRequest};
 
@@ -249,6 +251,19 @@ fn depth_debug_is_redacted() {
         !rendered.contains("1981") && !rendered.contains("4981"),
         "depth Debug must not render absorbed amounts: {rendered}"
     );
+
+    let rank = depth_rank(
+        &state,
+        &weth(),
+        AtomicAmount::new(1_000),
+        &targets(&[50, 100]),
+    )
+    .expect("bin depth rank");
+    let rank_rendered = format!("{rank:?}");
+    assert!(
+        !rank_rendered.contains("1981") && !rank_rendered.contains("4981"),
+        "depth rank Debug must not render absorbed amounts: {rank_rendered}"
+    );
 }
 
 #[test]
@@ -426,4 +441,69 @@ fn depth_foreign_chain_is_rejected_before_traversal() {
         ),
         Err(RoutingError::PoolChainMismatch)
     );
+}
+
+/// Far-from-zero active bin: every per-bin price is representable, but the
+/// `base^|diff|` form overflows `u128`, so the depth must be derived from the
+/// kernel's reduced per-bin prices instead of a large power.
+fn far_active_bin_pool() -> BinPoolState {
+    BinPoolState {
+        token_0: weth(),
+        token_1: usdc(),
+        decimals_0: 0,
+        decimals_1: 0,
+        active_bin_id: -9,
+        bin_step: 1,
+        fee_bps: bps(0),
+        bins: (-9i32..=9)
+            .map(|id| {
+                // Above the active bin only the base asset (reserve_0) is allowed.
+                let quote = if id == -9 { 1_000_000_000 } else { 0 };
+                LiquidityBin::new(
+                    id,
+                    AtomicAmount::new(1_000_000_000),
+                    AtomicAmount::new(quote),
+                )
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn bin_depth_is_exact_for_a_far_from_zero_active_bin() {
+    let state = PoolKindState::Bin(far_active_bin_pool());
+    let profile = depth_at_bps(&state, &usdc(), AtomicAmount::new(1_000), &targets(&[250]))
+        .expect("far-active-bin depth profile");
+    // The whole 19-bin range is only ~18 bps wide, so 250 bps covers all of it.
+    // `sum_{i=-9..=9} ceil(1e9 * price(i))` independently recomputed.
+    assert_eq!(
+        profile.levels[0].absorbed_in,
+        Some(AtomicAmount::new(19_000_002_857))
+    );
+    // The profiled trade (1_000) stays inside the active bin, so its impact is 0.
+    // The cross-bin impact is pinned directly in the `depth.rs` unit tests.
+    assert_eq!(profile.trade_impact_bps, Some(bps(0)));
+
+    // A narrower band must stop earlier: 1 bp needs only the first bin.
+    let narrow = depth_at_bps(&state, &usdc(), AtomicAmount::new(1_000), &targets(&[1]))
+        .expect("far-active-bin narrow profile");
+    let first = narrow.levels[0].absorbed_in.expect("bin -9 is inside 1 bp");
+    assert!(first.get() < 19_000_002_857);
+    assert!(first.get() > 0);
+}
+
+#[test]
+fn depth_survives_a_one_unit_rounding_hole() {
+    // A very deep pool can reject a one-unit exact quote (`InvariantViolated`,
+    // zero price movement) while accepting a larger input; depth must still be
+    // computed rather than being disabled wholesale.
+    let mut pool = wide_pool(30);
+    pool.liquidity = 1_000_000_000_000_000_000_000_000_000_000; // 1e30
+    let state = PoolKindState::Clmm(pool);
+    let profile = depth_at_bps(&state, &weth(), AtomicAmount::new(1), &default_targets())
+        .expect("a deep pool with a 1-unit rounding hole must still be profileable");
+    assert!(profile
+        .levels
+        .iter()
+        .any(|level| level.absorbed_in.is_some()));
 }

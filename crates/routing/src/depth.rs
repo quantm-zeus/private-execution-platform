@@ -25,8 +25,8 @@ use std::fmt;
 use chain_types::AssetId;
 use market_types::{AtomicAmount, BinPoolState, Bps, ClmmPoolState, PoolKindState};
 use simulation::{
-    cmp_u128_products, simulate_bin_exact_input, simulate_clmm_exact_input, BinExactInputRequest,
-    ClmmExactInputRequest,
+    atomic_bin_price, cmp_u128_products, mul_u128_wide, simulate_bin_exact_input,
+    simulate_clmm_exact_input, BinExactInputRequest, ClmmExactInputRequest,
 };
 
 use crate::error::RoutingError;
@@ -193,16 +193,26 @@ pub(crate) fn clmm_impact_bps(pool_sqrt: u128, resulting_sqrt: u128) -> Option<B
 /// Whole-basis-point ceiling of the exact Bin/DLMM impact from the post-trade
 /// active bin.
 ///
-/// The bin price is `((10_000 + bin_step) / 10_000) ^ bin_id`; the relative
-/// move is compared by exact cross multiplication. Returns `None` when the move
-/// exceeds [`Bps::MAX`] or an exact power overflows `u128` (which itself implies
-/// a move far beyond any representable band).
+/// Prices are compared through the kernel's own reduced per-bin prices
+/// ([`atomic_bin_price`]), so a far-from-zero active bin never overflows: the
+/// ratio between two bins is compared by exact cross multiplication instead of
+/// materialising `base^|diff|`. Returns `None` when the move exceeds
+/// [`Bps::MAX`] or a per-bin price is not representable.
 pub(crate) fn bin_impact_bps(
     bin_step: u16,
+    decimals_0: u8,
+    decimals_1: u8,
     active_bin_id: i32,
     resulting_bin_id: i32,
 ) -> Option<Bps> {
-    if !bin_within(bin_step, active_bin_id, resulting_bin_id, Bps::MAX) {
+    if !bin_within(
+        bin_step,
+        decimals_0,
+        decimals_1,
+        active_bin_id,
+        resulting_bin_id,
+        Bps::MAX,
+    ) {
         return None;
     }
     // `within(b)` is monotone in `b`; the smallest satisfying band is the
@@ -211,7 +221,14 @@ pub(crate) fn bin_impact_bps(
     let mut hi = Bps::MAX;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if bin_within(bin_step, active_bin_id, resulting_bin_id, mid) {
+        if bin_within(
+            bin_step,
+            decimals_0,
+            decimals_1,
+            active_bin_id,
+            resulting_bin_id,
+            mid,
+        ) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -240,50 +257,66 @@ fn clmm_within(pool_sqrt: u128, resulting_sqrt: u128, target_bps: u16) -> bool {
 }
 
 /// Exact predicate: is the Bin price move within `target_bps`?
-fn bin_within(bin_step: u16, active_bin_id: i32, resulting_bin_id: i32, target_bps: u16) -> bool {
-    let diff = resulting_bin_id as i64 - active_bin_id as i64;
-    if diff == 0 {
+///
+/// Fails closed (`false`, never a guessed band) when either per-bin price is not
+/// representable in the kernel's reduced form.
+fn bin_within(
+    bin_step: u16,
+    decimals_0: u8,
+    decimals_1: u8,
+    active_bin_id: i32,
+    resulting_bin_id: i32,
+    target_bps: u16,
+) -> bool {
+    if resulting_bin_id == active_bin_id {
         return true;
     }
-    let (base_num, base_den) = bin_base(bin_step);
-    let exponent = diff.unsigned_abs() as u32;
-    let t = target_bps as u128;
+    let (Ok(before), Ok(after)) = (
+        atomic_bin_price(bin_step, decimals_0, decimals_1, active_bin_id),
+        atomic_bin_price(bin_step, decimals_0, decimals_1, resulting_bin_id),
+    ) else {
+        return false;
+    };
+    bin_price_within(before, after, resulting_bin_id > active_bin_id, target_bps)
+}
 
-    if diff > 0 {
-        // Price rose: impact <= t <=> num^d * 10_000 <= (10_000 + t) * den^d.
-        let (Some(np), Some(dp)) = (
-            base_num.checked_pow(exponent),
-            base_den.checked_pow(exponent),
-        ) else {
-            return false;
-        };
-        cmp_u128_products(np, 10_000, 10_000 + t, dp) != Ordering::Greater
+/// Exact predicate: is `after / before` within `target_bps` of one?
+///
+/// `before`/`after` are reduced `(numerator, denominator)` bin prices; the
+/// relative move is compared by exact 256-bit cross multiplication, so it never
+/// materialises a large power (which would overflow for a far-from-zero active
+/// bin even when both per-bin prices are representable).
+fn bin_price_within(
+    before: (u128, u128),
+    after: (u128, u128),
+    rose: bool,
+    target_bps: u16,
+) -> bool {
+    let numerator = mul_u128_wide(after.0, before.1);
+    let denominator = mul_u128_wide(after.1, before.0);
+    let target = target_bps as u128;
+    if rose {
+        // ratio <= (10_000 + t) / 10_000.
+        cmp_scaled_u256(numerator, 10_000, denominator, 10_000 + target) != Ordering::Greater
     } else {
-        // Price fell: impact <= t <=> den^d * 10_000 >= (10_000 - t) * num^d.
-        let (Some(np), Some(dp)) = (
-            base_num.checked_pow(exponent),
-            base_den.checked_pow(exponent),
-        ) else {
-            return false;
-        };
-        cmp_u128_products(dp, 10_000, 10_000 - t, np) != Ordering::Less
+        // ratio >= (10_000 - t) / 10_000.
+        cmp_scaled_u256(numerator, 10_000, denominator, 10_000 - target) != Ordering::Less
     }
 }
 
-fn bin_base(bin_step: u16) -> (u128, u128) {
-    let num = 10_000u128 + bin_step as u128;
-    let den = 10_000u128;
-    let g = gcd_u128(num, den);
-    (num / g, den / g)
+/// Exact comparison of `a * scale_a` against `b * scale_b`, where the operands
+/// are 256-bit products of two `u128`s and the scales are small.
+fn cmp_scaled_u256(a: (u128, u128), scale_a: u128, b: (u128, u128), scale_b: u128) -> Ordering {
+    scale_u256(a, scale_a).cmp(&scale_u256(b, scale_b))
 }
 
-fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a
+/// Multiplies a 256-bit `(hi, lo)` by a small scalar into three `u128` limbs.
+fn scale_u256(value: (u128, u128), scalar: u128) -> (u128, u128, u128) {
+    let (low_carry, low) = mul_u128_wide(value.1, scalar);
+    let (high_carry, high) = mul_u128_wide(value.0, scalar);
+    let (mid, carry) = high.overflowing_add(low_carry);
+    let top = high_carry.wrapping_add(carry as u128);
+    (top, mid, low)
 }
 
 fn clmm_quote_sqrt(pool: &ClmmPoolState, token_in: &AssetId, amount: u128) -> Option<u128> {
@@ -306,15 +339,27 @@ fn bin_quote_id(pool: &BinPoolState, token_in: &AssetId, amount: u128) -> Option
 
 /// Largest input the kernel accepts, found by bounded doubling + bisection.
 ///
-/// Returns `None` when even a one-unit input fails. The predicate must be
-/// monotone (true below the capacity, false above it), which the exact-input
-/// kernels guarantee within the initialized range.
+/// A deep pool can reject a one-unit probe (an exact quote that rounds to zero
+/// price movement reports `InvariantViolated`) while accepting a slightly larger
+/// input, so the search first finds *any* accepted power-of-two input and only
+/// then brackets the capacity above it. Returns `None` when no probed input is
+/// accepted. The predicate must be monotone above the accepted start, which the
+/// exact-input kernels guarantee within the initialized range.
 fn max_traversable(probe_ok: impl Fn(u128) -> bool) -> Option<u128> {
-    if !probe_ok(1) {
+    let mut start: u128 = 1;
+    let mut found = false;
+    for _ in 0..MAX_DEPTH_DOUBLINGS {
+        if probe_ok(start) {
+            found = true;
+            break;
+        }
+        start = start.checked_mul(2)?;
+    }
+    if !found {
         return None;
     }
-    let mut lo: u128 = 1;
-    let mut hi: u128 = 1;
+    let mut lo: u128 = start;
+    let mut hi: u128 = start;
     let mut bracketed = false;
     for _ in 0..MAX_DEPTH_DOUBLINGS {
         match hi.checked_mul(2) {
@@ -424,8 +469,15 @@ fn bin_profile(
     let cap = max_traversable(|amount| bin_quote_id(pool, token_in, amount).is_some())
         .ok_or(RoutingError::UnsupportedPoolKind)?;
 
-    let trade_impact_bps = bin_quote_id(pool, token_in, amount_in.get())
-        .and_then(|resulting| bin_impact_bps(pool.bin_step, pool.active_bin_id, resulting));
+    let trade_impact_bps = bin_quote_id(pool, token_in, amount_in.get()).and_then(|resulting| {
+        bin_impact_bps(
+            pool.bin_step,
+            pool.decimals_0,
+            pool.decimals_1,
+            pool.active_bin_id,
+            resulting,
+        )
+    });
 
     let mut levels = Vec::with_capacity(targets.len());
     for target in targets {
@@ -433,7 +485,14 @@ fn bin_profile(
         let absorbed = max_within(cap, |amount| {
             bin_quote_id(pool, token_in, amount)
                 .map(|resulting| {
-                    bin_within(pool.bin_step, pool.active_bin_id, resulting, target_bps)
+                    bin_within(
+                        pool.bin_step,
+                        pool.decimals_0,
+                        pool.decimals_1,
+                        pool.active_bin_id,
+                        resulting,
+                        target_bps,
+                    )
                 })
                 .unwrap_or(false)
         });
@@ -465,12 +524,32 @@ mod tests {
 
     #[test]
     fn bin_impact_is_a_ceiling_and_fails_closed_above_max() {
-        assert_eq!(bin_impact_bps(100, 1, 1), Bps::new(0).ok());
+        assert_eq!(bin_impact_bps(100, 0, 0, 1, 1), Bps::new(0).ok());
         // (101/100) down is 99.01 bps, reported as its whole-bp ceiling of 100.
-        assert_eq!(bin_impact_bps(100, 1, 0), Bps::new(100).ok());
+        assert_eq!(bin_impact_bps(100, 0, 0, 1, 0), Bps::new(100).ok());
         // (1.1)^6 ~ 1.77x is representable...
-        assert_eq!(bin_impact_bps(1_000, 0, 6), Bps::new(7_716).ok());
+        assert_eq!(bin_impact_bps(1_000, 0, 0, 0, 6), Bps::new(7_716).ok());
         // ...while (1.1)^8 ~ 2.14x exceeds `Bps::MAX`.
-        assert_eq!(bin_impact_bps(1_000, 0, 8), None);
+        assert_eq!(bin_impact_bps(1_000, 0, 0, 0, 8), None);
+    }
+
+    #[test]
+    fn bin_impact_reuses_representable_per_bin_prices() {
+        // A far-from-zero active bin: `|diff| = 18` overflows `base^|diff|`, but
+        // every per-bin price is representable, so the ratio is still exact.
+        // (10001/10000)^18 - 1 = 18.0153 bps -> ceiling 19.
+        assert_eq!(bin_impact_bps(1, 0, 0, -9, 9), Bps::new(19).ok());
+        // (10001/10000)^10 - 1 = 10.0045 bps -> ceiling 11 (previously `None`).
+        assert_eq!(bin_impact_bps(1, 0, 0, -9, 1), Bps::new(11).ok());
+    }
+
+    #[test]
+    fn scale_u256_matches_wide_multiplication() {
+        // Low-limb scaling.
+        assert_eq!(scale_u256((0, 7), 10_000), (0, 0, 70_000));
+        // Low-limb carry into the middle limb: 2^127 * 2 = 2^128.
+        assert_eq!(scale_u256((0, 1u128 << 127), 2), (0, 1, 0));
+        // High-limb carry into the top limb.
+        assert_eq!(scale_u256((u128::MAX, 0), 2), (1, u128::MAX - 1, 0));
     }
 }

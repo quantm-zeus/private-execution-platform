@@ -243,14 +243,17 @@ fn canonical_key(route: &ScoredRoute) -> Vec<(String, String, String, String)> {
 /// Deterministic total order over scored routes: the best route sorts first.
 ///
 /// Keys, in order: gas-adjusted net output descending (or net output when no gas
-/// view), simulated net output descending, exact CLMM/Bin depth descending when
-/// **both** candidates carry a depth key, gas cost ascending when both costs
-/// share an asset, failure probability ascending, hop count ascending, canonical
+/// view), simulated net output descending, gas cost ascending when both costs
+/// share an asset, exact CLMM/Bin depth descending when **both** candidates carry
+/// a depth key, failure probability ascending, hop count ascending, canonical
 /// leg key ascending.
 ///
-/// Depth is strictly a tie-break below net output and is a no-op when either
-/// candidate lacks a key (CPMM, multi-hop, or depth disabled), so an empty
-/// target list reproduces the pre-depth ordering exactly.
+/// Depth is strictly a tie-break below net output **and** below gas cost (gas is
+/// part of the exact route economics, invariant #4). It is a no-op when depth is
+/// disabled (`None` on both sides); when only one candidate has a computed depth
+/// profile the known-depth candidate is preferred, which keeps the comparator a
+/// valid total order. An empty target list therefore reproduces the pre-depth
+/// ordering exactly.
 pub(crate) fn compare_scored(
     left: &ScoredRoute,
     left_net_after_gas: Option<u128>,
@@ -272,8 +275,8 @@ pub(crate) fn compare_scored(
                 .get()
                 .cmp(&left.score.simulated_net_output.amount.get())
         })
-        .then_with(|| depth_ascending(left_depth, right_depth))
         .then_with(|| gas_ascending(&left.score.gas_cost, &right.score.gas_cost))
+        .then_with(|| depth_ascending(left_depth, right_depth))
         .then_with(|| {
             left.score
                 .failure_probability
@@ -285,8 +288,12 @@ pub(crate) fn compare_scored(
 }
 
 /// Orders depth keys as a lower-priority tie-break: compare absorbed capacity
-/// from the widest band down, then lower exact impact. A missing key on either
-/// side is neutral.
+/// from the widest band down, then lower exact impact.
+///
+/// A candidate with a computed profile sorts ahead of one without. Treating the
+/// missing profile as the weakest value (rather than "neutral") keeps this key a
+/// total preorder, so the composed comparator stays a valid total order; with
+/// depth disabled every candidate is `None`, which is `Equal`.
 fn depth_ascending(left: Option<&DepthRank>, right: Option<&DepthRank>) -> Ordering {
     match (left, right) {
         (Some(left), Some(right)) => {
@@ -298,7 +305,9 @@ fn depth_ascending(left: Option<&DepthRank>, right: Option<&DepthRank>) -> Order
             }
             depth_impact_key(left.impact_bps).cmp(&depth_impact_key(right.impact_bps))
         }
-        _ => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
     }
 }
 

@@ -208,7 +208,12 @@ fn reduce_fraction(num: u128, den: u128) -> (u128, u128) {
 /// The human bin price is `P(b) = ((10000 + bin_step) / 10000)^b`; the atomic price
 /// scales it by `10^(decimals_1 - decimals_0)`. The base fraction is reduced before
 /// exponentiation so that representable bin prices do not spuriously overflow.
-fn atomic_bin_price(
+///
+/// Exposed so callers that need to compare two bins of the same pool (for example
+/// exact depth/price-impact profiling) reuse this representation instead of
+/// re-deriving `base^|diff|`, which overflows for a far-from-zero active bin even
+/// when both per-bin prices are representable.
+pub fn atomic_bin_price(
     bin_step: u16,
     decimals_0: u8,
     decimals_1: u8,
