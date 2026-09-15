@@ -1758,6 +1758,14 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     Ok(bytes)
 }
 
+/// A workspace artifact file is deliverable only when it is long enough to hold
+/// the header plus the AEAD tag and no larger than the hard bound. Kept as a
+/// named predicate so the exact boundary is unit-tested independently of the
+/// readiness probe's test seam.
+fn artifact_length_is_deliverable(len: u64) -> bool {
+    (crypto_envelope::MIN_ARTIFACT_LEN as u64..=MAX_ARTIFACT_BYTES as u64).contains(&len)
+}
+
 /// Read only the bounded artifact header (version + KID + encapsulated key) for
 /// the unauthenticated readiness probe. This never allocates or hashes the full
 /// ciphertext, so a probe cannot be used to amplify memory/CPU.
@@ -1774,9 +1782,7 @@ fn load_workspace_artifact_header() -> Result<Vec<u8>, StatusCode> {
     let header_len = crypto_envelope::ARTIFACT_HEADER_LEN as u64;
     // A file too short to hold a header plus the AEAD tag can never be delivered,
     // so it must not make readiness report a healthy artifact.
-    let min_len = crypto_envelope::MIN_ARTIFACT_LEN as u64;
-    if !metadata.is_file() || metadata.len() < min_len || metadata.len() > MAX_ARTIFACT_BYTES as u64
-    {
+    if !metadata.is_file() || !artifact_length_is_deliverable(metadata.len()) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let file = std::fs::File::open(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -5265,6 +5271,25 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["dispatcher"], false);
+    }
+
+    #[test]
+    fn artifact_length_bound_is_exact() {
+        // The readiness probe's test seam truncates to the header, so the real
+        // minimum-length boundary is pinned here.
+        assert!(artifact_length_is_deliverable(
+            crypto_envelope::MIN_ARTIFACT_LEN as u64
+        ));
+        assert!(!artifact_length_is_deliverable(
+            crypto_envelope::MIN_ARTIFACT_LEN as u64 - 1
+        ));
+        assert!(!artifact_length_is_deliverable(
+            crypto_envelope::ARTIFACT_HEADER_LEN as u64
+        ));
+        assert!(artifact_length_is_deliverable(MAX_ARTIFACT_BYTES as u64));
+        assert!(!artifact_length_is_deliverable(
+            MAX_ARTIFACT_BYTES as u64 + 1
+        ));
     }
 
     // ---- Passkey-bound recovery wrapper tests ----

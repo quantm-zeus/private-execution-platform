@@ -290,3 +290,25 @@ impl crate::OpaqueStreamRelay for PrivateStreamRelay {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unreadable_identity_file_refuses_startup() {
+        // The identity files are loaded eagerly in `new`, so a typo or an
+        // unreadable/malformed cert, key or CA is a startup error rather than a
+        // permanently-503 edge that still reports `/health` 200.
+        let config = PrivateRelayConfig {
+            identity: ServiceIdentityConfig {
+                cert_chain_path: "/nonexistent/evergreen-cert.pem".into(),
+                private_key_path: "/nonexistent/evergreen-key.pem".into(),
+                ca_path: "/nonexistent/evergreen-ca.pem".into(),
+                expected_peer_dns: "private-api.internal".to_string(),
+            },
+            endpoint_origin: "https://private-api.internal".to_string(),
+        };
+        assert!(PrivateRelay::new(config).is_err());
+    }
+}

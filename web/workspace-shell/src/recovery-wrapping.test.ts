@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  RECOVERY_AAD,
+  RECOVERY_KEY_SOURCE,
   RECOVERY_WRAPPER_VERSION,
   RECOVERY_WRAP_ALGORITHM,
   RecoveryWrappingError,
+  deriveRecoveryWrappingKey,
   extractPrfOutput,
   generateRecoverySalt,
   generateWorkspaceRootKey,
@@ -125,6 +128,38 @@ test("passkey wrapping requires a verified PRF output", async () => {
 
   // A different PRF output (another authenticator) cannot unwrap.
   await assert.rejects(unwrapWithPrf(record!, prfCredential(new Uint8Array(32).fill(0x34))));
+});
+
+test("a pre-binding wrapper (bare constant AAD) still unwraps", async () => {
+  // Records written before the credential-bound AAD used the bare domain
+  // constant. They must remain unwrappable rather than being silently
+  // invalidated; a bound record must not be downgradable to this path.
+  const rootKey = generateWorkspaceRootKey();
+  const prf = new Uint8Array(32).fill(0x21);
+  const salt = generateRecoverySalt();
+  const iv = new Uint8Array(12).fill(5);
+  const wrappingKey = await deriveRecoveryWrappingKey(prf, salt);
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: iv as unknown as BufferSource,
+      additionalData: new TextEncoder().encode(RECOVERY_AAD) as unknown as BufferSource,
+    },
+    wrappingKey,
+    rootKey as unknown as BufferSource,
+  );
+  const legacyRecord = {
+    version: RECOVERY_WRAPPER_VERSION,
+    algorithm: RECOVERY_WRAP_ALGORITHM,
+    key_source: RECOVERY_KEY_SOURCE,
+    salt_b64: b64(salt),
+    iv_b64: b64(iv),
+    wrapped_root_key_b64: b64(new Uint8Array(ciphertext)),
+  };
+  assert.deepEqual(await unwrapRootKey(prf, legacyRecord), rootKey);
+
+  // A wrong PRF still cannot open it.
+  await assert.rejects(unwrapRootKey(new Uint8Array(32).fill(0x22), legacyRecord));
 });
 
 function b64(bytes: Uint8Array): string {

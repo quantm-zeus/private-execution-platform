@@ -233,22 +233,34 @@ export async function unwrapRootKey(
     throw new RecoveryWrappingError("invalid_record");
   }
   const wrappingKey = await deriveRecoveryWrappingKey(ikm, salt, info);
-  try {
-    const plaintext = await subtleCrypto().decrypt(
-      {
-        name: "AES-GCM",
-        iv: iv as unknown as BufferSource,
-        additionalData: recoveryAadContext(record, credentialIdB64) as unknown as BufferSource,
-      },
-      wrappingKey,
-      ciphertext as unknown as BufferSource,
-    );
-    const rootKey = new Uint8Array(plaintext);
-    requireRootKey(rootKey);
-    return rootKey;
-  } catch {
-    throw new RecoveryWrappingError("unwrap_failed");
+  // Try the credential-bound AAD first, then the bare pre-binding domain
+  // constant. The fallback keeps a wrapper written by an earlier build
+  // unwrappable instead of silently invalidating it; it cannot downgrade a bound
+  // record, because the two AADs are distinct and a tag only verifies under the
+  // exact AAD it was created with.
+  const candidateAads = [
+    recoveryAadContext(record, credentialIdB64),
+    encoder.encode(RECOVERY_AAD),
+  ];
+  for (const additionalData of candidateAads) {
+    try {
+      const plaintext = await subtleCrypto().decrypt(
+        {
+          name: "AES-GCM",
+          iv: iv as unknown as BufferSource,
+          additionalData: additionalData as unknown as BufferSource,
+        },
+        wrappingKey,
+        ciphertext as unknown as BufferSource,
+      );
+      const rootKey = new Uint8Array(plaintext);
+      requireRootKey(rootKey);
+      return rootKey;
+    } catch {
+      // Try the next candidate AAD.
+    }
   }
+  throw new RecoveryWrappingError("unwrap_failed");
 }
 
 /**

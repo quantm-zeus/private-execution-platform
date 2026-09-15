@@ -457,7 +457,11 @@ export async function publishRelease({
   // Best-effort sweep of staging directories leaked by a previous killed
   // publish; age-bounded so a concurrent publish is never disturbed.
   await sweepStaleStaging(releasesRoot);
-  const shellAssetDigest = await digestDirectory(shellDir);
+  // Resolve the operator-supplied source shell directory once. A symlinked
+  // *source* is legitimate; symlinks *inside* a published release tree are
+  // still refused.
+  const shellSource = await realpath(shellDir);
+  const shellAssetDigest = await digestDirectory(shellSource);
   const manifest = computeReleaseManifest({
     releaseId,
     sourceSha,
@@ -472,8 +476,11 @@ export async function publishRelease({
     await writeFileDurable(join(staging, ARTIFACT_FILE), artifact, { mode: 0o600 });
     const stagedShell = join(staging, SHELL_DIR);
     await mkdir(stagedShell, { recursive: true });
-    await copyTree(shellDir, stagedShell);
+    await copyTree(shellSource, stagedShell);
     await writeShellCacheHeaders(stagedShell);
+    // Fsync the shell root itself after it is populated (copyTree only syncs
+    // nested directories), so top-level entries are as durable as the rest.
+    await syncDirectory(stagedShell);
     // The manifest covers the shell as shipped (including _headers).
     shippedShellDigest = await digestDirectory(stagedShell);
     manifest.shell.asset_digest_hex = shippedShellDigest;

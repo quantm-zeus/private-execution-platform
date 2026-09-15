@@ -9,6 +9,7 @@
 // path, key, or ciphertext is propagated.
 
 import {
+  RECOVERY_KEY_SOURCE,
   RECOVERY_WRAPPER_VERSION,
   unwrapRootKey,
   type WrappedRootKey,
@@ -57,9 +58,10 @@ export const RECOVERY_CHALLENGE_BYTES = 32;
 /**
  * The only wrapper key source this shell can unwrap. A record for an unknown
  * source (e.g. a future random-root-key migration) is rejected rather than
- * reinterpreted as the unlock secret.
+ * reinterpreted as the unlock secret. Aliased to the wrapping primitive's
+ * constant so the AAD and server-stored value can never drift.
  */
-export const SUPPORTED_KEY_SOURCE = "unlock_secret_v1";
+export const SUPPORTED_KEY_SOURCE = RECOVERY_KEY_SOURCE;
 
 export interface RecoveryClientOptions {
   fetchFn?: typeof fetch;
@@ -311,7 +313,7 @@ export async function addRecoveryWrapper(
           label: input.label,
           version: input.record.version,
           algorithm: input.record.algorithm,
-          key_source: SUPPORTED_KEY_SOURCE,
+          key_source: input.record.key_source,
           salt_b64: input.record.salt_b64,
           iv_b64: input.record.iv_b64,
           wrapped_root_key_b64: input.record.wrapped_root_key_b64,

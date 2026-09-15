@@ -790,12 +790,14 @@ remains best-effort; the byte copy is zeroized in a `finally`.
 `PRIVATE_API_RELAY_BIND_ADDR` with an incomplete identity (or any identity value
 without a bind) refuses startup. The relay listener is bound before it is
 spawned, so a bad address is a startup error, and `/ready` reports dependency
-readiness (relay bound, artifact and manifest header valid, dispatcher available,
-passkey store readable, optional recovery store readable) distinct from `/health`
-liveness. The artifact check requires a deliverable file (`MIN_ARTIFACT_LEN`,
-version 1, non-zero KID and encapsulated key), so a truncated or wrong-version
-file is never reported healthy; the `dispatcher` check reflects the opaque
-command surface, which a future composition can clear. `apps/edge-gateway`
+readiness (relay bound, artifact and manifest header valid, configured command
+surface present, passkey store readable, optional recovery store readable)
+distinct from `/health` liveness. The artifact check requires a deliverable file
+(`MIN_ARTIFACT_LEN`, version 1, non-zero KID and encapsulated key), so a
+truncated or wrong-version file is never reported healthy; the `dispatcher`
+check reflects whether the opaque command surface is configured (the production
+binary always wires a fail-closed dispatcher before serving and refuses startup
+without one), and a future composition that can lose its dispatcher clears it. `apps/edge-gateway`
 refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
 validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
 bypass that, so the loopback deployment mitigation cannot be widened silently.
