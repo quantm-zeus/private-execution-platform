@@ -360,6 +360,7 @@ fn every_relay_error_variant_is_redacted() {
     let errors = relay_error_sweep![
         TradingDisabled,
         ChainHealthUnavailable,
+        SigningUnavailable,
         SigningFailed,
         SigningRequestMismatch,
         ChainMismatch,

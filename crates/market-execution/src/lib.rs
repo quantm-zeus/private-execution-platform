@@ -375,9 +375,9 @@ fn checked_ceil_mul_div(a: u128, b: u128, d: u128) -> Result<u128, MarketExecuti
 /// `Unknown` so a caller never blindly retries a possibly-sent attempt. The
 /// definitive/ambiguous error split mirrors the P57 limit-engine executor; the
 /// P72 taxonomy additionally maps `TradingDisabled` to `Denied` and
-/// `ChainHealthUnavailable` to `Unavailable` (a transient gate, not a trade
-/// decision), and reports an in-flight `Submitted` for the observational
-/// journal states.
+/// `ChainHealthUnavailable` / `SigningUnavailable` to `Unavailable` (transient
+/// breaker gates, not trade decisions), and reports an in-flight `Submitted`
+/// for the observational journal states.
 fn map_outcome(
     result: Result<RelayOutcome, RelayError>,
 ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
@@ -397,8 +397,11 @@ fn map_outcome(
         }
         // Policy / kill switch.
         Err(RelayError::TradingDisabled) => Err(MarketExecutionError::Denied),
-        // Chain health is a transient gate, not a trade decision.
-        Err(RelayError::ChainHealthUnavailable) => Err(MarketExecutionError::Unavailable),
+        // Chain health / signing are transient breaker gates, not trade
+        // decisions.
+        Err(RelayError::ChainHealthUnavailable) | Err(RelayError::SigningUnavailable) => {
+            Err(MarketExecutionError::Unavailable)
+        }
         // Definitive pre-send: the relay provably did not reach submit.
         Err(RelayError::SigningFailed)
         | Err(RelayError::SigningRequestMismatch)
@@ -560,5 +563,13 @@ mod tests {
             floor.asset,
             AssetId::new(ChainId::Base, "TOKEN").expect("asset")
         );
+    }
+
+    #[test]
+    fn signing_unavailable_is_a_transient_unavailable_gate() {
+        assert!(matches!(
+            map_outcome(Err(RelayError::SigningUnavailable)),
+            Err(MarketExecutionError::Unavailable)
+        ));
     }
 }

@@ -36,7 +36,8 @@
 //! A relay error is **definitive pre-send** when the relay could not have
 //! reached `ChainSubmissionAdapter::submit`: the live kill switch is off
 //! (`TradingDisabled`), chain health blocked the attempt before submission
-//! (`ChainHealthUnavailable`), the payload or signed reference failed to bind
+//! (`ChainHealthUnavailable`), the signing-failure breaker blocked it
+//! (`SigningUnavailable`), the payload or signed reference failed to bind
 //! (`MissingSignedPayload`, `SignedPayloadEmpty`, `SignedPayloadTooLarge`,
 //! `SignedPayloadDigestMismatch`, `SigningRequestMismatch`, `ChainMismatch`),
 //! signing failed or the reservation store refused the claim (`SigningFailed`,
@@ -259,6 +260,7 @@ fn map_outcome(result: Result<RelayOutcome, RelayError>) -> AttemptResolution {
         // Definitive pre-send errors: the relay could not have reached `submit`.
         Err(RelayError::TradingDisabled)
         | Err(RelayError::ChainHealthUnavailable)
+        | Err(RelayError::SigningUnavailable)
         | Err(RelayError::SigningFailed)
         | Err(RelayError::SigningRequestMismatch)
         | Err(RelayError::ChainMismatch)
@@ -278,5 +280,18 @@ fn map_outcome(result: Result<RelayOutcome, RelayError>) -> AttemptResolution {
         | Err(RelayError::AdapterRejected)
         | Err(RelayError::UnknownSubmissionState)
         | Err(RelayError::InvalidTransition) => AttemptResolution::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signing_unavailable_is_a_definitive_pre_send_failure() {
+        assert!(matches!(
+            map_outcome(Err(RelayError::SigningUnavailable)),
+            AttemptResolution::FailedBeforeSubmit
+        ));
     }
 }
