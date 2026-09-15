@@ -205,13 +205,15 @@ export default function LimitsPanel(): JSX.Element {
     payload: PlaceLimitPayload;
   } | null>(null);
 
-  // Load once the authoritative session confirms the capability. A one-shot
-  // `onMount` check can observe the pre-bootstrap (all-false) capability set if
-  // the user navigates here before `/v1/bootstrap` settles, and then never load
-  // — presenting an unqueried "no orders" as if it were authoritative.
+  // Load once the authoritative session confirms the capability *and* the
+  // encrypted command channel is installed. A one-shot `onMount` check can
+  // observe the pre-bootstrap (all-false) capability set if the user navigates
+  // here before `/v1/bootstrap` settles, and firing before the BR-5 handoff
+  // installs the real client would map the fail-closed stub's
+  // `capability_missing` to a permanent `unavailable` state.
   let requested = false;
   createEffect(() => {
-    if (readDenial() === null && !requested) {
+    if (readDenial() === null && ws.commandReady() && !requested) {
       requested = true;
       void orders.run();
     }

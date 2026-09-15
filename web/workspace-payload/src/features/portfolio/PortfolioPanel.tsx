@@ -61,17 +61,19 @@ export default function PortfolioPanel(): JSX.Element {
   const portfolioDenial = createMemo(() => ws.capabilityDenial("portfolio"));
   const alertsDenial = createMemo(() => ws.capabilityDenial("intelligence"));
 
-  // Load each surface once its capability is authoritatively confirmed. A
-  // one-shot `onMount` check can observe the pre-bootstrap (all-false)
-  // capability set and then never load, rendering an unqueried empty state.
+  // Load each surface once its capability is authoritatively confirmed and the
+  // encrypted command channel is installed. A one-shot `onMount` check can
+  // observe the pre-bootstrap (all-false) capability set and then never load;
+  // firing before the BR-5 handoff installs the real client would latch the
+  // fail-closed stub's `capability_missing` as a permanent `unavailable`.
   let portfolioRequested = false;
   let alertsRequested = false;
   createEffect(() => {
-    if (!portfolioRequested && portfolioDenial() === null) {
+    if (!portfolioRequested && portfolioDenial() === null && ws.commandReady()) {
       portfolioRequested = true;
       void portfolio.run();
     }
-    if (!alertsRequested && alertsDenial() === null) {
+    if (!alertsRequested && alertsDenial() === null && ws.commandReady()) {
       alertsRequested = true;
       void alerts.run();
     }

@@ -1,7 +1,7 @@
 import { Show, createEffect, createMemo, createSignal, type Component } from "solid-js";
 import { formatAmount, formatBps, formatPercent } from "../../core/format";
 import { workspaceError } from "../../core/errors";
-import type { WorkspaceErrorShape } from "../../core/types";
+import type { CapabilityDenial, WorkspaceErrorShape } from "../../core/types";
 import type { ExecutionProgress, RfqLegView, RfqView, TwapRequest } from "../../contracts/execution";
 import { createCommandResource } from "../../state/command-state";
 import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/idempotency";
@@ -58,8 +58,15 @@ export const ExecutionPanel: Component = () => {
   // (BR-9): the server serves it even when `twap` is not advertised, so the
   // client must not hide it behind `twap` or an UNKNOWN execution could never
   // be reconciled. The read stays fail-closed server-side.
-  const progressDenial = (): null => null;
-  // ...but it must still wait for the authenticated encrypted command channel.
+  //
+  // Until the authenticated command channel is installed it must surface as
+  // "awaiting the channel" rather than an unqueried empty ("no execution
+  // running"), which a stalled handoff would otherwise show forever.
+  const progressDenial = (): CapabilityDenial | null =>
+    ws.commandReady()
+      ? null
+      : { capability: "twap", reason: "Awaiting the authenticated command channel." };
+  // ...and it must still wait for the authenticated encrypted command channel.
   // Firing before the BR-5 handoff installs the real client hits the fail-closed
   // stub, which maps to a permanent `unavailable` state (the request is
   // one-shot), so gate on `commandReady` rather than on `twap`.

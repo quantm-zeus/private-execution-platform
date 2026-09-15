@@ -80,8 +80,9 @@ export default function IntelligencePanel(): JSX.Element {
 
   let requested = false;
   createEffect(() => {
-    // Wait until the authoritative session confirms the capability, then load once.
-    if (denial() === null && !requested) {
+    // Wait until the authoritative session confirms the capability *and* the
+    // encrypted command channel is installed, then load once.
+    if (denial() === null && ws.commandReady() && !requested) {
       requested = true;
       void health.run();
     }
