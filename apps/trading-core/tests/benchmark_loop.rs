@@ -461,6 +461,32 @@ impl ProviderBenchmarkPort for SkippedPort {
     }
 }
 
+/// Port that records the `now_ms` it was called with, so a loop that stopped
+/// forwarding the caller's comparison instant is caught.
+struct NowRecordingPort {
+    nows: Mutex<Vec<i64>>,
+}
+
+impl NowRecordingPort {
+    fn new() -> Self {
+        Self {
+            nows: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn nows(&self) -> Vec<i64> {
+        lock(&self.nows).clone()
+    }
+}
+
+#[async_trait]
+impl ProviderBenchmarkPort for NowRecordingPort {
+    async fn evaluate(&self, _request: BenchmarkRequest, now_ms: i64) -> BenchmarkOutcome {
+        lock(&self.nows).push(now_ms);
+        skipped_outcome()
+    }
+}
+
 /// Scripted provider-quote source for the [`SharedProviderBenchmark`] adapter.
 struct ScriptedQuoteSource;
 
@@ -564,7 +590,31 @@ async fn spawned_loop_runs_until_shutdown() {
 
     let report = handle.await.expect("loop task");
     assert!(report.passes >= 1, "at least one pass ran: {report:?}");
-    assert_eq!(report.requested, report.skipped + report.compared);
+    // One request per pass, every outcome skipped: the accounting is only
+    // consistent when passes/requested/skipped agree and nothing compared.
+    assert_eq!(report.requested, report.passes);
+    assert_eq!(report.compared, 0);
+    assert_eq!(report.skipped, report.passes);
+}
+
+/// The loop must forward the caller's comparison instant to the port: the
+/// benchmark service derives the local-state age from it, so a constant would
+/// silently disable the P80 staleness guard at the loop level.
+#[tokio::test]
+async fn run_pass_forwards_the_caller_instant_to_the_port() {
+    let port = Arc::new(NowRecordingPort::new());
+    let loop_ = ProviderBenchmarkLoop::new(
+        port.clone(),
+        Arc::new(NoopRouteComparisonRecordSink),
+        Arc::new(FixedCountSource { count: 2 }),
+        MAX_BENCHMARK_REQUESTS_PER_PASS,
+    );
+
+    let report = loop_.run_pass(NOW + 12_345).await;
+
+    assert_eq!(report.requested, 2);
+    assert_eq!(report.skipped, 2);
+    assert_eq!(port.nows(), vec![NOW + 12_345, NOW + 12_345]);
 }
 
 #[tokio::test]
