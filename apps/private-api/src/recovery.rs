@@ -478,7 +478,9 @@ fn check_parent_directory(path: &Path) -> Result<(), AuthError> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let metadata = fs::metadata(parent).map_err(|_| AuthError::VerifierUnavailable)?;
-    if metadata.mode() & 0o002 != 0 {
+    // Group- OR world-writable: another local principal could rename/replace the
+    // store between our checks, so refuse the directory entirely.
+    if metadata.mode() & 0o022 != 0 {
         return Err(AuthError::VerifierUnavailable);
     }
     Ok(())
@@ -693,7 +695,7 @@ mod tests {
 
     #[test]
     fn file_store_roundtrips_owner_only_and_survives_reload() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_dir();
         let path = directory.path().join("recovery.json");
         let record = valid_input().into_record(5).unwrap();
         {
@@ -717,7 +719,7 @@ mod tests {
 
     #[test]
     fn file_store_upsert_revoke_touch_and_bounds() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_dir();
         let path = directory.path().join("recovery.json");
         let store = FileRecoveryWrapperStore::open(&path).unwrap();
         let mut record = valid_input().into_record(5).unwrap();
@@ -769,7 +771,7 @@ mod tests {
 
     #[test]
     fn corrupt_symlinked_and_group_readable_stores_refuse_startup() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_dir();
         let corrupt = directory.path().join("corrupt.json");
         fs::write(&corrupt, b"not json").unwrap();
         #[cfg(unix)]
@@ -804,9 +806,19 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// A store directory that satisfies the owner-only parent check. `tempfile`
+    /// honours `$TMPDIR`, which may be group/world-writable, so tests create an
+    /// explicitly private directory instead of relying on the ambient temp root.
+    fn private_dir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        set_mode(directory.path(), 0o700);
+        directory
+    }
+
     #[test]
     fn debug_never_exposes_wrapper_material() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_dir();
         let store = FileRecoveryWrapperStore::open(directory.path().join("recovery.json")).unwrap();
         assert_eq!(format!("{store:?}"), "FileRecoveryWrapperStore([REDACTED])");
     }

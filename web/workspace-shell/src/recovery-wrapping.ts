@@ -12,14 +12,14 @@
 // here. PRF is optional in WebAuthn, so a mandatory high-entropy offline
 // recovery secret remains the fallback.
 //
-// SECURITY / ROLLOUT STATUS
-// This module is a tested primitive and is intentionally NOT wired into the
-// production unlock path yet. Enabling passkey recovery requires (a) verified
-// PRF support for the operator's authenticator/browser, (b) durable server-side
-// wrapper storage, and (c) an explicitly versioned additive artifact-key
-// migration. Until those land, the existing offline recovery code remains the
-// only unlock credential and the existing artifact is never invalidated.
-// See docs/workspace-recovery.md.
+// ROLLOUT STATUS
+// Wired into the production unlock path as an ADDITIVE layer: a wrapper protects
+// the existing unlock secret (`key_source = "unlock_secret_v1"`), so no
+// artifact, KID or derivation changes and the mandatory offline recovery code
+// keeps working. PRF support is optional and per-authenticator:
+// `extractPrfOutput` returns `null` and the caller falls back to the offline
+// code. A future random root key would be a new, explicitly versioned key
+// source, not a change to these records. See docs/workspace-recovery.md.
 
 export const RECOVERY_WRAPPER_VERSION = 1;
 export const RECOVERY_WRAP_ALGORITHM = "HKDF-SHA256/AES-256-GCM";

@@ -267,8 +267,18 @@ pub fn preflight(
         Ok(envelope) => envelope,
         Err(_) => return UnlockCompatibility::ArtifactIncompatible,
     };
+    // Cheap, allocation-free checks first. The full manifest-vs-artifact
+    // validation hashes up to `MAX_ARTIFACT_BYTES`, so it must run only after
+    // the enrollment and recipient-fingerprint checks pass: otherwise any
+    // authenticated session could force a full SHA-256 over the artifact with a
+    // request that is going to be rejected anyway.
     if let Some(manifest) = manifest {
-        if manifest.validate_against(artifact).is_err() {
+        if manifest.validate_shape().is_err() {
+            return UnlockCompatibility::ArtifactIncompatible;
+        }
+        if envelope.version != manifest.artifact.version
+            || base64_encode(&envelope.kid) != manifest.artifact.kid_b64
+        {
             return UnlockCompatibility::ArtifactIncompatible;
         }
     }
@@ -282,6 +292,10 @@ pub fn preflight(
         if public_key_fingerprint_b64(&enrollment.public_key)
             != manifest.recipient.public_key_fingerprint_b64
         {
+            return UnlockCompatibility::ArtifactIncompatible;
+        }
+        // All cheap bindings hold; now pay for the full byte-level validation.
+        if manifest.validate_against(artifact).is_err() {
             return UnlockCompatibility::ArtifactIncompatible;
         }
     }

@@ -734,6 +734,37 @@ async fn verify_challenge(
         }
         Err(_) => return clear_challenge(generic_error(StatusCode::UNAUTHORIZED)),
     };
+    // Step-up verification: the caller already holds a live authenticated
+    // session, so this ceremony confirms one more passkey rather than logging
+    // in. Minting a new session here would silently replace the caller's
+    // session — and with it the workspace enrollment bound to it — so a
+    // subsequent recovery/artifact call would fail `enrollment_required`
+    // against a session the browser never had a chance to enroll. Keep the
+    // existing session and return its expiry; `PEP`'s single-owner model means
+    // the credential has still been verified by this ceremony.
+    if let Ok(Some(value)) = cookie_value(&headers, SESSION_COOKIE_NAME) {
+        let token = TransportToken(value.to_string());
+        let live = {
+            let mut transport = match state.transport.lock() {
+                Ok(v) => v,
+                Err(_) => return clear_challenge(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
+            };
+            transport.prune(now);
+            match transport.sessions.get(&token) {
+                Some((_, expires_at_ms)) if *expires_at_ms > now => Some(*expires_at_ms),
+                _ => None,
+            }
+        };
+        if live.is_some() {
+            let mut response = no_store(StatusCode::NO_CONTENT.into_response());
+            if append_challenge_clear(&mut response).is_err() {
+                // A response that cannot clear the consumed challenge could let
+                // it be replayed against the pending attempt, so fail closed.
+                return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            return response;
+        }
+    }
     let mut auth = match state.auth.lock() {
         Ok(v) => v,
         Err(_) => return clear_challenge(generic_error(StatusCode::SERVICE_UNAVAILABLE)),
@@ -1257,6 +1288,8 @@ struct RecoveryRevokeRequest {
 
 #[derive(serde::Deserialize)]
 struct RecoveryTouchRequest {
+    challenge_id: String,
+    proof_b64: String,
     credential_id_b64: String,
 }
 
@@ -1513,8 +1546,10 @@ async fn revoke_recovery_wrapper(
     }
 }
 
-/// Record a coarse last-used timestamp. Non-authoritative (a client can only
-/// report a wrapper it can name) and therefore only session-authenticated.
+/// Record a coarse last-used timestamp for a wrapper that was just used to
+/// unwrap. Like add/revoke this requires proof of possession: an unproven
+/// caller must not be able to forge the device audit signal or force a
+/// persisted store write on demand.
 async fn touch_recovery_wrapper(
     State(state): State<PrivateApiState>,
     headers: HeaderMap,
@@ -1527,7 +1562,7 @@ async fn touch_recovery_wrapper(
     if content_type(&headers) != Some(CONTENT_TYPE) {
         return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
-    let Some(_session_id) = session_id_from_headers(&state, &headers, now) else {
+    let Some(session_id) = session_id_from_headers(&state, &headers, now) else {
         return clear_session(generic_error(StatusCode::UNAUTHORIZED));
     };
     let Some(store) = state.recovery_store.as_ref() else {
@@ -1544,6 +1579,15 @@ async fn touch_recovery_wrapper(
     let Some(credential_id) = decode_recovery_credential_id(&request.credential_id_b64) else {
         return generic_error(StatusCode::BAD_REQUEST);
     };
+    if !consume_recovery_proof(
+        &state,
+        now,
+        &session_id,
+        &request.challenge_id,
+        &request.proof_b64,
+    ) {
+        return generic_error(StatusCode::UNAUTHORIZED);
+    }
     match store.touch(&credential_id, now) {
         Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
         Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
@@ -5118,6 +5162,14 @@ mod tests {
     ) -> (PrivateApiState, TestRegistrationClient, tempfile::TempDir) {
         let (state, client) = test_state(clock);
         let directory = tempfile::tempdir().unwrap();
+        // `tempfile` honours `$TMPDIR`, which may be group/world-writable; the
+        // store refuses such a parent, so create an explicitly private one.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
         let store = FileRecoveryWrapperStore::open(directory.path().join("recovery.json")).unwrap();
         (
             state.with_recovery_store(Arc::new(store)),
@@ -5329,19 +5381,36 @@ mod tests {
             establish_session_and_grant(&state, &client).await;
         let keypair = test_keypair(0x93, 0x94);
 
-        // No artifact/manifest configured: fail closed, never trust the session
-        // enrollment alone. Injected loaders keep this hermetic (no process env).
-        let unconfigured = state
-            .clone()
-            .with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)))
+        // A readable artifact but NO immutable manifest: there is no trusted
+        // recipient binding, so recovery mutation stays closed rather than
+        // trusting the session enrollment alone. Injected loaders keep this
+        // hermetic (no process env).
+        let no_manifest = recovery_release_state(state.clone(), &keypair)
             .with_manifest_loader(Arc::new(|| Ok(None)));
+        enroll_test_workspace(&no_manifest, &session_cookie, &keypair).await;
         let missing = post_raw(
-            &unconfigured,
+            &no_manifest,
             &session_cookie,
             "/internal/workspace/recovery/challenge",
         )
         .await;
-        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        let body = missing.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["code"], "recovery_manifest_required");
+
+        // An unreadable/malformed artifact is a hard 503, never a policy 409.
+        let broken_artifact = state
+            .clone()
+            .with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)))
+            .with_manifest_loader(Arc::new(|| Ok(None)));
+        let broken = post_raw(
+            &broken_artifact,
+            &session_cookie,
+            "/internal/workspace/recovery/challenge",
+        )
+        .await;
+        assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // Inject a real artifact + matching manifest and enroll the workspace key.
         let state = recovery_release_state(state, &keypair);
@@ -5385,6 +5454,89 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// The core authorization defence: a caller who enrolls a workspace key they
+    /// control (they know its secret) must NOT be able to issue a proof-of-
+    /// possession challenge, because the release manifest binds the artifact to
+    /// a DIFFERENT recipient fingerprint. Without this, an attacker could
+    /// self-enroll and then self-approve a recovery wrapper.
+    #[tokio::test]
+    async fn recovery_challenge_refuses_a_self_enrolled_foreign_key() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let released = test_keypair(0x95, 0x96);
+        let state = recovery_release_state(state, &released);
+
+        // Enroll an attacker-chosen key whose secret the caller knows.
+        let attacker = test_keypair(0xA1, 0xA2);
+        enroll_test_workspace(&state, &session_cookie, &attacker).await;
+
+        let response = post_raw(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery/challenge",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["code"], "artifact_incompatible");
+    }
+
+    #[tokio::test]
+    async fn recovery_touch_requires_proof_of_possession() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let keypair = test_keypair(0x97, 0x98);
+        let state = recovery_release_state(state, &keypair);
+        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+
+        // Add a wrapper so there is something to touch.
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let response = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery",
+            wrapper_body(&challenge_id, &base64_encode(&nonce)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // A bare session cannot forge the last-used signal.
+        let unproven = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery/touch",
+            serde_json::json!({
+                "challenge_id": "00",
+                "proof_b64": base64_encode(&[0u8; recovery::RECOVERY_CHALLENGE_BYTES]),
+                "credential_id_b64": base64_encode(&[0x11; 32]),
+            }),
+        )
+        .await;
+        assert_eq!(unproven.status(), StatusCode::UNAUTHORIZED);
+
+        // With a real proof it succeeds.
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let proven = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery/touch",
+            serde_json::json!({
+                "challenge_id": challenge_id,
+                "proof_b64": base64_encode(&nonce),
+                "credential_id_b64": base64_encode(&[0x11; 32]),
+            }),
+        )
+        .await;
+        assert_eq!(proven.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

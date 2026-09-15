@@ -164,8 +164,12 @@ test("add/revoke/touch send the expected wire body", async () => {
   );
   assert.equal(JSON.parse(body).credential_id_b64, "credential");
 
-  await touchRecoveryWrapper("credential", { fetchFn });
+  await touchRecoveryWrapper(
+    { challengeId: "challenge", proofB64: "proof", credentialIdB64: "credential" },
+    { fetchFn },
+  );
   assert.equal(JSON.parse(body).credential_id_b64, "credential");
+  assert.equal(JSON.parse(body).proof_b64, "proof");
 });
 
 test("unwrapWithPrfOutput roundtrips a wrapped secret", async () => {

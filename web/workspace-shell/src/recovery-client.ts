@@ -49,7 +49,7 @@ export const DEFAULT_RECOVERY_REVOKE_URL = "/internal/workspace/recovery/revoke"
 export const DEFAULT_RECOVERY_TOUCH_URL = "/internal/workspace/recovery/touch";
 
 /** Upper bound mirroring the server's per-workspace wrapper budget. */
-const MAX_WRAPPERS = 64;
+const MAX_WRAPPERS = 32;
 
 export interface RecoveryClientOptions {
   fetchFn?: typeof fetch;
@@ -321,8 +321,12 @@ export async function revokeRecoveryWrapper(
   if (!response.ok) return classify(response);
 }
 
+/**
+ * Record a coarse last-used timestamp. Requires the same proof of possession as
+ * add/revoke, so an unproven caller cannot forge the device audit signal.
+ */
 export async function touchRecoveryWrapper(
-  credentialIdB64: string,
+  input: { challengeId: string; proofB64: string; credentialIdB64: string },
   options: RecoveryClientOptions = {},
 ): Promise<void> {
   const fetchImpl = options.fetchFn ?? fetch;
@@ -332,7 +336,11 @@ export async function touchRecoveryWrapper(
       credentials: "same-origin",
       redirect: "error",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ credential_id_b64: credentialIdB64 }),
+      body: JSON.stringify({
+        challenge_id: input.challengeId,
+        proof_b64: input.proofB64,
+        credential_id_b64: input.credentialIdB64,
+      }),
     });
   } catch {
     // Non-authoritative metadata; a failure never blocks unlock.

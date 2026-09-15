@@ -397,7 +397,19 @@ function App() {
           setIsUnlocked(true);
           setStatus("Private workspace opened.");
           setRecoveryMessage("");
-          void touchRecoveryWrapper(credentialIdB64);
+          // Best-effort "last used" metadata; requires proof of possession like
+          // add/revoke, so it is issued as its own short-lived challenge.
+          void beginRecoveryProof((sealed) =>
+            defaultRuntime.decryptRecoveryChallenge(sealed),
+          )
+            .then((proof) =>
+              touchRecoveryWrapper({
+                challengeId: proof.challengeId,
+                proofB64: proof.proofB64,
+                credentialIdB64,
+              }),
+            )
+            .catch(() => {});
           return;
         } catch (error) {
           const failure = isUnlockError(error)
@@ -460,6 +472,9 @@ function App() {
         return;
       }
       const wrapped = await wrapRootKey(prfOutput, secret, salt);
+      // Drop the offline-code bytes before the proof-of-possession network
+      // round trip so they are not retained across it.
+      secret.fill(0);
       const proof = await beginRecoveryProof((sealed) =>
         defaultRuntime.decryptRecoveryChallenge(sealed),
       );
