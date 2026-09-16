@@ -384,11 +384,15 @@ test("the assertion signature is never returned as key material", async () => {
   assert.notDeepEqual(result.prfOutput, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
 });
 
-test("authenticateWithPasskey zeroizes its PRF copy when verify is rejected", async () => {
+test("authenticateWithPasskey zeroizes its PRF copy only on a rejected verify", async () => {
   const prf = new Uint8Array(32).fill(0x77);
   const credentials = {
     get: async () => prfAssertion(prf),
   } as unknown as CredentialsContainer;
+  const successFetch = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
   const failingFetch = (async (url: string) => {
     if (String(url).includes("challenge")) return challengeResponse();
     return new Response(null, { status: 401 });
@@ -410,12 +414,25 @@ test("authenticateWithPasskey zeroizes its PRF copy when verify is rejected", as
   } as typeof Uint8Array.prototype.fill;
 
   try {
+    // A successful verify returns the PRF to the caller, which owns it for the
+    // local unwrap: the client must NOT zeroize it here.
+    const ok = await authenticateWithPasskey({
+      credentials,
+      fetchFn: successFetch,
+    });
+    assert.equal(zeroized, 0, "a successful verify must not zeroize the returned PRF");
+    // Test-owned cleanup after the assertion; counted so the failure branch
+    // below still proves the client (not the test) zeroizes its own copy.
+    ok.prfOutput?.fill(0);
+    assert.equal(zeroized, 1);
+
+    // A rejected verify must zeroize the client's PRF copy before throwing.
     await assert.rejects(
       authenticateWithPasskey({ credentials, fetchFn: failingFetch }),
       (error: unknown) =>
         error instanceof PasskeyAuthError && error.code === "verification_rejected",
     );
-    assert.equal(zeroized, 1, "a rejected verify must zeroize the PRF copy");
+    assert.equal(zeroized, 2, "a rejected verify must zeroize the PRF copy");
   } finally {
     Uint8Array.prototype.fill = originalFill;
   }

@@ -212,6 +212,13 @@ test("an asserted credential with no live wrapper fails closed", async () => {
       error.code === "no_matching_wrapper",
   );
   assert.equal(unwrapCalls, 0);
+  // "Zeroized on every failure path" includes the unmatched-credential failure:
+  // the shared finally in `unwrapRootFromAssertion` must clear the PRF even
+  // though no wrapper was ever tried.
+  assert.ok(
+    assertion.prfOutput.every((byte) => byte === 0),
+    "PRF zeroized when no live wrapper matches the asserted credential",
+  );
 });
 
 test("a failed unwrap or a mismatched fingerprint fails closed and zeroizes the PRF", async () => {
