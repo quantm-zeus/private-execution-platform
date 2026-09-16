@@ -921,8 +921,9 @@ try {
     resolve("web/workspace-shell/src/unlock-runtime.ts"),
     resolve("web/workspace-shell/src/handoff-gate.ts"),
     resolve("web/workspace-shell/src/recovery-wrapping.ts"),
-    resolve("web/workspace-shell/src/recovery-passkey.ts"),
     resolve("web/workspace-shell/src/recovery-client.ts"),
+    resolve("web/workspace-shell/src/workspace-unlock.ts"),
+    resolve("web/workspace-shell/src/workspace-root.ts"),
     shellHtmlPath,
     shellHeadersPath,
   ];
@@ -950,6 +951,44 @@ try {
     // emit no `.map` file and would otherwise ship the full shell source.
     if (text.includes("sourceMappingURL")) {
       throw new Error(`shell file ${path} references a source map`);
+    }
+  }
+
+  // Single-ceremony guard (GPT-5.6 Sol/high Root-Key V2): the whole shell must
+  // call `navigator.credentials.get()` in exactly ONE place — the canonical
+  // `authenticateWithPasskey` in passkey-auth.ts. A second call site (for
+  // example a per-wrapper loop that asks for PRF again after authentication)
+  // reintroduces the audited second-ceremony defect, so it fails closed here at
+  // the source level rather than relying only on a unit test. Comments are
+  // stripped first so prose cannot register as a call site. This is a
+  // defense-in-depth heuristic, not a taint analysis.
+  const stripJsComments = (text) =>
+    text
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:])\/\/[^\n]*/gm, "$1");
+  const getSites = [];
+  for (const path of shellSourceFiles) {
+    const text = stripJsComments(await readFile(path, "utf8"));
+    const count = (text.match(/credentials\s*\.\s*get\s*\(\s*(?!\))/g) ?? []).length;
+    if (count > 0) getSites.push({ path, count });
+  }
+  const canonicalGetSite = resolve("web/workspace-shell/src/passkey-auth.ts");
+  if (
+    getSites.length !== 1 ||
+    getSites[0].path !== canonicalGetSite ||
+    getSites[0].count !== 1
+  ) {
+    throw new Error(
+      "shell must call credentials.get() exactly once, only in " +
+        `passkey-auth.ts; found ${JSON.stringify(getSites)}`,
+    );
+  }
+  for (const path of shellSourceFiles) {
+    const text = stripJsComments(await readFile(path, "utf8"));
+    if (text.includes("authenticateWithPrf")) {
+      throw new Error(
+        `shell file ${path} references the removed second-ceremony helper authenticateWithPrf`,
+      );
     }
   }
 

@@ -16,6 +16,7 @@ import {
   serializeAssertion,
   serializeAttestation,
 } from "./passkey-auth.ts";
+import { workspacePrfEvalSalt } from "./recovery-wrapping.ts";
 
 const bytes = (...values: number[]): Uint8Array => new Uint8Array(values);
 const buffer = (...values: number[]): ArrayBuffer =>
@@ -261,4 +262,181 @@ test("enrollPasskey carries the operator secret only to the enrollment routes", 
     serializeAttestation(fakeAttestation()),
   );
   await assert.rejects(() => enrollPasskey("", { fetchFn, credentials }));
+});
+
+// ---------------------------------------------------------------------------
+// Single-ceremony login contract (GPT-5.6 Sol/high Root-Key V2 remediation).
+//
+// The normal configured login must be EXACTLY ONE navigator.credentials.get()
+// that both authenticates (signature only, sent to the server) and evaluates
+// PRF against the stable workspace salt for the local unwrap.
+// ---------------------------------------------------------------------------
+
+function challengeResponse(): Response {
+  return new Response(
+    JSON.stringify({
+      publicKey: {
+        challenge: "AQID",
+        rpId: "example.com",
+        allowCredentials: [
+          { id: "AQID", type: "public-key" },
+          { id: "BAUG", type: "public-key" },
+        ],
+      },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+/** A WebAuthn assertion whose PRF extension returns `prfBytes`. */
+function prfAssertion(prfBytes: Uint8Array): PublicKeyCredential {
+  return {
+    id: "cred",
+    rawId: buffer(1, 2, 3),
+    type: "public-key",
+    response: {
+      clientDataJSON: buffer(4, 5),
+      authenticatorData: buffer(6),
+      // Deliberately distinctive: it must never surface as key material.
+      signature: buffer(0xde, 0xad, 0xbe, 0xef),
+      userHandle: null,
+    },
+    getClientExtensionResults: () =>
+      ({ prf: { results: { first: prfBytes } } }),
+  } as unknown as PublicKeyCredential;
+}
+
+test("normal login performs exactly one ceremony and returns stable PRF output", async () => {
+  const prfBytes = new Uint8Array(32).fill(0x5a);
+  let getCalls = 0;
+  let captured: PublicKeyCredentialRequestOptions | undefined;
+  const credentials = {
+    get: async (options: CredentialRequestOptions) => {
+      getCalls += 1;
+      captured = (options as { publicKey: PublicKeyCredentialRequestOptions })
+        .publicKey;
+      return prfAssertion(prfBytes);
+    },
+  } as unknown as CredentialsContainer;
+  const urls: string[] = [];
+  const fetchFn = (async (url: string) => {
+    urls.push(String(url));
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  const result = await authenticateWithPasskey({ credentials, fetchFn });
+
+  assert.equal(getCalls, 1, "one login is exactly one credentials.get()");
+  assert.deepEqual(urls, ["/internal/auth/challenge", "/internal/auth/verify"]);
+  assert.equal(result.credentialIdB64, "AQID");
+  assert.deepEqual(result.prfOutput, prfBytes);
+  // The single ceremony evaluates the stable, public workspace eval salt, so the
+  // returned PRF output can unwrap whichever wrapper matches the returned id.
+  const extensions = captured?.extensions as
+    | { prf?: { eval?: { first?: Uint8Array } } }
+    | undefined;
+  assert.deepEqual(extensions?.prf?.eval?.first, workspacePrfEvalSalt());
+  assert.ok((extensions?.prf?.eval?.first?.length ?? 0) > 0);
+});
+
+test("PRF-unavailable login authenticates once, returns null and never prompts again", async () => {
+  let getCalls = 0;
+  const credentials = {
+    get: async () => {
+      getCalls += 1;
+      return {
+        id: "cred",
+        rawId: buffer(1, 2, 3),
+        type: "public-key",
+        response: {
+          clientDataJSON: buffer(4, 5),
+          authenticatorData: buffer(6),
+          signature: buffer(7, 8),
+          userHandle: null,
+        },
+        getClientExtensionResults: () => ({ prf: {} }),
+      } as unknown as PublicKeyCredential;
+    },
+  } as unknown as CredentialsContainer;
+  const fetchFn = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  const result = await authenticateWithPasskey({ credentials, fetchFn });
+  assert.equal(result.prfOutput, null);
+  assert.equal(getCalls, 1, "PRF absence must not trigger a second ceremony");
+});
+
+test("the assertion signature is never returned as key material", async () => {
+  const prfBytes = new Uint8Array(32).fill(0x33);
+  const credentials = {
+    get: async () => prfAssertion(prfBytes),
+  } as unknown as CredentialsContainer;
+  const fetchFn = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  const result = await authenticateWithPasskey({ credentials, fetchFn });
+  assert.deepEqual(result.prfOutput, prfBytes);
+  assert.notDeepEqual(result.prfOutput, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+});
+
+test("authenticateWithPasskey zeroizes its PRF copy when verify is rejected", async () => {
+  const prf = new Uint8Array(32).fill(0x77);
+  const credentials = {
+    get: async () => prfAssertion(prf),
+  } as unknown as CredentialsContainer;
+  const failingFetch = (async (url: string) => {
+    if (String(url).includes("challenge")) return challengeResponse();
+    return new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+
+  // `extractPrfOutput` copies the authenticator bytes, so zeroization happens on
+  // that internal copy. Observe it at the buffer API boundary without exporting
+  // key material.
+  const originalFill = Uint8Array.prototype.fill;
+  let zeroized = 0;
+  Uint8Array.prototype.fill = function (
+    this: Uint8Array,
+    value: number,
+    start?: number,
+    end?: number,
+  ): Uint8Array {
+    if (value === 0 && this.length === 32 && this[0] === 0x77) zeroized += 1;
+    return originalFill.call(this, value, start, end);
+  } as typeof Uint8Array.prototype.fill;
+
+  try {
+    await assert.rejects(
+      authenticateWithPasskey({ credentials, fetchFn: failingFetch }),
+      (error: unknown) =>
+        error instanceof PasskeyAuthError && error.code === "verification_rejected",
+    );
+    assert.equal(zeroized, 1, "a rejected verify must zeroize the PRF copy");
+  } finally {
+    Uint8Array.prototype.fill = originalFill;
+  }
+});
+
+test("authenticateWithPasskey fails closed on unsupported and rejected paths", async () => {
+  const fetchFn = (async () => challengeResponse()) as unknown as typeof fetch;
+  await assert.rejects(
+    authenticateWithPasskey({ credentials: {} as CredentialsContainer, fetchFn }),
+    (error: unknown) =>
+      error instanceof PasskeyAuthError && error.code === "webauthn_unsupported",
+  );
+
+  const failingGet = {
+    get: async () => {
+      throw new Error("user cancelled");
+    },
+  } as unknown as CredentialsContainer;
+  await assert.rejects(
+    authenticateWithPasskey({ credentials: failingGet, fetchFn }),
+    (error: unknown) =>
+      error instanceof PasskeyAuthError && error.code === "assertion_unavailable",
+  );
 });

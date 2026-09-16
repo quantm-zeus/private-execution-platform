@@ -77,19 +77,29 @@ public key (`WORKSPACE_PUBLIC_KEY_B64`).
 ## Normal login and new devices
 
 ```
-Cloudflare Access ─► Passkey ─► auto-unlock ─► Workspace
+Cloudflare Access ─► ONE Passkey ceremony ─► auto-unlock ─► Workspace
 ```
 
-For each stored, non-revoked PRF wrapper the shell requests a PRF assertion,
-unwraps the root secret locally, and **validates the derived stable fingerprint
-against the durable workspace identity** before decrypting the current release.
-A new device with a usable PRF passkey therefore unlocks immediately.
+The single `navigator.credentials.get()` call both authenticates the operator
+(the assertion signature is server-verified authentication evidence only) and
+evaluates the WebAuthn PRF extension against the stable, public workspace eval
+salt (`evergreen/workspace-root-prf-eval/v2`). The shell then selects exactly the
+wrapper whose `credential_id_b64` matches the asserted credential, unwraps the
+root secret locally, and **validates the derived stable fingerprint against the
+durable workspace identity** before decrypting the current release. It never
+loops one ceremony per wrapper and never launches a second ceremony merely to
+obtain PRF, so a new device with a usable PRF passkey unlocks in that same
+ceremony. Per-wrapper freshness and domain separation come from each wrapper's
+random HKDF salt (`salt_b64`) and the credential-bound AEAD context, not from a
+changing PRF eval salt. The eval salt is public protocol metadata: the server is
+never involved in PRF evaluation and never sees the PRF output.
 
-If no PRF wrapper succeeds, the shell offers a small
-**Having trouble signing in?** action. The recovery-code path unwraps the same
-root, verifies the stable fingerprint, unlocks, and then offers to enroll the
-new device's passkey (authorized by the recovery code, without rotating the
-root).
+If the login ceremony returns no PRF output — or no live wrapper matches the
+asserted credential, or the fingerprint check fails — the shell fails closed to
+the small **Having trouble signing in?** action without launching another
+ceremony. The recovery-code path unwraps the same root, verifies the stable
+fingerprint, unlocks, and then offers to add the new device's passkey (authorized
+by the recovery code, without rotating the root).
 
 ## Server storage
 
@@ -164,12 +174,32 @@ release, so all future releases share the stable identity. A pre-v2 store has no
 wrappers, replacing any legacy `unlock_secret_v1` records, which the stable-root
 flow never reads and which the bootstrap rejects as inputs.
 
+The single-ceremony slice also moved the PRF eval salt from each record's
+`salt_b64` to the stable public constant
+`evergreen/workspace-root-prf-eval/v2`; `salt_b64` is now the per-wrapper HKDF
+salt only. A passkey wrapper written by an earlier pre-release candidate that
+evaluated PRF at its own `salt_b64` therefore cannot be unwrapped by the
+constant-salt ceremony. No production migration is required: those candidates
+were never deployed (production remained on the pre-V2 preview), and the
+recovery code is unaffected because its wrapper never used PRF. If such a
+candidate state exists, recover once with the offline recovery code and use
+**Add this device's passkey** to write a new constant-salt wrapper without
+rotating the root.
+
 ## Tests
 
 - `web/workspace-shell/src/workspace-root.test.ts` — root generation, recovery
   code round-trip and rejection, stable identity independence, PRF and recovery
   wrapper round-trips, wrong code/tamper/legacy failures, revoked exclusion, and
   a static no-persistent-storage check.
+- `web/workspace-shell/src/passkey-auth.test.ts` — the single-ceremony login
+  contract: exactly one `navigator.credentials.get()`, stable eval-salt request,
+  PRF extraction, signature-is-not-key-material, zeroize-on-reject and
+  fail-closed paths.
+- `web/workspace-shell/src/workspace-unlock.test.ts` — one ceremony selects the
+  asserted credential's wrapper (no per-wrapper loop), PRF-absent fails closed
+  without a second prompt, revocation/offline exclusion, unwrap/fingerprint
+  fail-closed zeroization, and a real-WASM synced/new-device round-trip.
 - `web/workspace-shell/src/recovery-client.test.ts` — public identity parsing,
   bootstrap body contains no secret material, wrapper list parsing rejects
   legacy/unknown sources, proof-of-possession flow.

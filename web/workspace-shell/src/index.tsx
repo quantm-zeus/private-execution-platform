@@ -6,6 +6,7 @@ import {
   authenticateWithPasskey,
   enrollPasskey,
   PasskeyAuthError,
+  type PasskeyAssertionResult,
 } from "./passkey-auth";
 import {
   fetchWorkspaceDescriptor,
@@ -19,15 +20,12 @@ import {
   bootstrapWorkspaceIdentity,
   fetchRecoveryWrappers,
   fetchWorkspaceIdentity,
-  fromBase64 as recoveryFromBase64,
   revokeRecoveryWrapper,
   touchRecoveryWrapper,
-  unwrapWithPrfOutput,
   type BootstrapWrapperInput,
   type RecoveryWrapperRecord,
   type WorkspaceIdentity,
 } from "./recovery-client";
-import { authenticateWithPrf } from "./recovery-passkey";
 import {
   OFFLINE_RECOVERY_CREDENTIAL_B64,
   WORKSPACE_ROOT_KEY_SOURCE,
@@ -44,6 +42,7 @@ import {
   workspaceRootMatchesFingerprint,
 } from "./workspace-root";
 import { generateRecoverySalt, wrapRootKey } from "./recovery-wrapping";
+import { unwrapRootFromAssertion } from "./workspace-unlock";
 import {
   isUnlockError,
   recoveryFor,
@@ -130,6 +129,11 @@ function App() {
   const [isUnlocked, setIsUnlocked] = createSignal(false);
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [autoUnlockRan, setAutoUnlockRan] = createSignal(false);
+  // Set when the single login ceremony cannot unwrap locally (no PRF output,
+  // no matching wrapper, a mismatched fingerprint or a failed unwrap). The
+  // normal surface then exposes only the explicit recovery action rather than
+  // inviting another passkey prompt.
+  const [prfUnavailable, setPrfUnavailable] = createSignal(false);
 
   const [cryptoReady, setCryptoReady] = createSignal(false);
   const [cryptoError, setCryptoError] = createSignal(false);
@@ -148,6 +152,15 @@ function App() {
   let frame: HTMLIFrameElement | undefined;
   let recoveryInput: HTMLInputElement | undefined;
   let alertRef: HTMLDivElement | undefined;
+  // The PRF output from the single login ceremony, held in memory only so
+  // initial setup can reuse it instead of prompting a second time. It is
+  // zeroized on unlock, on setup consumption, on lock, on cleanup, and on every
+  // early-return path that never reaches the unlock step.
+  let loginAssertion: PasskeyAssertionResult | null = null;
+  const discardLoginAssertion = () => {
+    if (loginAssertion?.prfOutput) loginAssertion.prfOutput.fill(0);
+    loginAssertion = null;
+  };
 
   // Same-document channel with the decrypted payload. Only messages from our
   // own frame and origin are honoured, and the ready ping must echo the
@@ -265,14 +278,26 @@ function App() {
     queueMicrotask(() => document.getElementById("workspace-region")?.focus());
   };
 
-  /** Load everything a signed-in session needs, then auto-unlock if configured. */
-  const refreshAccess = async () => {
+  /**
+   * Load everything a signed-in session needs. A passkey assertion from the
+   * single login ceremony is required to auto-unlock; a restored session or a
+   * manual retry carries no PRF and must not prompt implicitly.
+   */
+  const refreshAccess = async (assertion?: PasskeyAssertionResult) => {
     setAutoUnlockRan(false);
+    // A retry/restore without a fresh assertion re-offers the explicit passkey
+    // unlock action rather than staying stranded after a failed attempt.
+    if (!assertion) setPrfUnavailable(false);
     // The durable workspace identity is independent of any release, so it is
     // loaded even when no descriptor/artifact is published yet: initial setup
     // must remain reachable on a clean deployment where no release exists.
     const loadedIdentity = await loadIdentity();
-    if (!loadedIdentity) return;
+    if (!loadedIdentity) {
+      // No unlock step will run, so the ceremony's PRF output must not be
+      // retained. (The `!configured` setup branch below deliberately keeps it.)
+      if (assertion) discardLoginAssertion();
+      return;
+    }
     if (!loadedIdentity.configured) {
       if (setupPhase() !== "show_recovery") setSetupPhase("unconfigured");
       void loadDescriptor();
@@ -281,19 +306,44 @@ function App() {
     setSetupPhase("done");
     const descriptorOk = await loadDescriptor();
     const activeWrappers = await loadWrappers();
-    if (!descriptorOk) return;
-    void runAutoUnlock(loadedIdentity, activeWrappers);
+    if (!descriptorOk) {
+      if (assertion) discardLoginAssertion();
+      return;
+    }
+    if (assertion) {
+      void runAutoUnlock(loadedIdentity, activeWrappers, assertion);
+      return;
+    }
+    setStatus(
+      hasPasskeyUnlock()
+        ? "Unlock with your passkey when ready."
+        : "No passkey unlock is registered for this workspace. Use “Having trouble signing in?” and your recovery code.",
+    );
   };
 
+  /**
+   * Normal login: ONE WebAuthn ceremony authenticates the operator (signature
+   * only) AND returns the PRF output that unwraps the stable Workspace Root
+   * Secret locally. No wrapper may trigger a second prompt.
+   */
   const runAuthentication = async () => {
+    // A prior ceremony's PRF output, if any, is never reused by a new login.
+    discardLoginAssertion();
     setAuthState("authenticating");
     setAuthMessage("Waiting for your passkey...");
     setUnlockFailure(null);
+    setPrfUnavailable(false);
     try {
-      await authenticateWithPasskey();
+      const assertion = await authenticateWithPasskey();
+      loginAssertion = assertion;
       setAuthState("authenticated");
-      setAuthMessage("Passkey verified.");
-      await refreshAccess();
+      setAuthMessage(
+        assertion.prfOutput
+          ? "Passkey verified."
+          : "Passkey verified. Use “Having trouble signing in?” if this device cannot unlock.",
+      );
+      if (!assertion.prfOutput) setPrfUnavailable(true);
+      await refreshAccess(assertion);
     } catch (error) {
       if (error instanceof PasskeyAuthError && error.code === "webauthn_unsupported") {
         setAuthState("unsupported");
@@ -306,98 +356,87 @@ function App() {
   };
 
   /**
-   * Normal path: a passkey with a usable PRF output unwraps the same stable
-   * Workspace Root Secret, which is validated against the durable public
-   * identity before it is used to decrypt the current release.
+   * Normal path: the PRF output from the single login assertion unwraps the
+   * stable Workspace Root Secret, which is validated against the durable public
+   * identity before it is used to decrypt the current release. The asserted
+   * credential id selects exactly one wrapper; there is no per-wrapper loop and
+   * no second WebAuthn ceremony on any failure path.
    */
   const runAutoUnlock = async (
     identityValue: WorkspaceIdentity,
     wrapperList: RecoveryWrapperRecord[],
+    assertion: PasskeyAssertionResult,
   ) => {
-    if (isUnlocking() || isUnlocked() || autoUnlockRan()) return;
-    setAutoUnlockRan(true);
-    const activeDescriptor = descriptor();
-    if (!activeDescriptor || !identityValue.fingerprintB64) return;
-    const active = selectPasskeyUnlockWrappers(wrapperList);
-    if (active.length === 0) {
-      // Recovery stays behind the explicit "Having trouble signing in?" action;
-      // do not auto-open the code input on the normal unlock surface.
-      setStatus(
-        "No passkey unlock is registered for this workspace. Use “Having trouble signing in?” and your recovery code.",
-      );
-      return;
-    }
-    setIsUnlocking(true);
-    setUnlockFailure(null);
-    setUnlockStage("U1_WASM");
-    setStatus("Unlocking with your passkey...");
-    let lastFailure: UnlockRecovery | null = null;
+    // This function owns the login PRF output from here on. The assertion holds
+    // the only reference; the lifecycle PRF (used by initial setup) is dropped.
+    loginAssertion = null;
     try {
-      for (const wrapper of active) {
-        let salt: Uint8Array;
-        try {
-          salt = recoveryFromBase64(wrapper.salt_b64);
-        } catch {
-          continue;
-        }
-        let prfOutput: Uint8Array | null = null;
-        let credentialIdB64 = "";
-        try {
-          const result = await authenticateWithPrf({
-            allowCredentialB64: wrapper.credential_id_b64,
-            prfSalt: salt,
-          });
-          prfOutput = result.prfOutput;
-          credentialIdB64 = result.credentialIdB64;
-        } catch {
-          continue;
-        }
-        if (!prfOutput) continue;
-        let root: Uint8Array | null = null;
-        try {
-          root = await unwrapWithPrfOutput(prfOutput, wrapper);
-        } catch {
-          continue;
-        } finally {
-          prfOutput.fill(0);
-        }
-        if (!root) continue;
-        if (!(await workspaceRootMatchesFingerprint(root, identityValue.fingerprintB64))) {
-          root.fill(0);
-          continue;
-        }
-        try {
-          await finishUnlock(root, activeDescriptor);
-          // Best-effort last-used metadata; requires its own proof of possession.
-          void beginRecoveryProof((sealed) =>
-            defaultRuntime.decryptRecoveryChallenge(sealed),
-          )
-            .then((proof) =>
-              touchRecoveryWrapper({
-                challengeId: proof.challengeId,
-                proofB64: proof.proofB64,
-                credentialIdB64,
-              }),
-            )
-            .catch(() => {});
-          setTroubleOpen(false);
-          setRecoveryMessage("");
-          return;
-        } catch (error) {
-          defaultRuntime.lock();
-          lastFailure = isUnlockError(error)
-            ? recoveryFor(error.stage, error.reason)
-            : recoveryFor("U7_BOOT", "unknown");
-        }
+      if (isUnlocking() || isUnlocked() || autoUnlockRan()) return;
+      setAutoUnlockRan(true);
+      const activeDescriptor = descriptor();
+      if (!activeDescriptor || !identityValue.fingerprintB64) return;
+      const active = selectPasskeyUnlockWrappers(wrapperList);
+      if (active.length === 0) {
+        // Recovery stays behind the explicit "Having trouble signing in?"
+        // action; do not auto-open the code input on the normal unlock surface.
+        setStatus(
+          "No passkey unlock is registered for this workspace. Use “Having trouble signing in?” and your recovery code.",
+        );
+        return;
       }
-      setRecoveryMessage(
-        "Automatic passkey unlock was not available. Use your offline recovery code.",
-      );
-      if (lastFailure) setUnlockFailure(lastFailure);
-      setStatus(
-        "Automatic passkey unlock was not available. Use “Having trouble signing in?” and your recovery code.",
-      );
+      setIsUnlocking(true);
+      setUnlockFailure(null);
+      setUnlockStage("U1_WASM");
+      setStatus("Unlocking with your passkey...");
+      let root: Uint8Array | null = null;
+      try {
+        root = await unwrapRootFromAssertion(
+          assertion,
+          wrapperList,
+          identityValue.fingerprintB64,
+        );
+      } catch {
+        // PRF unavailable, no wrapper for the asserted credential, a mismatched
+        // fingerprint, or a failed unwrap: fail closed to the explicit offline
+        // recovery path. Never launch another WebAuthn ceremony.
+        setPrfUnavailable(true);
+        setRecoveryMessage(
+          "Automatic passkey unlock was not available. Use your offline recovery code.",
+        );
+        setStatus(
+          "Automatic passkey unlock was not available. Use “Having trouble signing in?” and your recovery code.",
+        );
+        return;
+      }
+      try {
+        await finishUnlock(root, activeDescriptor);
+      } catch (error) {
+        defaultRuntime.lock();
+        setUnlockFailure(
+          isUnlockError(error)
+            ? recoveryFor(error.stage, error.reason)
+            : recoveryFor("U7_BOOT", "unknown"),
+        );
+        return;
+      }
+      // Best-effort last-used metadata; requires its own proof of possession.
+      void beginRecoveryProof((sealed) =>
+        defaultRuntime.decryptRecoveryChallenge(sealed),
+      )
+        .then((proof) =>
+          touchRecoveryWrapper({
+            challengeId: proof.challengeId,
+            proofB64: proof.proofB64,
+            credentialIdB64: assertion.credentialIdB64,
+          }),
+        )
+        .catch(() => {});
+      setTroubleOpen(false);
+      setRecoveryMessage("");
     } finally {
+      // Zeroize on every path, including the early returns. `unwrapRootFromAssertion`
+      // already did so on its own paths; this is idempotent.
+      assertion.prfOutput?.fill(0);
       setUnlockStage(null);
       setIsUnlocking(false);
     }
@@ -436,35 +475,49 @@ function App() {
           record: recoveryRecord,
         },
       ];
-      // Attempt a passkey-PRF wrapper for automatic future unlock. An
-      // authenticator without PRF is not fatal: the recovery code remains the
+      // Build the passkey-PRF wrapper for automatic future unlock from the PRF
+      // output the single login ceremony already produced. When the login
+      // assertion exists it is consumed even if its PRF is null (so an
+      // authenticator without PRF is NOT re-prompted); only a restored session
+      // with no fresh assertion needs one explicit setup ceremony. An
+      // authenticator without PRF is not fatal and the recovery code remains the
       // mandatory fallback.
       let prfAvailable = false;
-      const salt = generateRecoverySalt();
-      try {
-        const assertion = await authenticateWithPrf({ prfSalt: salt });
-        if (assertion.prfOutput) {
-          try {
-            const record = await wrapRootKey(
-              assertion.prfOutput,
-              root,
-              salt,
-              undefined,
-              assertion.credentialIdB64,
-              WORKSPACE_ROOT_KEY_SOURCE,
-            );
-            prfAvailable = true;
-            bootstrapWrappers.push({
-              credentialIdB64: assertion.credentialIdB64,
-              label: deviceLabel().trim() || "This device",
-              record,
-            });
-          } finally {
-            assertion.prfOutput.fill(0);
-          }
+      let prfOutput: Uint8Array | null = null;
+      let prfCredentialIdB64 = "";
+      if (loginAssertion) {
+        prfOutput = loginAssertion.prfOutput;
+        prfCredentialIdB64 = loginAssertion.credentialIdB64;
+        loginAssertion = null;
+      } else {
+        try {
+          const assertion = await authenticateWithPasskey();
+          prfOutput = assertion.prfOutput;
+          prfCredentialIdB64 = assertion.credentialIdB64;
+        } catch {
+          // PRF unavailable: keep the recovery wrapper only.
         }
-      } catch {
-        // PRF unavailable: keep the recovery wrapper only.
+      }
+      if (prfOutput) {
+        try {
+          const salt = generateRecoverySalt();
+          const record = await wrapRootKey(
+            prfOutput,
+            root,
+            salt,
+            undefined,
+            prfCredentialIdB64,
+            WORKSPACE_ROOT_KEY_SOURCE,
+          );
+          prfAvailable = true;
+          bootstrapWrappers.push({
+            credentialIdB64: prfCredentialIdB64,
+            label: deviceLabel().trim() || "This device",
+            record,
+          });
+        } finally {
+          prfOutput.fill(0);
+        }
       }
       const created = await bootstrapWorkspaceIdentity({
         version: WORKSPACE_ROOT_VERSION,
@@ -663,6 +716,7 @@ function App() {
 
   onCleanup(() => {
     window.removeEventListener("message", onPayloadMessage);
+    discardLoginAssertion();
     defaultRuntime.lock();
   });
 
@@ -796,19 +850,21 @@ function App() {
         return;
       }
       setSecurityMessage("Waiting for your passkey...");
-      const salt = generateRecoverySalt();
-      const assertion = await authenticateWithPrf({ prfSalt: salt });
-      const prfOutput = assertion.prfOutput;
-      if (!prfOutput) {
-        root.fill(0);
-        setSecurityMessage(
-          "This authenticator does not support passkey unlock (WebAuthn PRF). The recovery code remains the fallback.",
-        );
-        return;
-      }
-      let record: Awaited<ReturnType<typeof wrapRootKey>>;
+      // One explicit ceremony for this deliberate add-a-passkey action. The PRF
+      // output is evaluated against the same stable workspace eval salt the
+      // normal login uses, so this wrapper unlocks on a future visit.
+      let prfOutput: Uint8Array | null = null;
       try {
-        record = await wrapRootKey(
+        const assertion = await authenticateWithPasskey();
+        prfOutput = assertion.prfOutput;
+        if (!prfOutput) {
+          setSecurityMessage(
+            "This authenticator does not support passkey unlock (WebAuthn PRF). The recovery code remains the fallback.",
+          );
+          return;
+        }
+        const salt = generateRecoverySalt();
+        const record = await wrapRootKey(
           prfOutput,
           root,
           salt,
@@ -816,23 +872,24 @@ function App() {
           assertion.credentialIdB64,
           WORKSPACE_ROOT_KEY_SOURCE,
         );
+        const proof = await beginRecoveryProof((sealed) =>
+          defaultRuntime.decryptRecoveryChallenge(sealed),
+        );
+        await addRecoveryWrapper({
+          challengeId: proof.challengeId,
+          proofB64: proof.proofB64,
+          credentialIdB64: assertion.credentialIdB64,
+          label: deviceLabel().trim() || "Recovery passkey",
+          record,
+        });
+        setSecurityMessage("This device's passkey was added.");
+        await loadWrappers();
       } finally {
-        // Zeroize both buffers even when wrapping throws.
-        prfOutput.fill(0);
+        // Zeroize the ceremony PRF and the unwrapped root on every path,
+        // including a cancelled/rejected ceremony before wrapping throws.
+        prfOutput?.fill(0);
         root.fill(0);
       }
-      const proof = await beginRecoveryProof((sealed) =>
-        defaultRuntime.decryptRecoveryChallenge(sealed),
-      );
-      await addRecoveryWrapper({
-        challengeId: proof.challengeId,
-        proofB64: proof.proofB64,
-        credentialIdB64: assertion.credentialIdB64,
-        label: deviceLabel().trim() || "Recovery passkey",
-        record,
-      });
-      setSecurityMessage("This device's passkey was added.");
-      await loadWrappers();
     } catch (error) {
       setSecurityMessage(
         error instanceof RecoveryClientError && error.code === "recovery_conflict"
@@ -870,6 +927,10 @@ function App() {
   };
 
   const handleLock = () => {
+    discardLoginAssertion();
+    // A fresh visit may offer the passkey unlock again; locking clears the
+    // fail-closed state from a previous PRF-unavailable attempt.
+    setPrfUnavailable(false);
     defaultRuntime.lock();
     setPayloadUrl("");
     setIsUnlocked(false);
@@ -881,6 +942,8 @@ function App() {
   const needsSetup = () =>
     authState() === "authenticated" && identity()?.configured === false;
   const showSetupRecovery = () => setupPhase() === "show_recovery";
+  const hasPasskeyUnlock = () =>
+    !prfUnavailable() && selectPasskeyUnlockWrappers(wrappers()).length > 0;
 
   return (
     <main class="gateway">
@@ -978,7 +1041,7 @@ function App() {
           <button
             type="button"
             class="button"
-            onClick={refreshAccess}
+            onClick={() => void refreshAccess()}
             disabled={descriptorLoading() || authState() !== "authenticated"}
           >
             {descriptorLoading() ? "Checking release..." : "Retry release check"}
@@ -993,7 +1056,7 @@ function App() {
           <button
             type="button"
             class="button"
-            onClick={refreshAccess}
+            onClick={() => void refreshAccess()}
             disabled={authState() !== "authenticated"}
           >
             Retry
@@ -1180,6 +1243,17 @@ function App() {
             </Show>
 
             <Show when={!troubleOpen() && !isUnlocking()}>
+              {/* One passkey ceremony unlocks; the recovery form never appears
+                  here unless the explicit trouble action is taken. */}
+              <Show when={hasPasskeyUnlock()}>
+                <button
+                  type="button"
+                  class="button button--primary"
+                  onClick={() => void runAuthentication()}
+                >
+                  Unlock with passkey
+                </button>
+              </Show>
               <button
                 type="button"
                 class="button"

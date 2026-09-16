@@ -12,6 +12,8 @@
 // - Fail closed. A missing WebAuthn API, a malformed challenge or a non-2xx
 //   response throws a typed error; the caller must keep the workspace locked.
 
+import { extractPrfOutput, workspacePrfEvalSalt } from "./recovery-wrapping.ts";
+
 /** Why a passkey operation could not complete. Deliberately transport-level. */
 export type PasskeyAuthErrorCode =
   | "webauthn_unsupported"
@@ -46,6 +48,20 @@ export interface PasskeyAuthOptions {
 export interface PasskeyEnrollmentOptions extends PasskeyAuthOptions {
   registerChallengeUrl?: string;
   registerVerifyUrl?: string;
+}
+
+/**
+ * Result of the single passkey login ceremony.
+ *
+ * `prfOutput` is the WebAuthn PRF extension output for the stable workspace
+ * eval salt, or `null` when the authenticator did not return one. It is never
+ * the assertion signature: signatures are authentication evidence only and are
+ * never used as key material. The caller owns the buffer and must zeroize it.
+ */
+export interface PasskeyAssertionResult {
+  /** Standard-base64 raw credential id of the credential that authenticated. */
+  credentialIdB64: string;
+  prfOutput: Uint8Array | null;
 }
 
 export const DEFAULT_CHALLENGE_URL = "/internal/auth/challenge";
@@ -103,6 +119,19 @@ function encodeBase64Url(value: ArrayBuffer | Uint8Array): string {
     binary += String.fromCharCode(view[i]);
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/**
+ * Standard (non-URL-safe) base64, matching the server's `credential_id_b64`
+ * wrapper metadata. Kept separate from the base64url WebAuthn wire encoding.
+ */
+function encodeStandardBase64(value: ArrayBuffer | Uint8Array): string {
+  const view = value instanceof Uint8Array ? value : new Uint8Array(value);
+  let binary = "";
+  for (let i = 0; i < view.length; i++) {
+    binary += String.fromCharCode(view[i]);
+  }
+  return btoa(binary);
 }
 
 function credentialDescriptors(
@@ -301,12 +330,24 @@ async function readChallenge(
 }
 
 /**
- * Complete a passkey authentication ceremony and install the server session.
- * Resolves on an authenticated session; throws a typed error otherwise.
+ * Complete the ONE passkey authentication ceremony and install the server
+ * session.
+ *
+ * The single `navigator.credentials.get()` call both authenticates the operator
+ * (the assertion signature is sent to the server as authentication evidence
+ * only) and evaluates the WebAuthn PRF extension against the stable workspace
+ * eval salt, so the caller can locally unwrap the Workspace Root Secret without
+ * a second prompt. It never loops one ceremony per wrapper: the returned
+ * credential id selects exactly the wrapper to use.
+ *
+ * Resolves with the asserted credential id and the PRF output (or `null` when
+ * the authenticator does not support PRF, in which case the caller must fall
+ * back to the explicit offline recovery path without another ceremony). Throws
+ * a typed error otherwise.
  */
 export async function authenticateWithPasskey(
   options: PasskeyAuthOptions = {},
-): Promise<void> {
+): Promise<PasskeyAssertionResult> {
   const fetchImpl = options.fetchFn ?? fetch;
   const credentials = webAuthnCredentials(options, "get");
   const publicKey = await readChallenge(
@@ -319,32 +360,56 @@ export async function authenticateWithPasskey(
       headers: { Accept: "application/json" },
     },
   );
+  const requestOptions = buildRequestOptions(publicKey);
+  // The stable, public workspace PRF salt is evaluated in the same assertion.
+  // An authenticator without PRF simply omits the extension results; the shell
+  // then fails closed to the offline recovery code, never to a second prompt.
+  const prfSalt = workspacePrfEvalSalt();
+  if (prfSalt.length > 0) {
+    requestOptions.extensions = {
+      ...((requestOptions.extensions as Record<string, unknown> | undefined) ?? {}),
+      prf: { eval: { first: prfSalt } },
+    } as AuthenticationExtensionsClientInputs;
+  }
   let assertion: Credential | null;
   try {
-    assertion = await credentials.get({ publicKey: buildRequestOptions(publicKey) });
+    // Exactly one WebAuthn ceremony for the whole login/unlock path.
+    assertion = await credentials.get({ publicKey: requestOptions });
   } catch {
     throw new PasskeyAuthError("assertion_unavailable");
   }
   if (!assertion) {
     throw new PasskeyAuthError("assertion_unavailable");
   }
-  let response: Response;
+  const publicKeyCredential = assertion as PublicKeyCredential;
+  const credentialIdB64 = encodeStandardBase64(publicKeyCredential.rawId);
+  // Only the PRF extension output may become key material. The signature is
+  // sent to the server below and is never used to derive a wrapping key.
+  const prfOutput = extractPrfOutput(assertion);
   try {
-    response = await fetchImpl(options.verifyUrl ?? DEFAULT_VERIFY_URL, {
-      method: "POST",
-      credentials: "same-origin",
-      redirect: "error",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(
-        serializeAssertion(assertion as PublicKeyCredential),
-      ),
-    });
-  } catch {
-    throw new PasskeyAuthError("verification_rejected");
+    let response: Response;
+    try {
+      response = await fetchImpl(options.verifyUrl ?? DEFAULT_VERIFY_URL, {
+        method: "POST",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(serializeAssertion(publicKeyCredential)),
+      });
+    } catch {
+      throw new PasskeyAuthError("verification_rejected");
+    }
+    if (!response.ok) {
+      throw new PasskeyAuthError("verification_rejected", response.status);
+    }
+  } catch (error) {
+    // Any failure after the PRF output exists must zeroize it before throwing:
+    // a rejected ceremony must not leave key material resident for the lifetime
+    // of the page.
+    prfOutput?.fill(0);
+    throw error;
   }
-  if (!response.ok) {
-    throw new PasskeyAuthError("verification_rejected", response.status);
-  }
+  return { credentialIdB64, prfOutput };
 }
 
 /**

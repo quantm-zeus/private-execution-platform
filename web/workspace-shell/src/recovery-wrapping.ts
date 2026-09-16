@@ -39,6 +39,24 @@ export const RECOVERY_KEY_SOURCES: readonly string[] = [
 export const RECOVERY_SALT_BYTES = 32;
 export const RECOVERY_IV_BYTES = 12;
 export const ROOT_KEY_BYTES = 32;
+/**
+ * Stable, public WebAuthn PRF evaluation salt for the single Workspace Root Key
+ * login ceremony.
+ *
+ * It is a protocol constant: never secret, never a release id/KID, and never
+ * derived from a wrapper record. A passkey wrapper is created and unwrapped by
+ * evaluating this one salt in the SAME assertion that authenticates the
+ * operator, so one ceremony yields the PRF output for whichever credential the
+ * user selects; the shell never launches one `navigator.credentials.get()` per
+ * wrapper to obtain per-wrapper salt outputs. Per-wrapper freshness and domain
+ * separation come from the record's random HKDF salt (`salt_b64`) and the
+ * credential-bound AEAD context, not from a changing eval salt.
+ *
+ * The server neither needs nor receives this value, the PRF output or an unwrap
+ * key; only the public wrapper record is stored.
+ */
+export const WORKSPACE_PRF_EVAL_SALT_INFO =
+  "evergreen/workspace-root-prf-eval/v2";
 /** AES-256-GCM authentication tag appended to the wrapped root key. */
 export const RECOVERY_GCM_TAG_BYTES = 16;
 /** Exact decoded length of `wrapped_root_key_b64`: root key plus GCM tag. */
@@ -131,6 +149,15 @@ export function generateWorkspaceRootKey(): Uint8Array {
 /** Generate a random per-wrapper HKDF salt. */
 export function generateRecoverySalt(): Uint8Array {
   return randomBytes(RECOVERY_SALT_BYTES);
+}
+
+/**
+ * A fresh copy of the stable PRF evaluation salt bytes. Exposed as a function
+ * (never a shared mutable buffer) so a caller can zeroize, compare or discard
+ * its copy without affecting other ceremonies. The value is public.
+ */
+export function workspacePrfEvalSalt(): Uint8Array {
+  return encoder.encode(WORKSPACE_PRF_EVAL_SALT_INFO);
 }
 
 /**

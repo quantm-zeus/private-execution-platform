@@ -289,7 +289,7 @@ test("the root modules never touch browser persistent storage", () => {
     "recovery-wrapping.ts",
     "unlock-runtime.ts",
     "recovery-client.ts",
-    "recovery-passkey.ts",
+    "workspace-unlock.ts",
     "passkey-auth.ts",
   ];
   for (const source of sources) {

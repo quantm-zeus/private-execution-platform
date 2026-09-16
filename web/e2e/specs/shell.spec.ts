@@ -238,6 +238,105 @@ test.describe("shell artifact unlock", () => {
     await expect(page.locator("#recovery-code")).toBeVisible();
   });
 
+  test("a PRF-unavailable login prompts once and exposes only the recovery fallback", async ({
+    page,
+    request,
+  }) => {
+    const info = await unlockInfo(request);
+    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
+    // Drive the real shell orchestration with TWO active passkey wrappers and a
+    // synthetic authenticator that authenticates but returns NO PRF output. The
+    // two wrappers exist so a per-wrapper ceremony loop would show up as more
+    // than one `credentials.get()` call; the single ceremony must not repeat,
+    // and the normal surface must fail closed to the explicit recovery action.
+    const passkeyWrapper = (credentialId: Buffer) => ({
+      credential_id_b64: credentialId.toString("base64"),
+      label: "This device",
+      version: 1,
+      algorithm: "HKDF-SHA256/AES-256-GCM",
+      key_source: "workspace_root_v2",
+      salt_b64: Buffer.alloc(32, 1).toString("base64"),
+      iv_b64: Buffer.alloc(12, 2).toString("base64"),
+      wrapped_root_key_b64: Buffer.alloc(48, 3).toString("base64"),
+      created_at_ms: 1,
+      last_used_at_ms: null,
+      revoked_at_ms: null,
+    });
+    await page.route("**/internal/workspace/recovery", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          wrappers: [
+            passkeyWrapper(Buffer.from([1, 2, 3])),
+            passkeyWrapper(Buffer.from([4, 5, 6])),
+          ],
+        }),
+      }),
+    );
+    await page.route("**/internal/auth/challenge", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          publicKey: {
+            challenge: "AQID",
+            rpId: "127.0.0.1",
+            allowCredentials: [{ id: "AQID", type: "public-key" }],
+          },
+        }),
+      }),
+    );
+    await page.route("**/internal/auth/verify", (route) =>
+      route.fulfill({ status: 204, body: "" }),
+    );
+    await page.addInitScript(() => {
+      (window as unknown as { __passkeyGetCalls: number }).__passkeyGetCalls = 0;
+      const container = navigator.credentials as unknown as Record<string, unknown>;
+      container.get = async () => {
+        (window as unknown as { __passkeyGetCalls: number }).__passkeyGetCalls += 1;
+        return {
+          id: "cred",
+          rawId: new Uint8Array([1, 2, 3]).buffer,
+          type: "public-key",
+          response: {
+            clientDataJSON: new Uint8Array([1]).buffer,
+            authenticatorData: new Uint8Array([2]).buffer,
+            signature: new Uint8Array([3]).buffer,
+            userHandle: null,
+          },
+          getClientExtensionResults: () => ({ prf: {} }),
+        };
+      };
+    });
+
+    await page.goto(`${SHELL_ORIGIN}/`);
+    const unlockButton = page.getByRole("button", { name: "Unlock with passkey" });
+    await expect(unlockButton).toBeVisible({ timeout: 20_000 });
+    await unlockButton.click();
+
+    // The single ceremony authenticates once, then fails closed to recovery:
+    // the recovery form stays behind the explicit action, the passkey retry is
+    // withdrawn, and no second prompt is launched.
+    await expect(
+      page.getByRole("button", { name: "Having trouble signing in?" }),
+    ).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator("#recovery-code")).toHaveCount(0);
+    await expect(unlockButton).toHaveCount(0);
+    // Prove the unlock path itself ran (and failed closed) before counting, so
+    // the counter below cannot pass before `runAutoUnlock` executes — and a
+    // per-wrapper ceremony loop would still be visible in the count.
+    await expect(page.locator("#status")).toContainText(
+      "Automatic passkey unlock was not available",
+      { timeout: 20_000 },
+    );
+    expect(
+      await page.evaluate(
+        () => (window as unknown as { __passkeyGetCalls: number }).__passkeyGetCalls,
+      ),
+    ).toBe(1);
+  });
+
   test("shows bootstrap enrollment only when the server reports it open", async ({ page }) => {
     // Positive control for the closed-state assertion above: when the server
     // actually reports first-run enrollment open, the control must appear.
