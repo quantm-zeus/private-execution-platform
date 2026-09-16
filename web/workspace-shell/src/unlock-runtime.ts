@@ -33,7 +33,12 @@ let wasmReady: Promise<unknown> | undefined;
 
 export function loadWasm(moduleOrPath?: unknown): Promise<unknown> {
   if (!wasmReady) {
-    wasmReady = init(moduleOrPath as any);
+    // Clear the memo on rejection so a mount-time load failure can be retried by
+    // the user instead of poisoning every later attempt with the same rejection.
+    wasmReady = init(moduleOrPath as any).catch((error) => {
+      wasmReady = undefined;
+      throw error;
+    });
   }
   return wasmReady;
 }

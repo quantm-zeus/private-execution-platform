@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   UnlockError,
   asUnlockError,
+  isCredentialFailure,
   isUnlockError,
   recoveryFor,
   type UnlockReason,
@@ -102,6 +103,20 @@ test("asUnlockError preserves an already-classified error", () => {
   const classified = asUnlockError(original, "U7_BOOT", "boot_failed");
   assert.equal(classified, original);
   assert.ok(isUnlockError(classified));
+});
+
+test("only credential-related failures mark the recovery field invalid", () => {
+  // Credential faults: the field must be marked invalid.
+  assert.equal(isCredentialFailure({ reason: "invalid_secret" }), true);
+  assert.equal(isCredentialFailure({ reason: "workspace_key_mismatch" }), true);
+  // `enrollment_conflict` carries the same re-enter guidance as a bad secret.
+  assert.equal(isCredentialFailure({ reason: "enrollment_conflict" }), true);
+  // Transport/grant/boot faults must NOT be announced as an invalid field.
+  assert.equal(isCredentialFailure({ reason: "transport_rejected" }), false);
+  assert.equal(isCredentialFailure({ reason: "grant_rejected" }), false);
+  assert.equal(isCredentialFailure({ reason: "boot_failed" }), false);
+  assert.equal(isCredentialFailure(null), false);
+  assert.equal(isCredentialFailure(undefined), false);
 });
 
 test("every reason maps without throwing", () => {

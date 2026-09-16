@@ -305,7 +305,7 @@ pub fn router_from_env() -> Result<axum::Router, EdgeError> {
 mod tests {
     use super::*;
     use crate::router;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
@@ -631,6 +631,57 @@ mod tests {
             "forged-by-a-direct-origin-caller".parse().expect("value"),
         );
         assert_eq!(call(forged).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// TRUST BOUNDARY, pinned explicitly: the edge verifies only that the
+    /// perimeter-injected assertion header is *present*, not that its value is a
+    /// valid Cloudflare Access JWT. With a live backend, a forged value is
+    /// accepted by design. The compensating control is the non-loopback
+    /// `EDGE_BIND_ADDR` refusal in `main.rs` (a direct-origin caller cannot reach
+    /// the listener) plus the private-api session/HPKE relay. This test documents
+    /// the assumption so a future change cannot mistake it for cryptographic
+    /// forgery rejection; if Access-JWT validation is implemented, this test must
+    /// be updated to expect 401.
+    #[tokio::test]
+    async fn a_forged_assertion_value_is_accepted_by_design_with_a_live_backend() {
+        struct EchoRelay;
+        #[async_trait]
+        impl crate::OpaqueRelay for EchoRelay {
+            async fn relay(
+                &self,
+                _route: crate::OpaqueRoute,
+                payload: Bytes,
+            ) -> Result<Bytes, EdgeError> {
+                Ok(payload)
+            }
+        }
+
+        let authorization =
+            Arc::new(HeaderAssertionAuthorization::new("cf-access-jwt-assertion").expect("config"));
+        let state = EdgeState::new(
+            authorization,
+            Arc::new(EchoRelay),
+            DEFAULT_MAX_OPAQUE_BODY_BYTES,
+        )
+        .expect("state");
+        let app = crate::router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/bootstrap")
+                    .header("content-type", "application/octet-stream")
+                    .header(
+                        "cf-access-jwt-assertion",
+                        "forged-by-a-direct-origin-caller",
+                    )
+                    .body(Body::from(vec![1u8, 2, 3]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

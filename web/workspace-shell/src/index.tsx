@@ -29,6 +29,7 @@ import {
 } from "./recovery-wrapping";
 import { authenticateWithPrf } from "./recovery-passkey";
 import {
+  isCredentialFailure,
   isUnlockError,
   recoveryFor,
   type RecoveryAction,
@@ -83,18 +84,6 @@ const RECOVERY_ACTION_LABELS: Partial<Record<RecoveryAction, string>> = {
   reenter_recovery: "Re-enter recovery code",
 };
 
-/**
- * Whether the failure is about the entered recovery credential, so the field is
- * marked invalid. A transport/grant/boot failure must not be announced as an
- * invalid field.
- */
-function isCredentialFailure(failure: UnlockRecovery | null): boolean {
-  return (
-    failure?.reason === "invalid_secret" ||
-    failure?.reason === "workspace_key_mismatch"
-  );
-}
-
 function App() {
   const [status, setStatus] = createSignal("Security gateway ready.");
   const [authState, setAuthState] = createSignal<AuthState>("checking");
@@ -110,6 +99,7 @@ function App() {
   const [unlockFailure, setUnlockFailure] = createSignal<UnlockRecovery | null>(null);
   const [isUnlocking, setIsUnlocking] = createSignal(false);
   const [cryptoReady, setCryptoReady] = createSignal(false);
+  const [cryptoError, setCryptoError] = createSignal(false);
   const [isUnlocked, setIsUnlocked] = createSignal(false);
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [enrollSecret, setEnrollSecret] = createSignal("");
@@ -311,13 +301,32 @@ function App() {
     try {
       await loadWasm();
       setCryptoReady(true);
+      setCryptoError(false);
       setStatus("Crypto boundary ready.");
     } catch {
+      // A mount-time crypto failure must not leave the form permanently disabled
+      // with no explanation: surface a recoverable notice instead.
+      setCryptoError(true);
       setStatus("Crypto boundary unavailable in this browser.");
     }
     await loadEnrollmentStatus();
     await checkExistingSession();
   });
+
+  /** Retry the audited WASM load after a mount-time failure. */
+  const retryCrypto = async () => {
+    setCryptoError(false);
+    setStatus("Loading the crypto boundary...");
+    try {
+      await loadWasm();
+      setCryptoReady(true);
+      setCryptoError(false);
+      setStatus("Crypto boundary ready.");
+    } catch {
+      setCryptoError(true);
+      setStatus("Crypto boundary unavailable in this browser.");
+    }
+  };
 
   onCleanup(() => {
     window.removeEventListener("message", onPayloadMessage);
@@ -502,6 +511,7 @@ function App() {
             lastFailure = failure;
             continue;
           }
+          setRecoveryMessage("");
           setUnlockFailure(failure);
           setStatus("Workspace unlock failed.");
           queueMicrotask(() => alertRef?.focus());
@@ -509,6 +519,9 @@ function App() {
         }
       }
       if (lastFailure) {
+        // Clear the transient "Waiting for your recovery passkey..." live-region
+        // text so it is not read out after the failure alert.
+        setRecoveryMessage("");
         setUnlockFailure(lastFailure);
         setStatus("Workspace unlock failed.");
         queueMicrotask(() => alertRef?.focus());
@@ -750,6 +763,19 @@ function App() {
             disabled={descriptorLoading() || authState() !== "authenticated"}
           >
             {descriptorLoading() ? "Checking release..." : "Retry release check"}
+          </button>
+        </div>
+      </Show>
+
+      <Show when={cryptoError()}>
+        <div class="notice notice--error" role="alert">
+          <p class="notice__title">The browser crypto module did not load.</p>
+          <p class="notice__detail">
+            This browser cannot unlock the workspace. Retry the module, reload the
+            page, or use a current browser that supports WebAssembly cryptography.
+          </p>
+          <button type="button" class="button" onClick={retryCrypto}>
+            Retry crypto module
           </button>
         </div>
       </Show>

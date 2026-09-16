@@ -495,7 +495,7 @@ async function __wbg_load(module, imports) {
                 const validResponse = expectedResponseType(module.type);
 
                 if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {
-                    console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
+                    void ("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
 
                 } else { throw e; }
             }
@@ -529,7 +529,7 @@ function initSync(module) {
         if (Object.getPrototypeOf(module) === Object.prototype) {
             ({module} = module)
         } else {
-            console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
+            void ('using deprecated parameters for `initSync()`; pass a single object instead')
         }
     }
 
@@ -549,7 +549,7 @@ async function __wbg_init(module_or_path) {
         if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
             ({module_or_path} = module_or_path)
         } else {
-            console.warn('using deprecated parameters for the initialization function; pass a single object instead')
+            void ('using deprecated parameters for the initialization function; pass a single object instead')
         }
     }
 

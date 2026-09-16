@@ -514,6 +514,69 @@ test("publish, switch and rollback are atomic and immutable", async () => {
   }
 });
 
+test("a release that cannot acquire the lock leaves no staging directory behind", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-staging-leak-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-staging-leak-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    // A live lock owned by this process is never evicted, so a tiny lock budget
+    // makes `withReleaseLock` reject before its callback ever runs. The staging
+    // directory is created before acquisition, so only the outer guard can
+    // remove it.
+    await plantLock(root, {
+      pid: process.pid,
+      token: "live-holder",
+      startedAtMs: Date.now(),
+    });
+    await assert.rejects(
+      publishRelease({
+        releasesRoot: root,
+        artifact: fakeArtifact(),
+        publicKeyB64: PUBLIC_KEY_B64,
+        kidB64: KID_B64,
+        sourceSha: "9a5a712",
+        shellDir,
+        lockTimeoutMs: 120,
+        lockStaleMs: 1,
+      }),
+      ReleaseLockTimeoutError,
+    );
+    const leftovers = (await readdir(root)).filter((name) => name.startsWith(".staging-"));
+    assert.deepEqual(leftovers, [], "a failed lock acquisition must not leak staging");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
+test("a world-writable release artifact is refused before switching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-mode-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-mode-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    // The private-api hardened loader refuses a group/world-writable trust file,
+    // so publication must refuse to switch `current` to one.
+    await chmod(join(root, releaseId, ARTIFACT_FILE), 0o666);
+    await assert.rejects(readRelease(root, releaseId), /group\/world writable/);
+    await assert.rejects(switchCurrent(root, releaseId), /group\/world writable/);
+    // A world-writable release directory is refused too.
+    await chmod(join(root, releaseId, ARTIFACT_FILE), 0o600);
+    await chmod(join(root, releaseId), 0o777);
+    await assert.rejects(readRelease(root, releaseId), /group\/world writable/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
 test("switching to an unpublished release refuses", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-switch-"));
   try {

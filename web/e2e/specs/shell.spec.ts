@@ -45,6 +45,10 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
   // never typed: it comes from the authenticated descriptor.
   await page.locator("#recovery-code").fill(info.secretB64!);
   await page.getByRole("button", { name: "Unlock Workspace" }).click();
+  // The recovery code is cleared from the DOM synchronously before the first
+  // network await, and the form stays mounted until the payload boots, so this
+  // pins the secret-lifetime claim.
+  await expect(page.locator("#recovery-code")).toHaveValue("");
   // The payload may announce readiness and overwrite the status text, so wait for
   // the instantiated frame itself rather than a transient status string.
   await expect(page.locator("#workspace-frame")).toBeVisible({ timeout: 20_000 });
@@ -198,6 +202,34 @@ test.describe("shell artifact unlock", () => {
         }));
     });
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  test("the security gateway honours reduced motion and 44px touch targets", async ({
+    page,
+    request,
+  }) => {
+    const info = await unlockInfo(request);
+    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
+    // Mobile viewport: every primary control must still meet the 44x44 minimum.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto(`${SHELL_ORIGIN}/`);
+
+    const primary = page.locator("button.button--primary").first();
+    await expect(primary).toBeVisible({ timeout: 20_000 });
+    const buttonBox = await primary.boundingBox();
+    expect(buttonBox).not.toBeNull();
+    expect(buttonBox!.height).toBeGreaterThanOrEqual(44);
+    expect(buttonBox!.width).toBeGreaterThanOrEqual(44);
+
+    const input = page.locator("#recovery-code");
+    await expect(input).toBeVisible();
+    const inputBox = await input.boundingBox();
+    expect(inputBox).not.toBeNull();
+    expect(inputBox!.height).toBeGreaterThanOrEqual(44);
+
+    // `* { transition: none !important }` under prefers-reduced-motion.
+    await expect(primary).toHaveCSS("transition-duration", "0s");
   });
 
   test("honours a lock request from the decrypted payload", async ({ page, request }) => {

@@ -124,12 +124,37 @@ async function main() {
     ]) {
       if (!generated.includes(expected)) throw new Error(`missing generated file: ${expected}`);
     }
+    await stripConsoleOutput(join(OUT_DIR, "crypto-envelope-wasm.js"));
     console.log(
       `crypto wasm bindings generated (${sha256File(join(OUT_DIR, "crypto-envelope-wasm_bg.wasm")).slice(0, 16)}…)`,
     );
   } finally {
     await rm(bindingsCache, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * wasm-bindgen's glue emits `console.warn` for deprecation and MIME-type
+ * fallbacks — including the original exception text and the wasm asset URL. The
+ * clear shell must not write to the developer console, so neutralize every
+ * console call in the generated glue. `console.warn(a, b)` becomes
+ * `void (a, b)`, which still evaluates the arguments (so an impure argument is
+ * not skipped) but writes nothing. The web-boundary gate independently rejects
+ * any console call remaining in the shipped bundles.
+ */
+async function stripConsoleOutput(gluePath) {
+  const source = readFileSync(gluePath, "utf8");
+  const stripped = source.replace(
+    /console\s*\.\s*(?:assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn)\s*\(/g,
+    "void (",
+  );
+  // Any remaining `console.` reference (a method outside the list) is a
+  // generation change we do not understand: fail rather than ship it.
+  const remaining = /console\s*\.\s*[A-Za-z_$]/.exec(stripped);
+  if (remaining) {
+    throw new Error(`console usage remains in the generated glue: ${remaining[0].trim()}`);
+  }
+  await writeFile(gluePath, stripped);
 }
 
 main().catch((error) => {

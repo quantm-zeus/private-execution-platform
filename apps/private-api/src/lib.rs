@@ -5366,21 +5366,24 @@ mod tests {
 
         // A header-length file whose public header is undeliverable (wrong
         // version / all-zero KID / all-zero encapsulated key) must not be
-        // reported as a healthy artifact.
+        // reported as a healthy artifact. The file is padded to
+        // `MIN_ARTIFACT_LEN` so it passes the length predicate and actually
+        // reaches `parse_artifact_header`; a 49-byte input would be rejected for
+        // its length alone and never exercise the parser.
         for bad_header in [
             {
-                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                let mut header = vec![0x11u8; crypto_envelope::MIN_ARTIFACT_LEN];
                 header[0] = auth::ARTIFACT_VERSION + 1;
                 header
             },
             {
-                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                let mut header = vec![0x11u8; crypto_envelope::MIN_ARTIFACT_LEN];
                 header[0] = auth::ARTIFACT_VERSION;
                 header[1..1 + auth::WORKSPACE_KID_BYTES].fill(0);
                 header
             },
             {
-                let mut header = vec![0x11u8; crypto_envelope::ARTIFACT_HEADER_LEN];
+                let mut header = vec![0x11u8; crypto_envelope::MIN_ARTIFACT_LEN];
                 header[0] = auth::ARTIFACT_VERSION;
                 header[1 + auth::WORKSPACE_KID_BYTES..].fill(0);
                 header

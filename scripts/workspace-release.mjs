@@ -100,11 +100,39 @@ async function syncFile(path) {
   let handle;
   try {
     handle = await open(path, "r+");
+  } catch {
+    // A read-only file (a 0444 shell asset, say) rejects `r+`. fsync only needs
+    // a readable descriptor on Linux, so fall back to `r` rather than skipping
+    // the durability barrier for exactly the files `copyTree` produces.
+    try {
+      handle = await open(path, "r");
+    } catch {
+      return;
+    }
+  }
+  try {
     await handle.sync();
   } catch {
-    // Not every file/filsystem permits a sync; ignore.
+    // Not every file/filesystem permits a sync; ignore.
   } finally {
-    if (handle) await handle.close().catch(() => {});
+    await handle.close().catch(() => {});
+  }
+}
+
+/**
+ * Reject a release file/directory whose mode would be refused by the private-api
+ * hardened loader at read time. Publication must never atomically switch
+ * `current` to a release the running API cannot serve. The owner check is left to
+ * the API (the release tooling may legitimately run as a different user); only
+ * the world/group-write bits are enforced here, and only on Unix.
+ */
+function assertTrustMode(stat, label, { directory = false } = {}) {
+  if (process.platform === "win32") return;
+  const forbidden = directory ? 0o002 : 0o022;
+  if ((stat.mode & forbidden) !== 0) {
+    throw new Error(
+      `${label} must not be group/world writable (the private API refuses it)`,
+    );
   }
 }
 
@@ -283,7 +311,9 @@ export async function releaseReleaseLock(lockPath, owner) {
  * and an owner-stamped crash-recovery guard. Re-entrant within one async call
  * chain, and serialized in-process per root.
  */
-export async function withReleaseLock(releasesRoot, fn) {
+export async function withReleaseLock(releasesRoot, fn, options = {}) {
+  const timeoutMs = options.timeoutMs ?? RELEASE_LOCK_TIMEOUT_MS;
+  const staleMs = options.staleMs ?? RELEASE_LOCK_STALE_MS;
   const key = resolve(releasesRoot);
   const held = releaseLockContext.getStore();
   if (held?.has(key)) return fn();
@@ -303,8 +333,8 @@ export async function withReleaseLock(releasesRoot, fn) {
     // The releases root must exist before the lock directory can be created.
     await mkdir(key, { recursive: true });
     owner = await acquireReleaseLock(lockPath, {
-      timeoutMs: RELEASE_LOCK_TIMEOUT_MS,
-      staleMs: RELEASE_LOCK_STALE_MS,
+      timeoutMs,
+      staleMs,
     });
     // Extend, do not replace, the held-key set so a nested cross-root chain
     // (A -> B -> A) still sees A as re-entrant.
@@ -741,6 +771,10 @@ export async function readRelease(releasesRoot, releaseId) {
   if ((await realpath(releaseDir)) !== join(rootReal, id)) {
     throw new Error("release directory escapes the releases root");
   }
+  // Match the private-api hardened loader: a world-writable release directory (a
+  // group-writable parent is tolerated there) makes every trust file within it
+  // swappable by another local user, so refuse to validate or switch it.
+  assertTrustMode(dirStat, "release directory", { directory: true });
   const shellPath = join(releaseDir, SHELL_DIR);
   const shellStat = await lstat(shellPath);
   if (shellStat.isSymbolicLink() || !shellStat.isDirectory()) {
@@ -758,6 +792,8 @@ export async function readRelease(releasesRoot, releaseId) {
   if (artifactStat.isSymbolicLink() || !artifactStat.isFile()) {
     throw new Error("release artifact must be a real regular file");
   }
+  assertTrustMode(manifestStat, "release manifest");
+  assertTrustMode(artifactStat, "release artifact");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   const artifact = await readFile(artifactPath);
   validateReleaseManifest(manifest, artifact);
@@ -817,6 +853,9 @@ export async function publishRelease({
   kidB64,
   sourceSha,
   shellDir,
+  // Test/ops seam for the advisory-lock budget; defaulted by `withReleaseLock`.
+  lockTimeoutMs,
+  lockStaleMs,
 }) {
   const artifactDigest = sha256Hex(artifact);
   const releaseId = releaseIdFor(sourceSha, artifactDigest);
@@ -867,53 +906,63 @@ export async function publishRelease({
   }
 
   // From here on the staging directory must never leak, even when an existing
-  // release cannot be read or the final rename fails. The existence check,
-  // rename and switch happen under the releases-root lock; an existing release
-  // is revalidated and switched through the internal unlocked switch so the
-  // lock is acquired exactly once (no self-deadlock).
-  return withReleaseLock(releasesRoot, async () => {
-    let published = false;
-    try {
-      let exists = false;
-      try {
-        await lstat(releaseDir);
-        exists = true;
-      } catch (error) {
-        // Only a genuinely absent directory means "new release"; any other stat
-        // failure (EACCES/EIO) must not be treated as absent.
-        if (error?.code !== "ENOENT") throw error;
-      }
-      if (exists) {
-        // Re-publishing is idempotent only when the release is byte-identical:
-        // same artifact AND same shipped shell digest. The release id is derived
-        // from the artifact, so a shell-only change under the same source SHA must
-        // be refused rather than silently switching to the stale shell.
-        const existing = await readRelease(releasesRoot, releaseId);
-        if (
-          !existing.artifact.equals(artifact) ||
-          existing.manifest.shell.asset_digest_hex !== shippedShellDigest ||
-          existing.manifest.source_sha !== manifest.source_sha ||
-          existing.manifest.artifact.kid_b64 !== manifest.artifact.kid_b64 ||
-          existing.manifest.recipient.public_key_fingerprint_b64 !==
-            manifest.recipient.public_key_fingerprint_b64
-        ) {
-          throw new Error("release already exists and is immutable");
-        }
-        await switchCurrentLocked(releasesRoot, releaseId);
-        return { releaseId, manifest: existing.manifest };
-      }
+  // release cannot be read, the final rename fails, or the advisory lock cannot
+  // be acquired at all (timeout while a live holder owns it, or a failing
+  // `mkdir`/owner-stamp write). The callback's own cleanup cannot cover the last
+  // case because the callback never runs, so the guard wraps the whole
+  // acquisition. After a successful rename the staging path no longer exists and
+  // the removal here is a no-op.
+  try {
+    return await withReleaseLock(
+      releasesRoot,
+      async () => {
+        let published = false;
+        try {
+          let exists = false;
+          try {
+            await lstat(releaseDir);
+            exists = true;
+          } catch (error) {
+            // Only a genuinely absent directory means "new release"; any other stat
+            // failure (EACCES/EIO) must not be treated as absent.
+            if (error?.code !== "ENOENT") throw error;
+          }
+          if (exists) {
+            // Re-publishing is idempotent only when the release is byte-identical:
+            // same artifact AND same shipped shell digest. The release id is derived
+            // from the artifact, so a shell-only change under the same source SHA must
+            // be refused rather than silently switching to the stale shell.
+            const existing = await readRelease(releasesRoot, releaseId);
+            if (
+              !existing.artifact.equals(artifact) ||
+              existing.manifest.shell.asset_digest_hex !== shippedShellDigest ||
+              existing.manifest.source_sha !== manifest.source_sha ||
+              existing.manifest.artifact.kid_b64 !== manifest.artifact.kid_b64 ||
+              existing.manifest.recipient.public_key_fingerprint_b64 !==
+                manifest.recipient.public_key_fingerprint_b64
+            ) {
+              throw new Error("release already exists and is immutable");
+            }
+            await switchCurrentLocked(releasesRoot, releaseId);
+            return { releaseId, manifest: existing.manifest };
+          }
 
-      await rename(staging, releaseDir);
-      published = true;
-      await syncDirectory(releasesRoot);
-      await switchCurrentLocked(releasesRoot, releaseId);
-      return { releaseId, manifest };
-    } finally {
-      if (!published) {
-        await rm(staging, { recursive: true, force: true }).catch(() => {});
-      }
-    }
-  });
+          await rename(staging, releaseDir);
+          published = true;
+          await syncDirectory(releasesRoot);
+          await switchCurrentLocked(releasesRoot, releaseId);
+          return { releaseId, manifest };
+        } finally {
+          if (!published) {
+            await rm(staging, { recursive: true, force: true }).catch(() => {});
+          }
+        }
+      },
+      { timeoutMs: lockTimeoutMs, staleMs: lockStaleMs },
+    );
+  } finally {
+    await rm(staging, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function copyTree(source, destination) {

@@ -151,7 +151,13 @@ export function extractPrfOutput(credential: unknown): Uint8Array | null {
   const first = prf?.results?.first;
   if (!(first instanceof ArrayBuffer) && !(first instanceof Uint8Array)) return null;
   const bytes = first instanceof Uint8Array ? first : new Uint8Array(first);
-  return bytes.length > 0 ? new Uint8Array(bytes) : null;
+  if (bytes.length === 0) return null;
+  const copy = new Uint8Array(bytes);
+  // An all-zero PRF output is a broken/synthetic authenticator response. Treat
+  // it as "no PRF support" so the caller falls back to the offline recovery
+  // code instead of deriving a publicly predictable wrapping key.
+  if (copy.every((byte) => byte === 0)) return null;
+  return copy;
 }
 
 /** Derive the AES-256-GCM wrapping key from high-entropy input key material. */
@@ -160,7 +166,13 @@ export async function deriveRecoveryWrappingKey(
   salt: Uint8Array,
   info: string = RECOVERY_KDF_INFO,
 ): Promise<CryptoKey> {
-  if (ikm.length !== ROOT_KEY_BYTES) throw new RecoveryWrappingError("invalid_root_key");
+  // Length *and* entropy floor: an all-zero (or empty) IKM would derive a
+  // wrapping key that anyone holding the stored record and salt can reproduce.
+  // Reject it here so every caller (PRF, offline secret, future key sources) is
+  // covered, not only the ones that remember to check.
+  if (ikm.length !== ROOT_KEY_BYTES || ikm.every((byte) => byte === 0)) {
+    throw new RecoveryWrappingError("invalid_root_key");
+  }
   const subtle = subtleCrypto();
   const base = await subtle.importKey("raw", ikm as unknown as BufferSource, "HKDF", false, [
     "deriveKey",

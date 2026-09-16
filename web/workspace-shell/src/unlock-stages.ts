@@ -108,6 +108,22 @@ export function recoveryFor(
   return { ...guidanceFor(stage, reason), reason };
 }
 
+/**
+ * Whether a failure is about the entered recovery credential, so the shell marks
+ * the field invalid. `enrollment_conflict` carries the same "re-enter the code"
+ * guidance as an invalid secret, so it must be marked invalid too; a transport,
+ * grant or boot failure must not be.
+ */
+export function isCredentialFailure(
+  failure: Pick<UnlockRecovery, "reason"> | null | undefined,
+): boolean {
+  return (
+    failure?.reason === "invalid_secret" ||
+    failure?.reason === "workspace_key_mismatch" ||
+    failure?.reason === "enrollment_conflict"
+  );
+}
+
 function guidanceFor(
   stage: UnlockStage,
   reason: UnlockReason,

@@ -246,6 +246,40 @@ function assertNoRuntimeMetadataWrites(text, label) {
 }
 
 /**
+ * The clear shell must not write to the developer console: a console line can
+ * carry exception text and asset paths (the vendored wasm-bindgen glue logs a
+ * WebAssembly instantiation error plus the wasm URL) out of the private origin's
+ * control. The generated glue is neutralized at build time, so the shipped
+ * bundle must contain no console call at all.
+ */
+const CONSOLE_CALL_PATTERN =
+  /console\s*\.\s*(?:assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn)\s*\(/;
+
+function assertNoConsoleUsage(text, label) {
+  const match = CONSOLE_CALL_PATTERN.exec(collapseStringConcatenation(text));
+  if (match) {
+    throw new Error(`${label} writes to the developer console: ${match[0].trim()}`);
+  }
+}
+
+/**
+ * True when `buffer` is valid UTF-8 text, so the regex scanners run over every
+ * text-like asset regardless of extension (`evil.json`, `.cjs`, `.svg`,
+ * `.webmanifest`, extensionless). Binary assets (wasm, images, fonts) are still
+ * covered by the latin1 storage/provider scans, which must not depend on
+ * decodability.
+ */
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+function isUtf8Text(buffer) {
+  try {
+    utf8Decoder.decode(buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Provider endpoints and credential names must never reach the browser bundle
  * (W13 / architecture lock L2): the web app asks the neutral first-party
  * contract for a routing source, and OKX is called only by the backend. A bare
@@ -350,6 +384,11 @@ function assertScannerControls() {
     ["provider split-literal host", () => assertNoProviderEndpoints('fetch("okx"+".com")', "control")],
     ["provider ok-access header", () => assertNoProviderEndpoints('"OK-ACCESS-KEY"', "control")],
     ["provider camelCase credential", () => assertNoProviderEndpoints("const okxApiKey = 1;", "control")],
+    ["console output", () => assertNoConsoleUsage('console.warn("wasm failed", e)', "control")],
+    [
+      "tracker in a decodable non-JS asset",
+      () => assertNoTrackers('{"endpoint":"https://www.google-analytics.com/g/collect"}', "control"),
+    ],
   ];
   for (const [name, run] of mustReject) {
     let rejected = false;
@@ -673,9 +712,6 @@ try {
     shellHtmlPath,
     shellHeadersPath,
   ];
-  for (const p of shellBuiltFiles) {
-    if (/\.(?:m?js|html|css)$/i.test(p)) shellSourceFiles.push(p);
-  }
   for (const path of shellSourceFiles) {
     const text = await readFile(path, "utf8");
     // No persistent browser storage
@@ -694,10 +730,38 @@ try {
     // No provider endpoint/credential literals either (a bare `okx_api_key`
     // string has no URL for the external-origin scanner to catch).
     assertNoProviderEndpoints(text, `shell file ${path}`);
+    // No console output (exception text / asset URLs must not leave the origin).
+    assertNoConsoleUsage(text, `shell file ${path}`);
     // No source maps — including inline (`sourceMappingURL=data:...`) maps that
     // emit no `.map` file and would otherwise ship the full shell source.
     if (text.includes("sourceMappingURL")) {
       throw new Error(`shell file ${path} references a source map`);
+    }
+  }
+
+  // Every built asset is scanned, not only a known extension allowlist: bytes
+  // (latin1) for the storage/provider deny-lists, and full UTF-8 text for the
+  // URL/tracker/metadata/source-map/console checks. A `dist/evil.json`, `.cjs`,
+  // `.svg`, `.webmanifest` or extensionless text asset can therefore no longer
+  // evade the gate; binary wasm/image/font assets still get the byte scans.
+  for (const path of shellBuiltFiles) {
+    const buffer = await readFile(path);
+    const latin1 = buffer.toString("latin1");
+    assertNoForbiddenStorage(latin1, `shell built file ${path}`);
+    assertNoProviderEndpoints(latin1, `shell built file ${path}`);
+    if (!isUtf8Text(buffer)) continue;
+    const text = buffer.toString("utf8");
+    assertNoRuntimeMetadataWrites(text, `shell built file ${path}`);
+    assertNoExternalUrls(text, `shell built file ${path}`);
+    assertNoTrackers(text, `shell built file ${path}`);
+    assertNoConsoleUsage(text, `shell built file ${path}`);
+    if (text.includes("sourceMappingURL")) {
+      throw new Error(`shell built file ${path} references a source map`);
+    }
+    for (const term of forbiddenTradingTerms) {
+      if (text.toLowerCase().includes(term.toLowerCase())) {
+        throw new Error(`shell built file ${path} encodes private trading semantic: ${term}`);
+      }
     }
   }
 
@@ -997,11 +1061,15 @@ try {
     // (including binaries and extensionless assets) so a forbidden API or a
     // provider hostname/credential hidden in a `.wasm`, image or font cannot slip
     // past a text-only allowlist.
-    const latin1 = (await readFile(p)).toString("latin1");
+    const buffer = await readFile(p);
+    const latin1 = buffer.toString("latin1");
     assertNoForbiddenStorage(latin1, `payload file ${p}`);
     assertNoProviderEndpoints(latin1, `payload file ${p}`);
-    if (!/\.(?:m?js|cjs|html|css|json|svg|txt|webmanifest)$/i.test(p)) continue;
-    const text = await readFile(p, "utf8");
+    // Decodability, not an extension allowlist, decides whether the text-only
+    // scanners run: a `.cjs`, `.webmanifest`, extensionless or otherwise-unknown
+    // text asset is still scanned. Binary assets keep the byte scans above.
+    if (!isUtf8Text(buffer)) continue;
+    const text = buffer.toString("utf8");
     // Any absolute network scheme (http/https/ws/wss) that is not loopback or a
     // pure XML namespace is an external dependency and must not be shipped.
     // Host is parsed (not string-prefixed) so `localhost.evil.example`,

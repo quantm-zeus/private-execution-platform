@@ -100,6 +100,24 @@ test("invalid root keys are refused before any wrapping", async () => {
   );
 });
 
+test("an all-zero wrapping key input is refused as low entropy", async () => {
+  const zero = new Uint8Array(32);
+  await assert.rejects(
+    deriveRecoveryWrappingKey(zero, new Uint8Array(32).fill(7)),
+    (error: unknown) =>
+      error instanceof RecoveryWrappingError && error.code === "invalid_root_key",
+  );
+  // The offline-secret path must cover it too, not only the root-key check.
+  await assert.rejects(
+    wrapWithRecoverySecret(generateWorkspaceRootKey(), zero),
+    (error: unknown) =>
+      error instanceof RecoveryWrappingError && error.code === "invalid_root_key",
+  );
+  // And a synthetic authenticator returning zeros is treated as "no PRF", so
+  // the caller falls back to the offline recovery code.
+  assert.equal(extractPrfOutput(prfCredential(zero)), null);
+});
+
 test("PRF output is extracted only when the authenticator produced one", () => {
   const bytes = new Uint8Array(32).fill(9);
   assert.deepEqual(extractPrfOutput(prfCredential(bytes)), bytes);
