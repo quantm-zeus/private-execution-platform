@@ -1,8 +1,9 @@
 // Memory-only unlock runtime and payload instantiation for workspace shell.
 //
 // Invariants:
-// - Audited WASM only: derives workspace public key in WASM memory, uses
-//   WasmInitiatorSession for transport decrypt and WasmWorkspaceKey for artifact decrypt.
+// - Audited WASM only: derives the stable Root-Key-V2 workspace public key in
+//   WASM memory, uses WasmInitiatorSession for transport decrypt and
+//   WasmWorkspaceRootKey for artifact decrypt.
 // - Ephemeral: the unlock secret is passed as bytes and zeroized immediately
 //   after key derivation in WASM. Callers must not hand over a retained string.
 // - No persistence: zero usage of client-side persistent storage, browser databases,
@@ -10,15 +11,17 @@
 // - No leakage: every stage failure is a typed UnlockError carrying only a
 //   stage and reason. No secret, key, KID, path, ciphertext, or exception text
 //   is interpolated into an error or logged.
-// - Compatibility: the artifact KID and expected recipient fingerprint come
-//   from the authenticated descriptor, never from user input.
+// - Compatibility: the expected recipient fingerprint comes from the
+//   authenticated descriptor, never from user input. The artifact KID is
+//   release metadata authenticated inside the envelope, never the workspace
+//   identity.
 // - Memory-only payload: unpacks payload archive in memory, instantiates via Blob URLs.
 // - Cleanup: revokes all Blob URLs and scrubs RAM references on lock/unload/error.
 
 import init, {
   WasmInitiatorSession,
   WasmOffer,
-  WasmWorkspaceKey,
+  WasmWorkspaceRootKey,
 } from "./wasm/crypto-envelope-wasm.js";
 import { HandoffGate, type ShellSessionKeys } from "./handoff-gate.ts";
 import {
@@ -30,14 +33,16 @@ import { UnlockError, asUnlockError, type UnlockStage } from "./unlock-stages.ts
 export type { ShellSessionKeys } from "./handoff-gate.ts";
 
 /**
- * Fixed 16-byte stable workspace derivation context (standard base64). It is
- * `sha256("evergreen/workspace-root-key/v2")[0..16]`, a protocol constant that
- * MUST NOT be derived from a release id or KID. It is the `kid` used for the
- * stable Workspace Root Key and for every artifact sealed to it, so the
- * workspace recipient identity is identical across releases.
+ * Fixed 16-byte stable workspace session-enrollment context (standard base64):
+ * `sha256("evergreen/workspace-root-key/v2")[0..16]`. It is a protocol constant
+ * used ONLY as the session-enrollment label the browser reports to the server.
+ * It is NOT the Root-Key-V2 derivation context and is never compared to the
+ * release artifact KID: the stable workspace recipient identity is derived
+ * inside WASM from the root secret under a fixed domain, independent of this
+ * value and of every KID.
  */
 export const WORKSPACE_ROOT_CONTEXT_B64 = "St8tQ/Ednd6gbvtkRXZJsQ==";
-/** Protocol version of the stable workspace key derivation. */
+/** Protocol version of the stable workspace envelope/bootstrap contract. */
 export const WORKSPACE_ROOT_VERSION = 1;
 
 let wasmReady: Promise<unknown> | undefined;
@@ -324,8 +329,9 @@ async function readErrorCode(response: Response): Promise<string | null> {
 }
 
 /**
- * The fixed stable workspace derivation context as raw bytes. Fails closed if
- * the embedded constant is ever malformed.
+ * The fixed stable workspace session-enrollment context as raw bytes, sent as
+ * the enrollment label. Fails closed if the embedded constant is ever malformed.
+ * This is NOT a recipient identity and is never compared to the artifact KID.
  */
 function workspaceContextKidBytes(): Uint8Array {
   let kidBytes: Uint8Array;
@@ -340,27 +346,9 @@ function workspaceContextKidBytes(): Uint8Array {
   return kidBytes;
 }
 
-/**
- * The descriptor's artifact KID is protocol/release metadata, not the workspace
- * identity. It must still be the stable context the artifact was sealed under;
- * a release sealed to any other KID is incompatible with this stable root.
- */
-function descriptorKidBytes(descriptor: WorkspaceDescriptor): Uint8Array {
-  let kidBytes: Uint8Array;
-  try {
-    kidBytes = fromBase64(descriptor.artifact_kid_b64);
-  } catch {
-    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
-  }
-  if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) {
-    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
-  }
-  return kidBytes;
-}
-
 export class WorkspaceUnlockRuntime {
   private activeUrls: Set<string> = new Set();
-  private currentKey: WasmWorkspaceKey | null = null;
+  private currentKey: WasmWorkspaceRootKey | null = null;
   private currentPayloadFiles: Map<string, Uint8Array> | null = null;
   /**
    * BR-5 handoff gate. Holds the transport session keys derived from the same
@@ -443,7 +431,7 @@ export class WorkspaceUnlockRuntime {
     const grantEndpoint = options.grantUrl || "/internal/artifact/grant";
     const deliverEndpoint = options.deliverUrl || "/internal/artifact";
 
-    let workspaceKey: WasmWorkspaceKey | null = null;
+    let workspaceKey: WasmWorkspaceRootKey | null = null;
     let initiator: WasmInitiatorSession | null = null;
     let unlocked = false;
 
@@ -469,13 +457,12 @@ export class WorkspaceUnlockRuntime {
         throw new UnlockError("U5_ARTIFACT", "protocol_incompatible");
       }
       const kidBytes = workspaceContextKidBytes();
-      // The release descriptor must be sealed under the stable workspace
-      // context. A descriptor KID that differs means this release was bound to a
-      // different identity, so the stable root could never open it.
-      const descriptorKid = descriptorKidBytes(descriptor);
-      if (toBase64(descriptorKid) !== toBase64(kidBytes)) {
-        throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
-      }
+      // The artifact KID is release metadata bound inside the sealed envelope
+      // (HPKE info + AAD) and covered by the descriptor's artifact digest. It is
+      // deliberately NOT compared to the stable enrollment context: two releases
+      // may carry different KIDs while remaining sealed to the same stable
+      // workspace recipient key. A tampered KID is rejected by the authenticated
+      // decrypt below.
 
       // U1: audited WASM boundary. Not a network await, but still classified.
       onStage("U1_WASM");
@@ -491,12 +478,12 @@ export class WorkspaceUnlockRuntime {
       // path.
       onStage("U2_ENROLL");
       try {
-        workspaceKey = new WasmWorkspaceKey(secretBytes, WORKSPACE_ROOT_VERSION, kidBytes);
+        workspaceKey = new WasmWorkspaceRootKey(secretBytes);
       } catch {
-        // Length/zero/KID/version are all validated in JS above and mirrored by
-        // the audited WASM constructor, so a throw here is an internal WASM/alloc
-        // fault, not an invalid recovery code. Classify it as such instead of
-        // telling the person to re-enter a valid code.
+        // Length/zero are validated in JS above and mirrored by the audited WASM
+        // constructor, so a throw here is an internal WASM/alloc fault, not an
+        // invalid recovery code. Classify it as such instead of telling the
+        // person to re-enter a valid code.
         throw new UnlockError("U1_WASM", "wasm_unavailable");
       }
       secretBytes.fill(0);

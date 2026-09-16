@@ -17,8 +17,7 @@ import { existsSync } from "node:fs";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  WORKSPACE_ROOT_CONTEXT_BYTES,
-  derivePublicKey,
+  deriveRootPublicKey,
   packDirectory,
   sealPackage,
 } from "../../scripts/workspace-artifact.mjs";
@@ -158,6 +157,7 @@ let descriptor = null;
 let workspaceIdentity = null;
 let recoveryWrapper = null;
 let enrolledKidB64 = null;
+let enrolledPublicKeyB64 = null;
 let grant = null;
 const host = new SessionHost();
 
@@ -168,12 +168,14 @@ const OFFLINE_RECOVERY_CREDENTIAL_B64 = Buffer.from(
 
 async function prepare() {
   const secret = randomBytes(32);
-  // Releases are sealed under the fixed stable workspace context, never a
-  // per-release KID; the recipient identity is the stable root's public key.
-  const kid = WORKSPACE_ROOT_CONTEXT_BYTES;
-  const publicKey = derivePublicKey(secret, kid, 1);
+  // The stable workspace recipient identity is derived from the root secret
+  // alone (no KID). The artifact KID below is deliberately a foreign
+  // release-metadata value, different from the protocol context, to prove the
+  // same stable root unlocks a release sealed under any valid KID.
+  const artifactKid = Buffer.from("e2e-artifact-kid");
+  const publicKey = deriveRootPublicKey(secret);
   const packed = await packDirectory(PAYLOAD_DIST);
-  const artifact = await sealPackage(packed, publicKey, kid, 1);
+  const artifact = await sealPackage(packed, publicKey, artifactKid, 1);
   sealedArtifactPath = join(resolve(process.env.TMPDIR ?? "/tmp"), `e2e-shell-artifact-${process.pid}.bin`);
   await writeFile(sealedArtifactPath, artifact, { mode: 0o600 });
 
@@ -212,7 +214,7 @@ async function prepare() {
   descriptor = {
     protocol_version: 1,
     artifact_version: 1,
-    artifact_kid_b64: Buffer.from(kid).toString("base64"),
+    artifact_kid_b64: Buffer.from(artifactKid).toString("base64"),
     artifact_size: artifact.length,
     artifact_sha256_hex: createHash("sha256").update(artifact).digest("hex"),
     package_format_version: 1,
@@ -317,12 +319,14 @@ const server = createServer(async (req, res) => {
       if (typeof body.public_key !== "string" || typeof body.kid !== "string") {
         return json(res, 400, { error: "malformed enrollment" });
       }
-      // Model the real server: an identical binding is idempotent, a different
-      // binding for the same session conflicts.
-      if (enrolledKidB64 !== null && enrolledKidB64 !== body.kid) {
+      // Model the real server: the workspace identity is the public key. An
+      // identical binding is idempotent (the enrollment KID is metadata); a
+      // different public key for the same session conflicts.
+      if (enrolledPublicKeyB64 !== null && enrolledPublicKeyB64 !== body.public_key) {
         return json(res, 409, { code: "enrollment_conflict" });
       }
       enrolledKidB64 = body.kid;
+      enrolledPublicKeyB64 = body.public_key;
       return json(res, 200, { ok: true });
     }
 

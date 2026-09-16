@@ -2,16 +2,17 @@
 //
 // One workspace has exactly one 32-byte **Workspace Root Secret**, generated in
 // the browser exactly once during initial setup. The stable workspace recipient
-// keypair is derived from that root secret under a **fixed, release-independent
-// derivation context** (`WORKSPACE_ROOT_CONTEXT_B64`). The context is a protocol
-// constant, never a release id or KID, so:
+// keypair is derived from that root secret under a **fixed Root-Key-V2 domain**,
+// entirely independent of any release id or artifact KID:
 //
 //   * the workspace public identity is the same for every release;
 //   * a future release is sealed to the same public key, with no reseal and no
 //     operator involvement;
-//   * per-artifact freshness comes from the HPKE envelope randomness plus the
-//     release metadata (release id, artifact digest) bound to the artifact over
-//     the authenticated channel, not from changing the workspace identity.
+//   * the artifact KID is release metadata bound into the HPKE envelope, never
+//     part of the recipient identity;
+//   * per-artifact cryptographic freshness comes from the HPKE envelope
+//     randomness plus the release metadata (release id, artifact digest) bound
+//     to the artifact over the authenticated channel.
 //
 // The root secret itself is never persisted anywhere. It is wrapped client-side
 // under (a) a passkey WebAuthn PRF output and (b) a separate high-entropy offline
@@ -36,7 +37,7 @@ import {
   wrapRootKey,
   type WrappedRootKey,
 } from "./recovery-wrapping.ts";
-import { WasmWorkspaceKey } from "./wasm/crypto-envelope-wasm.js";
+import { WasmWorkspaceRootKey } from "./wasm/crypto-envelope-wasm.js";
 
 export const WORKSPACE_ROOT_SECRET_BYTES = 32;
 export { WORKSPACE_ROOT_CONTEXT_B64, WORKSPACE_ROOT_VERSION };
@@ -145,23 +146,16 @@ export function decodeRecoveryCode(input: string): Uint8Array {
 }
 
 /**
- * Derive the stable workspace X25519 public key for a root secret. The context
- * is the fixed protocol constant, so this value is identical across releases.
- * Private key material stays inside WASM and is discarded on free.
+ * Derive the stable workspace X25519 public key for a root secret.
+ *
+ * The Root-Key-V2 derivation takes no KID and no release context, so this value
+ * is byte-identical across releases and KID rotations. Private key material stays
+ * inside WASM and is discarded on free.
  */
 export async function deriveWorkspaceRootPublicKey(
   rootSecret: Uint8Array,
 ): Promise<Uint8Array> {
   if (!isValidWorkspaceRootSecret(rootSecret)) {
-    throw new WorkspaceRootError("invalid_root");
-  }
-  let contextBytes: Uint8Array;
-  try {
-    contextBytes = fromBase64(WORKSPACE_ROOT_CONTEXT_B64);
-  } catch {
-    throw new WorkspaceRootError("invalid_root");
-  }
-  if (contextBytes.length !== 16 || contextBytes.every((byte) => byte === 0)) {
     throw new WorkspaceRootError("invalid_root");
   }
   try {
@@ -170,15 +164,14 @@ export async function deriveWorkspaceRootPublicKey(
     throw new WorkspaceRootError("crypto_unavailable");
   }
   const rootCopy = new Uint8Array(rootSecret);
-  let key: WasmWorkspaceKey | null = null;
+  let key: WasmWorkspaceRootKey | null = null;
   try {
-    key = new WasmWorkspaceKey(rootCopy, WORKSPACE_ROOT_VERSION, contextBytes);
+    key = new WasmWorkspaceRootKey(rootCopy);
     return new Uint8Array(key.public_key());
   } catch {
     throw new WorkspaceRootError("crypto_unavailable");
   } finally {
     rootCopy.fill(0);
-    contextBytes.fill(0);
     if (key) {
       try {
         key.free();

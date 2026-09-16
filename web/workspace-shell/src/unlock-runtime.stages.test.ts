@@ -102,33 +102,34 @@ test("an incompatible shell protocol fails as U5", async () => {
   );
 });
 
-test("a malformed, all-zero or non-stable descriptor KID fails as U5", async () => {
+test("a descriptor KID is release metadata, never a local workspace identity gate", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
   const runtime = new WorkspaceUnlockRuntime();
-  const secret = new Uint8Array(32).fill(1);
-  await expectStage(
-    () => runtime.unlock(secret, descriptor({ artifact_kid_b64: "!!!" })),
-    "U5_ARTIFACT",
-    "descriptor_invalid",
-  );
-  await expectStage(
-    () =>
-      runtime.unlock(
-        secret,
-        descriptor({ artifact_kid_b64: "AAAAAAAAAAAAAAAAAAAAAA==" }),
-      ),
-    "U5_ARTIFACT",
-    "descriptor_invalid",
-  );
-  // A release sealed under a different KID cannot be opened by the stable root.
+  const calls: string[] = [];
+  const fetchFn = (async (url: string) => {
+    const target = String(url);
+    calls.push(target);
+    // Enrollment succeeds; the grant then reports an expired session so the
+    // unlock stops at U2/session_expired.
+    if (target.includes("/artifact/grant")) return new Response(null, { status: 401 });
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  // A foreign-but-valid KID must not be rejected locally: the descriptor KID is
+  // authenticated inside the envelope and covered by the artifact digest, while
+  // the stable workspace recipient identity is derived from the root alone. The
+  // request therefore reaches the network instead of failing as U5.
   await expectStage(
     () =>
       runtime.unlock(
-        secret,
+        new Uint8Array(32).fill(1),
         descriptor({ artifact_kid_b64: "AQIDBAUGBwgJCgsMDQ4PEA==" }),
+        { fetchFn },
       ),
-    "U5_ARTIFACT",
-    "artifact_incompatible",
+    "U2_ENROLL",
+    "session_expired",
   );
+  assert.deepEqual(calls, ["/internal/auth/enroll", "/internal/artifact/grant"]);
 });
 
 test("a WASM loader failure is classified as U1", async () => {

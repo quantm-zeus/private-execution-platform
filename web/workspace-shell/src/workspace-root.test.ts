@@ -89,13 +89,14 @@ test("stable workspace public identity is deterministic and independent of relea
   assert.notDeepEqual(pk1, otherPk);
 });
 
-test("the fixed derivation context is the pinned protocol constant", () => {
+test("the pinned protocol constant is the session-enrollment context, not a derivation input", () => {
   const context = Buffer.from(WORKSPACE_ROOT_CONTEXT_B64, "base64");
   assert.equal(context.length, 16);
   assert.ok(context.some((byte) => byte !== 0));
   // Pin the exact value: sha256("evergreen/workspace-root-key/v2") truncated to
-  // 16 bytes, matching the server-side WORKSPACE_ROOT_CONTEXT_KID. A
-  // release-derived or otherwise wrong constant cannot pass.
+  // 16 bytes, matching the server-side WORKSPACE_ROOT_CONTEXT_KID. It is the
+  // session-enrollment label; the Root-Key-V2 recipient identity is derived in
+  // WASM from the root secret alone and does not consume this constant.
   const expected = createHash("sha256")
     .update("evergreen/workspace-root-key/v2")
     .digest()
@@ -105,6 +106,21 @@ test("the fixed derivation context is the pinned protocol constant", () => {
     context.toString("hex"),
     "4adf2d43f11d9ddea06efb64457649b1",
   );
+});
+
+test("the stable recipient identity is derived without any KID or release context", () => {
+  const rootSource = readFileSync(new URL("./workspace-root.ts", import.meta.url), "utf8");
+  const runtimeSource = readFileSync(
+    new URL("./unlock-runtime.ts", import.meta.url),
+    "utf8",
+  );
+  // Production derivation and decrypt must use the KID-free root key object.
+  assert.ok(rootSource.includes("new WasmWorkspaceRootKey(rootCopy)"));
+  assert.ok(runtimeSource.includes("new WasmWorkspaceRootKey(secretBytes)"));
+  // The legacy KID-dependent key object must not appear in either module (note
+  // that "WasmWorkspaceKey" is not a substring of "WasmWorkspaceRootKey").
+  assert.ok(!rootSource.includes("WasmWorkspaceKey"));
+  assert.ok(!runtimeSource.includes("WasmWorkspaceKey"));
 });
 
 test("invalid roots and a missing WASM boundary fail closed with typed errors", async () => {
