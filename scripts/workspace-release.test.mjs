@@ -25,14 +25,11 @@ import { fileURLToPath } from "node:url";
 import { writeArtifactAtomically } from "./build-workspace-encrypted.mjs";
 import { sanitizeConsoleSource } from "./build-crypto-wasm-bindings.mjs";
 import {
-  ARTIFACT_VERSION,
   KID_BYTES,
   WORKSPACE_ROOT_CONTEXT_B64,
-  WORKSPACE_ROOT_CONTEXT_BYTES,
   artifactKidFromEnv,
-  decryptArtifact,
-  derivePublicKey,
-  sealPackage,
+  decryptRootArtifact,
+  deriveRootPublicKey,
 } from "./workspace-artifact.mjs";
 import {
   ARTIFACT_FILE,
@@ -1418,7 +1415,8 @@ test("writeArtifactAtomically never removes the destination on failure", async (
 // both with no reseal and no manual operator action.
 // ---------------------------------------------------------------------------
 
-test("stable release tooling seals to the fixed context and rejects a foreign KID", () => {
+test("release tooling accepts an arbitrary artifact KID while sealing to the stable public key", () => {
+  // Unset defaults to the protocol context for continuity.
   assert.equal(artifactKidFromEnv({}).toString("base64"), WORKSPACE_ROOT_CONTEXT_B64);
   assert.equal(
     artifactKidFromEnv({
@@ -1426,12 +1424,28 @@ test("stable release tooling seals to the fixed context and rejects a foreign KI
     }).toString("base64"),
     WORKSPACE_ROOT_CONTEXT_B64,
   );
+  // A foreign-but-valid KID is release metadata and must be accepted.
+  const foreign = Buffer.alloc(16, 3);
+  assert.deepEqual(
+    artifactKidFromEnv({
+      WORKSPACE_ARTIFACT_KID_B64: foreign.toString("base64"),
+    }),
+    foreign,
+  );
+  assert.throws(
+    () => artifactKidFromEnv({ WORKSPACE_ARTIFACT_KID_B64: "!!!" }),
+    /invalid base64/,
+  );
   assert.throws(
     () =>
       artifactKidFromEnv({
-        WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16, 3).toString("base64"),
+        WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16).toString("base64"),
       }),
-    /deprecated|stable workspace context/,
+    /all-zero/,
+  );
+  assert.throws(
+    () => artifactKidFromEnv({ WORKSPACE_ARTIFACT_KID_B64: "short" }),
+    /invalid base64/,
   );
 });
 
@@ -1471,20 +1485,14 @@ test("the Rust workspace root context bytes match the TS/tooling constant", asyn
   );
 });
 
-test("operational: N and N+1 built from the stable public key decrypt with one root", async () => {
+test("operational: N and N+1 sealed to one stable public key with distinct KIDs decrypt with one root", async () => {
   const rootSecret = randomBytes(32);
-  const publicKey = derivePublicKey(
-    rootSecret,
-    WORKSPACE_ROOT_CONTEXT_BYTES,
-    ARTIFACT_VERSION,
-  );
+  const publicKey = deriveRootPublicKey(rootSecret);
   assert.equal(publicKey.length, 32);
-  // The recipient identity is a pure function of the root + fixed context, so
-  // it is identical for every release.
-  assert.deepEqual(
-    derivePublicKey(rootSecret, WORKSPACE_ROOT_CONTEXT_BYTES, ARTIFACT_VERSION),
-    publicKey,
-  );
+  // The stable recipient identity is a pure function of the root and the fixed
+  // Root-Key-V2 domain: repeated derivation is identical and takes no KID.
+  assert.deepEqual(deriveRootPublicKey(rootSecret), publicKey);
+  assert.notDeepEqual(deriveRootPublicKey(randomBytes(32)), publicKey);
 
   const root = await mkdtemp(join(tmpdir(), "root-release-ops-"));
   const shellDir = await mkdtemp(join(tmpdir(), "root-release-ops-shell-"));
@@ -1492,6 +1500,8 @@ test("operational: N and N+1 built from the stable public key decrypt with one r
   const payloadB = await mkdtemp(join(tmpdir(), "root-release-ops-payload-b-"));
   const previousKey = process.env.WORKSPACE_PUBLIC_KEY_B64;
   const previousKid = process.env.WORKSPACE_ARTIFACT_KID_B64;
+  const kidA = Buffer.alloc(16, 0x31);
+  const kidB = Buffer.alloc(16, 0x7e);
   try {
     await writeFile(join(shellDir, "_headers"), PRODUCTION_HEADERS);
     await writeFile(join(shellDir, "index.html"), "<!doctype html>");
@@ -1500,16 +1510,18 @@ test("operational: N and N+1 built from the stable public key decrypt with one r
     await writeFile(join(payloadA, "index.html"), "release-n");
     await writeFile(join(payloadB, "index.html"), "release-n-plus-1");
 
-    // The build path sees only the public key and no KID override.
-    delete process.env.WORKSPACE_ARTIFACT_KID_B64;
+    // The build path sees ONLY the stable PUBLIC key, never the root secret.
     process.env.WORKSPACE_PUBLIC_KEY_B64 = publicKey.toString("base64");
 
+    // Release N and release N+1 carry distinct artifact KIDs.
+    process.env.WORKSPACE_ARTIFACT_KID_B64 = kidA.toString("base64");
     const first = await buildAndPublishRelease({
       releasesRoot: root,
       shellDir,
       payloadDir: payloadA,
       sourceSha: "aaaa111",
     });
+    process.env.WORKSPACE_ARTIFACT_KID_B64 = kidB.toString("base64");
     const second = await buildAndPublishRelease({
       releasesRoot: root,
       shellDir,
@@ -1521,9 +1533,12 @@ test("operational: N and N+1 built from the stable public key decrypt with one r
     const { manifest: manifestFirst } = await readRelease(root, first.releaseId);
     const { manifest: manifestSecond } = await readRelease(root, second.releaseId);
 
-    // One stable identity: same envelope KID and same recipient fingerprint.
-    assert.equal(manifestFirst.artifact.kid_b64, WORKSPACE_ROOT_CONTEXT_B64);
-    assert.equal(manifestSecond.artifact.kid_b64, WORKSPACE_ROOT_CONTEXT_B64);
+    // Distinct KIDs, one stable recipient identity, both stable-root manifests.
+    assert.equal(manifestFirst.artifact.kid_b64, kidA.toString("base64"));
+    assert.equal(manifestSecond.artifact.kid_b64, kidB.toString("base64"));
+    assert.notEqual(manifestFirst.artifact.kid_b64, manifestSecond.artifact.kid_b64);
+    assert.equal(manifestFirst.recipient.root_key_v2, true);
+    assert.equal(manifestSecond.recipient.root_key_v2, true);
     assert.equal(
       manifestFirst.recipient.public_key_fingerprint_b64,
       manifestSecond.recipient.public_key_fingerprint_b64,
@@ -1542,26 +1557,17 @@ test("operational: N and N+1 built from the stable public key decrypt with one r
     );
     assert.equal(
       artifactFirst.subarray(1, 1 + KID_BYTES).toString("base64"),
-      WORKSPACE_ROOT_CONTEXT_B64,
+      kidA.toString("base64"),
     );
     assert.equal(
       artifactSecond.subarray(1, 1 + KID_BYTES).toString("base64"),
-      WORKSPACE_ROOT_CONTEXT_B64,
+      kidB.toString("base64"),
     );
 
-    // The same browser root unlocks both releases, with no reseal.
-    const plainFirst = await decryptArtifact(
-      artifactFirst,
-      rootSecret,
-      WORKSPACE_ROOT_CONTEXT_BYTES,
-      ARTIFACT_VERSION,
-    );
-    const plainSecond = await decryptArtifact(
-      artifactSecond,
-      rootSecret,
-      WORKSPACE_ROOT_CONTEXT_BYTES,
-      ARTIFACT_VERSION,
-    );
+    // The same browser root unlocks both releases, with no reseal, no operator
+    // action, and no KID argument.
+    const plainFirst = await decryptRootArtifact(artifactFirst, rootSecret);
+    const plainSecond = await decryptRootArtifact(artifactSecond, rootSecret);
     assert.ok(plainFirst.length > 0);
     assert.ok(plainSecond.length > 0);
     assert.notDeepEqual(plainFirst, plainSecond);
@@ -1570,39 +1576,20 @@ test("operational: N and N+1 built from the stable public key decrypt with one r
     // release for the stable root.
     await switchCurrent(root, first.releaseId);
     assert.equal(await readlink(join(root, CURRENT_LINK)), first.releaseId);
-    assert.ok(
-      (
-        await decryptArtifact(
-          artifactFirst,
-          rootSecret,
-          WORKSPACE_ROOT_CONTEXT_BYTES,
-          ARTIFACT_VERSION,
-        )
-      ).length > 0,
-    );
+    assert.ok((await decryptRootArtifact(artifactFirst, rootSecret)).length > 0);
     await switchCurrent(root, second.releaseId);
     assert.equal(await readlink(join(root, CURRENT_LINK)), second.releaseId);
-    assert.ok(
-      (
-        await decryptArtifact(
-          artifactSecond,
-          rootSecret,
-          WORKSPACE_ROOT_CONTEXT_BYTES,
-          ARTIFACT_VERSION,
-        )
-      ).length > 0,
-    );
+    assert.ok((await decryptRootArtifact(artifactSecond, rootSecret)).length > 0);
 
     // A different root cannot open either release.
     const otherRoot = randomBytes(32);
-    await assert.rejects(
-      decryptArtifact(
-        artifactFirst,
-        otherRoot,
-        WORKSPACE_ROOT_CONTEXT_BYTES,
-        ARTIFACT_VERSION,
-      ),
-    );
+    await assert.rejects(decryptRootArtifact(artifactFirst, otherRoot));
+    await assert.rejects(decryptRootArtifact(artifactSecond, otherRoot));
+
+    // A tampered artifact KID fails closed through the authenticated envelope.
+    const tamperedKid = Buffer.from(artifactSecond);
+    tamperedKid[1] ^= 0x01;
+    await assert.rejects(decryptRootArtifact(tamperedKid, rootSecret));
   } finally {
     if (previousKey === undefined) delete process.env.WORKSPACE_PUBLIC_KEY_B64;
     else process.env.WORKSPACE_PUBLIC_KEY_B64 = previousKey;

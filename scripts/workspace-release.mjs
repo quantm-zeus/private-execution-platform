@@ -42,7 +42,6 @@ import {
   MIN_ARTIFACT_BYTES,
   PUBLIC_KEY_BYTES,
   TAG_BYTES,
-  WORKSPACE_ROOT_CONTEXT_B64,
   artifactKidFromEnv,
   artifactPublicKeyFromEnv,
   packDirectory,
@@ -442,6 +441,11 @@ export function computeReleaseManifest({
     },
     recipient: {
       public_key_fingerprint_b64: publicKeyFingerprintB64(publicKey),
+      // Explicit stable-root marker: this release was sealed to the stable
+      // Root-Key-V2 workspace identity, not a legacy release-bound recipient.
+      // The artifact KID below is envelope metadata and may differ from release
+      // to release without changing this identity.
+      root_key_v2: true,
     },
     workspace_protocol: {
       min: WORKSPACE_PROTOCOL_VERSION,
@@ -524,6 +528,14 @@ export function validateReleaseManifest(manifest, artifact) {
     fingerprint.toString("base64") !== fingerprintB64
   ) {
     throw new Error("invalid recipient fingerprint");
+  }
+  // The stable-root marker is optional for legacy manifests (defaults to
+  // absent) but must be a real boolean when present.
+  if (
+    manifest.recipient.root_key_v2 !== undefined &&
+    typeof manifest.recipient.root_key_v2 !== "boolean"
+  ) {
+    throw new Error("invalid recipient root_key_v2 marker");
   }
   return manifest;
 }
@@ -905,11 +917,15 @@ export async function publishRelease({
   lockTimeoutMs,
   lockStaleMs,
 }) {
-  // Every release is sealed to the one stable workspace context. Reject a
-  // caller-supplied foreign KID here as well as in `artifactKidFromEnv`, so the
-  // lower-level publish API cannot bind a release to a different identity.
-  if (kidB64 !== WORKSPACE_ROOT_CONTEXT_B64) {
-    throw new Error("publishRelease requires the stable workspace context KID");
+  // The artifact KID is envelope metadata, not the workspace recipient identity:
+  // consecutive releases may use different KIDs while sealing to the same stable
+  // public key. Only its shape is constrained (canonical 16-byte, non-zero).
+  const kidBytes = Buffer.from(kidB64, "base64");
+  if (kidBytes.length !== KID_BYTES || kidBytes.toString("base64") !== kidB64) {
+    throw new Error("publishRelease requires a canonical 16-byte artifact KID");
+  }
+  if (kidBytes.every((byte) => byte === 0)) {
+    throw new Error("publishRelease rejects an all-zero artifact KID");
   }
   const artifactDigest = sha256Hex(artifact);
   const releaseId = releaseIdFor(sourceSha, artifactDigest);

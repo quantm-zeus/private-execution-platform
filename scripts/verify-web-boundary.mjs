@@ -10,7 +10,9 @@ import {
   ARTIFACT_HEADER_BYTES,
   ARTIFACT_VERSION,
   WORKSPACE_ROOT_CONTEXT_B64,
+  decryptRootArtifact,
   derivePublicKey,
+  deriveRootPublicKey,
   packDirectory,
   sealPackage,
   unpackPackage,
@@ -1223,7 +1225,7 @@ try {
   // differently. Regenerating the wasm is a reviewed change: update this digest
   // in the same commit.
   const EXPECTED_WASM_SHA256 =
-    "60d2b137f2b8449c4ecb19a561726a047b1020344cf5dcac22871bd6a11744a8";
+    "b960c5d15b048a7550b24fa2f60e4a54d317a4015fcc5bf7bdc6483eb6ecd093";
   const wasmSha256 = digest(wasmBytes);
   if (wasmSha256 !== EXPECTED_WASM_SHA256) {
     throw new Error(
@@ -1239,7 +1241,12 @@ try {
   if ("seal_workspace_artifact" in wasmModule || "seal_artifact" in wasmModule) {
     throw new Error("Slice A violation: seal function re-exported to JS wasm bindings");
   }
-  if (!wasmModule.WasmWorkspaceKey || !wasmModule.WasmOffer || !wasmModule.WasmInitiatorSession) {
+  if (
+    !wasmModule.WasmWorkspaceKey ||
+    !wasmModule.WasmWorkspaceRootKey ||
+    !wasmModule.WasmOffer ||
+    !wasmModule.WasmInitiatorSession
+  ) {
     throw new Error("audited wasm bindings missing required exported classes");
   }
 
@@ -1253,6 +1260,46 @@ try {
     throw new Error("wasm key derivation does not match Rust CLI derive-public-key");
   }
   testKey.free();
+
+  // Root-Key V2: the stable recipient identity is a function of the root alone
+  // (no KID) and must match the Rust CLI `--root-key-v2` mode. One stable root
+  // must open artifacts sealed under two distinct artifact KIDs.
+  const rootPublicKey = deriveRootPublicKey(testSecret);
+  if (!deriveRootPublicKey(testSecret).equals(rootPublicKey)) {
+    throw new Error("Root-Key V2 identity is not deterministic");
+  }
+  const rootKey = new wasmModule.WasmWorkspaceRootKey(testSecret);
+  if (!Buffer.from(rootKey.public_key()).equals(rootPublicKey)) {
+    throw new Error("WasmWorkspaceRootKey does not match Rust CLI derive-public-key --root-key-v2");
+  }
+  const sealedCrossKidA = await sealPackage(
+    Buffer.from("cross-kid-a"),
+    rootPublicKey,
+    Buffer.alloc(16, 0x11),
+  );
+  const sealedCrossKidB = await sealPackage(
+    Buffer.from("cross-kid-b"),
+    rootPublicKey,
+    Buffer.alloc(16, 0x22),
+  );
+  if (Buffer.from(rootKey.decrypt_artifact(new Uint8Array(sealedCrossKidA))).toString() !== "cross-kid-a") {
+    throw new Error("WasmWorkspaceRootKey failed to decrypt KID A");
+  }
+  if (Buffer.from(rootKey.decrypt_artifact(new Uint8Array(sealedCrossKidB))).toString() !== "cross-kid-b") {
+    throw new Error("WasmWorkspaceRootKey failed to decrypt KID B");
+  }
+  const tamperedCrossKid = Buffer.from(sealedCrossKidB);
+  tamperedCrossKid[1] ^= 0x01;
+  let crossKidRejected = false;
+  try {
+    rootKey.decrypt_artifact(new Uint8Array(tamperedCrossKid));
+  } catch {
+    crossKidRejected = true;
+  }
+  if (!crossKidRejected) {
+    throw new Error("WasmWorkspaceRootKey accepted a tampered artifact KID");
+  }
+  rootKey.free();
 
   // =========================================================================
   // 5. Forbidden key rejection across build, verification, and helpers
@@ -1307,30 +1354,30 @@ try {
   // 6. Strict validation on required WORKSPACE_PUBLIC_KEY_B64 and KID
   // =========================================================================
   unlockSecret = randomBytes(32);
-  // Releases are sealed to the fixed stable workspace context, never a
-  // per-release KID; the public identity is derived from the root + context.
+  // The stable workspace recipient identity is derived from the root alone; the
+  // protocol context is used only as the session-enrollment label and as the
+  // default artifact KID.
   const kid = Buffer.from(WORKSPACE_ROOT_CONTEXT_B64, "base64");
-  const publicKey = derivePublicKey(unlockSecret, kid, ARTIFACT_VERSION);
+  const publicKey = deriveRootPublicKey(unlockSecret);
+  // Deliberately a foreign artifact KID, different from the protocol context, to
+  // prove the stable root unlocks a release sealed under release metadata.
+  const artifactKid = Buffer.from("verify-artifact!");
 
-  // Missing kid now defaults to the stable workspace context (and never
-  // changes the workspace identity).
+  // Missing kid defaults to the stable workspace context.
   if (!artifactKidFromEnv({}).equals(kid)) {
     throw new Error(
       "missing WORKSPACE_ARTIFACT_KID_B64 did not default to the stable workspace context",
     );
   }
 
-  // A foreign KID is deprecated migration input and must fail closed.
-  let foreignKidRejected = false;
-  try {
-    artifactKidFromEnv({
-      WORKSPACE_ARTIFACT_KID_B64: randomBytes(16).toString("base64"),
-    });
-  } catch {
-    foreignKidRejected = true;
-  }
-  if (!foreignKidRejected) {
-    throw new Error("a foreign WORKSPACE_ARTIFACT_KID_B64 was accepted");
+  // A foreign KID is release metadata and must be accepted; it never changes the
+  // stable workspace public identity.
+  const foreignKid = randomBytes(16);
+  const acceptedForeignKid = artifactKidFromEnv({
+    WORKSPACE_ARTIFACT_KID_B64: foreignKid.toString("base64"),
+  });
+  if (!acceptedForeignKid.equals(foreignKid)) {
+    throw new Error("a foreign WORKSPACE_ARTIFACT_KID_B64 was not accepted as metadata");
   }
 
   // All-zero kid
@@ -1451,7 +1498,7 @@ try {
   run(["build:workspace:encrypted"], {
     ...process.env,
     WORKSPACE_PUBLIC_KEY_B64: publicKey.toString("base64"),
-    WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+    WORKSPACE_ARTIFACT_KID_B64: artifactKid.toString("base64"),
   });
 
   // 8a. Executable proof: Plaintext payload build directory must NOT exist after build
@@ -1493,14 +1540,15 @@ try {
   if (rawArtifact[0] !== ARTIFACT_VERSION) {
     throw new Error(`artifact has invalid version byte: ${rawArtifact[0]}`);
   }
-  if (!rawArtifact.subarray(1, 17).equals(kid)) {
+  if (!rawArtifact.subarray(1, 17).equals(artifactKid)) {
     throw new Error("artifact header kid mismatch");
   }
 
-  // 8c. Decrypt with valid unlock secret & kid
+  // 8c. Decrypt with the stable root. The artifact KID is metadata and is not
+  // passed to the Root-Key-V2 decrypt path.
   const { plaintext: decryptedPlaintext, files: unpackedMap } = await decryptArtifactFile(artifactPath, {
     WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-    WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+    WORKSPACE_ROOT_KEY_V2: "true",
   });
   if (digest(decryptedPlaintext) !== expectedPayloadHash) {
     throw new Error("decrypted artifact digest mismatch");
@@ -1555,7 +1603,7 @@ try {
       sourceSha,
       artifact: rawArtifact,
       publicKeyB64: publicKey.toString("base64"),
-      kidB64: kid.toString("base64"),
+      kidB64: artifactKid.toString("base64"),
       shellAssetDigest,
     });
     await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
@@ -1568,7 +1616,7 @@ try {
         JSON.stringify({
           artifactPath,
           secretB64: unlockSecret.toString("base64"),
-          kidB64: kid.toString("base64"),
+          kidB64: artifactKid.toString("base64"),
           manifestPath,
         }),
         { mode: 0o600 },
@@ -1649,7 +1697,7 @@ try {
   try {
     await decryptArtifactFile(tamperedCtPath, {
       WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+      WORKSPACE_ROOT_KEY_V2: "true",
     });
   } catch {
     rejected = true;
@@ -1665,7 +1713,7 @@ try {
   try {
     await decryptArtifactFile(tamperedKidPath, {
       WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+      WORKSPACE_ROOT_KEY_V2: "true",
     });
   } catch {
     rejected = true;
@@ -1681,7 +1729,7 @@ try {
   try {
     await decryptArtifactFile(tamperedVerPath, {
       WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+      WORKSPACE_ROOT_KEY_V2: "true",
     });
   } catch {
     rejected = true;
@@ -1695,38 +1743,35 @@ try {
   try {
     await decryptArtifactFile(artifactPath, {
       WORKSPACE_UNLOCK_SECRET_B64: wrongSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: kid.toString("base64"),
+      WORKSPACE_ROOT_KEY_V2: "true",
     });
   } catch {
     rejected = true;
   }
   if (!rejected) throw new Error("wrong unlock secret was accepted");
 
-  // 9f. Wrong kid in decrypt env fails closed
+  // 9f. Root-Key-V2 decrypt ignores the artifact-KID env entirely: a wrong KID
+  // is release metadata, not a local gate.
   const wrongKid = Buffer.from(kid);
   wrongKid[0] ^= 1;
-  rejected = false;
-  try {
-    await decryptArtifactFile(artifactPath, {
-      WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: wrongKid.toString("base64"),
-    });
-  } catch {
-    rejected = true;
+  const rootIgnoredWrongKid = await decryptArtifactFile(artifactPath, {
+    WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
+    WORKSPACE_ROOT_KEY_V2: "true",
+    WORKSPACE_ARTIFACT_KID_B64: wrongKid.toString("base64"),
+  });
+  if (digest(rootIgnoredWrongKid.plaintext) !== expectedPayloadHash) {
+    throw new Error("root decrypt with a wrong KID env produced the wrong payload");
   }
-  if (!rejected) throw new Error("wrong kid in decrypt env was accepted");
 
-  // 9g. All-zero kid in decrypt env fails closed
-  rejected = false;
-  try {
-    await decryptArtifactFile(artifactPath, {
-      WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
-      WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16).toString("base64"),
-    });
-  } catch {
-    rejected = true;
+  // 9g. The same holds for an all-zero KID env.
+  const rootIgnoredZeroKid = await decryptArtifactFile(artifactPath, {
+    WORKSPACE_UNLOCK_SECRET_B64: unlockSecret.toString("base64"),
+    WORKSPACE_ROOT_KEY_V2: "true",
+    WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16).toString("base64"),
+  });
+  if (digest(rootIgnoredZeroKid.plaintext) !== expectedPayloadHash) {
+    throw new Error("root decrypt with an all-zero KID env produced the wrong payload");
   }
-  if (!rejected) throw new Error("all-zero kid in decrypt env was accepted");
 
   // 9h. Preflight metadata: empty input file fails closed in seal-artifact CLI
   const emptyFile = join(temp, "empty-input.bin");
@@ -1817,7 +1862,7 @@ try {
   const descriptor = {
     protocol_version: 1,
     artifact_version: ARTIFACT_VERSION,
-    artifact_kid_b64: kid.toString("base64"),
+    artifact_kid_b64: artifactKid.toString("base64"),
     artifact_size: rawArtifact.length,
     artifact_sha256_hex: createHash("sha256").update(rawArtifact).digest("hex"),
     package_format_version: 1,
@@ -1834,70 +1879,58 @@ try {
   // 10a. Audited WASM loads and binds
   await loadShellWasm();
 
-  // 10b. Derive workspace keypair deterministically in WASM memory
-  const wasmKey = new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(kid));
+  // 10b. Derive the stable Root-Key-V2 workspace keypair in WASM memory. It
+  // takes no KID: the artifact KID is bound inside the envelope.
+  const wasmKey = new wasmModule.WasmWorkspaceRootKey(new Uint8Array(unlockSecret));
   try {
     const derivedPk = Buffer.from(wasmKey.public_key());
     if (!derivedPk.equals(publicKey)) {
-      throw new Error("WasmWorkspaceKey derived public key mismatch");
-    }
-    if (!Buffer.from(wasmKey.kid()).equals(kid)) {
-      throw new Error("WasmWorkspaceKey kid mismatch");
-    }
-    if (wasmKey.version() !== ARTIFACT_VERSION) {
-      throw new Error("WasmWorkspaceKey version mismatch");
+      throw new Error("WasmWorkspaceRootKey derived public key mismatch");
     }
 
-    // Strict parameter validation in WASM key constructor
+    // Strict parameter validation in the WASM root-key constructor.
     let wasmRejected = false;
     try {
-      new wasmModule.WasmWorkspaceKey(new Uint8Array(32), ARTIFACT_VERSION, new Uint8Array(kid));
+      new wasmModule.WasmWorkspaceRootKey(new Uint8Array(32));
     } catch {
       wasmRejected = true;
     }
-    if (!wasmRejected) throw new Error("all-zero secret accepted by WasmWorkspaceKey");
+    if (!wasmRejected) throw new Error("all-zero secret accepted by WasmWorkspaceRootKey");
 
     wasmRejected = false;
     try {
-      new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(16));
+      new wasmModule.WasmWorkspaceRootKey(new Uint8Array(31).fill(1));
     } catch {
       wasmRejected = true;
     }
-    if (!wasmRejected) throw new Error("all-zero kid accepted by WasmWorkspaceKey");
+    if (!wasmRejected) throw new Error("short secret accepted by WasmWorkspaceRootKey");
 
-    wasmRejected = false;
-    try {
-      new wasmModule.WasmWorkspaceKey(new Uint8Array(unlockSecret), 2, new Uint8Array(kid));
-    } catch {
-      wasmRejected = true;
-    }
-    if (!wasmRejected) throw new Error("unsupported version accepted by WasmWorkspaceKey");
-
-    // Standalone convenience derive
-    const convPk = Buffer.from(wasmModule.derive_workspace_public_key(new Uint8Array(unlockSecret), ARTIFACT_VERSION, new Uint8Array(kid)));
+    // Standalone convenience derive.
+    const convPk = Buffer.from(
+      wasmModule.derive_workspace_root_public_key(new Uint8Array(unlockSecret)),
+    );
     if (!convPk.equals(publicKey)) {
-      throw new Error("derive_workspace_public_key result mismatch");
+      throw new Error("derive_workspace_root_public_key result mismatch");
     }
 
-    // 10c. Decrypt inner artifact with WasmWorkspaceKey in memory
+    // 10c. Decrypt the inner artifact with the root key in WASM memory. The
+    // artifact carries a foreign KID and no KID is supplied here.
     const wasmDecryptedBytes = wasmKey.decrypt_artifact(new Uint8Array(rawArtifact));
     if (digest(Buffer.from(wasmDecryptedBytes)) !== expectedPayloadHash) {
-      throw new Error("WasmWorkspaceKey decrypted payload digest mismatch");
+      throw new Error("WasmWorkspaceRootKey decrypted payload digest mismatch");
     }
 
-    // Standalone convenience decrypt
-    const convDecrypted = wasmModule.decrypt_workspace_artifact(
+    // Standalone convenience decrypt.
+    const convDecrypted = wasmModule.decrypt_workspace_artifact_with_root(
       new Uint8Array(unlockSecret),
-      ARTIFACT_VERSION,
-      new Uint8Array(kid),
       new Uint8Array(rawArtifact),
     );
     if (digest(Buffer.from(convDecrypted)) !== expectedPayloadHash) {
-      throw new Error("decrypt_workspace_artifact result mismatch");
+      throw new Error("decrypt_workspace_artifact_with_root result mismatch");
     }
 
     // Negative crypto tamper checks directly in WASM:
-    // Tampered ciphertext fails closed
+    // Tampered ciphertext fails closed.
     wasmRejected = false;
     try {
       wasmKey.decrypt_artifact(new Uint8Array(tamperedCt));
@@ -1909,7 +1942,7 @@ try {
     }
     if (!wasmRejected) throw new Error("WASM accepted tampered ciphertext");
 
-    // Tampered kid fails closed
+    // Tampered kid fails closed.
     wasmRejected = false;
     try {
       wasmKey.decrypt_artifact(new Uint8Array(tamperedKid));
@@ -1918,7 +1951,7 @@ try {
     }
     if (!wasmRejected) throw new Error("WASM accepted tampered kid");
 
-    // Tampered version fails closed
+    // Tampered version fails closed.
     wasmRejected = false;
     try {
       wasmKey.decrypt_artifact(new Uint8Array(tamperedVer));
@@ -1927,8 +1960,8 @@ try {
     }
     if (!wasmRejected) throw new Error("WASM accepted tampered version");
 
-    // Wrong secret key fails closed
-    const wrongWasmKey = new wasmModule.WasmWorkspaceKey(new Uint8Array(wrongSecret), ARTIFACT_VERSION, new Uint8Array(kid));
+    // Wrong root secret fails closed.
+    const wrongWasmKey = new wasmModule.WasmWorkspaceRootKey(new Uint8Array(wrongSecret));
     try {
       wasmRejected = false;
       try {
@@ -1939,7 +1972,7 @@ try {
           throw new Error("wrong secret decrypt error leaked secret");
         }
       }
-      if (!wasmRejected) throw new Error("WASM accepted wrong unlock secret");
+      if (!wasmRejected) throw new Error("WASM accepted wrong root secret");
     } finally {
       wrongWasmKey.free();
     }
@@ -2216,24 +2249,21 @@ try {
   if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
   if (runtime.getActiveUrlCount() !== 0) throw new Error("runtime should have 0 URLs on failure");
 
-  // Wrong kid (descriptor carries a stale/mismatched KID)
-  unlockFailed = false;
-  try {
-    await runtime.unlock(
-      unlockSecret,
-      { ...descriptor, artifact_kid_b64: Buffer.from(wrongKid).toString("base64") },
-      {
-        fetchFn: mockFetch,
-      },
-    );
-  } catch (e) {
-    unlockFailed = true;
-    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
-      throw new Error(`wrong kid must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+  // A foreign descriptor KID is release metadata, not a local gate: the stable
+  // root still unlocks the release.
+  {
+    const foreignKidDescriptor = {
+      ...descriptor,
+      artifact_kid_b64: Buffer.from(wrongKid).toString("base64"),
+    };
+    const foreignKidResult = await runtime.unlock(unlockSecret, foreignKidDescriptor, {
+      fetchFn: mockFetch,
+    });
+    if (!runtime.unlocked || !foreignKidResult.htmlUrl.startsWith("blob:")) {
+      throw new Error("runtime did not unlock with a foreign artifact KID");
     }
+    runtime.lock();
   }
-  if (!unlockFailed) throw new Error("runtime unlock accepted wrong kid");
-  if (runtime.unlocked) throw new Error("runtime should remain locked on failure");
 
   // Tampered artifact digest: the descriptor's authenticated SHA-256 no longer
   // matches the delivered artifact, so the runtime rejects it as U5 before the
@@ -2285,21 +2315,21 @@ try {
   }
   if (!unlockFailed) throw new Error("runtime accepted all-zero secret");
 
-  // All-zero kid fails closed before network
-  unlockFailed = false;
-  try {
-    await runtime.unlock(
-      unlockSecret,
-      { ...descriptor, artifact_kid_b64: Buffer.alloc(16).toString("base64") },
-      { fetchFn: mockFetch },
-    );
-  } catch (e) {
-    unlockFailed = true;
-    if (!(e instanceof UnlockError) || e.stage !== "U5_ARTIFACT") {
-      throw new Error(`all-zero kid must fail as U5_ARTIFACT, got ${e?.stage ?? e}`);
+  // An all-zero descriptor KID is likewise just metadata; the stable root still
+  // unlocks the release.
+  {
+    const zeroKidDescriptor = {
+      ...descriptor,
+      artifact_kid_b64: Buffer.alloc(16).toString("base64"),
+    };
+    const zeroKidResult = await runtime.unlock(unlockSecret, zeroKidDescriptor, {
+      fetchFn: mockFetch,
+    });
+    if (!runtime.unlocked || !zeroKidResult.htmlUrl.startsWith("blob:")) {
+      throw new Error("runtime did not unlock with an all-zero artifact KID");
     }
+    runtime.lock();
   }
-  if (!unlockFailed) throw new Error("runtime accepted all-zero kid");
 
   // Server enrollment error fails closed
   unlockFailed = false;

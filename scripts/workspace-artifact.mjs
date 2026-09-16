@@ -17,11 +17,12 @@ export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_PACKAGE_BYTES = 256 * 1024 * 1024;
 
 /**
- * Fixed 16-byte stable workspace derivation context (standard base64):
- * `sha256("evergreen/workspace-root-key/v2")[0..16]`. It is a protocol constant,
- * never a release id or KID. Every release is sealed under this context so the
- * workspace recipient identity is identical across releases and no reseal is
- * needed.
+ * Fixed 16-byte stable workspace protocol context (standard base64):
+ * `sha256("evergreen/workspace-root-key/v2")[0..16]`. It is used as the session
+ * enrollment label and as the default artifact KID. It is NOT the Root-Key-V2
+ * derivation context: the stable workspace recipient identity is derived from
+ * the root secret alone, so every release is sealed to the same stable public
+ * key regardless of the artifact KID and no reseal is needed.
  */
 export const WORKSPACE_ROOT_CONTEXT_B64 = "St8tQ/Ednd6gbvtkRXZJsQ==";
 export const WORKSPACE_ROOT_CONTEXT_BYTES = Buffer.from(
@@ -65,11 +66,13 @@ export function artifactPublicKeyFromEnv(env = process.env) {
 }
 
 /**
- * The envelope KID is the fixed stable workspace context, never a per-release
- * value. `WORKSPACE_ARTIFACT_KID_B64` is deprecated migration input: if set it
- * must equal the stable context, so an operator cannot accidentally seal a
- * release to a different workspace identity (which the stable root could never
- * open). Release tooling never needs the root secret.
+ * The artifact KID is release/envelope metadata, authenticated inside the sealed
+ * envelope but never part of the stable workspace recipient identity. It may
+ * change between consecutive releases sealed to the same stable public key.
+ * When unset it defaults to the fixed protocol context for continuity.
+ *
+ * `WORKSPACE_ARTIFACT_KEY_B64` (a plaintext secret) is always forbidden: release
+ * sealing requires the canonical 32-byte `WORKSPACE_PUBLIC_KEY_B64` only.
  */
 export function artifactKidFromEnv(env = process.env) {
   if (env.WORKSPACE_ARTIFACT_KEY_B64) {
@@ -91,12 +94,7 @@ export function artifactKidFromEnv(env = process.env) {
   if (kid.every((b) => b === 0)) {
     throw new Error("all-zero workspace kid rejected");
   }
-  if (raw !== WORKSPACE_ROOT_CONTEXT_B64) {
-    throw new Error(
-      "WORKSPACE_ARTIFACT_KID_B64 is deprecated; releases are sealed to the stable workspace context",
-    );
-  }
-  return WORKSPACE_ROOT_CONTEXT_BYTES;
+  return kid;
 }
 
 export function unlockSecretFromEnv(env = process.env) {
@@ -200,6 +198,43 @@ export function derivePublicKey(
   return pk;
 }
 
+/**
+ * Derive the stable Root-Key-V2 workspace public key from a 32-byte Workspace
+ * Root Secret. This takes NO artifact KID: the recipient identity is a function
+ * of the root and the fixed Root-Key-V2 domain only. It exists for browser
+ * bootstrap simulation and tests; production release tooling never holds the
+ * root secret and uses `artifactPublicKeyFromEnv()` instead.
+ */
+export function deriveRootPublicKey(rootSecret) {
+  if (!Buffer.isBuffer(rootSecret) || rootSecret.length !== UNLOCK_SECRET_BYTES) {
+    throw new Error("invalid root secret");
+  }
+  if (rootSecret.every((b) => b === 0)) {
+    throw new Error("all-zero workspace root secret rejected");
+  }
+  const { directPath } = resolveBin("derive-public-key");
+  const env = unlockSecretEnv(rootSecret);
+  const args = ["--root-key-v2"];
+  let result = spawnSync(directPath, args, { stdio: "pipe", env });
+  if (result.status !== 0 && result.error?.code === "ENOENT") {
+    result = spawnSync(
+      "cargo",
+      ["run", "--quiet", "-p", "crypto-envelope", "--bin", "derive-public-key", "--", ...args],
+      { stdio: "pipe", env },
+    );
+  }
+  if (result.status !== 0) {
+    const err = result.stderr ? result.stderr.toString() : "derive-public-key failed";
+    throw new Error(`derive-public-key failed: ${err}`);
+  }
+  const outB64 = result.stdout.toString().trim();
+  const pk = Buffer.from(outB64, "base64");
+  if (pk.length !== PUBLIC_KEY_BYTES) {
+    throw new Error("derived root public key invalid size");
+  }
+  return pk;
+}
+
 export async function sealPackage(
   plaintext,
   publicKey,
@@ -295,6 +330,47 @@ export async function decryptArtifact(
         outPath,
       ],
       unlockSecretEnv(unlockSecret),
+    );
+    const plaintext = await readFile(outPath);
+    if (plaintext.length === 0 || plaintext.length > MAX_PACKAGE_BYTES) {
+      throw new Error("invalid artifact package");
+    }
+    return plaintext;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Decrypt a Root-Key-V2 artifact with the 32-byte Workspace Root Secret. The
+ * artifact KID is release metadata bound inside the envelope; it is not passed
+ * and must not be needed. Test/bootstrap tooling only: production release
+ * tooling never holds the root secret.
+ */
+export async function decryptRootArtifact(artifact, rootSecret) {
+  if (
+    !Buffer.isBuffer(artifact) ||
+    artifact.length < MIN_ARTIFACT_BYTES ||
+    artifact.length > MAX_PACKAGE_BYTES
+  ) {
+    throw new Error("invalid artifact");
+  }
+  if (!Buffer.isBuffer(rootSecret) || rootSecret.length !== UNLOCK_SECRET_BYTES) {
+    throw new Error("invalid root secret");
+  }
+  if (rootSecret.every((b) => b === 0)) {
+    throw new Error("all-zero workspace root secret rejected");
+  }
+
+  const tempDir = await mkdtemp(join(tmpdir(), "artifact-root-decrypt-"));
+  const inPath = join(tempDir, "input.bin");
+  const outPath = join(tempDir, "output.bin");
+  try {
+    await writeFile(inPath, artifact);
+    runRustCli(
+      "decrypt-artifact",
+      ["--root-key-v2", "--input", inPath, "--output", outPath],
+      unlockSecretEnv(rootSecret),
     );
     const plaintext = await readFile(outPath);
     if (plaintext.length === 0 || plaintext.length > MAX_PACKAGE_BYTES) {

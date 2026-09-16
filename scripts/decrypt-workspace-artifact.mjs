@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import {
   artifactKidFromEnv,
   decryptArtifact,
+  decryptRootArtifact,
   unlockSecretFromEnv,
   unpackPackage,
   writeUnpacked,
@@ -16,7 +17,9 @@ export async function decryptArtifactFile(path, env = process.env) {
     );
   }
   const secret = unlockSecretFromEnv(env);
-  const kid = artifactKidFromEnv(env);
+  // Root-Key-V2 mode takes no artifact KID: the KID is bound inside the sealed
+  // envelope, so it is read from the artifact rather than from the caller.
+  const rootKeyV2 = env.WORKSPACE_ROOT_KEY_V2 === "true";
   try {
     const st = await stat(path);
     if (!st.isFile()) {
@@ -25,7 +28,10 @@ export async function decryptArtifactFile(path, env = process.env) {
     if (st.size < MIN_ARTIFACT_BYTES || st.size > MAX_PACKAGE_BYTES) {
       throw new Error("artifact file size out of bounds");
     }
-    const plaintext = await decryptArtifact(await readFile(path), secret, kid);
+    const artifact = await readFile(path);
+    const plaintext = rootKeyV2
+      ? await decryptRootArtifact(artifact, secret)
+      : await decryptArtifact(artifact, secret, artifactKidFromEnv(env));
     return { plaintext, files: unpackPackage(plaintext) };
   } finally {
     secret.fill(0);
