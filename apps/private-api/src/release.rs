@@ -25,8 +25,14 @@ use crate::base64_encode;
 pub const WORKSPACE_PROTOCOL_VERSION: u8 = 1;
 /// Custom in-memory package format version produced by the build script.
 pub const PACKAGE_FORMAT_VERSION: u8 = 1;
-/// Accepted release-manifest schema version.
-pub const MANIFEST_VERSION: u8 = 1;
+/// Current stable Root-Key-V2 release-manifest schema version. A current
+/// manifest MUST declare `recipient.root_key_v2 = true`; a manifest that omits
+/// the marker cannot be silently treated as stable-root.
+pub const MANIFEST_VERSION: u8 = 2;
+/// Bounded legacy release-bound manifest schema. It predates the stable root and
+/// carries no `root_key_v2` marker; it is accepted only as the explicit
+/// release-bound migration path.
+pub const LEGACY_MANIFEST_VERSION: u8 = 1;
 
 /// Environment variable naming the immutable release manifest.
 pub const RELEASE_MANIFEST_ENV: &str = "WORKSPACE_RELEASE_MANIFEST";
@@ -169,6 +175,7 @@ pub struct ManifestArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestRecipient {
     pub public_key_fingerprint_b64: String,
     /// Explicit marker that this release was sealed to the stable Root-Key-V2
@@ -180,7 +187,9 @@ pub struct ManifestRecipient {
     /// the stable root and must not constrain the bootstrap. Artifact KID is
     /// deliberately not used for this decision, because KID is release metadata
     /// and must never be part of the recipient identity. Defaults to `false` so
-    /// a pre-marker manifest deserializes as legacy.
+    /// a legacy manifest deserializes as release-bound; a current
+    /// (`MANIFEST_VERSION`) manifest that omits it is rejected by
+    /// [`ReleaseManifest::validate_shape`], never silently treated as legacy.
     #[serde(default)]
     pub root_key_v2: bool,
 }
@@ -387,8 +396,20 @@ impl ReleaseManifest {
 
     /// Validate the public, artifact-independent manifest fields.
     pub(crate) fn validate_shape(&self) -> Result<(), DescriptorError> {
-        if self.manifest_version != MANIFEST_VERSION {
-            return Err(DescriptorError::ManifestInvalid);
+        match self.manifest_version {
+            LEGACY_MANIFEST_VERSION => {
+                // The bounded release-bound migration schema. It carries no
+                // stable-root marker and must never be reinterpreted as one.
+            }
+            MANIFEST_VERSION => {
+                // A current manifest must explicitly declare the stable-root
+                // recipient scheme. An absent or misspelled marker must fail
+                // closed rather than silently skipping the identity binding.
+                if !self.recipient.root_key_v2 {
+                    return Err(DescriptorError::ManifestInvalid);
+                }
+            }
+            _ => return Err(DescriptorError::ManifestInvalid),
         }
         if self.release_id.trim().is_empty() || self.source_sha.trim().is_empty() {
             return Err(DescriptorError::ManifestInvalid);
@@ -745,6 +766,54 @@ mod tests {
         ))
         .unwrap();
         assert!(!legacy.root_key_v2);
+    }
+
+    #[test]
+    fn current_manifest_must_declare_the_stable_root_marker() {
+        let (artifact, snapshot) = sealed_artifact();
+        let manifest = manifest_for(&artifact, &snapshot);
+        assert_eq!(manifest.manifest_version, MANIFEST_VERSION);
+        assert!(manifest.recipient.root_key_v2);
+        assert!(manifest.validate_shape().is_ok());
+
+        // A current manifest whose recipient omits the marker must fail closed
+        // instead of silently skipping the bootstrap identity binding.
+        let mut missing_marker = manifest.clone();
+        missing_marker.recipient.root_key_v2 = false;
+        assert_eq!(
+            missing_marker.validate_shape(),
+            Err(DescriptorError::ManifestInvalid)
+        );
+        assert_eq!(
+            preflight(&artifact, Some(&snapshot), Some(&missing_marker)),
+            UnlockCompatibility::ArtifactIncompatible
+        );
+
+        // A legacy schema manifest without the marker remains valid as the
+        // explicit release-bound migration path.
+        let mut legacy = manifest.clone();
+        legacy.manifest_version = LEGACY_MANIFEST_VERSION;
+        legacy.recipient.root_key_v2 = false;
+        assert!(legacy.validate_shape().is_ok());
+
+        // An unsupported schema version is rejected.
+        let mut future = manifest.clone();
+        future.manifest_version = MANIFEST_VERSION + 1;
+        assert_eq!(
+            future.validate_shape(),
+            Err(DescriptorError::ManifestInvalid)
+        );
+    }
+
+    #[test]
+    fn a_misspelled_recipient_marker_is_rejected_at_parse() {
+        // `deny_unknown_fields` turns a typo into a manifest parse failure
+        // (fail closed) rather than a silently dropped marker.
+        let parsed: Result<ManifestRecipient, _> = serde_json::from_str(&format!(
+            "{{\"public_key_fingerprint_b64\":\"{}\",\"rootKeyV2\":true}}",
+            public_key_fingerprint_b64(&[2u8; 32])
+        ));
+        assert!(parsed.is_err());
     }
 
     #[test]

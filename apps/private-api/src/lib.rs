@@ -5708,7 +5708,7 @@ mod tests {
         // A matching manifest is the healthy baseline; pin the loader so
         // `manifest_configured` is not racy against other tests that mutate
         // `WORKSPACE_RELEASE_MANIFEST`.
-        let baseline_manifest = test_manifest(&artifact, &keypair.public_key_bytes(), false);
+        let baseline_manifest = test_manifest(&artifact, &keypair.public_key_bytes(), true);
         let state = state
             .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
             .with_manifest_loader(Arc::new(move || Ok(Some(baseline_manifest.clone()))));
@@ -5759,7 +5759,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Some(test_manifest(
                 &artifact,
                 &keypair.public_key_bytes(),
-                false,
+                true,
             ))));
         let cell = manifest_cell.clone();
         let swap_state = state
@@ -5828,7 +5828,7 @@ mod tests {
             bytes[last] ^= 0x01;
             bytes
         };
-        let manifest_for_original = test_manifest(&artifact, &keypair.public_key_bytes(), false);
+        let manifest_for_original = test_manifest(&artifact, &keypair.public_key_bytes(), true);
         let tampered = state
             .clone()
             .with_artifact_loader(Arc::new({

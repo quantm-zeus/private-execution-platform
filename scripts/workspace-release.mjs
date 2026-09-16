@@ -48,7 +48,9 @@ import {
   sealPackage,
 } from "./workspace-artifact.mjs";
 
-export const RELEASE_MANIFEST_VERSION = 1;
+export const RELEASE_MANIFEST_VERSION = 2;
+/** Bounded release-bound manifest schema accepted only as a legacy migration path. */
+export const LEGACY_MANIFEST_VERSION = 1;
 export const PACKAGE_FORMAT_VERSION = 1;
 export const WORKSPACE_PROTOCOL_VERSION = 1;
 export const MANIFEST_FILE = "manifest.json";
@@ -463,7 +465,10 @@ export function computeReleaseManifest({
  */
 export function validateReleaseManifest(manifest, artifact) {
   if (!manifest || typeof manifest !== "object") throw new Error("manifest missing");
-  if (manifest.manifest_version !== RELEASE_MANIFEST_VERSION) {
+  if (
+    manifest.manifest_version !== RELEASE_MANIFEST_VERSION &&
+    manifest.manifest_version !== LEGACY_MANIFEST_VERSION
+  ) {
     throw new Error("unsupported manifest version");
   }
   if (!manifest.release_id || !manifest.source_sha) throw new Error("manifest identity incomplete");
@@ -472,6 +477,15 @@ export function validateReleaseManifest(manifest, artifact) {
   }
   if (!manifest.recipient || typeof manifest.recipient !== "object") {
     throw new Error("manifest recipient missing");
+  }
+  // A current manifest must explicitly declare the stable-root recipient
+  // scheme; an absent marker on the current schema fails closed instead of
+  // being silently treated as a legacy release-bound manifest.
+  if (
+    manifest.manifest_version === RELEASE_MANIFEST_VERSION &&
+    manifest.recipient.root_key_v2 !== true
+  ) {
+    throw new Error("stable-root manifest must declare recipient.root_key_v2");
   }
   if (!manifest.workspace_protocol || typeof manifest.workspace_protocol !== "object") {
     throw new Error("manifest protocol missing");

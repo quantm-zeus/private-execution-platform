@@ -37,8 +37,10 @@ import {
   DEFAULT_PAYLOAD_DIR,
   MANIFEST_FILE,
   PREVIOUS_LINK,
+  LEGACY_MANIFEST_VERSION,
   RELEASE_LOCK_DIR,
   RELEASE_LOCK_OWNER_FILE,
+  RELEASE_MANIFEST_VERSION,
   ReleaseLockTimeoutError,
   SHELL_DIR,
   acquireReleaseLock,
@@ -175,7 +177,46 @@ test("manifest roundtrips and is bound to exact artifact bytes", () => {
   assert.equal(manifest.artifact.sha256_hex, createHash("sha256").update(artifact).digest("hex"));
   assert.equal(manifest.artifact.size, artifact.length);
   assert.equal(manifest.artifact.kid_b64, KID_B64);
-  assert.equal(manifest.manifest_version, 1);
+  assert.equal(manifest.manifest_version, RELEASE_MANIFEST_VERSION);
+  assert.equal(manifest.recipient.root_key_v2, true);
+});
+
+test("manifest schema version gates the stable-root recipient marker", () => {
+  const artifact = fakeArtifact();
+  const manifest = manifestFor(artifact);
+  validateReleaseManifest(manifest, artifact);
+
+  // A current manifest that omits the stable-root marker fails closed.
+  assert.throws(
+    () =>
+      validateReleaseManifest(
+        {
+          ...manifest,
+          recipient: {
+            public_key_fingerprint_b64: manifest.recipient.public_key_fingerprint_b64,
+          },
+        },
+        artifact,
+      ),
+    /root_key_v2/,
+  );
+  // A legacy schema manifest without the marker stays valid as the bounded
+  // release-bound migration path.
+  assert.doesNotThrow(() =>
+    validateReleaseManifest(
+      { ...manifest, manifest_version: LEGACY_MANIFEST_VERSION, recipient: { ...manifest.recipient, root_key_v2: false } },
+      artifact,
+    ),
+  );
+  // A non-boolean marker is rejected.
+  assert.throws(
+    () =>
+      validateReleaseManifest(
+        { ...manifest, recipient: { ...manifest.recipient, root_key_v2: "yes" } },
+        artifact,
+      ),
+    /root_key_v2/,
+  );
 });
 
 test("console neutralization is valid JS for zero- and multi-arg calls", () => {
@@ -203,7 +244,7 @@ test("manifest validation rejects every mismatch", () => {
   validateReleaseManifest(manifest, artifact);
 
   assert.throws(() =>
-    validateReleaseManifest({ ...manifest, manifest_version: 2 }, artifact),
+    validateReleaseManifest({ ...manifest, manifest_version: RELEASE_MANIFEST_VERSION + 1 }, artifact),
   );
   assert.throws(() => validateReleaseManifest(manifest, Buffer.concat([artifact, Buffer.from([0])])));
   assert.throws(() =>
