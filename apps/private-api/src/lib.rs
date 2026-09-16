@@ -1962,13 +1962,19 @@ async fn bootstrap_workspace_identity(
     // controls and every future release would be sealed to it. A legacy manifest
     // (still sealed under a per-release KID) predates the stable root and does
     // not constrain the one-time migration bootstrap.
-    if let Ok(Some(manifest)) = state.load_manifest().await {
-        let stable_context_kid_b64 = base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID);
-        if manifest.artifact.kid_b64 == stable_context_kid_b64
-            && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
-        {
-            return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
+    match state.load_manifest().await {
+        Ok(Some(manifest)) => {
+            let stable_context_kid_b64 = base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID);
+            if manifest.artifact.kid_b64 == stable_context_kid_b64
+                && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
+            {
+                return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
+            }
         }
+        Ok(None) => {}
+        // A configured-but-broken manifest is a server misconfiguration; fail
+        // the bootstrap closed rather than skipping the recipient binding.
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     }
     if request.wrappers.is_empty() || request.wrappers.len() > recovery::MAX_RECOVERY_WRAPPERS {
         return generic_error(StatusCode::BAD_REQUEST);
@@ -6412,6 +6418,18 @@ mod tests {
                 .await
                 .status(),
             StatusCode::OK
+        );
+
+        // A configured-but-broken manifest fails the bootstrap closed rather
+        // than skipping the recipient binding.
+        let broken = state
+            .clone()
+            .with_manifest_loader(Arc::new(|| Err(release::DescriptorError::ManifestInvalid)));
+        assert_eq!(
+            bootstrap_identity(&broken, &session_cookie, &attacker)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
