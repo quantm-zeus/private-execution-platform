@@ -397,19 +397,17 @@ and relevant MEDIUM findings were fixed with regression tests:
   `portfolio`, while the web views expect camelCase/top-level fields. The
   projection is not implemented yet; the surfaces stay non-fabricating but
   partially blank.
-- **Shell BR-5 handoff test coverage**: the shell's token injection and one-shot
-  gate are implemented and were verified by the fresh-context review, but
-  `web/workspace-shell` has no unit-test runner and the browser e2e delivers the
-  session key to the payload directly, so there is no automated regression test
-  for "no token / wrong token / repeat ping delivers nothing". Adding one needs a
-  shell test setup or a shell-level e2e that asserts delivery only after the
-  token echo.
-- **Client/server capability-label mismatches (pre-existing)**: the shipped UI
-  gates `search_token`/`get_token` on `intelligence` (the server maps them to
-  `market`) and `get_execution_progress` on `twap` (the server leaves it
-  ungated). The server is authoritative and fail-closed, so this can only hide a
-  surface prematurely or return a determinate `capability_missing`; aligning the
-  client labels is a small web-only follow-up.
+- **Shell BR-5 handoff test coverage (resolved).** The shell now has a
+  `node --test` unit runner (`web/workspace-shell/package.json` `test`, run in CI
+  as `pnpm test:shell`) and `unlock-document.test.ts` covers the handoff-token
+  injection. `scripts/verify-web-boundary.mjs` additionally proves the shell's
+  live gate end-to-end: missing, wrong and repeated `evergreen:lock-request`
+  tokens deliver nothing, and a correct token echo arms the one-shot handoff.
+- **Client/server capability-label mismatches (resolved).** The shipped UI and
+  the server now agree: Discover gates `search_token`/`get_token` on `market`
+  (`web/workspace-payload/src/app/views.ts`), and `get_execution_progress` is
+  gated on command readiness, not `twap` (`ExecutionPanel.tsx`), matching
+  `apps/private-api/src/opaque.rs`.
 - **Operator wiring (partially closed)**: the production binaries now compose
   honestly instead of always serving the fail-closed stub:
   - `apps/edge-gateway` builds its router from `production::router_from_env()`.
@@ -1084,10 +1082,33 @@ with the bridge's own bearer key.
   depend on exact route simulation / net executable economics, never a chart
   crossing.
 
-**Residual (operator / FOMO-lane owned).** The currently deployed `fomo-mcp`
-image does not yet expose `/market/bars`; a separate read-only lane is landing
-that bridge. Until it is deployed, a configured PEP fails closed with
-`Unavailable` and the chart renders only the local decrypted frame buffer —
-never fabricated data. PEP does not modify `fomo-mcp` (the sole FOMO upstream
-owner) and carries no FOMO auth tokens.
+**Residual (operator / FOMO-lane owned).** The PEP adapter, the descriptor and
+the browser chart are implemented and exact-SHA CI green, but the deployed
+`fomo-mcp` image does not yet expose `/market/bars`. The coordinated read-only
+bridge is implemented on `fomo-mcp` branch `worker/deepseek-pep-market-source`
+(implementation commit `dced9624a16e3566679cda560ffcc9a8a0220bff`, backed by the
+verified-current FOMO `POST /proxy/getBarsNew`); PEP and that branch agree on the
+request shape (`symbol=address:networkId`, `resolution`, `countBack`, `from`/`to`
+unix seconds), the ascending/unique-millisecond OHLCV response and
+`source.provenance == "polling"`. It is **not deployed**, so a configured PEP
+still fails closed with `Unavailable` and the chart renders only the local
+decrypted frame buffer — never fabricated data. PEP does not modify `fomo-mcp`
+(the sole FOMO upstream owner) and carries no FOMO auth tokens. The FOMO `prices`
+WS topic and the `mobula-api.fomo.family` OHLCV stream remain CORROBORATED only
+and are deliberately not promoted; the shipped source is bounded REST polling.
+
+**Unlock-proof coverage split (explicit).** The production-faithful unlock proof
+is delivered in two halves that together cover the whole chain, because no single
+runner has both the Rust loader and a browser DOM:
+`scripts/verify-web-boundary.mjs` runs `apps/private-api`'s real default
+`load_workspace_artifact` + real HPKE routes over the artifact built by the
+production build script and the manifest written by the production writer, then
+performs the outer transport decrypt, inner artifact decrypt and production
+package unpack (`production_build_script_artifact_loads_delivers_and_unpacks`,
+an anti-vacuous `--ignored` test whose exact stdout is asserted). The browser E2E
+(`web/e2e/specs/shell.spec.ts`) boots that same production package format with
+the real WASM decrypt + `unpackPackageFromMemory` under the production CSP and
+asserts the decrypted workspace actually renders. The only unproven composition
+is a single runner that does *both* the real Rust loader and a real DOM boot; it
+is recorded here rather than implied.
 

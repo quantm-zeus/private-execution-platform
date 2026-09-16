@@ -56,9 +56,12 @@ Implemented and composed (exact-SHA CI green):
 - Live signing, chain submission, balances, persistence and most provider
   transports remain unwired. The PEP-side FOMO market bridge is implemented and
   tested, but the currently deployed `fomo-mcp` image does not yet expose
-  `/market/bars` (a separate read-only lane is landing it); until then a
-  configured PEP fails closed with `Unavailable` and the chart renders only the
-  local decrypted frame buffer — never fabricated data.
+  `/market/bars`. The coordinated read-only bridge is implemented on the
+  `fomo-mcp` branch `worker/deepseek-pep-market-source` (commit `dced9624`,
+  backed by the verified-current FOMO `POST /proxy/getBarsNew`) and is pending
+  operator deployment; until then a configured PEP fails closed with
+  `Unavailable` and the chart renders only the local decrypted frame buffer —
+  never fabricated data.
 - Perimeter trust at the edge is header-presence only; cryptographic Cloudflare
   Access JWT validation is not implemented (loopback binding is the mitigation).
 - With no `WORKSPACE_RELEASE_MANIFEST` configured, the server has no trusted

@@ -57,12 +57,38 @@ until the `fomo-mcp` `/market/bars` bridge is deployed. Treating a fail-closed s
 product complete" would be an overstatement — the remaining integration is a backend/operator
 contract dependency, not UI work.
 
+### Status reconciliation (2026-09-16, `worker/deepseek-release-remediation`)
+
+Several blockers recorded earlier in this log are resolved in the current tree and must not be
+read as open. This addendum is authoritative over the dated continuation notes below; the code is
+the evidence.
+
+- **BR-5 session-key handoff — resolved.** `WasmInitiatorSession::app_session_keys()`
+  (`crates/crypto-envelope-wasm/src/lib.rs`) is re-exported to the shell, which derives the
+  directional keys in WASM (`web/workspace-shell/src/unlock-runtime.ts`) and posts the
+  `evergreen:session-key` handoff (`web/workspace-shell/src/index.tsx`). `verify:web-boundary`
+  proves the one-shot handoff-token gate end-to-end (missing/wrong/repeated tokens deliver nothing).
+- **Edge `/v1/command` — exists.** `apps/edge-gateway/src/lib.rs` routes it (opaque, bounded,
+  octet-stream); the residual is only the missing canonical `execution_id`/`router_source`
+  execute-response fields (BR-10, PARTIAL).
+- **Shell unit-test runner — exists.** `pnpm test:shell` runs the `web/workspace-shell`
+  `node --test` suite in CI.
+- **Client/server capability labels — aligned.** Discover gates token reads on `market`;
+  `get_execution_progress` is command-readiness-gated.
+- **Private API — composed.** Production passkey composition and the encrypted
+  artifact/descriptor/release flow are implemented. What remains absent is the **Trading Core**
+  composition (`dispatcher: None`, `stream_source: None`, `live_execution_wired=false`), not the
+  private API.
+- **Chart / FOMO.** KLineChart Pro is pinned `0.1.1` + `klinecharts 9.1.1` over a renderer-agnostic
+  local datafeed; the read-only `fomo-mcp` `/market/bars` bridge is implemented on the coordinated
+  `worker/deepseek-pep-market-source` branch and is pending operator deployment.
+
 ### Progress notes
 
-- **W1–W9** are implemented in `web/workspace-payload/src` against the typed architecture. Because the backend
-  private API is not deployed (see `BACKEND_REQUESTS.md`), every data surface renders an explicit
-  `unavailable`/`stale`/`empty` state and every mutation is disabled with a reason; no synthetic data is
-  ever shown as live.
+- **W1–W9** are implemented in `web/workspace-payload/src` against the typed architecture. Because the
+  backend **Trading Core** is not composed (`dispatcher`/`stream_source` are `None`; see
+  `BACKEND_REQUESTS.md`), every data surface renders an explicit `unavailable`/`stale`/`empty` state and
+  every mutation is disabled with a reason; no synthetic data is ever shown as live.
 - **W10** delivered: keyboard-navigable nav rail, focus-visible styles, `aria-live`/`role="status"` on
   async surfaces, labelled controls, `prefers-reduced-motion`, responsive 1440/1024/760 layouts.
   **Continuation:** axe-core now runs in real headless Chromium across all nine views as part of the
@@ -178,8 +204,9 @@ green → draft PR updated (never autonomously merged to main while the backend 
 
 ## W12 final QA note (functional/visual, no-backend deployment)
 
-Because the backend private API is not deployed, the following was verified structurally and in the
-component/unit harness rather than against live data:
+Because the backend Trading Core is not composed (the private API exists but advertises no
+market/execution backend), the following was verified structurally and in the component/unit harness
+rather than against live data:
 
 - Every one of the nine views renders with an explicit state (loading/empty/error/unavailable/stale);
   no view renders a synthetic market value. Mutation controls are disabled with a visible reason.
@@ -282,10 +309,10 @@ relevant MEDIUM findings were fixed, each with a regression test. Acceptance cri
 
 ### Remaining blocker (not a code defect)
 
-The live `evergreen:session-key` producer (BR-5) is still absent backend-side, so in production the
-realtime/command channel never starts and everything stays explicitly offline. This is the single
-integration dependency that separates the fail-closed UI from a live product; it is recorded in
-`.dsh/web-product/BACKEND_REQUESTS.md`.
+At the time of this continuation the live `evergreen:session-key` producer (BR-5) was absent
+backend-side. It has since been implemented (see *Status reconciliation* above): the shell derives the
+directional keys in WASM and hands them to the payload. The remaining integration dependency is a
+reachable, Trading-Core-composed private API, not the handoff itself.
 
 ## Continuation 3 — fourth fresh-context adversarial review (rollback/auth + surface-load hardening)
 
@@ -411,9 +438,10 @@ and relevant MEDIUM findings were fixed with regression tests; full narrative an
 
 ### Recorded residuals (contract-level)
 
-- **BR-7** — the deployed edge's `/v1/bootstrap|sync` require `application/octet-stream`, the WS relays
-  binary only, and `/v1/command` is absent; the web transports stay fail-closed until the backend picks
-  a contract (opaque-everywhere vs a JSON private origin).
+- **BR-7** — the deployed edge's `/v1/bootstrap|sync` require `application/octet-stream` and the WS
+  relays binary only. `/v1/command` now exists on the edge (opaque, bounded); the remaining gap is the
+  canonical `execution_id`/`router_source` execute-response fields (BR-10, PARTIAL). The web transports
+  stay fail-closed until the backend is composed and reachable.
 - **BR-8** — the ADR shell CSP needs an operator-approved update to the shipped minimal `blob:` policy.
 - **BR-9** — no UNKNOWN reconciliation lookup; the guard release stays a two-step acknowledgement.
 - **Main-thread command decryptor** — the command channel decrypts/seals on the UI thread; the client is
@@ -746,9 +774,9 @@ Acceptance criteria:
   `TradePanel.test.tsx` covers it.
 - **AC-W15.5 (ledger truth).** BR-10 is downgraded to `PARTIAL`: the request-field contract is MET by the
   canonical backend, while the private `/v1/command` execute response still lacks an `execution_id` and a
-  `router_source` echo (`execution_outcome` returns `{"execution":{"state":...}}`), and no `/v1/command`
-  route exists on `apps/edge-gateway`. This remains the precise live-integration gap, recorded in
-  `.dsh/web-product/BACKEND_REQUESTS.md`.
+  `router_source` echo (`execution_outcome` returns `{"execution":{"state":...}}`). The `/v1/command`
+  route **does** exist on `apps/edge-gateway` (opaque, bounded; see the status reconciliation above), so
+  the remaining gap is the response fields alone, recorded in `.dsh/web-product/BACKEND_REQUESTS.md`.
 - **AC-W15.6 (gates).** `pnpm typecheck`, `pnpm test:web`, `pnpm build:workspace-payload` and
   `verify:web-boundary` pass.
 
@@ -841,10 +869,10 @@ Acceptance criteria:
   fell back to `Date.now()`/`Math.random()` when `crypto` was absent, making write keys and anti-replay
   nonces predictable. Both now use `crypto.randomUUID()` or `crypto.getRandomValues()` and **fail
   closed** otherwise (real browsers always provide `crypto`).
-- **AC-C12.8 (recorded residual, BR-5).** The reviewers reconfirmed the single live blocker: the shipped
-  `WasmInitiatorSession` exposes no directional-key accessor and the shell has no `evergreen:session-key`
-  producer, so the encrypted realtime/command path cannot start in production. This is a backend/WASM
-  contract dependency (BR-5), not a web defect; the payload fails closed with an explicit reason and no
-  data is fabricated. `web/e2e` injects the key directly, which is why CI cannot see it.
+- **AC-C12.8 (recorded residual, BR-5 — since resolved).** At the time of this continuation the shipped
+  `WasmInitiatorSession` exposed no directional-key accessor and the shell had no `evergreen:session-key`
+  producer. Both now exist (`app_session_keys()` in `crates/crypto-envelope-wasm`, producer in
+  `web/workspace-shell/src/index.tsx`) and `verify:web-boundary` exercises the handoff gate, so the
+  handoff itself is no longer a blocker; the residual is a reachable, Trading-Core-composed private API.
 - **AC-C12.9 (gates).** `pnpm typecheck`, `pnpm test:web`, `pnpm build:workspace-payload` and
   `verify:web-boundary` pass. Browser E2E remains CI-gated (the sandbox lacks Chromium's `libnspr4.so`).
