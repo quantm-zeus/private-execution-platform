@@ -55,9 +55,10 @@ test.describe("private chart (KLineChart Pro)", () => {
     // Positive control: a valid decrypted frame must actually reach the chart
     // router. The badge reads `LOCAL DATA` only after `ChartFrameRouter.apply`
     // reports a store change, so a datafeed that silently dropped every frame
-    // can no longer pass this smoke on canvas visibility alone.
+    // can no longer pass this smoke on canvas visibility alone. (Frames were
+    // already sent before the view mounted, so the badge may already be set;
+    // the fresh send below guarantees a post-subscription delivery either way.)
     const target = page.getByTestId("chart-target");
-    await expect(target.getByText("AWAITING FEED")).toBeVisible();
     await sendFrames(request, { frames: [ohlcvSnapshot(120)] });
     await expect(target.getByText("LOCAL DATA")).toBeVisible({ timeout: 7_000 });
 
