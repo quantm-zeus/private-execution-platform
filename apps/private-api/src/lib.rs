@@ -39,6 +39,7 @@ pub mod production;
 pub mod recovery;
 pub mod release;
 pub mod stream;
+pub mod trading;
 pub mod web_contract;
 pub mod web_integration;
 
@@ -50,9 +51,10 @@ pub use release::{
 };
 
 pub use fomo_market::{
-    build_wiring as build_fomo_market_wiring, Bar, BarsProvider, FomoBarsClient,
-    FomoChartDispatcher, FomoMarketConfig, FomoMarketError, FomoMarketWiring,
-    FomoOhlcvStreamSource,
+    build_wiring as build_fomo_market_wiring,
+    build_wiring_with_health as build_fomo_market_wiring_with_health, probe_realtime, Bar,
+    BarsProvider, FomoBarsClient, FomoChartDispatcher, FomoMarketConfig, FomoMarketError,
+    FomoMarketWiring, FomoOhlcvStreamSource,
 };
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -368,6 +370,11 @@ pub struct PrivateApiState {
     /// (a build without one refuses startup), so this defaults to ready; a
     /// composition that can lose its dispatcher clears it to fail `/ready`.
     dispatcher_ready: Arc<AtomicBool>,
+    /// Whether the realtime stream source is a required dependency and whether
+    /// its listener/source is currently usable. Without a composed source it is
+    /// not required, so the fail-closed default does not fail readiness.
+    stream_required: bool,
+    stream_ready: Arc<AtomicBool>,
 }
 
 impl PrivateApiState {
@@ -396,6 +403,8 @@ impl PrivateApiState {
             relay_required: false,
             relay_ready: Arc::new(AtomicBool::new(false)),
             dispatcher_ready: Arc::new(AtomicBool::new(true)),
+            stream_required: false,
+            stream_ready: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -472,6 +481,17 @@ impl PrivateApiState {
         self
     }
 
+    /// Attach the realtime stream source's readiness contract. `required`
+    /// records that the composition advertises `realtime` and therefore depends
+    /// on a live stream; without a composed source the dependency is absent and
+    /// readiness is unaffected. A composition whose stream dies clears `ready`
+    /// to fail `/ready` while `/health` stays live.
+    pub fn with_stream_readiness(mut self, required: bool, ready: Arc<AtomicBool>) -> Self {
+        self.stream_required = required;
+        self.stream_ready = ready;
+        self
+    }
+
     #[cfg(test)]
     fn with_test_dependencies(
         config: PrivateApiConfig,
@@ -502,6 +522,8 @@ impl PrivateApiState {
             relay_required: false,
             relay_ready: Arc::new(AtomicBool::new(false)),
             dispatcher_ready: Arc::new(AtomicBool::new(true)),
+            stream_required: false,
+            stream_ready: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -681,8 +703,20 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     // wires one before serving (startup refuses otherwise); a composition that
     // clears this flag must not be reported ready.
     let dispatcher_ok = state.dispatcher_ready.load(Ordering::SeqCst);
-    let ready =
-        relay_ok && artifact_ok && manifest_ok && dispatcher_ok && passkey_store_ok && recovery_ok;
+    // The realtime stream is a dependency only when the composition advertises
+    // `realtime`; an unadvertised, absent source does not fail readiness.
+    let stream_ok = if state.stream_required {
+        state.stream_ready.load(Ordering::SeqCst)
+    } else {
+        true
+    };
+    let ready = relay_ok
+        && artifact_ok
+        && manifest_ok
+        && dispatcher_ok
+        && stream_ok
+        && passkey_store_ok
+        && recovery_ok;
     let body = serde_json::json!({
         "ready": ready,
         "manifest_configured": manifest_configured,
@@ -691,6 +725,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
             "artifact": artifact_ok,
             "release_manifest": manifest_ok,
             "dispatcher": dispatcher_ok,
+            "stream": stream_ok,
             "passkey_store": passkey_store_ok,
             "recovery_store": recovery_ok,
         }
@@ -5454,6 +5489,30 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["dispatcher"], false);
+
+        // A realtime source is not required by default, so an absent stream does
+        // not fail readiness.
+        let ready = get(router(state.clone()), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["checks"]["stream"], true);
+
+        // When the composition advertises realtime, a dead stream fails `/ready`
+        // while `/health` stays live (liveness is not readiness).
+        let dead_stream = state
+            .clone()
+            .with_stream_readiness(true, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            get(router(dead_stream.clone()), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(router(dead_stream), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["stream"], false);
     }
 
     #[test]

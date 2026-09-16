@@ -5,11 +5,12 @@
 //! evidence of execute capability, and wiring a trait object is not evidence
 //! that the backing service works.
 //!
-//! Integration status: this is the typed surface the private-api bootstrap must
-//! read instead of `WiredCapabilities` booleans. It is intentionally not yet
-//! consumed by `apps/private-api` (out of this lane's write scope); wiring it in
-//! is part of the integration contract in
-//! `.dsh/release-remediation/CORE_READY_FOR_INTEGRATION.md`.
+//! Integration status: this is the typed surface the private-api bootstrap
+//! reads instead of `WiredCapabilities` booleans. `apps/private-api::trading`
+//! turns the injected durable/chain/signer/market/limit/realtime probes into a
+//! [`CapabilityReadiness`], and `production::build_opaque` gates the advertised
+//! document on those proofs. A wired trait object with no healthy proof can no
+//! longer advertise the capability.
 //!
 //! Each proof type has no public constructor: it can only be produced by
 //! [`MarketCapability::prove`] / [`ExecutionCapability::prove`] / etc., which

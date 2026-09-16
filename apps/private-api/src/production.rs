@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 
+use trading_core::capability::CapabilityReadiness;
+
 use crate::opaque::{
     BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry, CommandDispatcher,
     FailClosedDispatcher, OpaqueClock, OpaqueServiceState,
@@ -202,6 +204,12 @@ pub struct OpaqueComposition {
     /// Operator-injected realtime source. `None` => fail-closed source.
     pub stream_source: Option<Arc<dyn StreamSource>>,
     pub chains: Vec<ChainEntry>,
+    /// Typed proof of which trading dependencies are actually healthy.
+    ///
+    /// The default [`CapabilityReadiness::deny_all`] denies every trading
+    /// capability regardless of the claimed [`WiredCapabilities`]: presence of
+    /// a seam is not evidence the backing dependency works (remediation F6).
+    pub readiness: CapabilityReadiness,
 }
 
 impl std::fmt::Debug for OpaqueComposition {
@@ -211,6 +219,10 @@ impl std::fmt::Debug for OpaqueComposition {
             .field("gate", &self.gate)
             .field("dispatcher_wired", &self.dispatcher.is_some())
             .field("stream_wired", &self.stream_source.is_some())
+            .field("market_proven", &self.readiness.market())
+            .field("execute_proven", &self.readiness.execute())
+            .field("limits_proven", &self.readiness.limits())
+            .field("realtime_proven", &self.readiness.realtime())
             .field("chains", &self.chains.len())
             .finish()
     }
@@ -222,12 +234,20 @@ impl std::fmt::Debug for OpaqueComposition {
 /// denies every mutation and emits a single authenticated error frame — never
 /// fabricated data.
 ///
-/// The advertised document is derived from the seams that are actually present,
-/// not from the caller-supplied [`WiredCapabilities`] alone: an absent dispatcher
-/// forces every command capability false and an absent stream source forces
-/// `realtime` false, so the document cannot advertise a command surface when no
-/// command backend is present. Presence is a necessary condition, not a
-/// guarantee of capability — the injected seam still enforces its own denials.
+/// The advertised document is derived from the seams that are actually present
+/// **and** the typed [`CapabilityReadiness`] proofs, not from the caller-supplied
+/// [`WiredCapabilities`] alone:
+///
+/// * an absent dispatcher forces every command capability false;
+/// * an absent stream source forces `realtime` false;
+/// * `market`, `execute`, `limits` and `realtime` are each additionally gated on
+///   a proof that the backing dependency was observed healthy;
+/// * every other mutation (`twap`/`rfq`/`withdraw`/`wallet_limits`) rides the
+///   same live execution path, so it requires the execution proof.
+///
+/// Presence is a necessary condition, not a guarantee of capability: even a
+/// wired seam cannot advertise a capability whose dependency is unproven, and
+/// the injected seam still enforces its own denials at dispatch time.
 pub fn build_opaque(composition: OpaqueComposition) -> Result<OpaqueProduction, &'static str> {
     let dispatcher = composition.dispatcher;
     let stream_source = composition.stream_source;
@@ -243,6 +263,24 @@ pub fn build_opaque(composition: OpaqueComposition) -> Result<OpaqueProduction, 
     if stream_source.is_none() {
         wired.realtime = false;
     }
+
+    // Remediation F6: a typed, healthy proof is authoritative for the trading
+    // path. A wired trait object is not evidence that the backing dependency
+    // works, so nothing here can advertise a capability it cannot prove. Every
+    // mutating capability additionally requires the live trading gate: a
+    // disabled gate can never advertise a mutation even if a caller passes a
+    // readiness surface that was proven with the gate on.
+    let readiness = composition.readiness;
+    let live = composition.gate.is_enabled();
+    let execution_proven = live && readiness.execute();
+    wired.market &= readiness.market();
+    wired.execute &= execution_proven;
+    wired.limits &= live && readiness.limits();
+    wired.realtime &= readiness.realtime();
+    wired.wallet_limits &= execution_proven;
+    wired.twap &= execution_proven;
+    wired.rfq &= execution_proven;
+    wired.withdraw &= execution_proven;
 
     let mut document = document_for(composition.gate, wired);
     document.chains = composition.chains;
@@ -263,6 +301,25 @@ pub fn build_opaque(composition: OpaqueComposition) -> Result<OpaqueProduction, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trading::{
+        healthy, TradingSeams, COMPONENT_CHAIN, COMPONENT_DURABLE_STORE, COMPONENT_LIMIT,
+        COMPONENT_MARKET, COMPONENT_REALTIME, COMPONENT_SIGNER,
+    };
+
+    /// A readiness surface in which every trading dependency is proven healthy.
+    fn proven_readiness() -> CapabilityReadiness {
+        TradingSeams::new()
+            .with_durable_store(
+                Arc::new(execution_relay::DeterministicDurableStore::new()),
+                healthy(COMPONENT_DURABLE_STORE),
+            )
+            .with_chain_probe(healthy(COMPONENT_CHAIN))
+            .with_signer_probe(healthy(COMPONENT_SIGNER))
+            .with_market_probe(healthy(COMPONENT_MARKET))
+            .with_limit_probe(healthy(COMPONENT_LIMIT))
+            .with_realtime_probe(healthy(COMPONENT_REALTIME))
+            .readiness(true)
+    }
 
     #[test]
     fn trading_gate_parses_strictly() {
@@ -346,6 +403,7 @@ mod tests {
             wired: WiredCapabilities::default(),
             stream_source: None,
             chains: Vec::new(),
+            readiness: CapabilityReadiness::deny_all(),
         })
         .expect("compose");
         // Even with TRADING_ENABLED=true, no wired backend means no capability.
@@ -377,6 +435,7 @@ mod tests {
             },
             stream_source: None,
             chains: Vec::new(),
+            readiness: CapabilityReadiness::deny_all(),
         })
         .expect("compose");
         let document = produced.state.bootstrap().document();
@@ -401,11 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn build_opaque_advertises_a_capability_when_its_seam_is_wired() {
-        // Presence of the seam is necessary for the capability to be advertised
-        // (the inverse of the absent-seam test above). It is not a promise that
-        // the seam will accept every request: `FailClosedDispatcher` still denies
-        // its own operations, so this test only pins the document derivation.
+    fn build_opaque_does_not_advertise_unproven_execution() {
+        // Remediation F6: a wired dispatcher is not evidence of execute
+        // capability. With no healthy dependency proof, the document must stay
+        // fail-closed even though every seam and boolean is supplied.
         let sessions = Arc::new(std::sync::Mutex::new(
             session_transport::SessionRegistry::new(),
         ));
@@ -416,20 +474,189 @@ mod tests {
             gate: TradingGate::Enabled,
             dispatcher: Some(Arc::new(FailClosedDispatcher)),
             wired: WiredCapabilities {
+                market: true,
                 execute: true,
+                limits: true,
+                twap: true,
+                rfq: true,
+                withdraw: true,
+                wallet_limits: true,
                 okx: true,
                 realtime: true,
                 ..WiredCapabilities::default()
             },
             stream_source: Some(Arc::new(FailClosedStreamSource)),
             chains: Vec::new(),
+            readiness: CapabilityReadiness::deny_all(),
         })
         .expect("compose");
         let document = produced.state.bootstrap().document();
-        assert!(document.capabilities.execute);
+        assert!(
+            !document.capabilities.market,
+            "unproven market must not be advertised"
+        );
+        assert!(
+            !document.capabilities.execute,
+            "unproven execution must not be advertised"
+        );
+        assert!(
+            !document.capabilities.limits,
+            "unproven limit engine must not be advertised"
+        );
+        for (name, value) in [
+            ("twap", document.capabilities.twap),
+            ("rfq", document.capabilities.rfq),
+            ("withdraw", document.capabilities.withdraw),
+            ("wallet_limits", document.capabilities.wallet_limits),
+        ] {
+            assert!(
+                !value,
+                "{name} rides the execution path and must not be advertised"
+            );
+        }
+        assert!(
+            !document.capabilities.realtime,
+            "unproven realtime must not be advertised"
+        );
+        // `okx` is a routing capability, not a trading-path proof; a wired
+        // dispatcher may still advertise it (the Local-only default does not).
         assert!(document.capabilities.okx);
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_advertises_execution_only_with_a_readiness_proof() {
+        // The inverse: a healthy readiness proof plus the wired seams is the
+        // only composition that advertises execution and disengages the kill
+        // switch. The seam itself still enforces its own denials at dispatch.
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Enabled,
+            dispatcher: Some(Arc::new(FailClosedDispatcher)),
+            wired: WiredCapabilities {
+                market: true,
+                execute: true,
+                limits: true,
+                twap: true,
+                rfq: true,
+                withdraw: true,
+                wallet_limits: true,
+                okx: true,
+                realtime: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: Some(Arc::new(FailClosedStreamSource)),
+            chains: Vec::new(),
+            readiness: proven_readiness(),
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        assert!(document.capabilities.market);
+        assert!(document.capabilities.execute);
+        assert!(document.capabilities.limits);
+        assert!(document.capabilities.twap);
+        assert!(document.capabilities.rfq);
+        assert!(document.capabilities.withdraw);
+        assert!(document.capabilities.wallet_limits);
         assert!(document.capabilities.realtime);
+        assert!(document.capabilities.okx);
         assert!(document.trading_enabled);
         assert!(!document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_readiness_does_not_override_the_disabled_gate() {
+        // A healthy trading path with TRADING_ENABLED=false must still keep the
+        // kill switch engaged and never advertise any mutating capability, even
+        // though the readiness surface was proven with the gate on.
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Disabled,
+            dispatcher: Some(Arc::new(FailClosedDispatcher)),
+            wired: WiredCapabilities {
+                market: true,
+                execute: true,
+                limits: true,
+                twap: true,
+                rfq: true,
+                withdraw: true,
+                wallet_limits: true,
+                realtime: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: Some(Arc::new(FailClosedStreamSource)),
+            chains: Vec::new(),
+            readiness: proven_readiness(),
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        for (name, value) in [
+            ("execute", document.capabilities.execute),
+            ("limits", document.capabilities.limits),
+            ("twap", document.capabilities.twap),
+            ("rfq", document.capabilities.rfq),
+            ("withdraw", document.capabilities.withdraw),
+            ("wallet_limits", document.capabilities.wallet_limits),
+        ] {
+            assert!(
+                !value,
+                "a disabled gate must not advertise mutating capability {name}"
+            );
+        }
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_forces_capabilities_whose_seam_is_absent_even_when_proven() {
+        // A proven readiness surface cannot substitute for a missing seam: with
+        // no dispatcher and no stream source nothing is servable.
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Enabled,
+            dispatcher: None,
+            wired: WiredCapabilities {
+                market: true,
+                execute: true,
+                limits: true,
+                twap: true,
+                rfq: true,
+                withdraw: true,
+                wallet_limits: true,
+                realtime: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: None,
+            chains: Vec::new(),
+            readiness: proven_readiness(),
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        assert!(!document.capabilities.market);
+        assert!(!document.capabilities.execute);
+        assert!(!document.capabilities.limits);
+        assert!(!document.capabilities.twap);
+        assert!(!document.capabilities.rfq);
+        assert!(!document.capabilities.withdraw);
+        assert!(!document.capabilities.wallet_limits);
+        assert!(!document.capabilities.realtime);
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
     }
 }

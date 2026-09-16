@@ -45,14 +45,25 @@ Implemented and composed (exact-SHA CI green):
 
 ## Not composed / residual (do not overstate)
 
-- **Trading Core production composition does not exist.** `apps/trading-core`
-  remains a Phase-0 shell; the private API still composes `dispatcher: None`,
-  `WiredCapabilities::default()`, `stream_source: None` and no chains, so
-  `live_execution_wired=false` and every mutation is an authenticated
+- **Trading Core production composition is not complete.** `apps/trading-core`
+  remains a Phase-0 shell and the concrete per-user Trading Core backend
+  (real `AgentBackend`, `InstrumentRegistry`, `WebContractBackend`) is not built
+  by the binary. The private API now derives the advertised trading document
+  from typed capability readiness (`apps/private-api/src/trading.rs` ->
+  `trading_core::capability`): `market`/`execute`/`limits`/`realtime` require a
+  healthy dependency proof, and `twap`/`rfq`/`withdraw`/`wallet_limits` ride the
+  execution proof. The durable exactly-once attempt store is a real Postgres
+  adapter (`crates/execution-store`, migration `0003`) connected only behind the
+  explicit `TRADING_CORE_LIVE=1` opt-in. No concrete `BaseChainTransport` or
+  `PrivyHttpClient` exists in-repo, so `execute` is never advertised,
+  `live_execution_wired=false`, and every mutation remains an authenticated
   `capability_missing` denial. `TRADING_ENABLED` is parsed strictly and must
   stay `false`.
-- Durable exactly-once execution (reservation/journal and Privy idempotency) is
-  process-local and is not release-safe for live funds.
+- Durable exactly-once execution has a concrete adapter
+  (`execution_store::PostgresExecutionAttemptStore`) and a wired readiness/store
+  seam, but the live relay that would use it is not composed in the deployed
+  binary (no chain transport, signer, or payload source), so it is not yet
+  release-safe for live funds.
 - Live signing, chain submission, balances, persistence and most provider
   transports remain unwired. The PEP-side FOMO market bridge is implemented and
   tested, but the currently deployed `fomo-mcp` image does not yet expose
@@ -61,15 +72,20 @@ Implemented and composed (exact-SHA CI green):
   backed by the verified-current FOMO `POST /proxy/getBarsNew`) and is pending
   operator deployment; until then a configured PEP fails closed with
   `Unavailable` and the chart renders only the local decrypted frame buffer —
-  never fabricated data.
+  never fabricated data. The startup reachability probe leaves `realtime`
+  unadvertised and the `/ready` `stream` check fails while the bridge is
+  unreachable, so the browser is never told a dead stream is live.
 - Perimeter trust at the edge is header-presence only; cryptographic Cloudflare
   Access JWT validation is not implemented (loopback binding is the mitigation).
-- With no `WORKSPACE_RELEASE_MANIFEST` configured, the server has no trusted
-  recipient fingerprint, so delivery of a well-formed artifact to a mismatched
-  enrollment is only caught by the browser's fail-closed inner decrypt
-  (`U5_ARTIFACT`), not by the server preflight. Deployments must configure the
-  manifest; the release/operator steps do. The manifest also makes revoke/add
-  recovery authorization possible.
+- The immutable release manifest is the normal production mode:
+  `WORKSPACE_RELEASE_MANIFEST` binds the artifact to the trusted recipient
+  fingerprint, and an absent manifest now refuses startup unless the operator
+  explicitly sets `WORKSPACE_ALLOW_NO_MANIFEST=true`. In that weaker opt-in mode
+  there is no trusted recipient fingerprint, so delivery of a well-formed
+  artifact to a mismatched enrollment is only caught by the browser's
+  fail-closed inner decrypt (`U5_ARTIFACT`), not by the server preflight.
+  Deployments must configure the manifest; the release/operator steps do. The
+  manifest also makes revoke/add recovery authorization possible.
 - Cloudflare Access remains perimeter identity only and can never recover or
   decrypt a workspace.
 - `main` branch protection and required-status-check enforcement are an

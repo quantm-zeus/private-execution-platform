@@ -421,18 +421,32 @@ and relevant MEDIUM findings were fixed with regression tests:
     explicitly configured and never authorizes an unstamped request.
   - `apps/private-api` parses `TRADING_ENABLED` strictly (`"true"`/`"false"`;
     unset disables; anything else refuses startup) and derives the advertised
-    bootstrap document from *what is actually wired*. Enabling trading does not
-    advertise a capability whose backend is absent, and the kill switch stays
-    engaged until a mutating seam is injected.
+    bootstrap document from *what is actually wired and proven*. Enabling
+    trading does not advertise a capability whose backend is absent, and the
+    kill switch stays engaged until a mutating seam is injected.
+  - The trading path is built from typed capability proofs
+    (`apps/private-api::trading` -> `trading_core::capability`). `market`,
+    `execute` and `limits` are each gated on a healthy dependency proof, and
+    `twap`/`rfq`/`withdraw`/`wallet_limits` ride the execution proof; a wired
+    dispatcher with no proof cannot advertise them. `realtime` requires the FOMO
+    stream source **and** a bounded startup reachability probe of the bridge
+    (`probe_realtime`); the shared health flag is updated by every later stream
+    read and drives the `/ready` `stream` check. The durable attempt store is a
+    real Postgres adapter (`execution_store`), connected only behind the
+    explicit `TRADING_CORE_LIVE=1` opt-in; a partial live configuration (opt-in
+    missing an endpoint) refuses startup, and `TRADING_CORE_LIVE` itself is
+    parsed strictly (`"1"`/`"0"`).
   - Still residual: the concrete Trading Core composition (real `AgentBackend`,
     authoritative `AgentCapabilities`, `InstrumentRegistry` backed by market
     metadata, `WebContractBackend` for wallet limits/reconciliation, real
     `StreamSource`) is injected through `web_command_dispatcher` /
     `production::OpaqueComposition` but not built by the binary. Wiring it needs
     genuinely operator-owned inputs (owner/wallet/chain/risk limits, Privy
-    signing, chain adapters, live market data), so with none supplied the
-    `FailClosed*` defaults remain and every mutation is an authenticated
-    `capability_missing` denial — never a fabricated success.
+    signing, a Base chain transport, live market data), so with none supplied
+    the `FailClosed*` defaults remain. There is no concrete `BaseChainTransport`
+    or `PrivyHttpClient` in the repository, so the shipped binary can never prove
+    execution and every mutation is an authenticated `capability_missing`
+    denial — never a fabricated success.
 - **Accepted LOW hardening residuals (fresh-context adversarial review)**: the
   s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
   substitution today; the cross-route c2s DoS is now fixed by validating before
@@ -523,18 +537,23 @@ being worked around:
   `order_id`. Wiring the client ids and the UNKNOWN lookup is a web-flow change
   that belongs with the Trading Core wiring.
 - **Advertised-vs-backed capabilities (F5/audit[4]).** `document_for` derives the
-  document from `WiredCapabilities`; an operator that advertises
-  `twap`/`rfq`/`withdraw`/`intelligence` without the matching
-  `WebContractBackend` handler gets a determinate `capability_missing` (never a
-  false success). A `serves(op)` probe on the seams would make the advertisement
-  authoritative.
-- **Shipped binary composition (F1/F10, operator-owned).** `main.rs` still passes
-  `dispatcher: None`, so the binary serves the fail-closed default; the concrete
-  Trading Core read/trade backend, `WebContractBackend`, `InstrumentRegistry`,
-  `StreamSource` and chains need operator inputs (owner/wallet/chain/risk limits,
-  Privy signing, live market data). The read ports for
-  `search_token`/`get_token`/`get_intelligence`/`get_chart` are likewise
-  unwired.
+  document from `WiredCapabilities`, now additionally gated on the typed
+  `CapabilityReadiness` proofs: `market`/`execute`/`limits`/`realtime` require a
+  healthy dependency proof and the mutating capabilities ride the execution
+  proof. An operator that advertises `twap`/`rfq`/`withdraw`/`intelligence`
+  without the matching `WebContractBackend` handler still gets a determinate
+  `capability_missing` (never a false success); `intelligence`/`twitter`/`gmgn`
+  remain presence-declared reads. A `serves(op)` probe on the seams would make
+  the remaining advertisement authoritative.
+- **Shipped binary composition (F1/F10, operator-owned).** `main.rs` composes the
+  configured FOMO chart dispatcher (or the fail-closed default) and the FOMO
+  stream source, then derives readiness from `TradingSeams`: the durable
+  Postgres attempt store is connected only under `TRADING_CORE_LIVE=1`, and no
+  Base chain transport or Privy HTTP client is injected, so `execute` is never
+  advertised. The concrete Trading Core read/trade backend, `WebContractBackend`,
+  `InstrumentRegistry`, `StreamSource` and chains still need operator inputs
+  (owner/wallet/chain/risk limits, Privy signing, live market data). The read
+  ports for `search_token`/`get_token`/`get_intelligence` are likewise unwired.
 - **Web defaults the server refuses (F6/F7/F8).** A blank limit expiry and the
   default `usd` amount type are determinate server refusals (no canonical USD
   price; the canonical expiry is a required `i64`), and per-order risk caps are
@@ -759,7 +778,10 @@ private API never serves the shell itself.
 
 `apps/private-api/src/release.rs` reads `WORKSPACE_RELEASE_MANIFEST` on every
 request (no in-process cache) and validates it against the exact artifact bytes
-read from `WORKSPACE_ARTIFACT_PATH`. Shell HTML is served `no-store,
+read from `WORKSPACE_ARTIFACT_PATH`. The manifest is the normal production mode:
+`main.rs` refuses startup when it is absent unless the operator explicitly sets
+`WORKSPACE_ALLOW_NO_MANIFEST=true`, and a present-but-blank path is always a
+misconfiguration. Shell HTML is served `no-store,
 must-revalidate`; hashed assets under `/assets/*` may be `public,
 max-age=31536000, immutable` (`_headers` is written into the release).
 
@@ -789,13 +811,17 @@ remains best-effort; the byte copy is zeroized in a `finally`.
 without a bind) refuses startup. The relay listener is bound before it is
 spawned, so a bad address is a startup error, and `/ready` reports dependency
 readiness (relay bound, artifact and manifest header valid, configured command
-surface present, passkey store readable, optional recovery store readable)
-distinct from `/health` liveness. The artifact check requires a deliverable file
+surface present, configured realtime stream usable, passkey store readable,
+optional recovery store readable) distinct from `/health` liveness. The artifact
+check requires a deliverable file
 (`MIN_ARTIFACT_LEN`, version 1, non-zero KID and encapsulated key), so a
 truncated or wrong-version file is never reported healthy; the `dispatcher`
 check reflects whether the opaque command surface is configured (the production
 binary always wires a fail-closed dispatcher before serving and refuses startup
-without one), and a future composition that can lose its dispatcher clears it. `apps/edge-gateway`
+without one), and a future composition that can lose its dispatcher clears it.
+The `stream` check is required only when the composition advertises `realtime`
+(that is, when a FOMO stream source is configured); without a source it is not a
+dependency. `apps/edge-gateway`
 refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
 validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
 bypass that, so the loopback deployment mitigation cannot be widened silently.
@@ -939,8 +965,9 @@ were fixed with regression tests:
   `cf-connecting-ip`, …) while still accepting the dedicated assertion header and
   the oauth2-proxy identity headers (`x-forwarded-access-token/-user/-email/-groups`);
   `strict_bool_env` refuses a non-Unicode setting instead of defaulting; and
-  `/ready` reports `manifest_configured` so operators can see the weaker
-  no-manifest mode.
+  `/ready` reports `manifest_configured` so operators can see whether the
+  explicit no-manifest opt-in is in effect (`WORKSPACE_ALLOW_NO_MANIFEST=true`);
+  without it an absent `WORKSPACE_RELEASE_MANIFEST` refuses startup.
 - **Non-text contrast (WCAG 2.2 AA 1.4.11).** Interactive `.button` and
   `.field__input` boundaries use a dedicated `--line-interactive` token
   (≈4.5:1) instead of the lower-contrast divider color.

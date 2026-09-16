@@ -177,10 +177,20 @@ impl PostgresExecutionAttemptStore {
         bucket_for(self.clock.now_ms(), self.bucket_ms)
     }
 
-    /// Readiness probe over one pooled connection (`SELECT 1` only).
+    /// Readiness probe over one pooled connection.
+    ///
+    /// Reads the `execution_attempts` table (bounded to one row) rather than a
+    /// bare `SELECT 1`: a reachable database that has not had migration `0003`
+    /// applied is not a usable durable store and must probe unavailable, so the
+    /// caller cannot prove execution capability from a store that cannot
+    /// reserve.
     pub async fn health(&self) -> storage::HealthProbe {
         let now = self.clock.now_ms();
-        match self.next_client().simple_query("SELECT 1").await {
+        match self
+            .next_client()
+            .simple_query("SELECT 1 FROM execution_attempts LIMIT 1")
+            .await
+        {
             Ok(_) => healthy_probe("execution-store.postgres", now),
             Err(_) => unavailable_probe("execution-store.postgres", now),
         }

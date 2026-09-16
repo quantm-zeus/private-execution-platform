@@ -50,6 +50,28 @@ fn strict_bool_env(name: &str, default: bool) -> Result<bool, std::io::Error> {
     }
 }
 
+/// Enforce the immutable release manifest as the normal production mode.
+///
+/// `WORKSPACE_RELEASE_MANIFEST` binds the artifact to the trusted recipient
+/// public-key fingerprint; without it the compatibility preflight enforces only
+/// version/KID. That weaker mode is now an explicit, opt-in fallback: an absent
+/// manifest refuses startup unless `WORKSPACE_ALLOW_NO_MANIFEST=true`. A
+/// present-but-blank path is always a misconfiguration, never an opt-out.
+fn release_manifest_policy(
+    manifest: Option<&str>,
+    allow_no_manifest: bool,
+) -> Result<(), &'static str> {
+    match manifest {
+        Some(value) if !value.trim().is_empty() => Ok(()),
+        Some(_) => Err("WORKSPACE_RELEASE_MANIFEST must not be blank"),
+        None if allow_no_manifest => Ok(()),
+        None => Err(
+            "WORKSPACE_RELEASE_MANIFEST is required; set WORKSPACE_ALLOW_NO_MANIFEST=true \
+             to explicitly accept the weaker version/KID-only preflight",
+        ),
+    }
+}
+
 /// Strict all-or-none relay configuration.
 ///
 /// The relay is optional: with none of the five variables supplied it stays
@@ -286,6 +308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let session_ttl_ms = config.session_ttl_ms;
 
+    // The immutable release manifest is the normal production mode; the weaker
+    // version/KID-only preflight is an explicit opt-in.
+    release_manifest_policy(
+        read_env(private_api::release::RELEASE_MANIFEST_ENV)?.as_deref(),
+        strict_bool_env("WORKSPACE_ALLOW_NO_MANIFEST", false)?,
+    )
+    .map_err(std::io::Error::other)?;
+
     // Production passkey composition. The operator bootstrap secret is only
     // meaningful together with a durable store (otherwise an enrolled credential
     // could not survive a restart), so a secret without a store refuses startup
@@ -326,22 +356,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // denial — never a fabricated success.
     let gate = private_api::production::TradingGate::from_env()
         .map_err(|_| std::io::Error::other("TRADING_ENABLED must be true or false"))?;
+    // Live trading wiring is presence-only and explicitly opt-in; it never reads
+    // a credential value. A partial configuration (opted in but missing an
+    // endpoint) refuses startup rather than running as if it were complete.
+    let live_opted_in =
+        private_api::trading::parse_live_opt_in(read_env("TRADING_CORE_LIVE")?.as_deref())
+            .map_err(|_| std::io::Error::other("TRADING_CORE_LIVE must be 1 or 0"))?;
+    let live_wiring = private_api::trading::LiveWiring::from_presence(
+        live_opted_in,
+        read_env("EXECUTION_DATABASE_DSN")?.as_deref(),
+        read_env("BASE_RPC_ENDPOINT")?.as_deref(),
+        read_env("PRIVY_HTTP_ENDPOINT")?.as_deref(),
+    );
+    if gate.is_enabled() && live_wiring.partial() {
+        return Err(std::io::Error::other(
+            "live trading wiring requires TRADING_CORE_LIVE=1 together with \
+             EXECUTION_DATABASE_DSN, BASE_RPC_ENDPOINT and PRIVY_HTTP_ENDPOINT",
+        )
+        .into());
+    }
+    // Typed capability readiness. Every seam defaults absent, so the default
+    // composition proves nothing and the bootstrap advertises no trading
+    // capability. Connecting the durable store is gated behind the explicit
+    // live opt-in, so the disabled deployment performs no trading I/O.
+    let mut trading_seams = private_api::trading::TradingSeams::new();
+    if gate.is_enabled() && live_wiring.durable_store_configured() {
+        let dsn = read_env("EXECUTION_DATABASE_DSN")?.expect("checked present");
+        match private_api::trading::connect_durable_attempt_store(&dsn).await {
+            Ok((store, probe)) => {
+                trading_seams = trading_seams.with_durable_store(store, probe);
+            }
+            Err(_) => {
+                // A configured live path without its durable store is a
+                // determinate refusal, never a process that claims readiness.
+                return Err(std::io::Error::other("execution database unavailable").into());
+            }
+        }
+    }
     // Optional read-only FOMO market bridge. With no configuration the chart
     // stays on its bounded local buffer and no capability is advertised; the
     // chart dispatcher wraps the fail-closed default for every non-chart op.
     let fomo = optional_fomo_market_config()?;
+    // Observational health flag shared with the realtime stream source and
+    // `/ready`; it starts false and is only set true by an observed successful
+    // bridge read, so a configured-but-unreachable provider is never reported
+    // healthy.
+    let stream_health = Arc::new(AtomicBool::new(false));
     let (fomo_dispatcher, fomo_stream, fomo_wired) = match fomo {
         Some((config, api_key)) => {
             let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
                 private_api::FomoBarsClient::new(&config.base_url, api_key, config.request_timeout)
                     .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
             );
-            let wiring = private_api::build_fomo_market_wiring(
+            let probe_provider = provider.clone();
+            let wiring = private_api::build_fomo_market_wiring_with_health(
                 &config,
                 provider,
                 Arc::new(private_api::FailClosedDispatcher),
+                Some(stream_health.clone()),
             )
             .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
+            // Observe the configured realtime source once at startup. A
+            // reachable bridge proves the realtime capability; an unavailable
+            // one leaves it unadvertised (fail closed) rather than claiming a
+            // stream that was never reached. The shared flag keeps `/ready`
+            // honest for later poll failures too.
+            if wiring.stream_source.is_some() {
+                let reachable = private_api::probe_realtime(probe_provider.as_ref(), &config).await;
+                stream_health.store(reachable, Ordering::SeqCst);
+                if reachable {
+                    trading_seams = trading_seams.with_realtime_probe(
+                        private_api::trading::healthy(private_api::trading::COMPONENT_REALTIME),
+                    );
+                }
+            }
             let wired = private_api::production::WiredCapabilities {
                 // Chart history only: `search_token`/`get_token` stay denied
                 // because FOMO does not back them (capability truth, audit F6).
@@ -357,6 +445,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             private_api::production::WiredCapabilities::default(),
         ),
     };
+    let fomo_stream_present = fomo_stream.is_some();
+    let readiness = trading_seams.readiness(gate.is_enabled());
+    // The stream is a required readiness dependency only when the composition
+    // both advertises realtime and proved it reachable at startup.
+    let stream_required = fomo_stream_present && readiness.realtime();
     let production =
         private_api::production::build_opaque(private_api::production::OpaqueComposition {
             sessions: state.sessions(),
@@ -367,6 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wired: fomo_wired,
             stream_source: fomo_stream,
             chains: Vec::new(),
+            readiness,
         })
         .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
     let opaque_state = production.state;
@@ -407,7 +501,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = relay_router.serve_with_incoming(incoming).await;
         });
     }
-    let state = state.with_relay_readiness(relay_required, relay_ready);
+    // The opaque dispatcher is always wired (the fail-closed default is a real
+    // dispatcher), so it is ready by construction. The realtime stream is a
+    // required dependency only when a reachable source was composed; the shared
+    // flag flips false if the source later exhausts its bounded failure budget.
+    let dispatcher_ready = Arc::new(AtomicBool::new(true));
+    let state = state
+        .with_relay_readiness(relay_required, relay_ready)
+        .with_dispatcher_readiness(dispatcher_ready)
+        .with_stream_readiness(stream_required, stream_health);
 
     let bind =
         std::env::var("PRIVATE_API_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
@@ -496,6 +598,23 @@ mod tests {
         std::env::set_var(name, "1");
         assert!(strict_bool_env(name, false).is_err());
         std::env::remove_var(name);
+    }
+
+    #[test]
+    fn release_manifest_is_required_unless_explicitly_opted_out() {
+        // A configured manifest is the normal mode.
+        assert_eq!(
+            release_manifest_policy(Some("/srv/pep/manifest.json"), false),
+            Ok(())
+        );
+        // No manifest refuses unless the operator explicitly accepts the weaker
+        // version/KID-only preflight.
+        assert!(release_manifest_policy(None, false).is_err());
+        assert_eq!(release_manifest_policy(None, true), Ok(()));
+        // A present-but-blank path is always a misconfiguration, never an opt-out.
+        assert!(release_manifest_policy(Some("   "), true).is_err());
+        assert!(release_manifest_policy(Some(""), true).is_err());
+        assert!(release_manifest_policy(Some("   "), false).is_err());
     }
 
     #[test]

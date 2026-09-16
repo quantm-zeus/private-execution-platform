@@ -81,6 +81,7 @@ agent-commands = { path = "crates/agent-commands" }
 mcp-server = { path = "crates/mcp-server" }
 agent-backend = { path = "crates/agent-backend" }
 market-execution = { path = "crates/market-execution" }
+trading-core = { path = "apps/trading-core" }
 telegram-bot = { path = "crates/telegram-bot" }
 social-intel = { path = "crates/social-intel" }
 adaptive-exec = { path = "crates/adaptive-exec" }

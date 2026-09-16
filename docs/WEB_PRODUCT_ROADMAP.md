@@ -76,9 +76,13 @@ the evidence.
 - **Client/server capability labels — aligned.** Discover gates token reads on `market`;
   `get_execution_progress` is command-readiness-gated.
 - **Private API — composed.** Production passkey composition and the encrypted
-  artifact/descriptor/release flow are implemented. What remains absent is the **Trading Core**
-  composition (`dispatcher: None`, `stream_source: None`, `live_execution_wired=false`), not the
-  private API.
+  artifact/descriptor/release flow are implemented. The command dispatcher is the
+  configured FOMO chart dispatcher (or the fail-closed default), the realtime
+  source is the configured FOMO bounded-polling stream, and the advertised
+  trading document is gated on typed capability readiness. What remains absent is
+  the per-user **Trading Core** backend (`live_execution_wired=false`; `execute`
+  is never advertised because no Base chain transport or Privy HTTP client
+  exists), not the private API.
 - **Chart / FOMO.** KLineChart Pro is pinned `0.1.1` + `klinecharts 9.1.1` over a renderer-agnostic
   local datafeed; the read-only `fomo-mcp` `/market/bars` bridge is implemented on the coordinated
   `worker/deepseek-pep-market-source` branch and is pending operator deployment.
@@ -86,9 +90,11 @@ the evidence.
 ### Progress notes
 
 - **W1–W9** are implemented in `web/workspace-payload/src` against the typed architecture. Because the
-  backend **Trading Core** is not composed (`dispatcher`/`stream_source` are `None`; see
+  backend **Trading Core** per-user composition is absent (`execute`/`limits` unproven; see
   `BACKEND_REQUESTS.md`), every data surface renders an explicit `unavailable`/`stale`/`empty` state and
-  every mutation is disabled with a reason; no synthetic data is ever shown as live.
+  every mutation is disabled with a reason; no synthetic data is
+  ever shown as live. The FOMO chart history/realtime path is the only wired
+  market-data surface.
 - **W10** delivered: keyboard-navigable nav rail, focus-visible styles, `aria-live`/`role="status"` on
   async surfaces, labelled controls, `prefers-reduced-motion`, responsive 1440/1024/760 layouts.
   **Continuation:** axe-core now runs in real headless Chromium across all nine views as part of the

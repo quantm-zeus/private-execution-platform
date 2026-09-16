@@ -36,6 +36,7 @@
 //! route simulation / net executable economics, never on a chart crossing.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -678,6 +679,14 @@ pub struct FomoOhlcvStreamSource {
     entity_key: String,
     count_back: u32,
     interval: Duration,
+    /// Optional observational health flag.
+    ///
+    /// When present it is set `true` on every successful bridge read and
+    /// `false` when a snapshot read fails or the bounded consecutive-failure
+    /// budget is exhausted (the point at which the source ends the stream). The
+    /// readiness probe reads it, so `/ready` reflects an observed provider
+    /// outage rather than a configuration claim.
+    health: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for FomoOhlcvStreamSource {
@@ -717,7 +726,23 @@ impl FomoOhlcvStreamSource {
             entity_key,
             count_back: FomoMarketConfig::clamp_count_back(count_back),
             interval,
+            health: None,
         })
+    }
+
+    /// Attaches an observational health flag updated on every bridge read.
+    ///
+    /// The composition shares this flag with `/ready`; it is never a
+    /// configuration assertion (the initial value is chosen by the caller).
+    pub fn with_health_flag(mut self, health: Arc<AtomicBool>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    fn mark_health(&self, healthy: bool) {
+        if let Some(flag) = self.health.as_ref() {
+            flag.store(healthy, Ordering::SeqCst);
+        }
     }
 
     /// Test-only constructor that bypasses the production poll-cadence floor so
@@ -763,7 +788,16 @@ impl FomoOhlcvStreamSource {
 #[async_trait]
 impl StreamSource for FomoOhlcvStreamSource {
     async fn snapshot(&self, _from_seq: Option<u64>) -> Option<SourceFrame> {
-        let bars = self.fetch().await.ok()?;
+        let bars = match self.fetch().await {
+            Ok(bars) => {
+                self.mark_health(true);
+                bars
+            }
+            Err(_) => {
+                self.mark_health(false);
+                return None;
+            }
+        };
         let latest = bars.last()?;
         Some(
             SourceFrame::snapshot(
@@ -788,6 +822,7 @@ impl StreamSource for FomoOhlcvStreamSource {
                 Ok(bars) => {
                     // A reachable-but-empty response is still a success.
                     failures = 0;
+                    self.mark_health(true);
                     bars
                 }
                 // Provider outage: stay silent rather than fabricate. After a
@@ -797,6 +832,7 @@ impl StreamSource for FomoOhlcvStreamSource {
                 Err(_) => {
                     failures = failures.saturating_add(1);
                     if failures >= MAX_STREAM_FAILURES {
+                        self.mark_health(false);
                         return None;
                     }
                     continue;
@@ -842,23 +878,72 @@ pub fn build_wiring(
     provider: Arc<dyn BarsProvider>,
     inner: Arc<dyn CommandDispatcher>,
 ) -> Result<FomoMarketWiring, FomoMarketError> {
+    build_wiring_with_health(config, provider, inner, None)
+}
+
+/// Build the FOMO market wiring, optionally attaching an observational health
+/// flag to the realtime source.
+///
+/// The flag is updated by the source on every bridge read; the composition
+/// shares it with `/ready` so a sustained provider outage is observable. It is
+/// not a configuration assertion.
+pub fn build_wiring_with_health(
+    config: &FomoMarketConfig,
+    provider: Arc<dyn BarsProvider>,
+    inner: Arc<dyn CommandDispatcher>,
+    health: Option<Arc<AtomicBool>>,
+) -> Result<FomoMarketWiring, FomoMarketError> {
     let dispatcher: Arc<dyn CommandDispatcher> =
         Arc::new(FomoChartDispatcher::new(inner, provider.clone()));
     let stream_source: Option<Arc<dyn StreamSource>> = match &config.stream_target {
         None => None,
-        Some((chain, address, timeframe)) => Some(Arc::new(FomoOhlcvStreamSource::new(
-            provider,
-            chain.clone(),
-            address.clone(),
-            timeframe.clone(),
-            config.stream_count_back,
-            config.stream_poll,
-        )?)),
+        Some((chain, address, timeframe)) => {
+            let source = FomoOhlcvStreamSource::new(
+                provider,
+                chain.clone(),
+                address.clone(),
+                timeframe.clone(),
+                config.stream_count_back,
+                config.stream_poll,
+            )?;
+            let source = match health {
+                Some(flag) => source.with_health_flag(flag),
+                None => source,
+            };
+            Some(Arc::new(source))
+        }
     };
     Ok(FomoMarketWiring {
         dispatcher,
         stream_source,
     })
+}
+
+/// One bounded `/market/latest` read observing whether the configured realtime
+/// source is reachable at startup.
+///
+/// A reachable-but-empty response is healthy (matching the stream source's own
+/// success rule); an unreachable/malformed response is not. Returns `false` when
+/// no realtime target is configured.
+pub async fn probe_realtime(provider: &dyn BarsProvider, config: &FomoMarketConfig) -> bool {
+    let Some((chain, address, timeframe)) = config.stream_target.as_ref() else {
+        return false;
+    };
+    let Some(resolution) = fomo_resolution(timeframe) else {
+        return false;
+    };
+    provider
+        .bars(BarsQuery {
+            chain_slug: chain,
+            address,
+            resolution,
+            count_back: FomoMarketConfig::clamp_count_back(config.stream_count_back),
+            from_s: None,
+            to_s: None,
+            latest: true,
+        })
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -1098,6 +1183,65 @@ mod tests {
             .await
             .expect("bounded");
         assert!(delta.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_health_flag_tracks_bridge_reads() {
+        // The flag starts false and is only set true by an observed success, so
+        // a configured-but-unreachable provider is never reported healthy.
+        let health = Arc::new(AtomicBool::new(false));
+
+        let reachable = FomoOhlcvStreamSource::new_for_test(
+            fake(vec![bar(1_000, 10.0)]),
+            "base".into(),
+            "0xabc".into(),
+            "1m".into(),
+            10,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .with_health_flag(health.clone());
+        assert!(!health.load(Ordering::SeqCst));
+        assert!(reachable.snapshot(None).await.is_some());
+        assert!(health.load(Ordering::SeqCst));
+
+        // An exhausted outage marks the stream unhealthy.
+        let down = Arc::new(FakeProvider::new(vec![Err(FomoMarketError::Unavailable)]));
+        let source = FomoOhlcvStreamSource::new_for_test(
+            down,
+            "base".into(),
+            "0xabc".into(),
+            "1m".into(),
+            10,
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .with_health_flag(health.clone());
+        assert!(source.next_delta().await.is_none());
+        assert!(!health.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn realtime_probe_requires_a_reachable_target() {
+        let no_target = FomoMarketConfig {
+            base_url: "http://127.0.0.1:8787".into(),
+            api_key_file: PathBuf::from("/tmp/key"),
+            request_timeout: Duration::from_millis(100),
+            stream_target: None,
+            stream_poll: Duration::from_secs(5),
+            stream_count_back: 10,
+        };
+        // No configured target: not reachable.
+        assert!(!probe_realtime(fake(vec![bar(1_000, 1.0)]).as_ref(), &no_target).await);
+
+        let config = FomoMarketConfig {
+            stream_target: Some(("base".into(), "0xabc".into(), "1m".into())),
+            ..no_target
+        };
+        // A reachable provider (even empty) is healthy; a failing one is not.
+        assert!(probe_realtime(fake(vec![bar(1_000, 1.0)]).as_ref(), &config).await);
+        let down = Arc::new(FakeProvider::new(vec![Err(FomoMarketError::Unavailable)]));
+        assert!(!probe_realtime(down.as_ref(), &config).await);
     }
 
     fn request(payload: Value) -> CommandRequest {

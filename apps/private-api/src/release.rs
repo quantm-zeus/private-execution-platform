@@ -210,9 +210,10 @@ impl ReleaseManifest {
 /// Read and validate the operator-configured release manifest.
 ///
 /// `Ok(None)` means the operator has not configured an immutable manifest; the
-/// descriptor then falls back to artifact-derived public metadata so existing
-/// deployments keep working. A configured-but-broken manifest is an error and
-/// must not be silently ignored.
+/// descriptor then falls back to artifact-derived public metadata. The binary
+/// treats that as the explicit, opt-in weaker mode (`WORKSPACE_ALLOW_NO_MANIFEST=true`),
+/// so the normal production mode always has a manifest. A configured-but-broken
+/// manifest is an error and must not be silently ignored.
 pub fn load_release_manifest_from_env() -> Result<Option<ReleaseManifest>, DescriptorError> {
     match std::env::var(RELEASE_MANIFEST_ENV) {
         Ok(value) if !value.trim().is_empty() => {
