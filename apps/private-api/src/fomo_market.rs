@@ -460,11 +460,12 @@ impl FomoBarsClient {
         if !response.status().is_success() {
             // A determinate per-request 4xx rejection (for example an unknown
             // token) must not let any authenticated caller flip the shared
-            // `/ready` dependency. Auth/permission failures (401/403) are an
-            // operator/access outage, and 5xx/transport failures are real
+            // `/ready` dependency. Auth/permission failures (401/403) and
+            // provider throttling/cool-off statuses (408/425/429) are access or
+            // availability problems, and 5xx/transport failures are real
             // outages, so those stay `Unavailable`.
             let code = response.status().as_u16();
-            if (400..500).contains(&code) && code != 401 && code != 403 {
+            if (400..500).contains(&code) && !matches!(code, 401 | 403 | 408 | 425 | 429) {
                 return Err(FomoMarketError::InvalidRequest);
             }
             return Err(FomoMarketError::Unavailable);

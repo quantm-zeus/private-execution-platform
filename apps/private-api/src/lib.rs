@@ -1919,9 +1919,9 @@ async fn get_workspace_identity(
 /// Secret locally and uploads only the derived public key plus the opaque
 /// passkey-PRF and offline-recovery wrappers. Create-once: a second bootstrap is
 /// refused, so the workspace identity can never be replaced or rotated here.
-/// Requires the operator enrollment secret, like passkey registration, so the
-/// create-once identity cannot be squatted by an arbitrary authenticated
-/// session.
+/// Once a release is sealed to the stable context the submitted key must match
+/// that release's recipient fingerprint, so the create-once identity cannot be
+/// squatted by an arbitrary authenticated session.
 async fn bootstrap_workspace_identity(
     State(state): State<PrivateApiState>,
     headers: HeaderMap,
@@ -1964,8 +1964,13 @@ async fn bootstrap_workspace_identity(
     // not constrain the one-time migration bootstrap.
     match state.load_manifest().await {
         Ok(Some(manifest)) => {
-            let stable_context_kid_b64 = base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID);
-            if manifest.artifact.kid_b64 == stable_context_kid_b64
+            // Decode the manifest KID canonically before comparing, so a
+            // non-canonical-but-equal encoding cannot skip the binding.
+            let manifest_kid_is_stable =
+                release::decode_canonical_b64_variable(&manifest.artifact.kid_b64)
+                    .map(|kid| kid == recovery::WORKSPACE_ROOT_CONTEXT_KID)
+                    .unwrap_or(false);
+            if manifest_kid_is_stable
                 && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
             {
                 return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");

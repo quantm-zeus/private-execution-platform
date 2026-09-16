@@ -410,10 +410,13 @@ function App() {
     setSetupError("");
     setStatus("Creating this workspace...");
     let root: Uint8Array | null = null;
+    // Hoisted: if the create-once bootstrap response is lost we must still be
+    // able to surface this code (the identity can never be recreated).
+    let recoveryCode = "";
     try {
       root = generateWorkspaceRootSecret();
       const publicKey = await deriveWorkspaceRootPublicKey(root);
-      const recoveryCode = generateRecoveryCode();
+      recoveryCode = generateRecoveryCode();
       const recoveryBytes = decodeRecoveryCode(recoveryCode);
       let recoveryRecord;
       try {
@@ -492,13 +495,35 @@ function App() {
         );
       }
     } catch (error) {
-      setSetupError(
-        error instanceof RecoveryClientError && error.code === "recovery_conflict"
-          ? "This workspace is already set up. Reload to unlock it."
-          : "Workspace setup did not complete. Retry, or contact the operator.",
-      );
-      setSetupPhase("unconfigured");
-      setStatus("Workspace setup failed.");
+      // The create-once bootstrap may have committed even when the response was
+      // lost (a network drop or post-commit 5xx). Re-read the durable identity:
+      // if it now matches the root we generated, surface the recovery code
+      // instead of abandoning it, because the identity can never be recreated.
+      let recovered = false;
+      if (recoveryCode && root) {
+        const current = await loadIdentity();
+        if (
+          current?.configured &&
+          (await workspaceRootMatchesFingerprint(root, current.fingerprintB64))
+        ) {
+          setSetupRecoveryCode(recoveryCode);
+          setSavedConfirmed(false);
+          setSetupPhase("show_recovery");
+          setStatus(
+            "Workspace created. Save your recovery code; the server response was interrupted.",
+          );
+          recovered = true;
+        }
+      }
+      if (!recovered) {
+        setSetupError(
+          error instanceof RecoveryClientError && error.code === "recovery_conflict"
+            ? "This workspace is already set up. Reload to unlock it."
+            : "Workspace setup did not complete. Retry, or contact the operator.",
+        );
+        setSetupPhase("unconfigured");
+        setStatus("Workspace setup failed.");
+      }
     } finally {
       if (root) root.fill(0);
     }
