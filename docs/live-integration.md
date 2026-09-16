@@ -1013,10 +1013,10 @@ not be used under Pro 0.1.1.
   Pro's `Period`/`KLineData` vocabulary; `chart/pro/pro-chart.ts` owns the Pro
   lifecycle. No Pro type reaches session/domain/realtime code.
 - **History.** `getHistoryKLineData` calls the authenticated/encrypted
-  `get_chart` command (capability-gated on `market`) and normalizes the
-  response defensively; when the capability is absent, the channel is not ready,
-  the timeframe has no canonical window, or the response is malformed it falls
-  back to the bounded local buffer. It never fabricates a candle.
+  `get_chart` command (capability-gated on the `chart` capability) and normalizes
+  the response defensively; when the capability is absent, the channel is not
+  ready, the timeframe has no canonical window, or the response is malformed it
+  falls back to the bounded local buffer. It never fabricates a candle.
 - **Realtime.** `subscribe` consumes the already-decrypted local frame bus
   (`ChartFrameRouter`, fed by the worker's decoded `ohlcv` frames) and
   `unsubscribe`/`dispose` tear every subscription down. Pro may re-subscribe
@@ -1052,10 +1052,10 @@ with the bridge's own bearer key.
 
 - **Configuration (all-or-none).** `PRIVATE_FOMO_MARKET_URL` (loopback
   `http://…`) plus `PRIVATE_FOMO_MARKET_API_KEY_FILE` (owner-only, non-symlink,
-  read through the hardened reader) enable the chart read. `market` is
-  advertised only when this is wired; `search_token`/`get_token` remain
-  determinate `capability_missing` denials because they are not backed by FOMO —
-  an accepted capability-truth residual (audit F6).
+  read through the hardened reader) enable the chart read. The dedicated `chart`
+  capability is advertised only when this is wired; `market` stays false, so
+  `search_token`/`get_token` remain determinate `capability_missing` denials
+  because they are not backed by FOMO (capability truth, audit F6).
 - **History.** `get_chart` accepts
   `{chain,address,window,countBack?,from?,to?}`. Both the frontend timeframe ids
   and the canonical `m5/m15/h1/h4/d1` windows map through a closed table to a
