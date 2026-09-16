@@ -1454,6 +1454,21 @@ test("the Rust workspace root context bytes match the TS/tooling constant", asyn
     WORKSPACE_ROOT_CONTEXT_B64,
     "Rust WORKSPACE_ROOT_CONTEXT_KID must equal the TS/tooling constant",
   );
+  // The shell carries its own copy of the literal; pin it to the same value so
+  // all three languages stay byte-identical.
+  const shellRuntime = await readFile(
+    resolve("web/workspace-shell/src/unlock-runtime.ts"),
+    "utf8",
+  );
+  const shellMatch = shellRuntime.match(
+    /WORKSPACE_ROOT_CONTEXT_B64\s*=\s*"([A-Za-z0-9+/=]+)"/,
+  );
+  assert.ok(shellMatch, "unlock-runtime.ts must declare WORKSPACE_ROOT_CONTEXT_B64");
+  assert.equal(
+    shellMatch[1],
+    WORKSPACE_ROOT_CONTEXT_B64,
+    "shell WORKSPACE_ROOT_CONTEXT_B64 must equal the Rust/tooling constant",
+  );
 });
 
 test("operational: N and N+1 built from the stable public key decrypt with one root", async () => {

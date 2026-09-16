@@ -962,9 +962,11 @@ try {
   // the source level rather than relying only on a unit test. Comments are
   // stripped first so prose cannot register as a call site.
   //
-  // Coverage: every non-test text source file under the shell `src` tree is
-  // scanned (not a hardcoded list), so a NEW file added by a future change
-  // cannot slip a second ceremony past the gate. The pattern also matches the
+  // Coverage: every non-test text source file under the shell package tree
+  // (.mts/.cts included, dependency/build outputs pruned) plus the HTML
+  // entrypoints is scanned (not a hardcoded list), so a NEW file added by a
+  // future change does not silently slip a second ceremony past the gate. The
+  // pattern also matches the
   // optional-chained and computed-bracket spellings, and a self-test proves the
   // matcher fires on those evasions while staying silent on `create()`. This is
   // a defense-in-depth heuristic, not a taint analysis (an unrelated alias such
@@ -996,15 +998,33 @@ try {
     throw new Error("credentials.get() guard must not match credentials.create()");
   }
   const isShellTestSource = (path) =>
-    /\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(path);
+    /\.(?:test|spec)\.(?:mts|cts|ts|tsx|js|jsx|mjs|cjs)$/i.test(path);
   const isShellTextSource = (path) =>
-    /\.(?:ts|tsx|js|jsx|mjs|cjs|css|html)$/i.test(path);
+    /\.(?:mts|cts|ts|tsx|js|jsx|mjs|cjs|css|html)$/i.test(path);
+  // Walk the whole shell package (not just `src`) so a helper added in a new
+  // top-level file or directory is still scanned, while pruning dependency and
+  // build-output trees that are not hand-edited shipped source.
+  const shellSourceTree = [];
+  {
+    const skipDirs = new Set(["node_modules", "dist", ".vite", ".turbo"]);
+    const walk = async (dir) => {
+      for (const name of (await readdir(dir)).sort()) {
+        if (skipDirs.has(name)) continue;
+        const candidate = join(dir, name);
+        const entry = await stat(candidate);
+        if (entry.isDirectory()) await walk(candidate);
+        else if (entry.isFile()) shellSourceTree.push(candidate);
+      }
+    };
+    await walk(resolve("web/workspace-shell"));
+  }
   const singleCeremonyScanSet = [
-    ...(await filesUnder(resolve("web/workspace-shell/src"))).filter(
+    ...shellSourceTree.filter(
       (path) => isShellTextSource(path) && !isShellTestSource(path),
     ),
-    // The shipped HTML entrypoint can hold an inline script, so keep it in
-    // scope too (the runtime header artifact cannot execute script).
+    // The built HTML entrypoint is kept in scope too (the runtime header
+    // artifact cannot execute script). Minified `dist/assets` bundles are not
+    // name-scanned: the behavioral unit/E2E tests remain authoritative.
     shellHtmlPath,
   ];
   const getSites = [];

@@ -367,11 +367,12 @@ test("wrapper creation and unlock evaluate the SAME stable PRF eval salt", async
 
 test("a pre-fix per-wrapper eval-salt wrapper fails closed, and the documented re-add migrates it", async () => {
   // The single-ceremony fix moved the PRF eval salt from each record's random
-  // `salt_b64` to the stable workspace constant. A wrapper written by an
-  // earlier pre-release candidate therefore cannot unwrap under the constant
-  // salt: the login must fail closed (never unlock with the wrong key), and the
-  // documented recovery-then-"Add this device's passkey" path must rewrite a
-  // working wrapper under the same root. This pins docs/workspace-recovery.md.
+  // `salt_b64` to the stable workspace constant, so the PRF an authenticator
+  // returns for an old wrapper differs from the constant-salt PRF (modelled
+  // here by two different PRF byte strings). The old wrapper must fail closed
+  // (never unlock with the wrong key), and the documented recovery-then-"Add
+  // this device's passkey" path must rewrite a working wrapper under the same
+  // root. This pins docs/workspace-recovery.md.
   const root = new Uint8Array(32).fill(0x7a);
   const fingerprint = await deriveWorkspaceRootFingerprint(root);
   const credentialIdB64 = "AQID";
