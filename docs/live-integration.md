@@ -1160,3 +1160,35 @@ asserts the decrypted workspace actually renders. The only unproven composition
 is a single runner that does *both* the real Rust loader and a real DOM boot; it
 is recorded here rather than implied.
 
+
+## Stable Workspace Root Key (v2) — release identity and recovery
+
+The release-bound recovery/unlock model has been replaced by a stable Workspace
+Root Key. Full rationale and invariants are in
+`docs/decisions/0003-stable-workspace-root-key.md` and
+`docs/workspace-recovery.md`; the operational summary:
+
+- One client-generated 32-byte Workspace Root Secret per workspace, created
+  once. The stable recipient keypair is derived under the fixed context
+  `base64(sha256("evergreen/workspace-root-key/v2")[0..16])`, never a release
+  id/KID.
+- `GET /internal/workspace/identity` returns the durable public identity;
+  `POST /internal/workspace/identity` is the create-once bootstrap and accepts
+  only the public key plus opaque `workspace_root_v2` wrappers.
+- Recovery proof-of-possession challenges seal to the durable workspace identity
+  under the fixed context, so recovery mutation no longer depends on a release
+  manifest or session enrollment.
+- The server persists only the public identity plus encrypted wrappers/metadata.
+  The root secret, recovery code, PRF output and unwrap keys never reach it; a
+  bootstrap body carrying a secret-shaped field is rejected (`deny_unknown_fields`).
+- Release tooling seals to `WORKSPACE_PUBLIC_KEY_B64` under the fixed context and
+  never reads `WORKSPACE_UNLOCK_SECRET_B64`. `WORKSPACE_ARTIFACT_KID_B64` is
+  deprecated: absent it defaults to the stable context, and a foreign value
+  fails closed.
+- Normal login is Access -> Passkey -> auto-unlock; the recovery code is behind a
+  small "Having trouble signing in?" action and is shown once at setup.
+- The mandatory operational test builds releases N and N+1 from only the stable
+  public key and proves the same root unlocks both with no reseal.
+
+Legacy `unlock_secret_v1` wrapper records remain parseable as bounded migration
+data but are ignored by the normal flow and rejected at bootstrap.
