@@ -276,7 +276,7 @@ fn optional_fomo_market_config(
         100,
         30_000,
     )?;
-    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 5_000, 60_000)?;
+    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 1_000, 60_000)?;
     let stream_count_back = parse_u32_env("PRIVATE_FOMO_STREAM_COUNT_BACK", 300, 1, 1_500)?;
     let target = match stream_target {
         Some(value) => Some(parse_stream_target(&value)?),
@@ -288,7 +288,10 @@ fn optional_fomo_market_config(
             api_key_file: std::path::PathBuf::from(key_file),
             request_timeout,
             stream_target: target,
-            stream_poll,
+            // Clamp, never reject, a faster-than-approved operator value: the
+            // approved realtime source is REST polling at >=5s, so an existing
+            // sub-5s setting becomes 5s instead of a startup failure.
+            stream_poll: private_api::FomoMarketConfig::clamp_poll(stream_poll),
             stream_count_back,
         },
         api_key,

@@ -240,10 +240,12 @@ impl std::fmt::Debug for OpaqueComposition {
 ///
 /// * an absent dispatcher forces every command capability false;
 /// * an absent stream source forces `realtime` false;
-/// * `market`, `execute`, `limits` and `realtime` are each additionally gated on
-///   a proof that the backing dependency was observed healthy;
-/// * every other mutation (`twap`/`rfq`/`withdraw`/`wallet_limits`) rides the
-///   same live execution path, so it requires the execution proof.
+/// * `market` and `realtime` each require a proof that their backing read
+///   dependency was observed healthy;
+/// * `limits` requires the limit-engine proof **and** the full execution proof,
+///   because a limit order is a capital-committing mutation;
+/// * the other mutations (`twap`/`rfq`/`withdraw`/`wallet_limits`) ride the
+///   same live execution path, so they require the execution proof.
 ///
 /// Presence is a necessary condition, not a guarantee of capability: even a
 /// wired seam cannot advertise a capability whose dependency is unproven, and
