@@ -171,6 +171,18 @@ pub struct ManifestArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestRecipient {
     pub public_key_fingerprint_b64: String,
+    /// Explicit marker that this release was sealed to the stable Root-Key-V2
+    /// workspace identity (as opposed to a legacy release-bound recipient).
+    ///
+    /// It exists so the one-time identity bootstrap can enforce the
+    /// recipient-fingerprint binding for stable-root releases while still
+    /// allowing the bounded legacy→stable migration: a legacy manifest predates
+    /// the stable root and must not constrain the bootstrap. Artifact KID is
+    /// deliberately not used for this decision, because KID is release metadata
+    /// and must never be part of the recipient identity. Defaults to `false` so
+    /// a pre-marker manifest deserializes as legacy.
+    #[serde(default)]
+    pub root_key_v2: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,11 +274,14 @@ fn load_release_manifest_from(path: &std::path::Path) -> Result<ReleaseManifest,
 ///
 /// The decision is derived only from public metadata (artifact header, enrolled
 /// public key, release fingerprint); it is not an oracle for the unlock secret.
-/// With no configured release manifest the server has no trusted recipient
-/// public key to compare, so it enforces the version/KID binding only; a
-/// mismatched key in that mode is still rejected fail-closed by the browser's
-/// `decrypt_artifact` and by the enrolled-key fingerprint when a manifest is
-/// present.
+/// The artifact KID is release metadata bound into the sealed envelope, so it is
+/// validated against the manifest (integrity) but never against the enrolled
+/// workspace identity: two releases may carry different KIDs while remaining
+/// sealed to the same stable workspace public key. With no configured release
+/// manifest the server has no trusted recipient public key to compare, so it
+/// enforces the version binding only; a mismatched key in that mode is still
+/// rejected fail-closed by the browser's Root-Key-V2 decrypt and by the
+/// enrolled-key fingerprint when a manifest is present.
 pub fn preflight(
     artifact: &[u8],
     enrollment: Option<&EnrollmentSnapshot>,
@@ -294,7 +309,7 @@ pub fn preflight(
     let Some(enrollment) = enrollment else {
         return UnlockCompatibility::EnrollmentRequired;
     };
-    if enrollment.version != envelope.version || enrollment.kid != envelope.kid {
+    if enrollment.version != envelope.version {
         return UnlockCompatibility::ArtifactIncompatible;
     }
     if let Some(manifest) = manifest {
@@ -371,7 +386,7 @@ impl ReleaseManifest {
     }
 
     /// Validate the public, artifact-independent manifest fields.
-    fn validate_shape(&self) -> Result<(), DescriptorError> {
+    pub(crate) fn validate_shape(&self) -> Result<(), DescriptorError> {
         if self.manifest_version != MANIFEST_VERSION {
             return Err(DescriptorError::ManifestInvalid);
         }
@@ -482,14 +497,16 @@ impl ArtifactDescriptor {
 mod tests {
     use super::*;
     use crypto_envelope::{
-        derive_workspace_keypair, seal_artifact, ARTIFACT_VERSION, UNLOCK_SECRET_LEN,
+        derive_workspace_root_keypair, seal_artifact, ARTIFACT_VERSION, UNLOCK_SECRET_LEN,
     };
 
     const TEST_SECRET: [u8; UNLOCK_SECRET_LEN] = [0x33; UNLOCK_SECRET_LEN];
     const TEST_KID: [u8; auth::WORKSPACE_KID_BYTES] = [0x44; auth::WORKSPACE_KID_BYTES];
 
     fn sealed_artifact() -> (Vec<u8>, EnrollmentSnapshot) {
-        let keypair = derive_workspace_keypair(&TEST_SECRET, ARTIFACT_VERSION, &TEST_KID).unwrap();
+        // Stable Root-Key-V2 identity: derived from the root secret alone, then
+        // sealed with the (metadata-only) artifact KID.
+        let keypair = derive_workspace_root_keypair(&TEST_SECRET).unwrap();
         let artifact = seal_artifact(
             &keypair.public_key(),
             ARTIFACT_VERSION,
@@ -569,13 +586,17 @@ mod tests {
             UnlockCompatibility::Ok
         );
 
-        let mut wrong_kid = snapshot;
-        wrong_kid.kid[0] ^= 1;
+        // The artifact KID is release metadata, not the workspace identity: a
+        // different enrollment label with the same stable public key is still
+        // compatible.
+        let mut relabeled = snapshot;
+        relabeled.kid[0] ^= 1;
         assert_eq!(
-            preflight(&artifact, Some(&wrong_kid), None),
-            UnlockCompatibility::ArtifactIncompatible
+            preflight(&artifact, Some(&relabeled), None),
+            UnlockCompatibility::Ok
         );
 
+        // A wrong envelope version is still incompatible.
         let mut wrong_version = snapshot;
         wrong_version.version = ARTIFACT_VERSION + 1;
         assert_eq!(
@@ -603,6 +624,7 @@ mod tests {
             },
             recipient: ManifestRecipient {
                 public_key_fingerprint_b64: public_key_fingerprint_b64(&snapshot.public_key),
+                root_key_v2: true,
             },
             workspace_protocol: ManifestProtocol {
                 min: WORKSPACE_PROTOCOL_VERSION,
@@ -677,6 +699,52 @@ mod tests {
             preflight(&artifact, Some(&snapshot), Some(&bad_shell_digest)),
             UnlockCompatibility::ArtifactIncompatible
         );
+    }
+
+    #[test]
+    fn preflight_accepts_distinct_artifact_kids_for_one_stable_identity() {
+        // One stable workspace public key, two releases with different artifact
+        // KIDs, and an enrollment label that matches neither. Both releases must
+        // be compatible: KID is envelope metadata, not recipient identity.
+        let root = derive_workspace_root_keypair(&TEST_SECRET).unwrap();
+        let enrollment = EnrollmentSnapshot {
+            version: ARTIFACT_VERSION,
+            kid: TEST_KID,
+            public_key: root.public_key_bytes(),
+        };
+
+        for artifact_kid in [
+            [0x99u8; auth::WORKSPACE_KID_BYTES],
+            [0x77u8; auth::WORKSPACE_KID_BYTES],
+        ] {
+            let artifact = seal_artifact(
+                &root.public_key(),
+                ARTIFACT_VERSION,
+                &artifact_kid,
+                b"payload",
+            )
+            .unwrap();
+            let sealing = EnrollmentSnapshot {
+                version: ARTIFACT_VERSION,
+                kid: artifact_kid,
+                public_key: root.public_key_bytes(),
+            };
+            let manifest = manifest_for(&artifact, &sealing);
+            assert!(manifest.recipient.root_key_v2);
+            assert_eq!(
+                preflight(&artifact, Some(&enrollment), Some(&manifest)),
+                UnlockCompatibility::Ok
+            );
+        }
+
+        // A legacy manifest without the marker deserializes as non-root-v2, so it
+        // cannot be silently reinterpreted as a stable-root release.
+        let legacy: ManifestRecipient = serde_json::from_str(&format!(
+            "{{\"public_key_fingerprint_b64\":\"{}\"}}",
+            public_key_fingerprint_b64(&[1u8; 32])
+        ))
+        .unwrap();
+        assert!(!legacy.root_key_v2);
     }
 
     #[test]

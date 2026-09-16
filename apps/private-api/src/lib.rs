@@ -1963,30 +1963,26 @@ async fn bootstrap_workspace_identity(
             Ok(identity) => identity,
             Err(_) => return generic_error(StatusCode::BAD_REQUEST),
         };
-    // Once a release has been sealed to the stable workspace context, the
-    // create-once identity must match that release's recipient fingerprint.
-    // Otherwise an authenticated session could squat the identity with a key it
-    // controls and every future release would be sealed to it. A legacy manifest
-    // (still sealed under a per-release KID) predates the stable root and does
-    // not constrain the one-time migration bootstrap.
+    // Once a stable Root-Key-V2 release is published, the create-once identity
+    // must match that release's recipient public-key fingerprint. Otherwise an
+    // authenticated session could squat the identity with a key it controls and
+    // every future release would be sealed to it. The decision keys off the
+    // explicit `root_key_v2` marker, never the artifact KID: the KID is release
+    // metadata and may change between consecutive releases for the same stable
+    // workspace identity. A legacy release-bound manifest predates the stable
+    // root and does not constrain the one-time migration bootstrap.
     match state.load_manifest().await {
         Ok(Some(manifest)) => {
-            // Decode the manifest KID canonically so a non-canonical-but-equal
-            // encoding cannot skip the recipient binding, and an undecodable KID
-            // fails closed instead of silently disabling the binding.
-            match release::decode_canonical_b64_variable(&manifest.artifact.kid_b64) {
-                Some(kid) if kid == recovery::WORKSPACE_ROOT_CONTEXT_KID => {
-                    if manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64 {
-                        return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
-                    }
-                }
-                // A legacy per-release KID predates the stable root and does not
-                // constrain the one-time migration bootstrap.
-                Some(_) => {}
-                // A configured manifest whose KID cannot be decoded is a server
-                // misconfiguration; fail the bootstrap closed rather than
-                // skipping the recipient binding.
-                None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+            // A configured-but-broken manifest is a server misconfiguration;
+            // fail the bootstrap closed rather than skipping the recipient
+            // binding.
+            if manifest.validate_shape().is_err() {
+                return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            if manifest.recipient.root_key_v2
+                && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
+            {
+                return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
             }
         }
         Ok(None) => {}
@@ -4120,15 +4116,41 @@ mod tests {
     }
 
     /// Authenticated workspace enrollment for a test session.
-    async fn enroll_test_workspace(
+    /// Minimal test seam over the two workspace key shapes: a legacy
+    /// release-bound keypair (with its own KID) and the stable Root-Key-V2
+    /// keypair (whose enrollment label is the fixed protocol context).
+    trait TestWorkspaceKey {
+        fn test_enrollment_kid(&self) -> [u8; auth::WORKSPACE_KID_BYTES];
+        fn test_public_key(&self) -> [u8; crypto_envelope::PUBLIC_KEY_LEN];
+    }
+
+    impl TestWorkspaceKey for crypto_envelope::WorkspaceUnlockKeyPair {
+        fn test_enrollment_kid(&self) -> [u8; auth::WORKSPACE_KID_BYTES] {
+            self.kid()
+        }
+        fn test_public_key(&self) -> [u8; crypto_envelope::PUBLIC_KEY_LEN] {
+            self.public_key_bytes()
+        }
+    }
+
+    impl TestWorkspaceKey for crypto_envelope::WorkspaceRootKeyPair {
+        fn test_enrollment_kid(&self) -> [u8; auth::WORKSPACE_KID_BYTES] {
+            recovery::WORKSPACE_ROOT_CONTEXT_KID
+        }
+        fn test_public_key(&self) -> [u8; crypto_envelope::PUBLIC_KEY_LEN] {
+            self.public_key_bytes()
+        }
+    }
+
+    async fn enroll_test_workspace<K: TestWorkspaceKey>(
         state: &PrivateApiState,
         session_cookie: &str,
-        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+        keypair: &K,
     ) {
         let body = serde_json::json!({
             "version": auth::ARTIFACT_VERSION,
-            "kid": base64_encode(&keypair.kid()),
-            "public_key": base64_encode(&keypair.public_key_bytes()),
+            "kid": base64_encode(&keypair.test_enrollment_kid()),
+            "public_key": base64_encode(&keypair.test_public_key()),
         });
         let response = router(state.clone())
             .oneshot(
@@ -5189,28 +5211,32 @@ mod tests {
         (status, bytes)
     }
 
+    /// The release manifest is the trusted binding between the sealed release and
+    /// the stable workspace recipient. A session that enrolled a different
+    /// workspace key must be rejected with a typed code before any outer HPKE
+    /// wrapping happens.
     #[tokio::test]
-    async fn artifact_delivery_rejects_kid_mismatch_before_transport() {
+    async fn artifact_delivery_rejects_recipient_mismatch_before_transport() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let (state, client) = test_state(clock);
-        // Enrollment uses kid A; the artifact on disk was sealed under kid B.
-        // This is the production class of failure: delivery must be rejected
-        // with a typed code before any outer HPKE wrapping happens.
-        let enrolled = test_keypair(0x5a, 0x01);
-        let sealed_under = test_keypair(0x5a, 0x02);
+        let released = test_root_keypair(0x5a);
+        let attacker = test_root_keypair(0x5b);
         let package = pack_test_files(&[("index.html", b"workspace")]);
         let artifact = crypto_envelope::seal_artifact(
-            &sealed_under.public_key(),
+            &released.public_key(),
             auth::ARTIFACT_VERSION,
-            &sealed_under.kid(),
+            &[0x42u8; auth::WORKSPACE_KID_BYTES],
             &package,
         )
         .unwrap();
         let artifact_copy = artifact.clone();
-        let state = state.with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())));
+        let manifest = test_manifest(&artifact, &released.public_key_bytes(), true);
+        let state = state
+            .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
+            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))));
         let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
             establish_session_and_grant(&state, &client).await;
-        enroll_test_workspace(&state, &session_cookie, &enrolled).await;
+        enroll_test_workspace(&state, &session_cookie, &attacker).await;
 
         let (status, body) = deliver_artifact_request(
             &state,
@@ -5225,6 +5251,50 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["code"], "artifact_incompatible");
         assert!(body.len() < 4096, "error body must be bounded");
+    }
+
+    /// The artifact KID is release metadata: a release sealed to the stable
+    /// workspace recipient with a KID that differs from the protocol context must
+    /// still be delivered, and the stable root opens it.
+    #[tokio::test]
+    async fn artifact_delivery_accepts_a_foreign_artifact_kid_for_the_stable_recipient() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client) = test_state(clock);
+        let released = test_root_keypair(0x5c);
+        let foreign_kid = [0x7eu8; auth::WORKSPACE_KID_BYTES];
+        assert_ne!(foreign_kid, recovery::WORKSPACE_ROOT_CONTEXT_KID);
+        let package = pack_test_files(&[("index.html", b"workspace")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &released.public_key(),
+            auth::ARTIFACT_VERSION,
+            &foreign_kid,
+            &package,
+        )
+        .unwrap();
+        let artifact_copy = artifact.clone();
+        let manifest = test_manifest(&artifact, &released.public_key_bytes(), true);
+        let state = state
+            .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
+            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))));
+        let (session_cookie, grant_cookie, grant_id, (server_kid, server_pk)) =
+            establish_session_and_grant(&state, &client).await;
+        enroll_test_workspace(&state, &session_cookie, &released).await;
+
+        let (status, body) = deliver_artifact_request(
+            &state,
+            &session_cookie,
+            &grant_cookie,
+            &grant_id,
+            &server_kid,
+            &server_pk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "delivery body: {body:?}");
+        // The same stable root decrypts the foreign-KID artifact.
+        assert_eq!(
+            crypto_envelope::decrypt_artifact_with_root(&released, &artifact).unwrap(),
+            package
+        );
     }
 
     #[tokio::test]
@@ -5528,17 +5598,12 @@ mod tests {
             crypto_envelope::UNLOCK_SECRET_LEN,
         )
         .expect("fixture secret");
-        let kid_bytes = release::decode_canonical_b64(
-            fixture["kidB64"].as_str().expect("kidB64"),
-            auth::WORKSPACE_KID_BYTES,
-        )
-        .expect("fixture kid");
         let secret: [u8; crypto_envelope::UNLOCK_SECRET_LEN] =
             secret_bytes.try_into().expect("secret length");
-        let kid: [u8; auth::WORKSPACE_KID_BYTES] = kid_bytes.try_into().expect("kid length");
-        let keypair =
-            crypto_envelope::derive_workspace_keypair(&secret, auth::ARTIFACT_VERSION, &kid)
-                .expect("derive workspace keypair");
+        // The production build script seals to the stable Root-Key-V2 public key,
+        // so the fixture secret derives the KID-free root keypair.
+        let keypair = crypto_envelope::derive_workspace_root_keypair(&secret)
+            .expect("derive root workspace keypair");
         let expected_artifact = std::fs::read(&artifact_path).expect("artifact readable");
 
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
@@ -5597,7 +5662,7 @@ mod tests {
             delivered_artifact, expected_artifact,
             "delivered bytes must equal the production build-script artifact"
         );
-        let package = crypto_envelope::decrypt_artifact(&keypair, &delivered_artifact)
+        let package = crypto_envelope::decrypt_artifact_with_root(&keypair, &delivered_artifact)
             .expect("inner artifact decrypt");
         let files = unpack_test_package(&package);
         let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
@@ -5643,7 +5708,7 @@ mod tests {
         // A matching manifest is the healthy baseline; pin the loader so
         // `manifest_configured` is not racy against other tests that mutate
         // `WORKSPACE_RELEASE_MANIFEST`.
-        let baseline_manifest = test_manifest(&artifact, &keypair);
+        let baseline_manifest = test_manifest(&artifact, &keypair.public_key_bytes(), false);
         let state = state
             .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
             .with_manifest_loader(Arc::new(move || Ok(Some(baseline_manifest.clone()))));
@@ -5690,9 +5755,12 @@ mod tests {
         // Manifest swap after startup: the artifact verdict is cached, so a
         // manifest that is corrupted *after* the artifact was verified must
         // still fail readiness on the next probe (no stale-green).
-        let manifest_cell: Arc<std::sync::Mutex<Option<release::ReleaseManifest>>> = Arc::new(
-            std::sync::Mutex::new(Some(test_manifest(&artifact, &keypair))),
-        );
+        let manifest_cell: Arc<std::sync::Mutex<Option<release::ReleaseManifest>>> =
+            Arc::new(std::sync::Mutex::new(Some(test_manifest(
+                &artifact,
+                &keypair.public_key_bytes(),
+                false,
+            ))));
         let cell = manifest_cell.clone();
         let swap_state = state
             .clone()
@@ -5760,7 +5828,7 @@ mod tests {
             bytes[last] ^= 0x01;
             bytes
         };
-        let manifest_for_original = test_manifest(&artifact, &keypair);
+        let manifest_for_original = test_manifest(&artifact, &keypair.public_key_bytes(), false);
         let tampered = state
             .clone()
             .with_artifact_loader(Arc::new({
@@ -5947,23 +6015,27 @@ mod tests {
 
     fn test_manifest(
         artifact: &[u8],
-        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+        public_key: &[u8; crypto_envelope::PUBLIC_KEY_LEN],
+        root_key_v2: bool,
     ) -> release::ReleaseManifest {
+        // The artifact KID is envelope metadata: read it from the sealed bytes
+        // rather than from the recipient key, so a manifest can describe any
+        // valid KID for the same stable workspace identity.
+        let envelope = crypto_envelope::ArtifactEnvelope::from_bytes(artifact).unwrap();
         release::ReleaseManifest {
             manifest_version: release::MANIFEST_VERSION,
             release_id: "release-recovery-test".into(),
             source_sha: "9a5a712".into(),
             artifact: release::ManifestArtifact {
                 version: auth::ARTIFACT_VERSION,
-                kid_b64: base64_encode(&keypair.kid()),
+                kid_b64: base64_encode(&envelope.kid),
                 sha256_hex: release::sha256_hex(artifact),
                 size: artifact.len() as u64,
                 package_format_version: release::PACKAGE_FORMAT_VERSION,
             },
             recipient: release::ManifestRecipient {
-                public_key_fingerprint_b64: release::public_key_fingerprint_b64(
-                    &keypair.public_key_bytes(),
-                ),
+                public_key_fingerprint_b64: release::public_key_fingerprint_b64(public_key),
+                root_key_v2,
             },
             workspace_protocol: release::ManifestProtocol {
                 min: release::WORKSPACE_PROTOCOL_VERSION,
@@ -6001,14 +6073,12 @@ mod tests {
         )
     }
 
-    /// Stable workspace root keypair for a test root secret under the fixed
-    /// protocol context. It never depends on a release KID, so the identity is
-    /// identical across releases.
-    fn test_root_keypair(secret_byte: u8) -> crypto_envelope::WorkspaceUnlockKeyPair {
-        crypto_envelope::derive_workspace_keypair(
+    /// Stable Root-Key-V2 workspace keypair for a test root secret. It is derived
+    /// from the root secret under the fixed Root-Key-V2 domain and never depends
+    /// on a release KID, so the identity is identical across releases.
+    fn test_root_keypair(secret_byte: u8) -> crypto_envelope::WorkspaceRootKeyPair {
+        crypto_envelope::derive_workspace_root_keypair(
             &[secret_byte; crypto_envelope::UNLOCK_SECRET_LEN],
-            auth::ARTIFACT_VERSION,
-            &recovery::WORKSPACE_ROOT_CONTEXT_KID,
         )
         .unwrap()
     }
@@ -6030,7 +6100,7 @@ mod tests {
     async fn bootstrap_identity(
         state: &PrivateApiState,
         session_cookie: &str,
-        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+        keypair: &crypto_envelope::WorkspaceRootKeyPair,
     ) -> Response {
         let body = serde_json::json!({
             "version": recovery::WORKSPACE_IDENTITY_VERSION,
@@ -6115,7 +6185,7 @@ mod tests {
         // sealed to the durable workspace identity, so only the holder of the
         // stable root can open it.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         let proof = base64_encode(&nonce);
         let response = post_json(
             &state,
@@ -6149,7 +6219,8 @@ mod tests {
 
         // A wrong proof is rejected and consumes the challenge.
         let (wrong_challenge_id, wrong_sealed) = issue_recovery(&state, &session_cookie).await;
-        let correct_nonce = crypto_envelope::decrypt_artifact(&keypair, &wrong_sealed).unwrap();
+        let correct_nonce =
+            crypto_envelope::decrypt_artifact_with_root(&keypair, &wrong_sealed).unwrap();
         let wrong = base64_encode(&[0u8; recovery::RECOVERY_CHALLENGE_BYTES]);
         let response = post_json(
             &state,
@@ -6171,7 +6242,7 @@ mod tests {
 
         // Revoke needs a fresh proof.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         let revoke = post_json(
             &state,
             &session_cookie,
@@ -6188,7 +6259,7 @@ mod tests {
         // A legacy `unlock_secret_v1` wrapper must never be accepted back into
         // the stable-root store through add/rotate, even with a valid proof.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         let mut legacy = wrapper_body(&challenge_id, &base64_encode(&nonce));
         legacy["wrapper"]["key_source"] =
             serde_json::json!(recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1);
@@ -6250,7 +6321,7 @@ mod tests {
             recovery::RECOVERY_CHALLENGE_ID_BYTES * 2
         );
         assert_eq!(sealed.len(), 97);
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         assert_eq!(nonce.len(), recovery::RECOVERY_CHALLENGE_BYTES);
     }
 
@@ -6340,8 +6411,8 @@ mod tests {
 
         // A challenge still opens only with the original stable root.
         let (_, sealed) = issue_recovery(&state, &session_cookie).await;
-        assert!(crypto_envelope::decrypt_artifact(&released, &sealed).is_ok());
-        assert!(crypto_envelope::decrypt_artifact(&attacker, &sealed).is_err());
+        assert!(crypto_envelope::decrypt_artifact_with_root(&released, &sealed).is_ok());
+        assert!(crypto_envelope::decrypt_artifact_with_root(&attacker, &sealed).is_err());
     }
 
     /// The bootstrap API must reject any attempt to smuggle plaintext secret
@@ -6427,9 +6498,9 @@ mod tests {
             &package,
         )
         .unwrap();
-        // `test_manifest` records the keypair's context KID and fingerprint, so
-        // this is a release already bound to the stable workspace identity.
-        let manifest = test_manifest(&artifact, &released);
+        // `test_manifest` reads the artifact KID from the sealed bytes and records
+        // the recipient fingerprint, so this is a stable-root release.
+        let manifest = test_manifest(&artifact, &released.public_key_bytes(), true);
         assert_eq!(
             manifest.artifact.kid_b64,
             base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID)
@@ -6447,15 +6518,15 @@ mod tests {
         let (_, identity_body) = get_identity(&state, &session_cookie).await;
         assert_eq!(identity_body["configured"], false);
 
-        // A configured manifest whose KID cannot be decoded fails the bootstrap
+        // A configured manifest that is structurally invalid fails the bootstrap
         // closed rather than silently skipping the recipient binding.
-        let mut garbled_manifest = manifest.clone();
-        garbled_manifest.artifact.kid_b64 = "not-canonical!".to_string();
-        let garbled_state = state
+        let mut malformed_manifest = manifest.clone();
+        malformed_manifest.recipient.public_key_fingerprint_b64 = "not-canonical!".to_string();
+        let malformed_state = state
             .clone()
-            .with_manifest_loader(Arc::new(move || Ok(Some(garbled_manifest.clone()))));
+            .with_manifest_loader(Arc::new(move || Ok(Some(malformed_manifest.clone()))));
         assert_eq!(
-            bootstrap_identity(&garbled_state, &session_cookie, &attacker)
+            bootstrap_identity(&malformed_state, &session_cookie, &attacker)
                 .await
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -6482,6 +6553,52 @@ mod tests {
         );
     }
 
+    /// A stable-root manifest binds the identity by recipient fingerprint, never
+    /// by artifact KID: a release whose envelope KID differs from the protocol
+    /// context still constrains the bootstrap, so a KID rotation cannot let an
+    /// attacker squat the identity.
+    #[tokio::test]
+    async fn workspace_identity_bootstrap_binds_across_artifact_kids() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let released = test_root_keypair(0xB7);
+        let foreign_kid = [0x5eu8; auth::WORKSPACE_KID_BYTES];
+        assert_ne!(foreign_kid, recovery::WORKSPACE_ROOT_CONTEXT_KID);
+        let package = pack_test_files(&[("index.html", b"ok")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &released.public_key(),
+            auth::ARTIFACT_VERSION,
+            &foreign_kid,
+            &package,
+        )
+        .unwrap();
+        let manifest = test_manifest(&artifact, &released.public_key_bytes(), true);
+        assert!(manifest.recipient.root_key_v2);
+        assert_eq!(manifest.artifact.kid_b64, base64_encode(&foreign_kid));
+        let manifest_clone = manifest.clone();
+        let state = state.with_manifest_loader(Arc::new(move || Ok(Some(manifest_clone.clone()))));
+
+        // A key that does not match the published stable fingerprint is refused
+        // even though the artifact KID is foreign.
+        let attacker = test_root_keypair(0xC3);
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &attacker)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        // The stable key bootstraps.
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &released)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
     #[tokio::test]
     async fn recovery_touch_requires_proof_of_possession() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
@@ -6498,7 +6615,7 @@ mod tests {
 
         // Add a wrapper so there is something to touch.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         let response = post_json(
             &state,
             &session_cookie,
@@ -6524,7 +6641,7 @@ mod tests {
 
         // With a real proof it succeeds.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let nonce = crypto_envelope::decrypt_artifact_with_root(&keypair, &sealed).unwrap();
         let proven = post_json(
             &state,
             &session_cookie,
