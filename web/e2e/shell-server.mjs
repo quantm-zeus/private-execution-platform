@@ -17,10 +17,15 @@ import { existsSync } from "node:fs";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  WORKSPACE_ROOT_CONTEXT_BYTES,
   derivePublicKey,
   packDirectory,
   sealPackage,
 } from "../../scripts/workspace-artifact.mjs";
+import {
+  RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
+  wrapRootKey,
+} from "../workspace-shell/src/recovery-wrapping.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = resolve(here, "../..");
@@ -150,40 +155,77 @@ let prepareError = null;
 let secrets = null;
 let sealedArtifactPath = null;
 let descriptor = null;
+let workspaceIdentity = null;
+let recoveryWrapper = null;
 let enrolledKidB64 = null;
 let grant = null;
 const host = new SessionHost();
 
+// The shell reserves this credential id for the offline recovery wrapper.
+const OFFLINE_RECOVERY_CREDENTIAL_B64 = Buffer.from(
+  "evergreen-offline-recovery/v2",
+).toString("base64");
+
 async function prepare() {
   const secret = randomBytes(32);
-  const kid = randomBytes(16);
+  // Releases are sealed under the fixed stable workspace context, never a
+  // per-release KID; the recipient identity is the stable root's public key.
+  const kid = WORKSPACE_ROOT_CONTEXT_BYTES;
   const publicKey = derivePublicKey(secret, kid, 1);
   const packed = await packDirectory(PAYLOAD_DIST);
   const artifact = await sealPackage(packed, publicKey, kid, 1);
   sealedArtifactPath = join(resolve(process.env.TMPDIR ?? "/tmp"), `e2e-shell-artifact-${process.pid}.bin`);
   await writeFile(sealedArtifactPath, artifact, { mode: 0o600 });
-  secrets = { secretB64: secret.toString("base64"), kidB64: kid.toString("base64") };
-  // Authenticated descriptor: the KID is discovered from the server, never
-  // typed by the user, and the expected fingerprint lets the shell reject the
-  // wrong recovery code before any network call.
+
+  // Wrap the same stable root under a known offline recovery code, exactly as
+  // the browser would at initial setup. The root itself never leaves this host.
+  const recoveryCode = randomBytes(32).toString("base64");
+  const record = await wrapRootKey(
+    Buffer.from(recoveryCode, "base64"),
+    secret,
+    undefined,
+    undefined,
+    "",
+    RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
+  );
+  recoveryWrapper = {
+    credential_id_b64: OFFLINE_RECOVERY_CREDENTIAL_B64,
+    label: "Offline recovery code",
+    version: record.version,
+    algorithm: record.algorithm,
+    key_source: record.key_source,
+    salt_b64: record.salt_b64,
+    iv_b64: record.iv_b64,
+    wrapped_root_key_b64: record.wrapped_root_key_b64,
+    created_at_ms: Date.now(),
+    last_used_at_ms: null,
+    revoked_at_ms: null,
+  };
+
+  const fingerprintB64 = createHash("sha256").update(publicKey).digest("base64");
+  workspaceIdentity = {
+    configured: true,
+    version: 1,
+    public_key_b64: publicKey.toString("base64"),
+    fingerprint_b64: fingerprintB64,
+  };
   descriptor = {
     protocol_version: 1,
     artifact_version: 1,
-    artifact_kid_b64: kid.toString("base64"),
+    artifact_kid_b64: Buffer.from(kid).toString("base64"),
     artifact_size: artifact.length,
     artifact_sha256_hex: createHash("sha256").update(artifact).digest("hex"),
     package_format_version: 1,
     release_id: "e2e-release",
     source_sha: "e2e",
-    expected_public_key_fingerprint_b64: createHash("sha256")
-      .update(publicKey)
-      .digest("base64"),
+    expected_public_key_fingerprint_b64: fingerprintB64,
     min_shell_protocol: 1,
     max_shell_protocol: 1,
     enrolled: false,
     enrolled_kid_b64: null,
     enrolled_public_key_fingerprint_b64: null,
   };
+  secrets = { recoveryCode, fingerprintB64 };
   host.start();
   ready = true;
 }
@@ -318,9 +360,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // The passkey-recovery surface is closed on this host (no wrapper store is
-    // configured), so the shell must not advertise it. A uniform 503 keeps the
-    // test host honest instead of letting a 404 be mistaken for a live surface.
+    if (path === "/internal/workspace/identity" && req.method === "GET") {
+      if (!ready || !workspaceIdentity) return json(res, 503, { error: "not ready" });
+      return json(res, 200, workspaceIdentity);
+    }
+
+    if (path === "/internal/workspace/recovery" && req.method === "GET") {
+      if (!ready || !recoveryWrapper) return json(res, 503, { error: "not ready" });
+      return json(res, 200, { wrappers: [recoveryWrapper] });
+    }
+
+    // Wrapper mutation requires proof of possession; this minimal host does not
+    // implement it, so it stays closed rather than pretending to accept a write.
     if (path.startsWith("/internal/workspace/recovery")) {
       return json(res, 503, { code: "recovery_unavailable" });
     }

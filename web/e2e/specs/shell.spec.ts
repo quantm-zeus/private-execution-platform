@@ -3,14 +3,18 @@ import { expect, test } from "@playwright/test";
 const SHELL_ORIGIN = `http://127.0.0.1:${process.env.E2E_SHELL_PORT ?? 4320}`;
 const ALLOW_SKIP = process.env.E2E_ALLOW_SKIP === "1";
 
-async function unlockInfo(request: import("@playwright/test").APIRequestContext) {
+interface UnlockInfo {
+  available: boolean;
+  reason?: string;
+  recoveryCode?: string;
+  fingerprintB64?: string;
+}
+
+async function unlockInfo(
+  request: import("@playwright/test").APIRequestContext,
+): Promise<UnlockInfo> {
   const response = await request.get(`${SHELL_ORIGIN}/__test__/unlock`);
-  return (await response.json()) as {
-    available: boolean;
-    reason?: string;
-    secretB64?: string;
-    kidB64?: string;
-  };
+  return (await response.json()) as UnlockInfo;
 }
 
 /**
@@ -38,23 +42,32 @@ test.beforeAll(async () => {
   }
 });
 
-async function unlock(page: import("@playwright/test").Page, info: { secretB64?: string; kidB64?: string }) {
+/** Reveal the recovery fallback if the shell has not already surfaced it. */
+async function openRecovery(page: import("@playwright/test").Page) {
+  const recovery = page.locator("#recovery-code");
+  const trouble = page.getByRole("button", { name: "Having trouble signing in?" });
+  await recovery.or(trouble).first().waitFor({ state: "visible", timeout: 20_000 });
+  if (!(await recovery.isVisible())) {
+    await trouble.click();
+  }
+  await expect(recovery).toBeVisible({ timeout: 20_000 });
+}
+
+async function unlock(
+  page: import("@playwright/test").Page,
+  info: UnlockInfo,
+) {
   await page.goto(`${SHELL_ORIGIN}/`);
-  // The host reports an existing operator session, so the descriptor loads
-  // automatically and only the offline recovery code is required. The KID is
-  // never typed: it comes from the authenticated descriptor.
-  await page.locator("#recovery-code").fill(info.secretB64!);
+  // The host reports an existing operator session, a configured stable
+  // workspace identity, and only an offline recovery wrapper. There is no
+  // passkey auto-unlock, so the shell surfaces the recovery action.
+  await openRecovery(page);
+  await page.locator("#recovery-code").fill(info.recoveryCode!);
   // Snapshot the field at the instant the first unlock network exchange starts.
   // `toHaveValue("")` below retries for up to 7s, so on its own it would also
-  // pass if the secret were cleared only after the exchange; this route pins the
-  // "cleared before the first await" claim. The grant request always fires on an
-  // unlock (enrollment may be skipped once the host has bound the key).
+  // pass if the code were cleared only after the exchange; this route pins the
+  // "cleared before the first await" claim.
   let valueAtFirstGrant: string | null = null;
-  // Resolved by the first intercepted grant request. `page.route` handlers run
-  // asynchronously, so reading `valueAtFirstGrant` straight after the clear
-  // assertion can observe `null` before the grant route has fired; awaiting this
-  // promise makes the observation deterministic without weakening the DOM-clear
-  // security assertion below.
   let resolveFirstGrant: () => void = () => {};
   const firstGrantSeen = new Promise<void>((resolve) => {
     resolveFirstGrant = resolve;
@@ -66,10 +79,10 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
     }
     await route.continue();
   });
-  await page.getByRole("button", { name: "Unlock Workspace" }).click();
-  // The recovery code is cleared from the DOM synchronously before the first
-  // network await, and the form stays mounted until the payload boots, so this
-  // pins the secret-lifetime claim.
+  await page.getByRole("button", { name: "Unlock with recovery code" }).click();
+  // The code is cleared from the DOM synchronously before the first network
+  // await, and the form stays mounted until the payload boots, so this pins the
+  // secret-lifetime claim.
   await expect(page.locator("#recovery-code")).toHaveValue("");
   await firstGrantSeen;
   expect(valueAtFirstGrant).toBe("");
@@ -80,8 +93,8 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
 
 /**
  * Exercises the real authenticated-unlock boundary: the shell derives the
- * workspace key in audited WASM, HPKE-unwraps the encrypted artifact, and
- * instantiates the decrypted payload from `blob:` URLs inside a
+ * stable workspace key in audited WASM, HPKE-unwraps the encrypted artifact,
+ * and instantiates the decrypted payload from `blob:` URLs inside a
  * `sandbox="allow-scripts allow-same-origin"` frame under the production CSP.
  */
 test.describe("shell artifact unlock", () => {
@@ -116,25 +129,26 @@ test.describe("shell artifact unlock", () => {
     await expect(page.getByText("Workspace locked.")).toBeVisible();
   });
 
-  test("rejects a wrong unlock secret without instantiating a payload", async ({ page, request }) => {
+  test("rejects a wrong recovery code locally without instantiating a payload", async ({ page, request }) => {
     const info = await unlockInfo(request);
     test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
 
     await page.goto(`${SHELL_ORIGIN}/`);
+    await openRecovery(page);
     await page.locator("#recovery-code").fill(Buffer.alloc(32, 9).toString("base64"));
-    await page.getByRole("button", { name: "Unlock Workspace" }).click();
+    await page.getByRole("button", { name: "Unlock with recovery code" }).click();
 
-    // The published release fingerprint lets the shell reject the wrong code
-    // locally, before any network call, with actionable recovery guidance.
-    await expect(page.locator(".notice__title")).toContainText(
-      /does not match the published release/i,
+    // The unwrapped root is checked against the durable identity fingerprint, so
+    // a wrong code is rejected locally with actionable guidance.
+    await expect(page.locator("#recovery-message")).toContainText(
+      /does not match this workspace/i,
       { timeout: 20_000 },
     );
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
     await expect(page.locator("#recovery-code")).toHaveCount(1);
   });
 
-  test("shows an explicit open action, never a KID field, and no passkey on mount", async ({ page }) => {
+  test("normal login never exposes KID, keys, fingerprints, or a recovery input", async ({ page }) => {
     // Count WebAuthn ceremonies so an accidental auto-authentication on mount
     // cannot hide behind a prompt the harness silently rejects.
     await page.addInitScript(() => {
@@ -162,10 +176,27 @@ test.describe("shell artifact unlock", () => {
     // No manual Key ID anywhere in the normal flow.
     await expect(page.locator("#unlock-kid")).toHaveCount(0);
     await expect(page.locator("#kid")).toHaveCount(0);
-    // The unlock form is not offered until the operator acts.
+    // The recovery form is behind an explicit action, not on the login screen.
     await expect(page.locator("#recovery-code")).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Having trouble signing in?" }),
+    ).toHaveCount(0);
+    // No release compatibility, key-binding, reseal or protocol detail leaks.
+    const body = (await page.locator("main.gateway").innerText()).toLowerCase();
+    for (const forbidden of [
+      "kid",
+      "public key",
+      "fingerprint",
+      "reseal",
+      "artifact digest",
+      "protocol metadata",
+      "key binding",
+      "recovery code",
+    ]) {
+      expect(body, `normal login must not mention ${forbidden}`).not.toContain(forbidden);
+    }
     // Bootstrap enrollment stays hidden while the server reports it closed.
-    await expect(page.getByText("First-run passkey enrollment")).toHaveCount(0);
+    await expect(page.getByText("First-run operator enrollment")).toHaveCount(0);
     // No passkey pop-up on mount: exactly zero ceremonies until the user acts.
     expect(
       await page.evaluate(
@@ -188,6 +219,21 @@ test.describe("shell artifact unlock", () => {
     ).toBeGreaterThanOrEqual(1);
   });
 
+  test("the recovery input appears only behind the trouble action", async ({ page, request }) => {
+    const info = await unlockInfo(request);
+    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
+
+    await page.goto(`${SHELL_ORIGIN}/`);
+    await expect(
+      page.getByRole("heading", { name: "Unlock the sealed release" }),
+    ).toBeVisible({ timeout: 20_000 });
+    // No passkey unlock is registered on this host, so the shell may have
+    // already surfaced the fallback; either way the recovery input is never on
+    // the initial login screen and only the explicit action controls it.
+    await openRecovery(page);
+    await expect(page.locator("#recovery-code")).toBeVisible();
+  });
+
   test("shows bootstrap enrollment only when the server reports it open", async ({ page }) => {
     // Positive control for the closed-state assertion above: when the server
     // actually reports first-run enrollment open, the control must appear.
@@ -202,7 +248,7 @@ test.describe("shell artifact unlock", () => {
       }),
     );
     await page.goto(`${SHELL_ORIGIN}/`);
-    await expect(page.getByText("First-run passkey enrollment")).toBeVisible();
+    await expect(page.getByText("First-run operator enrollment")).toBeVisible();
   });
 
   test("security gateway has no moderate-or-worse axe violations", async ({ page }) => {
@@ -249,16 +295,16 @@ test.describe("shell artifact unlock", () => {
       });
 
     await page.goto(`${SHELL_ORIGIN}/`);
-    // Authenticated + descriptor loaded: the unlock form, release fingerprint and
-    // recovery guidance are mounted, none of which the signed-out scan covers.
-    await expect(page.locator("#recovery-code")).toBeVisible({ timeout: 20_000 });
+    // Authenticated + identity loaded: the recovery fallback is mounted, which
+    // the signed-out scan does not cover.
+    await openRecovery(page);
     await page.addScriptTag({ url: "/__test__/axe.min.js" });
     expect(await axeViolations(), "authenticated unlock surface").toEqual([]);
 
     // Trigger the credential-failure alert and scan that security-relevant state.
     await page.locator("#recovery-code").fill(Buffer.alloc(32, 9).toString("base64"));
-    await page.getByRole("button", { name: "Unlock Workspace" }).click();
-    await expect(page.locator(".notice__title")).toBeVisible({ timeout: 20_000 });
+    await page.getByRole("button", { name: "Unlock with recovery code" }).click();
+    await expect(page.locator("#recovery-message")).toBeVisible({ timeout: 20_000 });
     expect(await axeViolations(), "credential-failure alert").toEqual([]);
   });
 
@@ -273,7 +319,8 @@ test.describe("shell artifact unlock", () => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.goto(`${SHELL_ORIGIN}/`);
 
-    const primary = page.locator("button.button--primary").first();
+    await openRecovery(page);
+    const primary = page.getByRole("button", { name: "Unlock with recovery code" });
     await expect(primary).toBeVisible({ timeout: 20_000 });
     const buttonBox = await primary.boundingBox();
     expect(buttonBox).not.toBeNull();
@@ -303,22 +350,6 @@ test.describe("shell artifact unlock", () => {
     await frame.getByRole("button", { name: "Lock", exact: true }).click();
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
     await expect(page.getByText("Workspace locked.")).toBeVisible();
-  });
-
-  test("offers no recovery-passkey control when the server reports none", async ({ page, request }) => {
-    const info = await unlockInfo(request);
-    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
-
-    await unlock(page, info);
-    // The test host does not configure the recovery wrapper store, so the shell
-    // must not advertise a passkey-recovery path it cannot complete. The offline
-    // recovery code remains the only credential.
-    await expect(
-      page.getByRole("button", { name: "Unlock with a recovery passkey" }),
-    ).toHaveCount(0);
-    await expect(
-      page.getByRole("heading", { name: "Trusted recovery credentials" }),
-    ).toHaveCount(0);
   });
 
   test("descriptor failure offers a retry instead of a dead end", async ({ page }) => {
