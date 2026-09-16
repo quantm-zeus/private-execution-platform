@@ -225,10 +225,7 @@ pub struct WorkspaceIdentityRecord {
 
 impl WorkspaceIdentityRecord {
     /// Validate a client-supplied public key and compute its fingerprint.
-    pub fn from_public_key(
-        public_key_b64: &str,
-        now_ms: i64,
-    ) -> Result<Self, RecoveryInputError> {
+    pub fn from_public_key(public_key_b64: &str, now_ms: i64) -> Result<Self, RecoveryInputError> {
         let key = decode_canonical_b64(public_key_b64, WORKSPACE_PUBLIC_KEY_BYTES)
             .ok_or(RecoveryInputError::Invalid)?;
         if key.iter().all(|&byte| byte == 0) {

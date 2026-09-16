@@ -1923,11 +1923,11 @@ async fn bootstrap_workspace_identity(
     if request.version != recovery::WORKSPACE_IDENTITY_VERSION {
         return generic_error(StatusCode::BAD_REQUEST);
     }
-    let identity = match recovery::WorkspaceIdentityRecord::from_public_key(&request.public_key, now)
-    {
-        Ok(identity) => identity,
-        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
-    };
+    let identity =
+        match recovery::WorkspaceIdentityRecord::from_public_key(&request.public_key, now) {
+            Ok(identity) => identity,
+            Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+        };
     if request.wrappers.is_empty() || request.wrappers.len() > recovery::MAX_RECOVERY_WRAPPERS {
         return generic_error(StatusCode::BAD_REQUEST);
     }
@@ -6037,11 +6037,9 @@ mod tests {
         let body = listed.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["wrappers"].as_array().unwrap().len(), 2);
-        assert!(parsed["wrappers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|wrapper| wrapper["key_source"] == recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2));
+        assert!(parsed["wrappers"].as_array().unwrap().iter().all(
+            |wrapper| wrapper["key_source"] == recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2
+        ));
         assert!(parsed["wrappers"][0]["wrapped_root_key_b64"].is_string());
 
         // A wrong proof is rejected and consumes the challenge.
@@ -6241,7 +6239,10 @@ mod tests {
         // `deny_unknown_fields`, so the server never even reads it.
         for (field, value) in [
             ("root_secret", serde_json::json!(base64_encode(&[0x77; 32]))),
-            ("recovery_code", serde_json::json!(base64_encode(&[0x77; 32]))),
+            (
+                "recovery_code",
+                serde_json::json!(base64_encode(&[0x77; 32])),
+            ),
             ("prf_output", serde_json::json!(base64_encode(&[0x77; 32]))),
             ("unwrap_key", serde_json::json!(base64_encode(&[0x77; 32]))),
         ] {
