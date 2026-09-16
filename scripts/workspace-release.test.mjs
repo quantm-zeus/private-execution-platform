@@ -23,6 +23,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { writeArtifactAtomically } from "./build-workspace-encrypted.mjs";
+import { sanitizeConsoleSource } from "./build-crypto-wasm-bindings.mjs";
 import {
   ARTIFACT_FILE,
   CURRENT_LINK,
@@ -123,6 +124,25 @@ test("manifest roundtrips and is bound to exact artifact bytes", () => {
   assert.equal(manifest.artifact.size, artifact.length);
   assert.equal(manifest.artifact.kid_b64, KID_B64);
   assert.equal(manifest.manifest_version, 1);
+});
+
+test("console neutralization is valid JS for zero- and multi-arg calls", () => {
+  const source = [
+    'console.warn("wasm failed", e);',
+    "console.groupEnd();",
+    'console["warn"]("bracket", e);',
+    "const x = 1;",
+  ].join("\n");
+  const stripped = sanitizeConsoleSource(source);
+  assert.ok(!/\bconsole\b/.test(stripped), "no console identifier remains");
+  assert.ok(stripped.includes('(()=>{})("wasm failed", e)'));
+  assert.ok(stripped.includes("(()=>{})()"), "zero-arg call neutralized");
+  assert.ok(stripped.includes('(()=>{})("bracket", e)'), "computed-bracket call neutralized");
+  // The transform must never emit syntactically invalid JS (the old `void (`
+  // replacement turned `console.groupEnd()` into the invalid `void ();`).
+  assert.doesNotThrow(() => new Function(stripped));
+  // A form the transform does not understand is refused, not shipped.
+  assert.throws(() => sanitizeConsoleSource("const c = console;"), /console usage remains/);
 });
 
 test("manifest validation rejects every mismatch", () => {

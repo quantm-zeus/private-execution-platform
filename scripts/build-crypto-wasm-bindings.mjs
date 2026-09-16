@@ -137,27 +137,42 @@ async function main() {
  * wasm-bindgen's glue emits `console.warn` for deprecation and MIME-type
  * fallbacks — including the original exception text and the wasm asset URL. The
  * clear shell must not write to the developer console, so neutralize every
- * console call in the generated glue. `console.warn(a, b)` becomes
- * `void (a, b)`, which still evaluates the arguments (so an impure argument is
- * not skipped) but writes nothing. The web-boundary gate independently rejects
- * any console call remaining in the shipped bundles.
+ * console call in the generated glue. A call is replaced by an empty arrow
+ * function call, `console.warn(a, b)` -> `(()=>{})(a, b)`, which is valid for
+ * zero *or* more arguments (unlike `void (`, which is a SyntaxError for
+ * `console.groupEnd()`), still evaluates the arguments, and writes nothing. Both
+ * dotted and computed-bracket access are handled. The web-boundary gate
+ * independently rejects any console call remaining in the shipped bundles.
  */
+const CONSOLE_METHODS =
+  "assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn";
+const CONSOLE_CALL_PATTERN = new RegExp(
+  `console\\s*(?:\\.\\s*(?:${CONSOLE_METHODS})\\s*|\\[\\s*["'\`](?:${CONSOLE_METHODS})["'\`]\\s*\\]\\s*)\\(`,
+  "g",
+);
+
 async function stripConsoleOutput(gluePath) {
-  const source = readFileSync(gluePath, "utf8");
-  const stripped = source.replace(
-    /console\s*\.\s*(?:assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn)\s*\(/g,
-    "void (",
-  );
-  // Any remaining `console.` reference (a method outside the list) is a
-  // generation change we do not understand: fail rather than ship it.
-  const remaining = /console\s*\.\s*[A-Za-z_$]/.exec(stripped);
+  await writeFile(gluePath, sanitizeConsoleSource(readFileSync(gluePath, "utf8")));
+}
+
+/** Pure transform behind `stripConsoleOutput`; exported for the tooling test. */
+export function sanitizeConsoleSource(source) {
+  const stripped = source.replace(CONSOLE_CALL_PATTERN, "(()=>{})(");
+  // Any remaining `console` identifier (a method outside the list, a bare
+  // reference, or a new access form) is a generation change we do not
+  // understand: fail rather than ship it.
+  const remaining = /\bconsole\b/.exec(stripped);
   if (remaining) {
     throw new Error(`console usage remains in the generated glue: ${remaining[0].trim()}`);
   }
-  await writeFile(gluePath, stripped);
+  return stripped;
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+// Run only when executed as a script, so the tooling test can import the pure
+// sanitizer without triggering a wasm-bindgen build.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

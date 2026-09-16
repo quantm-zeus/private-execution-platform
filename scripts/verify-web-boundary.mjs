@@ -250,10 +250,14 @@ function assertNoRuntimeMetadataWrites(text, label) {
  * carry exception text and asset paths (the vendored wasm-bindgen glue logs a
  * WebAssembly instantiation error plus the wasm URL) out of the private origin's
  * control. The generated glue is neutralized at build time, so the shipped
- * bundle must contain no console call at all.
+ * bundle must contain no console call at all. Both dotted and computed-bracket
+ * access are matched, so `console["warn"](...)` cannot evade the gate.
  */
-const CONSOLE_CALL_PATTERN =
-  /console\s*\.\s*(?:assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn)\s*\(/;
+const CONSOLE_METHODS =
+  "assert|clear|count|countReset|debug|dir|dirxml|error|group|groupCollapsed|groupEnd|info|log|table|time|timeEnd|timeLog|trace|warn";
+const CONSOLE_CALL_PATTERN = new RegExp(
+  `console\\s*(?:\\.\\s*(?:${CONSOLE_METHODS})\\s*|\\[\\s*["'\`](?:${CONSOLE_METHODS})["'\`]\\s*\\]\\s*)\\s*\\(`,
+);
 
 function assertNoConsoleUsage(text, label) {
   const match = CONSOLE_CALL_PATTERN.exec(collapseStringConcatenation(text));
@@ -384,7 +388,11 @@ function assertScannerControls() {
     ["provider split-literal host", () => assertNoProviderEndpoints('fetch("okx"+".com")', "control")],
     ["provider ok-access header", () => assertNoProviderEndpoints('"OK-ACCESS-KEY"', "control")],
     ["provider camelCase credential", () => assertNoProviderEndpoints("const okxApiKey = 1;", "control")],
-    ["console output", () => assertNoConsoleUsage('console.warn("wasm failed", e)', "control")],
+    ["console dotted call", () => assertNoConsoleUsage('console.warn("wasm failed", e)', "control")],
+    [
+      "console bracket call",
+      () => assertNoConsoleUsage('console["warn"]("wasm failed", e)', "control"),
+    ],
     [
       "tracker in a decodable non-JS asset",
       () => assertNoTrackers('{"endpoint":"https://www.google-analytics.com/g/collect"}', "control"),
