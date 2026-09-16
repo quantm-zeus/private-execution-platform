@@ -722,12 +722,17 @@ pub fn router(state: PrivateApiState) -> Router {
             "/internal/workspace/recovery/touch",
             post(touch_recovery_wrapper),
         )
+        .route(
+            "/internal/workspace/identity",
+            get(get_workspace_identity).post(bootstrap_workspace_identity),
+        )
         .route("/internal/artifact/grant", post(issue_artifact_grant))
         .route("/internal/artifact", post(deliver_artifact))
         .layer(DefaultBodyLimit::max(
             MAX_ASSERTION_BYTES
                 .max(MAX_OFFER_BYTES)
-                .max(MAX_ENROLLMENT_BYTES),
+                .max(MAX_ENROLLMENT_BYTES)
+                .max(MAX_WORKSPACE_BOOTSTRAP_BYTES),
         ))
         .with_state(state)
 }
@@ -1492,6 +1497,9 @@ async fn get_workspace_descriptor_handler(
 }
 
 const RECOVERY_WRAPPER_REQUEST_BYTES: usize = 8192;
+/// Upper bound on a workspace identity bootstrap: a public key plus up to
+/// `MAX_RECOVERY_WRAPPERS` opaque wrappers.
+const MAX_WORKSPACE_BOOTSTRAP_BYTES: usize = 128 * 1024;
 
 #[derive(serde::Serialize)]
 struct RecoveryChallengeResponse {
@@ -1524,6 +1532,49 @@ struct RecoveryTouchRequest {
 #[derive(serde::Serialize)]
 struct RecoveryWrapperListResponse {
     wrappers: Vec<recovery::RecoveryWrapperRecord>,
+}
+
+/// Public workspace identity. Contains no secret material: only the stable
+/// public key and its fingerprint (server-computed).
+#[derive(serde::Serialize)]
+struct WorkspaceIdentityResponse {
+    configured: bool,
+    version: Option<u8>,
+    public_key_b64: Option<String>,
+    fingerprint_b64: Option<String>,
+}
+
+impl WorkspaceIdentityResponse {
+    fn unconfigured() -> Self {
+        Self {
+            configured: false,
+            version: None,
+            public_key_b64: None,
+            fingerprint_b64: None,
+        }
+    }
+
+    fn configured(identity: &recovery::WorkspaceIdentityRecord) -> Self {
+        Self {
+            configured: true,
+            version: Some(identity.version),
+            public_key_b64: Some(identity.public_key_b64.clone()),
+            fingerprint_b64: Some(identity.fingerprint_b64.clone()),
+        }
+    }
+}
+
+/// One-time initial workspace setup. The browser generates the Workspace Root
+/// Secret locally, derives the stable public key, wraps the root under a
+/// passkey-PRF wrapper and an offline-recovery wrapper, and uploads only the
+/// public key plus the opaque wrappers here. No secret field exists, and
+/// `deny_unknown_fields` rejects a client that tries to add one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceBootstrapRequest {
+    version: u8,
+    public_key: String,
+    wrappers: Vec<recovery::RecoveryWrapperInput>,
 }
 
 /// Consume a single-use proof-of-possession challenge and compare the returned
@@ -1583,45 +1634,30 @@ async fn issue_recovery_challenge(
     if state.recovery_store.is_none() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let artifact = match state.load_artifact().await {
-        Ok(artifact) => artifact,
-        Err(status) => return generic_error(status),
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     };
-    // The recipient fingerprint in an immutable manifest is what stops an
-    // attacker enrolling a key they control and self-approving. Without a
-    // manifest there is no trusted recipient binding, so recovery mutation stays
-    // closed rather than trusting the session enrollment alone.
-    let manifest = match state.load_manifest().await {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => return typed_error(StatusCode::CONFLICT, "recovery_manifest_required"),
+    // The durable public workspace identity is the trust anchor for recovery
+    // mutation. It is created exactly once at bootstrap and never changes, so a
+    // caller can only self-approve a wrapper when they already hold the
+    // workspace root (and therefore the private key the server seals to here).
+    // This is deliberately independent of any release id/KID.
+    let identity = match store.identity() {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return typed_error(StatusCode::CONFLICT, "workspace_identity_required"),
         Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let enrollment = match enrollment_snapshot(&state, &session_id, now) {
-        EnrollmentLookup::Enrolled(snapshot) => snapshot,
-        EnrollmentLookup::NotEnrolled => {
-            return typed_error(StatusCode::CONFLICT, "enrollment_required")
-        }
-        EnrollmentLookup::Unavailable => {
-            return clear_session(generic_error(StatusCode::UNAUTHORIZED))
-        }
-    };
-    if release::preflight(&artifact, Some(&enrollment), Some(&manifest))
-        != release::UnlockCompatibility::Ok
-    {
-        return typed_error(StatusCode::CONFLICT, "artifact_incompatible");
-    }
-    let envelope = match crypto_envelope::ArtifactEnvelope::from_bytes(&artifact) {
-        Ok(envelope) => envelope,
-        Err(_) => return typed_error(StatusCode::CONFLICT, "artifact_incompatible"),
+    let Some(public_key) = identity.public_key_bytes() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     };
     let mut nonce = [0u8; recovery::RECOVERY_CHALLENGE_BYTES];
     if getrandom::getrandom(&mut nonce).is_err() {
         return generic_error(StatusCode::SERVICE_UNAVAILABLE);
     }
     let sealed = match crypto_envelope::seal_artifact(
-        &crypto_envelope::hpke::HpkePublicKey(enrollment.public_key),
-        envelope.version,
-        &envelope.kid,
+        &crypto_envelope::hpke::HpkePublicKey(public_key),
+        crypto_envelope::ARTIFACT_VERSION,
+        &recovery::WORKSPACE_ROOT_CONTEXT_KID,
         &nonce,
     ) {
         Ok(sealed) => sealed,
@@ -1818,6 +1854,112 @@ async fn touch_recovery_wrapper(
     }
     match store.touch(&credential_id, now) {
         Ok(()) => no_store(StatusCode::NO_CONTENT.into_response()),
+        Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Return the durable public workspace identity, if configured. Public metadata
+/// only. Any authenticated session may read it so a new device can validate the
+/// root it just unwrapped before trusting it.
+async fn get_workspace_identity(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Some(_session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let identity = match store.identity() {
+        Ok(identity) => identity,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let response = match &identity {
+        Some(identity) => WorkspaceIdentityResponse::configured(identity),
+        None => WorkspaceIdentityResponse::unconfigured(),
+    };
+    let body = match serde_json::to_vec(&response) {
+        Ok(body) => body,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+}
+
+/// One-time initial workspace setup. The browser generates the Workspace Root
+/// Secret locally and uploads only the derived public key plus the opaque
+/// passkey-PRF and offline-recovery wrappers. Create-once: a second bootstrap is
+/// refused, so the workspace identity can never be replaced or rotated here.
+async fn bootstrap_workspace_identity(
+    State(state): State<PrivateApiState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let now = match state.clock.now_ms() {
+        Ok(v) => v,
+        Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if content_type(&headers) != Some(CONTENT_TYPE) {
+        return generic_error(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let Some(_session_id) = session_id_from_headers(&state, &headers, now) else {
+        return clear_session(generic_error(StatusCode::UNAUTHORIZED));
+    };
+    let Some(store) = state.recovery_store.as_ref() else {
+        return generic_error(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body_bytes = match to_bytes(body, MAX_WORKSPACE_BOOTSTRAP_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return generic_error(StatusCode::PAYLOAD_TOO_LARGE),
+    };
+    let request: WorkspaceBootstrapRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(request) => request,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    if request.version != recovery::WORKSPACE_IDENTITY_VERSION {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
+    let identity = match recovery::WorkspaceIdentityRecord::from_public_key(&request.public_key, now)
+    {
+        Ok(identity) => identity,
+        Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+    };
+    if request.wrappers.is_empty() || request.wrappers.len() > recovery::MAX_RECOVERY_WRAPPERS {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
+    let mut wrappers = Vec::with_capacity(request.wrappers.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for input in request.wrappers {
+        let record = match input.into_record(now) {
+            Ok(record) => record,
+            Err(_) => return generic_error(StatusCode::BAD_REQUEST),
+        };
+        // Bootstrap creates the stable identity; every initial wrapper must be
+        // the stable `workspace_root_v2` source. Legacy wrappers are bounded
+        // migration records, never part of a new workspace root.
+        if record.key_source != recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2
+            || !seen.insert(record.credential_id_b64.clone())
+        {
+            return generic_error(StatusCode::BAD_REQUEST);
+        }
+        wrappers.push(record);
+    }
+    match store.bootstrap_identity(identity.clone(), wrappers) {
+        Ok(()) => {
+            let response = WorkspaceIdentityResponse::configured(&identity);
+            let body = match serde_json::to_vec(&response) {
+                Ok(body) => body,
+                Err(_) => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
+            };
+            no_store((StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body).into_response())
+        }
+        Err(AuthError::CredentialConflict) => {
+            typed_error(StatusCode::CONFLICT, "workspace_identity_configured")
+        }
         Err(_) => generic_error(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -5735,27 +5877,6 @@ mod tests {
         }
     }
 
-    /// Inject a real sealed artifact and its matching immutable manifest into a
-    /// test state, so recovery tests are hermetic (no process-global env).
-    fn recovery_release_state(
-        state: PrivateApiState,
-        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
-    ) -> PrivateApiState {
-        let package = pack_test_files(&[("index.html", b"ok")]);
-        let artifact = crypto_envelope::seal_artifact(
-            &keypair.public_key(),
-            auth::ARTIFACT_VERSION,
-            &keypair.kid(),
-            &package,
-        )
-        .unwrap();
-        let manifest = test_manifest(&artifact, keypair);
-        let artifact_copy = artifact.clone();
-        state
-            .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
-            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))))
-    }
-
     async fn issue_recovery(state: &PrivateApiState, session_cookie: &str) -> (String, Vec<u8>) {
         let response = router(state.clone())
             .oneshot(
@@ -5784,20 +5905,70 @@ mod tests {
         )
     }
 
+    /// Stable workspace root keypair for a test root secret under the fixed
+    /// protocol context. It never depends on a release KID, so the identity is
+    /// identical across releases.
+    fn test_root_keypair(secret_byte: u8) -> crypto_envelope::WorkspaceUnlockKeyPair {
+        crypto_envelope::derive_workspace_keypair(
+            &[secret_byte; crypto_envelope::UNLOCK_SECRET_LEN],
+            auth::ARTIFACT_VERSION,
+            &recovery::WORKSPACE_ROOT_CONTEXT_KID,
+        )
+        .unwrap()
+    }
+
+    fn v2_wrapper_json(credential_byte: u8) -> serde_json::Value {
+        serde_json::json!({
+            "credential_id_b64": base64_encode(&[credential_byte; 32]),
+            "label": "Test device",
+            "version": recovery::RECOVERY_WRAPPER_VERSION,
+            "algorithm": recovery::RECOVERY_ALGORITHM,
+            "key_source": recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
+            "salt_b64": base64_encode(&[0x22; recovery::RECOVERY_SALT_BYTES]),
+            "iv_b64": base64_encode(&[0x33; recovery::RECOVERY_IV_BYTES]),
+            "wrapped_root_key_b64": base64_encode(&[0x44; recovery::WRAPPED_ROOT_KEY_BYTES]),
+        })
+    }
+
+    /// One-time initial setup: upload only the public identity + opaque wrappers.
+    async fn bootstrap_identity(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        keypair: &crypto_envelope::WorkspaceUnlockKeyPair,
+    ) -> Response {
+        let body = serde_json::json!({
+            "version": recovery::WORKSPACE_IDENTITY_VERSION,
+            "public_key": base64_encode(&keypair.public_key_bytes()),
+            "wrappers": [v2_wrapper_json(0x10)],
+        });
+        post_json(state, session_cookie, "/internal/workspace/identity", body).await
+    }
+
+    async fn get_identity(
+        state: &PrivateApiState,
+        session_cookie: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/workspace/identity")
+                    .header(header::COOKIE, session_cookie.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     fn wrapper_body(challenge_id: &str, proof_b64: &str) -> serde_json::Value {
         serde_json::json!({
             "challenge_id": challenge_id,
             "proof_b64": proof_b64,
-            "wrapper": {
-                "credential_id_b64": base64_encode(&[0x11; 32]),
-                "label": "Test device",
-                "version": recovery::RECOVERY_WRAPPER_VERSION,
-                "algorithm": recovery::RECOVERY_ALGORITHM,
-                "key_source": recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1,
-                "salt_b64": base64_encode(&[0x22; recovery::RECOVERY_SALT_BYTES]),
-                "iv_b64": base64_encode(&[0x33; recovery::RECOVERY_IV_BYTES]),
-                "wrapped_root_key_b64": base64_encode(&[0x44; recovery::WRAPPED_ROOT_KEY_BYTES]),
-            }
+            "wrapper": v2_wrapper_json(0x11),
         })
     }
 
@@ -5827,11 +5998,17 @@ mod tests {
         let (state, client, _directory) = recovery_state(clock);
         let (session_cookie, _grant_cookie, _grant_id, _offer) =
             establish_session_and_grant(&state, &client).await;
-        let keypair = test_keypair(0x91, 0x92);
-        let state = recovery_release_state(state, &keypair);
-        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+        let keypair = test_root_keypair(0x91);
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &keypair)
+                .await
+                .status(),
+            StatusCode::OK
+        );
 
-        // Add a wrapper using a valid proof of possession.
+        // Add a wrapper using a valid proof of possession. The challenge is
+        // sealed to the durable workspace identity, so only the holder of the
+        // stable root can open it.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
         let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
         let proof = base64_encode(&nonce);
@@ -5859,8 +6036,12 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::OK);
         let body = listed.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["wrappers"].as_array().unwrap().len(), 1);
-        assert_eq!(parsed["wrappers"][0]["key_source"], "unlock_secret_v1");
+        assert_eq!(parsed["wrappers"].as_array().unwrap().len(), 2);
+        assert!(parsed["wrappers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|wrapper| wrapper["key_source"] == recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2));
         assert!(parsed["wrappers"][0]["wrapped_root_key_b64"].is_string());
 
         // A wrong proof is rejected and consumes the challenge.
@@ -5903,22 +6084,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_challenge_fails_closed() {
+    async fn recovery_challenge_requires_a_durable_workspace_identity() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let (state, client, _directory) = recovery_state(clock);
         let (session_cookie, _grant_cookie, _grant_id, _offer) =
             establish_session_and_grant(&state, &client).await;
-        let keypair = test_keypair(0x93, 0x94);
 
-        // A readable artifact but NO immutable manifest: there is no trusted
-        // recipient binding, so recovery mutation stays closed rather than
-        // trusting the session enrollment alone. Injected loaders keep this
-        // hermetic (no process env).
-        let no_manifest = recovery_release_state(state.clone(), &keypair)
-            .with_manifest_loader(Arc::new(|| Ok(None)));
-        enroll_test_workspace(&no_manifest, &session_cookie, &keypair).await;
+        // No identity yet: recovery mutation is closed, not silently allowed.
         let missing = post_raw(
-            &no_manifest,
+            &state,
             &session_cookie,
             "/internal/workspace/recovery/challenge",
         )
@@ -5926,30 +6100,7 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::CONFLICT);
         let body = missing.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["code"], "recovery_manifest_required");
-
-        // An unreadable/malformed artifact is a hard 503, never a policy 409.
-        let broken_artifact = state
-            .clone()
-            .with_artifact_loader(Arc::new(|| Err(StatusCode::SERVICE_UNAVAILABLE)))
-            .with_manifest_loader(Arc::new(|| Ok(None)));
-        let broken = post_raw(
-            &broken_artifact,
-            &session_cookie,
-            "/internal/workspace/recovery/challenge",
-        )
-        .await;
-        assert_eq!(broken.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        // Inject a real artifact + matching manifest and enroll the workspace key.
-        let state = recovery_release_state(state, &keypair);
-        enroll_test_workspace(&state, &session_cookie, &keypair).await;
-        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
-        assert_eq!(
-            challenge_id.len(),
-            recovery::RECOVERY_CHALLENGE_ID_BYTES * 2
-        );
-        assert_eq!(sealed.len(), 97);
+        assert_eq!(parsed["code"], "workspace_identity_required");
 
         // Unauthenticated callers are rejected before any check.
         let anonymous = router(state.clone())
@@ -5964,6 +6115,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        // After bootstrap the challenge is a full-size sealed nonce that only the
+        // stable root can open.
+        let keypair = test_root_keypair(0x93);
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &keypair)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        assert_eq!(
+            challenge_id.len(),
+            recovery::RECOVERY_CHALLENGE_ID_BYTES * 2
+        );
+        assert_eq!(sealed.len(), 97);
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        assert_eq!(nonce.len(), recovery::RECOVERY_CHALLENGE_BYTES);
     }
 
     async fn post_raw(
@@ -5985,37 +6154,146 @@ mod tests {
             .unwrap()
     }
 
-    /// The core authorization defence: a caller who enrolls a workspace key they
-    /// control (they know its secret) must NOT be able to issue a proof-of-
-    /// possession challenge, because the release manifest binds the artifact to
-    /// a DIFFERENT recipient fingerprint. Without this, an attacker could
-    /// self-enroll and then self-approve a recovery wrapper.
+    /// Create-once is the self-approval defence: a caller that controls a
+    /// different workspace key cannot replace the durable identity (and so
+    /// cannot make the server seal recovery challenges to a key they hold),
+    /// because bootstrap refuses once an identity exists.
     #[tokio::test]
-    async fn recovery_challenge_refuses_a_self_enrolled_foreign_key() {
+    async fn workspace_identity_bootstrap_is_create_once_and_public_only() {
         let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
         let (state, client, _directory) = recovery_state(clock);
         let (session_cookie, _grant_cookie, _grant_id, _offer) =
             establish_session_and_grant(&state, &client).await;
-        let released = test_keypair(0x95, 0x96);
-        let state = recovery_release_state(state, &released);
+        let released = test_root_keypair(0x95);
 
-        // Enroll an attacker-chosen key whose secret the caller knows. The KID
-        // deliberately matches the released artifact so the request reaches — and
-        // must be rejected by — the recipient-fingerprint check, not the cheaper
-        // KID mismatch that would mask a regression in the fingerprint gate.
-        let attacker = test_keypair(0xA1, 0x96);
-        enroll_test_workspace(&state, &session_cookie, &attacker).await;
+        // Before bootstrap the identity is explicitly unconfigured.
+        let (status, body) = get_identity(&state, &session_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configured"], false);
+        assert!(body["public_key_b64"].is_null());
 
-        let response = post_raw(
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &released)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let (status, body) = get_identity(&state, &session_cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["configured"], true);
+        assert_eq!(
+            body["fingerprint_b64"],
+            release::public_key_fingerprint_b64(&released.public_key_bytes())
+        );
+        // Public metadata only: no secret-shaped field is ever returned.
+        for forbidden in [
+            "root_secret",
+            "recovery_code",
+            "prf_output",
+            "unwrap_key",
+            "private_key",
+        ] {
+            assert!(
+                body.get(forbidden).is_none(),
+                "identity response must not expose {forbidden}"
+            );
+        }
+
+        // A second bootstrap with a different key cannot replace the identity.
+        let attacker = test_root_keypair(0xA1);
+        let replace = post_json(
             &state,
             &session_cookie,
-            "/internal/workspace/recovery/challenge",
+            "/internal/workspace/identity",
+            serde_json::json!({
+                "version": recovery::WORKSPACE_IDENTITY_VERSION,
+                "public_key": base64_encode(&attacker.public_key_bytes()),
+                "wrappers": [v2_wrapper_json(0x12)],
+            }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["code"], "artifact_incompatible");
+        assert_eq!(replace.status(), StatusCode::CONFLICT);
+        let (_, body) = get_identity(&state, &session_cookie).await;
+        assert_eq!(
+            body["fingerprint_b64"],
+            release::public_key_fingerprint_b64(&released.public_key_bytes())
+        );
+
+        // A challenge still opens only with the original stable root.
+        let (_, sealed) = issue_recovery(&state, &session_cookie).await;
+        assert!(crypto_envelope::decrypt_artifact(&released, &sealed).is_ok());
+        assert!(crypto_envelope::decrypt_artifact(&attacker, &sealed).is_err());
+    }
+
+    /// The bootstrap API must reject any attempt to smuggle plaintext secret
+    /// material, and must only accept stable `workspace_root_v2` wrappers.
+    #[tokio::test]
+    async fn workspace_identity_bootstrap_rejects_secret_fields_and_legacy_wrappers() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let keypair = test_root_keypair(0x92);
+        let public_key = base64_encode(&keypair.public_key_bytes());
+
+        // A secret field a client might try to send is refused outright by
+        // `deny_unknown_fields`, so the server never even reads it.
+        for (field, value) in [
+            ("root_secret", serde_json::json!(base64_encode(&[0x77; 32]))),
+            ("recovery_code", serde_json::json!(base64_encode(&[0x77; 32]))),
+            ("prf_output", serde_json::json!(base64_encode(&[0x77; 32]))),
+            ("unwrap_key", serde_json::json!(base64_encode(&[0x77; 32]))),
+        ] {
+            let mut body = serde_json::json!({
+                "version": recovery::WORKSPACE_IDENTITY_VERSION,
+                "public_key": public_key.clone(),
+                "wrappers": [v2_wrapper_json(0x11)],
+            });
+            body[field] = value;
+            let response = post_json(
+                &state,
+                &session_cookie,
+                "/internal/workspace/identity",
+                body,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{field} must be refused"
+            );
+        }
+
+        // A legacy `unlock_secret_v1` wrapper is never part of a new workspace root.
+        let mut legacy = v2_wrapper_json(0x11);
+        legacy["key_source"] = serde_json::json!(recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1);
+        let response = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/identity",
+            serde_json::json!({
+                "version": recovery::WORKSPACE_IDENTITY_VERSION,
+                "public_key": public_key.clone(),
+                "wrappers": [legacy],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // An all-zero public key is refused.
+        let response = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/identity",
+            serde_json::json!({
+                "version": recovery::WORKSPACE_IDENTITY_VERSION,
+                "public_key": base64_encode(&[0u8; recovery::WORKSPACE_PUBLIC_KEY_BYTES]),
+                "wrappers": [v2_wrapper_json(0x11)],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -6024,9 +6302,13 @@ mod tests {
         let (state, client, _directory) = recovery_state(clock);
         let (session_cookie, _grant_cookie, _grant_id, _offer) =
             establish_session_and_grant(&state, &client).await;
-        let keypair = test_keypair(0x97, 0x98);
-        let state = recovery_release_state(state, &keypair);
-        enroll_test_workspace(&state, &session_cookie, &keypair).await;
+        let keypair = test_root_keypair(0x97);
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &keypair)
+                .await
+                .status(),
+            StatusCode::OK
+        );
 
         // Add a wrapper so there is something to touch.
         let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;

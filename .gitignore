@@ -21,4 +21,7 @@ web/workspace-artifact/
 web/workspace-releases/
 web/e2e/test-results/
 web/e2e/playwright-report/
+# Local audit/gate scratch space (sandbox profiles, logs, sysroot, tmp). Never
+# product code; must never be committed.
+.dsh/
 

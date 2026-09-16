@@ -63,6 +63,16 @@ pub const RECOVERY_ALGORITHM: &str = "HKDF-SHA256/AES-256-GCM";
 /// random-root-key migration must introduce a new value rather than reinterpret
 /// existing records.
 pub const RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1: &str = "unlock_secret_v1";
+/// Stable Workspace Root Key wrapper key source (v2). Wrappers created by the
+/// workspace-root flow protect the client-generated Workspace Root Secret under
+/// this value; legacy records are never reinterpreted as v2 (or vice versa).
+pub const RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2: &str = "workspace_root_v2";
+/// Accepted wrapper key sources. `workspace_root_v2` is the normal product
+/// path; `unlock_secret_v1` is bounded legacy migration only.
+pub const RECOVERY_KEY_SOURCES: [&str; 2] = [
+    RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
+    RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1,
+];
 pub const RECOVERY_SALT_BYTES: usize = 32;
 pub const RECOVERY_IV_BYTES: usize = 12;
 /// AES-256-GCM ciphertext of a 32-byte secret (32 bytes plaintext + 16-byte tag).
@@ -110,7 +120,13 @@ pub struct RecoveryWrapperRecord {
 }
 
 /// Client-supplied wrapper fields. Lifecycle timestamps are server-owned.
+///
+/// `deny_unknown_fields` is a security property, not strictness for its own
+/// sake: a client must never be able to smuggle a plaintext root secret,
+/// recovery code, PRF output or unwrap key into a request the server would
+/// otherwise silently ignore.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryWrapperInput {
     pub credential_id_b64: String,
     pub label: String,
@@ -150,7 +166,7 @@ impl RecoveryWrapperInput {
         };
         if self.version != RECOVERY_WRAPPER_VERSION
             || self.algorithm != RECOVERY_ALGORITHM
-            || self.key_source != RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1
+            || !RECOVERY_KEY_SOURCES.contains(&self.key_source.as_str())
         {
             return Err(RecoveryInputError::Invalid);
         }
@@ -165,7 +181,7 @@ impl RecoveryWrapperInput {
             label,
             version: RECOVERY_WRAPPER_VERSION,
             algorithm: RECOVERY_ALGORITHM.to_string(),
-            key_source: RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1.to_string(),
+            key_source: self.key_source,
             salt_b64: self.salt_b64,
             iv_b64: self.iv_b64,
             wrapped_root_key_b64: self.wrapped_root_key_b64,
@@ -182,6 +198,61 @@ pub fn proof_matches(proof: &[u8], expected: &[u8]) -> bool {
     proof.len() == expected.len() && proof.ct_eq(expected).into()
 }
 
+/// Schema version of the durable workspace identity record.
+pub const WORKSPACE_IDENTITY_VERSION: u8 = 1;
+/// Exact length of the stable workspace public key.
+pub const WORKSPACE_PUBLIC_KEY_BYTES: usize = 32;
+/// Fixed 16-byte derivation context for the stable workspace recipient keypair:
+/// `sha256("evergreen/workspace-root-key/v2")[0..16]`. Mirrors
+/// `WORKSPACE_ROOT_CONTEXT_B64` in the shell and the release tooling. It is a
+/// protocol constant and MUST NOT be derived from a release id or KID.
+pub const WORKSPACE_ROOT_CONTEXT_KID: [u8; auth::WORKSPACE_KID_BYTES] = [
+    0x4a, 0xdf, 0x2d, 0x43, 0xf1, 0x1d, 0x9d, 0xde, 0xa0, 0x6e, 0xfb, 0x64, 0x45, 0x76, 0x49, 0xb1,
+];
+
+/// Durable, public workspace identity. Persists exactly the stable public key
+/// and its fingerprint; the Workspace Root Secret is never present.
+///
+/// The fingerprint is computed server-side from the validated public key, so a
+/// client cannot claim an identity that does not match the key it supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceIdentityRecord {
+    pub version: u8,
+    pub public_key_b64: String,
+    pub fingerprint_b64: String,
+    pub created_at_ms: i64,
+}
+
+impl WorkspaceIdentityRecord {
+    /// Validate a client-supplied public key and compute its fingerprint.
+    pub fn from_public_key(
+        public_key_b64: &str,
+        now_ms: i64,
+    ) -> Result<Self, RecoveryInputError> {
+        let key = decode_canonical_b64(public_key_b64, WORKSPACE_PUBLIC_KEY_BYTES)
+            .ok_or(RecoveryInputError::Invalid)?;
+        if key.iter().all(|&byte| byte == 0) {
+            return Err(RecoveryInputError::Invalid);
+        }
+        let mut public_key = [0u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        public_key.copy_from_slice(&key);
+        Ok(Self {
+            version: WORKSPACE_IDENTITY_VERSION,
+            public_key_b64: base64_encode(&public_key),
+            fingerprint_b64: crate::release::public_key_fingerprint_b64(&public_key),
+            created_at_ms: now_ms,
+        })
+    }
+
+    /// The validated public key bytes, or `None` for a corrupt record.
+    pub fn public_key_bytes(&self) -> Option<[u8; WORKSPACE_PUBLIC_KEY_BYTES]> {
+        let key = decode_canonical_b64(&self.public_key_b64, WORKSPACE_PUBLIC_KEY_BYTES)?;
+        let mut public_key = [0u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        public_key.copy_from_slice(&key);
+        Some(public_key)
+    }
+}
+
 /// Durable, operator-owned wrapper store.
 pub trait RecoveryWrapperStore: Send + Sync {
     fn list(&self) -> Result<Vec<RecoveryWrapperRecord>, AuthError>;
@@ -193,6 +264,16 @@ pub trait RecoveryWrapperStore: Send + Sync {
     fn revoke(&self, credential_id_b64: &str, now_ms: i64) -> Result<bool, AuthError>;
     /// Record a coarse last-used timestamp for a live credential.
     fn touch(&self, credential_id_b64: &str, now_ms: i64) -> Result<(), AuthError>;
+    /// The durable public workspace identity, if the workspace is configured.
+    fn identity(&self) -> Result<Option<WorkspaceIdentityRecord>, AuthError>;
+    /// Create the immutable public identity plus its initial wrappers in one
+    /// atomic write. Refuses (`CredentialConflict`) when an identity already
+    /// exists, so a bootstrap cannot replace or rotate the workspace identity.
+    fn bootstrap_identity(
+        &self,
+        identity: WorkspaceIdentityRecord,
+        wrappers: Vec<RecoveryWrapperRecord>,
+    ) -> Result<(), AuthError>;
 }
 
 /// Pending proof-of-possession challenge. The nonce is zeroized on drop.
@@ -275,6 +356,10 @@ struct RecoveryStoreDocument {
     version: u32,
     #[serde(default)]
     wrappers: Vec<RecoveryWrapperRecord>,
+    /// Durable public workspace identity. Absent on legacy stores, which are
+    /// treated as "no workspace root configured" (bootstrap required).
+    #[serde(default)]
+    identity: Option<WorkspaceIdentityRecord>,
 }
 
 /// File-backed [`RecoveryWrapperStore`] with the same on-disk safety properties
@@ -283,6 +368,7 @@ struct RecoveryStoreDocument {
 pub struct FileRecoveryWrapperStore {
     path: PathBuf,
     wrappers: Mutex<Vec<RecoveryWrapperRecord>>,
+    identity: Mutex<Option<WorkspaceIdentityRecord>>,
 }
 
 impl fmt::Debug for FileRecoveryWrapperStore {
@@ -296,10 +382,11 @@ impl FileRecoveryWrapperStore {
     /// every other failure refuses startup.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, AuthError> {
         let path = path.into();
-        let wrappers = load_wrappers(&path)?;
+        let (wrappers, identity) = load_store(&path)?;
         Ok(Self {
             path,
             wrappers: Mutex::new(wrappers),
+            identity: Mutex::new(identity),
         })
     }
 
@@ -309,9 +396,26 @@ impl FileRecoveryWrapperStore {
     }
 
     fn persist(&self, wrappers: &[RecoveryWrapperRecord]) -> Result<(), AuthError> {
+        let identity = self
+            .identity
+            .lock()
+            .map_err(|_| AuthError::VerifierUnavailable)?
+            .clone();
+        self.persist_document(wrappers, identity.as_ref())
+    }
+
+    /// Write the full store document. Callers must not hold both the wrappers
+    /// and identity locks at once in opposite order; `bootstrap_identity`
+    /// deliberately releases the identity lock before taking the wrappers lock.
+    fn persist_document(
+        &self,
+        wrappers: &[RecoveryWrapperRecord],
+        identity: Option<&WorkspaceIdentityRecord>,
+    ) -> Result<(), AuthError> {
         let document = RecoveryStoreDocument {
             version: RECOVERY_STORE_VERSION,
             wrappers: wrappers.to_vec(),
+            identity: identity.cloned(),
         };
         let bytes = serde_json::to_vec(&document).map_err(|_| AuthError::VerifierUnavailable)?;
         let temp_path = unique_temp_path(&self.path)?;
@@ -406,11 +510,50 @@ impl RecoveryWrapperStore for FileRecoveryWrapperStore {
         *wrappers = updated;
         Ok(())
     }
+
+    fn identity(&self) -> Result<Option<WorkspaceIdentityRecord>, AuthError> {
+        self.identity
+            .lock()
+            .map(|identity| identity.clone())
+            .map_err(|_| AuthError::VerifierUnavailable)
+    }
+
+    fn bootstrap_identity(
+        &self,
+        identity: WorkspaceIdentityRecord,
+        wrappers: Vec<RecoveryWrapperRecord>,
+    ) -> Result<(), AuthError> {
+        if wrappers.is_empty() || wrappers.len() > MAX_RECOVERY_WRAPPERS {
+            return Err(AuthError::VerifierUnavailable);
+        }
+        // Hold the identity lock across the check and the write so two
+        // concurrent bootstraps cannot both succeed. `persist_document` takes
+        // no other lock, and the identity lock is released before the wrappers
+        // lock is taken, so this cannot invert the wrappers -> identity order
+        // used by `persist`.
+        let mut current = self
+            .identity
+            .lock()
+            .map_err(|_| AuthError::VerifierUnavailable)?;
+        if current.is_some() {
+            return Err(AuthError::CredentialConflict);
+        }
+        self.persist_document(&wrappers, Some(&identity))?;
+        *current = Some(identity);
+        drop(current);
+        *self
+            .wrappers
+            .lock()
+            .map_err(|_| AuthError::VerifierUnavailable)? = wrappers;
+        Ok(())
+    }
 }
 
-fn load_wrappers(path: &Path) -> Result<Vec<RecoveryWrapperRecord>, AuthError> {
+fn load_store(
+    path: &Path,
+) -> Result<(Vec<RecoveryWrapperRecord>, Option<WorkspaceIdentityRecord>), AuthError> {
     let Some((metadata, file)) = open_private_file(path)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     if metadata.len() > MAX_RECOVERY_STORE_BYTES {
         return Err(AuthError::VerifierUnavailable);
@@ -428,7 +571,19 @@ fn load_wrappers(path: &Path) -> Result<Vec<RecoveryWrapperRecord>, AuthError> {
     {
         return Err(AuthError::VerifierUnavailable);
     }
-    Ok(document.wrappers)
+    if let Some(identity) = &document.identity {
+        // Refuse a tampered/corrupt identity rather than serving a public key
+        // whose fingerprint does not match; recovery challenges seal to it.
+        let Some(public_key) = identity.public_key_bytes() else {
+            return Err(AuthError::VerifierUnavailable);
+        };
+        if identity.version != WORKSPACE_IDENTITY_VERSION
+            || crate::release::public_key_fingerprint_b64(&public_key) != identity.fingerprint_b64
+        {
+            return Err(AuthError::VerifierUnavailable);
+        }
+    }
+    Ok((document.wrappers, document.identity))
 }
 
 /// Open an existing private store file after validating the parent directory,
@@ -850,5 +1005,101 @@ mod tests {
         let directory = private_dir();
         let store = FileRecoveryWrapperStore::open(directory.path().join("recovery.json")).unwrap();
         assert_eq!(format!("{store:?}"), "FileRecoveryWrapperStore([REDACTED])");
+    }
+
+    fn valid_v2_input() -> RecoveryWrapperInput {
+        let mut input = valid_input();
+        input.key_source = RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2.to_string();
+        input
+    }
+
+    #[test]
+    fn identity_from_public_key_validates_and_computes_fingerprint() {
+        let public_key = [0x21u8; WORKSPACE_PUBLIC_KEY_BYTES];
+        let record =
+            WorkspaceIdentityRecord::from_public_key(&base64_encode(&public_key), 7).unwrap();
+        assert_eq!(record.version, WORKSPACE_IDENTITY_VERSION);
+        assert_eq!(record.created_at_ms, 7);
+        assert_eq!(record.public_key_bytes().unwrap(), public_key);
+        assert_eq!(
+            record.fingerprint_b64,
+            crate::release::public_key_fingerprint_b64(&public_key)
+        );
+
+        assert!(WorkspaceIdentityRecord::from_public_key(
+            &base64_encode(&[0u8; WORKSPACE_PUBLIC_KEY_BYTES]),
+            0
+        )
+        .is_err());
+        assert!(WorkspaceIdentityRecord::from_public_key("not-base64!", 0).is_err());
+        assert!(
+            WorkspaceIdentityRecord::from_public_key(&base64_encode(&[0x21u8; 31]), 0).is_err()
+        );
+
+        // A record whose stored fingerprint does not match the public key is
+        // refused on reload.
+        let mut corrupt = record;
+        corrupt.fingerprint_b64 = base64_encode(&[0x99u8; 32]);
+        let directory = private_dir();
+        let path = directory.path().join("store.json");
+        let document = serde_json::json!({
+            "version": RECOVERY_STORE_VERSION,
+            "wrappers": [],
+            "identity": corrupt,
+        });
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        #[cfg(unix)]
+        set_mode(&path, 0o600);
+        assert!(FileRecoveryWrapperStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn bootstrap_identity_is_create_once_and_survives_reload() {
+        let directory = private_dir();
+        let path = directory.path().join("store.json");
+        let identity =
+            WorkspaceIdentityRecord::from_public_key(&base64_encode(&[0x21u8; 32]), 7).unwrap();
+        let wrapper = valid_v2_input().into_record(8).unwrap();
+        {
+            let store = FileRecoveryWrapperStore::open(&path).unwrap();
+            assert!(store.identity().unwrap().is_none());
+            store
+                .bootstrap_identity(identity.clone(), vec![wrapper.clone()])
+                .unwrap();
+            assert_eq!(store.identity().unwrap(), Some(identity.clone()));
+            assert_eq!(store.list().unwrap().len(), 1);
+            // A second bootstrap cannot replace the identity.
+            let other =
+                WorkspaceIdentityRecord::from_public_key(&base64_encode(&[0x22u8; 32]), 9).unwrap();
+            assert!(store.bootstrap_identity(other, vec![]).is_err());
+            assert_eq!(store.identity().unwrap(), Some(identity.clone()));
+        }
+        let reloaded = FileRecoveryWrapperStore::open(&path).unwrap();
+        assert_eq!(reloaded.identity().unwrap(), Some(identity));
+        assert_eq!(reloaded.list().unwrap().len(), 1);
+        assert_eq!(
+            reloaded.list().unwrap()[0].key_source,
+            RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2
+        );
+    }
+
+    #[test]
+    fn bootstrap_identity_requires_at_least_one_wrapper() {
+        let directory = private_dir();
+        let store = FileRecoveryWrapperStore::open(directory.path().join("store.json")).unwrap();
+        let identity =
+            WorkspaceIdentityRecord::from_public_key(&base64_encode(&[0x21u8; 32]), 7).unwrap();
+        assert!(store.bootstrap_identity(identity, vec![]).is_err());
+    }
+
+    #[test]
+    fn v2_wrapper_key_source_is_accepted_while_unknown_sources_are_rejected() {
+        assert_eq!(
+            valid_v2_input().into_record(0).unwrap().key_source,
+            RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2
+        );
+        let mut unknown = valid_input();
+        unknown.key_source = "root_key_v3".to_string();
+        assert!(unknown.into_record(0).is_err());
     }
 }
