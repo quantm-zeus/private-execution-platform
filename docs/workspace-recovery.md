@@ -20,8 +20,8 @@ protocol constant, never a release id or KID. Consequences:
 2. Every future release is HPKE-sealed to the same stable public key, so there is
    no reseal step and the operator never re-enters a recovery code at deploy.
 3. Per-artifact cryptographic freshness comes from the HPKE envelope randomness
-   and the signed release metadata (release id, artifact digest), not from
-   changing the workspace identity.
+   and the release metadata (release id, artifact digest) bound to the artifact
+   over the authenticated channel, not from changing the workspace identity.
 
 ```
 Workspace Root Secret (32B, client-only)
@@ -69,8 +69,10 @@ recovery code is shown and gated on confirmation before any unlock attempt, so a
 release that is not yet sealed to the new identity cannot cause the code to be
 lost.
 
-The recoverable public identity is client-generated and uploaded; the operator
-never receives or handles a public key, and no helper page derives one.
+The public identity is client-generated and uploaded; the operator never
+receives or handles the Workspace Root Secret, and no helper page derives a
+public key for manual resealing. Release tooling is given only the derived
+public key (`WORKSPACE_PUBLIC_KEY_B64`).
 
 ## Normal login and new devices
 
@@ -157,9 +159,10 @@ an operator runbook step that creates a new workspace identity.
 Existing preview/release-bound state is legacy. The one-time migration is the
 normal initial setup above, performed once in a controlled browser session. The
 resulting stable public key is then used by release tooling to seal the current
-release, so all future releases share the stable identity. Legacy
-`unlock_secret_v1` wrapper records stay in the store but are ignored by the
-stable-root flow and rejected at bootstrap.
+release, so all future releases share the stable identity. A pre-v2 store has no
+`identity`; the create-once bootstrap writes the stable identity and its v2
+wrappers, replacing any legacy `unlock_secret_v1` records, which the stable-root
+flow never reads and which the bootstrap rejects as inputs.
 
 ## Tests
 

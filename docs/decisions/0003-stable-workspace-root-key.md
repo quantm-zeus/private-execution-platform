@@ -22,7 +22,7 @@ Introduce a stable Workspace Root Key:
    stable workspace recipient keypair. The context is a protocol constant; KID
    and release id are metadata that must not change the identity.
 3. Every release is HPKE-sealed to the same stable public key. Freshness comes
-   from the HPKE envelope randomness and the signed release manifest, not from a
+   from the HPKE envelope randomness and the release manifest, not from a
    changed identity.
 4. The browser wraps the root under a passkey WebAuthn PRF output and under a
    separate high-entropy offline recovery code. The server persists only the

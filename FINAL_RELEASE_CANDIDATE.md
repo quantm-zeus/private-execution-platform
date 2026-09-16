@@ -7,6 +7,13 @@
 **GitHub Actions CI (exact SHA):** [run 35109740599](https://github.com/quantm-zeus/private-execution-platform/actions/runs/35109740599) — **success** (`rust`, `web-boundary`, `web-e2e`)
 **State:** reviewed, exact-SHA CI green, deployable. **Not deployed by this lane. `TRADING_ENABLED=false`. No real funds were touched.**
 
+> **Superseded candidate notice.** This document records the earlier `a0ee01b`
+> candidate. The branch `worker/deepseek-final-release` now carries the **stable
+> Workspace Root Key v2** architecture (ADR 0003, `docs/workspace-recovery.md`)
+> and the concrete-but-disabled Base/Privy transports in
+> `apps/private-api/src/live.rs`. The current HEAD is **pending a fresh native
+> GPT-5.6 Sol/high audit** and is not deployed.
+
 This candidate is the integration of the merged reviewed slices plus the fail-closed production
 private-API / trading composition. It does not enable live signing or submission, and it does not
 add optional features.
@@ -23,8 +30,10 @@ add optional features.
   `WORKSPACE_RELEASE_MANIFEST` is the **normal production mode**: an absent manifest refuses startup
   unless the operator explicitly sets `WORKSPACE_ALLOW_NO_MANIFEST=true`; a present-but-blank path is
   always a misconfiguration, never an opt-out.
-- Recovery wrappers (WebAuthn PRF only) with a mandatory high-entropy offline recovery code; revocation
-  is soft; the recovery code is cleared from the DOM/reactive signal before the first network await.
+- Recovery wrappers (stable Workspace Root Key v2): passkey-PRF and a mandatory
+  high-entropy offline recovery code wrap one client-generated root; the recovery
+  code is shown once at setup and cleared from the DOM/reactive signal before the
+  first network await.
 - Verified this candidate does not regress the flow (no web application code changed except one
   comment); the new manifest policy is startup-only.
 
@@ -46,9 +55,11 @@ add optional features.
   - `limits` = limit-engine proof **and** the full execution proof (a limit order is a mutation);
   - `twap`/`rfq`/`withdraw`/`wallet_limits` = the execution proof;
   - `market`/`realtime` = their own read-dependency proof; `chart` = the configured dispatcher.
-- The shipped binary never injects a chain or signer probe (no concrete `BaseChainTransport` or
-  `PrivyHttpClient` exists in-repo), so **`execute` is never advertised** and every mutation is an
-  authenticated `capability_missing` denial — never a fabricated success.
+- Concrete Base RPC, Privy HTTP signing and signed-payload transports exist in
+  `apps/private-api/src/live.rs` but are composed only behind `TRADING_CORE_LIVE=1`;
+  the shipped default injects no live probe, so **`execute` is never advertised**
+  and every mutation is an authenticated `capability_missing` denial — never a
+  fabricated success.
 - Durable exactly-once store: `execution_store::PostgresExecutionAttemptStore`, connected only behind
   the explicit `TRADING_CORE_LIVE=1` opt-in with all endpoints present. Startup connect and the first
   health read are bounded (5 s); health requires migration
@@ -130,8 +141,8 @@ green. Reproduced deterministically only in the local, `--no-sudo` sandbox envir
   Requires the coordinated `fomo-mcp` read-only `/market/bars` bridge
   (`worker/deepseek-pep-market-source`, commit `dced9624`) to be deployed by the operator.
 - **Live trading (residual, not enabled):** `TRADING_CORE_LIVE=1`, `EXECUTION_DATABASE_DSN` (Postgres
-  with migration `0003`), `BASE_RPC_ENDPOINT`, `PRIVY_HTTP_ENDPOINT`, plus in-repo concrete chain and
-  signing adapters that do not exist yet. `TRADING_ENABLED` must stay `false`.
+  with migration `0003`), `BASE_RPC_ENDPOINT`, `PRIVY_HTTP_ENDPOINT`, plus the concrete chain and
+  signing transports in `apps/private-api/src/live.rs` (disabled by default). `TRADING_ENABLED` must stay `false`.
 - **Toolchain:** Rust `1.98.1` (`rust-toolchain.toml`), Node 24, pnpm `11.22.0`.
 
 ---
@@ -166,9 +177,11 @@ green. Reproduced deterministically only in the local, `--no-sudo` sandbox envir
 
 ## 7. Residual / explicitly not composed
 
-- Live signing, chain submission, balances, and provider transports are **not wired**. There is no
-  concrete `BaseChainTransport` or `PrivyHttpClient` in the repository, so `execute` can never be
-  advertised and no real-funds path exists.
+- Live signing, chain submission and balances are **not enabled**. Concrete
+  `BaseRpcChainTransport`/`HttpPrivyClient` transports exist in
+  `apps/private-api/src/live.rs` but are gated behind the disabled
+  `TRADING_CORE_LIVE` opt-in, so `execute` is never advertised and no
+  real-funds path exists.
 - The deployed `fomo-mcp` image does not yet expose `/market/bars`; the bridge is implemented on the
   coordinated branch and pending operator deployment. Until then a configured PEP leaves `realtime`
   unadvertised and the chart renders only local, already-decrypted frames — never fabricated data.

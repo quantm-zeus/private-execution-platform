@@ -42,6 +42,7 @@ import {
   MIN_ARTIFACT_BYTES,
   PUBLIC_KEY_BYTES,
   TAG_BYTES,
+  WORKSPACE_ROOT_CONTEXT_B64,
   artifactKidFromEnv,
   artifactPublicKeyFromEnv,
   packDirectory,
@@ -904,6 +905,12 @@ export async function publishRelease({
   lockTimeoutMs,
   lockStaleMs,
 }) {
+  // Every release is sealed to the one stable workspace context. Reject a
+  // caller-supplied foreign KID here as well as in `artifactKidFromEnv`, so the
+  // lower-level publish API cannot bind a release to a different identity.
+  if (kidB64 !== WORKSPACE_ROOT_CONTEXT_B64) {
+    throw new Error("publishRelease requires the stable workspace context KID");
+  }
   const artifactDigest = sha256Hex(artifact);
   const releaseId = releaseIdFor(sourceSha, artifactDigest);
   const releaseDir = join(releasesRoot, releaseId);

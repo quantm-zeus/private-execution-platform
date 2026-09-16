@@ -25,12 +25,14 @@ Implemented and composed (exact-SHA CI green):
 - Production-faithful unlock proof: `verify:web-boundary` builds an artifact with
   the production build script and drives it through the real private-api loader,
   real HPKE delivery, inner decrypt and production package unpack.
-- Passkey-bound recovery wrappers (WebAuthn PRF only, requested at enrollment and
-  verified at use), proof-of-possession authorization for add/revoke, and
-  trusted-credential management UI. The high-entropy offline recovery code stays
-  a mandatory fallback and no existing artifact is invalidated. Revocation is
-  soft (it deactivates the wrapper, not the stored ciphertext); rotating the
-  secret is an operator re-seal runbook. See `docs/workspace-recovery.md`.
+- Stable **Workspace Root Key v2**: one client-generated 32-byte Workspace Root
+  Secret per workspace, derived into a release-independent recipient keypair
+  under a fixed context. Passkey (WebAuthn PRF) and a separate high-entropy
+  offline recovery code wrap the same root client-side; only the public identity
+  and opaque wrappers are stored server-side (`apps/private-api/src/recovery.rs`).
+  Wrapper mutation requires proof of possession of the workspace key. The legacy
+  release-bound `unlock_secret_v1` records are bounded migration data only. See
+  `docs/workspace-recovery.md`.
 - Dependency readiness distinct from liveness, strict all-or-none relay
   configuration, and an edge-gateway refusal to bind a non-loopback address
   while perimeter assertion trust is presence-only.
@@ -52,13 +54,14 @@ Implemented and composed (exact-SHA CI green):
   from typed capability readiness (`apps/private-api/src/trading.rs` ->
   `trading_core::capability`): `market`/`execute`/`limits`/`realtime` require a
   healthy dependency proof, and `twap`/`rfq`/`withdraw`/`wallet_limits` ride the
-  execution proof. The durable exactly-once attempt store is a real Postgres
-  adapter (`crates/execution-store`, migration `0003`) connected only behind the
-  explicit `TRADING_CORE_LIVE=1` opt-in. No concrete `BaseChainTransport` or
-  `PrivyHttpClient` exists in-repo, so `execute` is never advertised,
-  `live_execution_wired=false`, and every mutation remains an authenticated
-  `capability_missing` denial. `TRADING_ENABLED` is parsed strictly and must
-  stay `false`.
+  execution proof. Concrete Base RPC, Privy HTTP signing and signed-payload
+  transports are implemented in `apps/private-api/src/live.rs` but composed only
+  behind the explicit `TRADING_CORE_LIVE=1` opt-in with every endpoint and
+  credential file present, and probed read-only at startup. The durable
+  exactly-once attempt store is a real Postgres adapter (`crates/execution-store`,
+  migration `0003`). No gate advertises `execute`, `live_execution_wired=false`,
+  and every mutation remains an authenticated `capability_missing` denial.
+  `TRADING_ENABLED` is parsed strictly and must stay `false`.
 - Durable exactly-once execution has a concrete adapter
   (`execution_store::PostgresExecutionAttemptStore`) and a wired readiness/store
   seam, but the live relay that would use it is not composed in the deployed
@@ -87,7 +90,8 @@ Implemented and composed (exact-SHA CI green):
   artifact to a mismatched enrollment is only caught by the browser's
   fail-closed inner decrypt (`U5_ARTIFACT`), not by the server preflight.
   Deployments must configure the manifest; the release/operator steps do. The
-  manifest also makes revoke/add recovery authorization possible.
+  durable workspace identity, not the release manifest, is the trust anchor for
+  add/revoke recovery authorization (proof of possession of the workspace key).
 - Cloudflare Access remains perimeter identity only and can never recover or
   decrypt a workspace.
 - `main` branch protection and required-status-check enforcement are an

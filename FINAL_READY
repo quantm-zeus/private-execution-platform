@@ -1,6 +1,12 @@
 FINAL_READY — Evergreen PEP final release candidate
 ================================================================
 
+NOTE: this marker records the earlier a0ee01b candidate. The branch HEAD now
+carries the stable Workspace Root Key v2 architecture (ADR 0003,
+docs/workspace-recovery.md) plus the concrete-but-disabled Base/Privy transports
+in apps/private-api/src/live.rs. That HEAD is PENDING a fresh native GPT-5.6
+Sol/high audit, is not deployed, and is not a completion claim.
+
 Repository:   quantm-zeus/private-execution-platform
 Branch:       worker/deepseek-final-release
 Exact SHA:    a0ee01b914253d030c72757f031ee5d60091864a
