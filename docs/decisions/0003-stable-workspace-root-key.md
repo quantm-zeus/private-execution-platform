@@ -17,10 +17,14 @@ Introduce a stable Workspace Root Key:
 
 1. One client-generated 32-byte Workspace Root Secret per workspace, created
    exactly once and never persisted in plaintext or sent to the server.
-2. A fixed 16-byte derivation context
-   (`base64(sha256("evergreen/workspace-root-key/v2")[0..16])`) derives the
-   stable workspace recipient keypair. The context is a protocol constant; KID
-   and release id are metadata that must not change the identity.
+2. A **fixed Root-Key-V2 derivation domain**
+   (`private-execution/workspace-root-key/v2 || version`) derives the stable
+   workspace recipient keypair from the root secret alone. The artifact KID is
+   **not** an input to recipient-key derivation: it is release/envelope
+   metadata bound into the HPKE `info`/AAD, so rotating a KID cannot change the
+   recipient identity. The 16-byte protocol constant
+   (`base64(sha256("evergreen/workspace-root-key/v2")[0..16])`) is now only the
+   session-enrollment label and the default artifact KID.
 3. Every release is HPKE-sealed to the same stable public key. Freshness comes
    from the HPKE envelope randomness and the release manifest, not from a
    changed identity.
@@ -40,14 +44,32 @@ Introduce a stable Workspace Root Key:
 - **Keep the release-bound KID derivation and re-seal per release.** Rejected:
   it requires operator reseal and a recovery-code re-entry, and makes the
   workspace identity a function of release metadata.
-- **Add a new unchecked "random root" WASM primitive.** Rejected: the existing
-  audited `derive_workspace_keypair` already gives domain-separated
-  deterministic derivation; a fixed context constant plus a new wrapper key
-  source (`workspace_root_v2`) is a smaller, reviewable change that does not
-  alter the audited artifact envelope format.
+- **Add a new unchecked "random root" WASM primitive.** Rejected: an audited,
+  deterministic, domain-separated derivation is a smaller and reviewable change
+  that does not alter the audited artifact envelope format. The final design
+  adds `derive_workspace_root_keypair(root_secret)` (KID-free) to
+  `crypto-envelope` and exposes it as `WasmWorkspaceRootKey`; the legacy
+  `derive_workspace_keypair(secret, version, kid)` is retained only for bounded
+  `unlock_secret_v1` migration.
 - **Require a virtual authenticator with PRF for every login.** Rejected: the
   offline recovery code must remain a mandatory fallback, so setup succeeds with
   a recovery wrapper alone and PRF is an optional convenience.
+
+## Amendment (KID-independence remediation)
+
+The first Root-Key V2 implementation derived the recipient keypair through the
+legacy `derive_workspace_keypair(unlock_secret, version, kid)` with one frozen
+16-byte context used as the KID, and both the shell and the release tooling
+rejected any foreign KID. A native audit correctly found that this made the
+identity "stable only because KID is frozen", not independent of KID. The
+amendment above (`derive_workspace_root_keypair` / `decrypt_artifact_with_root`)
+removes that coupling: the recipient key is a function of the root and the fixed
+domain only, the artifact KID is authenticated envelope metadata that may change
+between releases, and the release tooling seals to the stable public key while
+accepting any canonical KID. Stable-root releases are marked in the manifest by
+`recipient.root_key_v2 = true` so the one-time identity bootstrap binds to the
+recipient fingerprint without consulting the KID; a legacy release-bound
+manifest (no marker) remains a bounded migration input.
 
 ## Consequences
 

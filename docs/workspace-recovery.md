@@ -12,20 +12,25 @@ the browser exactly once during initial setup. It is never persisted in
 plaintext and never sent to the server.
 
 The stable workspace recipient keypair is derived from that root secret under a
-**fixed, release-independent derivation context**
-(`base64(sha256("evergreen/workspace-root-key/v2")[0..16])`). The context is a
-protocol constant, never a release id or KID. Consequences:
+**fixed Root-Key-V2 domain**
+(`private-execution/workspace-root-key/v2 || version`). The derivation takes no
+KID and no release id: the artifact KID is release/envelope metadata bound into
+the HPKE `info`/AAD, never a recipient-identity input. The 16-byte protocol
+constant (`base64(sha256("evergreen/workspace-root-key/v2")[0..16])`) is only
+the session-enrollment label and the default artifact KID. Consequences:
 
-1. The workspace public identity is identical for every release.
+1. The workspace public identity is identical for every release, independent of
+   the artifact KID.
 2. Every future release is HPKE-sealed to the same stable public key, so there is
-   no reseal step and the operator never re-enters a recovery code at deploy.
+   no reseal step and the operator never re-enters a recovery code at deploy;
+   consecutive releases may carry different KIDs.
 3. Per-artifact cryptographic freshness comes from the HPKE envelope randomness
    and the release metadata (release id, artifact digest) bound to the artifact
    over the authenticated channel, not from changing the workspace identity.
 
 ```
 Workspace Root Secret (32B, client-only)
-   ├─ HKDF/context ──► stable X25519 recipient keypair ──► public identity (server-stored)
+   ├─ HKDF/Root-Key-V2 domain ──► stable X25519 recipient keypair ──► public identity (server-stored)
    ├─ passkey PRF output ──HKDF──► AES-256-GCM wrapping key ──► PRF wrapper   (server-stored ciphertext)
    └─ offline recovery code ─HKDF──► AES-256-GCM wrapping key ──► recovery wrapper (server-stored ciphertext)
 ```
@@ -117,11 +122,14 @@ The durable store (`apps/private-api/src/recovery.rs`, env
 | `revoked_at_ms` | soft revoke |
 
 The identity is create-once and immutable; a second bootstrap is refused. Once a
-release has been sealed to the stable context, the bootstrap additionally
-requires the submitted public key to match that release manifest's recipient
-fingerprint, so an authenticated session cannot squat the identity with a key it
-controls (a legacy per-release manifest does not constrain the one-time
-migration bootstrap). The bootstrap request uses `deny_unknown_fields`, so a
+release has been sealed to the stable Root-Key-V2 identity (its manifest marks
+`recipient.root_key_v2 = true`), the bootstrap additionally requires the submitted
+public key to match that manifest's recipient fingerprint, so an authenticated
+session cannot squat the identity with a key it controls. The binding keys off
+that explicit marker, never the artifact KID, because the KID is release metadata
+that may change between consecutive releases. A legacy per-release manifest (no
+marker) predates the stable root and does not constrain the one-time migration
+bootstrap. The bootstrap request uses `deny_unknown_fields`, so a
 client can never smuggle a plaintext root secret, recovery code, PRF output or
 unwrap key into a write. The store is file-backed with owner-only atomic writes,
 refused symlinks, checked inode/permissions, and a bounded document size. A
@@ -135,8 +143,9 @@ and the workspace cannot be set up or unlocked in the stable-root model.
 Mutating a wrapper requires proof of possession of the workspace private key:
 
 1. `POST /internal/workspace/recovery/challenge` seals a fresh random nonce to
-   the **durable workspace public identity** under the fixed stable context and
-   stores it under a single-use, session-bound, TTL-bounded challenge id.
+   the **durable workspace public identity** and stores it under a single-use,
+   session-bound, TTL-bounded challenge id. The server may label the envelope
+   with the protocol context KID; the stable root opens it regardless of KID.
 2. The browser decrypts the nonce with its in-memory stable workspace key and
    returns it as `proof_b64`.
 3. The server compares it in constant time and consumes the challenge.
@@ -147,14 +156,17 @@ self-approve. A normal passkey signature is never key material.
 
 ## Release tooling
 
-`scripts/workspace-artifact.mjs` seals every release to the stable context using
-only `WORKSPACE_PUBLIC_KEY_B64` from a durable operator-safe source. The build
-path never reads `WORKSPACE_UNLOCK_SECRET_B64`; CI and release tooling never need
-the root secret. `WORKSPACE_ARTIFACT_KID_B64` is deprecated: absent it defaults
-to the stable context, and a foreign value fails closed. The mandatory
-operational test (`scripts/workspace-release.test.mjs`) builds releases N and
-N+1 from only the public key, switches the descriptor, and proves the same root
-unlocks both.
+`scripts/workspace-artifact.mjs` seals every release to the stable **public key**
+using only `WORKSPACE_PUBLIC_KEY_B64` from a durable operator-safe source. The
+build path never reads `WORKSPACE_UNLOCK_SECRET_B64`; CI and release tooling never
+need the root secret. `WORKSPACE_ARTIFACT_KID_B64` is envelope metadata: absent it
+defaults to the protocol context, and any other canonical 16-byte non-zero value
+is accepted, so N and N+1 may carry different KIDs while sealed to the same stable
+identity. A wrong or tampered KID still fails closed through the authenticated
+envelope binding. The mandatory operational test
+(`scripts/workspace-release.test.mjs`) builds releases N and N+1 from only the
+public key with distinct KIDs, switches the descriptor, and proves the same root
+unlocks both with no reseal or manual operator action.
 
 ## Credential and device management (UI)
 
@@ -204,11 +216,13 @@ rotating the root.
   bootstrap body contains no secret material, wrapper list parsing rejects
   legacy/unknown sources, proof-of-possession flow.
 - `web/workspace-shell/src/unlock-runtime.stages.test.ts` — the runtime derives
-  from the fixed context and refuses a release sealed under any other KID.
+  the KID-free root key and treats a descriptor KID as release metadata (a
+  foreign KID reaches the network rather than failing as `U5/artifact_incompatible`).
 - `apps/private-api/src/recovery.rs` / `lib.rs` — identity validation,
   create-once bootstrap, secret-field rejection, proof-of-possession matrix,
-  file-store lifecycle.
-- `scripts/workspace-release.test.mjs` — stable-context sealing, foreign-KID
-  rejection, and the N/N+1 single-root operational proof.
+  file-store lifecycle, and the cross-KID / recipient-mismatch preflight.
+- `scripts/workspace-release.test.mjs` — stable-public-key sealing with
+  arbitrary canonical KIDs, KID tamper failure, and the N/N+1 single-root
+  operational proof.
 - `web/e2e/specs/shell.spec.ts` — recovery unlock, wrong-code rejection, and no
   KID/public-key/fingerprint/recovery input on the normal login screen.
