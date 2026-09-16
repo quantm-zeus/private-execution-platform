@@ -10,7 +10,7 @@
 
 import {
   RECOVERY_IV_BYTES,
-  RECOVERY_KEY_SOURCE,
+  RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
   RECOVERY_SALT_BYTES,
   RECOVERY_WRAPPER_VERSION,
   RECOVERY_WRAPPED_ROOT_KEY_BYTES,
@@ -60,12 +60,13 @@ const MAX_WRAPPERS = 32;
 export const RECOVERY_CHALLENGE_BYTES = 32;
 
 /**
- * The only wrapper key source this shell can unwrap. A record for an unknown
- * source (e.g. a future random-root-key migration) is rejected rather than
- * reinterpreted as the unlock secret. Aliased to the wrapping primitive's
- * constant so the AAD and server-stored value can never drift.
+ * The only wrapper key source this shell can unwrap: the stable Workspace Root
+ * Key source (`workspace_root_v2`). Legacy `unlock_secret_v1` records are
+ * bounded migration data and are skipped rather than reinterpreted as a stable
+ * root. Aliased to the wrapping primitive's constant so the AAD and
+ * server-stored value can never drift.
  */
-export const SUPPORTED_KEY_SOURCE = RECOVERY_KEY_SOURCE;
+export const SUPPORTED_KEY_SOURCE = RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2;
 
 export interface RecoveryClientOptions {
   fetchFn?: typeof fetch;
@@ -73,6 +74,7 @@ export interface RecoveryClientOptions {
   challengeUrl?: string;
   revokeUrl?: string;
   touchUrl?: string;
+  identityUrl?: string;
 }
 
 const BASE64_ALPHABET =
@@ -412,6 +414,143 @@ export async function unwrapWithPrfOutput(
   record: WrappedRootKey & { credential_id_b64?: string },
 ): Promise<Uint8Array> {
   // Bind the owning credential id into the AAD so a rewritten record cannot be
-  // reassigned to another credential without failing authentication.
-  return unwrapRootKey(prfOutput, record, undefined, record.credential_id_b64 ?? "");
+  // reassigned to another credential without failing authentication. Only the
+  // stable root key source is unwrapped here.
+  return unwrapRootKey(
+    prfOutput,
+    record,
+    undefined,
+    record.credential_id_b64 ?? "",
+    SUPPORTED_KEY_SOURCE,
+  );
+}
+
+export const DEFAULT_WORKSPACE_IDENTITY_URL = "/internal/workspace/identity";
+
+/** Durable public workspace identity (public metadata only). */
+export interface WorkspaceIdentity {
+  configured: boolean;
+  version: number | null;
+  publicKeyB64: string | null;
+  fingerprintB64: string | null;
+}
+
+/** Parse the public identity response. Never carries secret material. */
+export function parseWorkspaceIdentity(input: unknown): WorkspaceIdentity {
+  if (!isRecord(input)) throw new RecoveryClientError("recovery_malformed");
+  if (input.configured !== true) {
+    return {
+      configured: false,
+      version: null,
+      publicKeyB64: null,
+      fingerprintB64: null,
+    };
+  }
+  const version = input.version;
+  if (typeof version !== "number" || !Number.isInteger(version)) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  const publicKeyB64 = requireString(input.public_key_b64, 128);
+  const fingerprintB64 = requireString(input.fingerprint_b64, 128);
+  // A public key must decode to exactly 32 bytes; the fingerprint is a base64
+  // SHA-256 (44 chars). Structural validation only; the browser recomputes the
+  // fingerprint from the unwrapped root before trusting it.
+  if (fromBase64(publicKeyB64).length !== 32) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  if (fromBase64(fingerprintB64).length !== 32) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  return {
+    configured: true,
+    version,
+    publicKeyB64,
+    fingerprintB64,
+  };
+}
+
+/** Fetch the durable public workspace identity. */
+export async function fetchWorkspaceIdentity(
+  options: RecoveryClientOptions = {},
+): Promise<WorkspaceIdentity> {
+  const fetchImpl = options.fetchFn ?? fetch;
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      options.identityUrl ?? DEFAULT_WORKSPACE_IDENTITY_URL,
+      {
+        method: "GET",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { Accept: "application/json" },
+      },
+    );
+  } catch {
+    throw new RecoveryClientError("recovery_unavailable");
+  }
+  if (!response.ok) return classify(response);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  return parseWorkspaceIdentity(body);
+}
+
+export interface BootstrapWrapperInput {
+  credentialIdB64: string;
+  label: string;
+  record: WrappedRootKey;
+}
+
+/**
+ * One-time initial workspace setup: upload only the stable public identity and
+ * the opaque wrappers. No secret field is ever sent.
+ */
+export async function bootstrapWorkspaceIdentity(
+  input: {
+    version: number;
+    publicKeyB64: string;
+    wrappers: BootstrapWrapperInput[];
+  },
+  options: RecoveryClientOptions = {},
+): Promise<WorkspaceIdentity> {
+  const fetchImpl = options.fetchFn ?? fetch;
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      options.identityUrl ?? DEFAULT_WORKSPACE_IDENTITY_URL,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          version: input.version,
+          public_key: input.publicKeyB64,
+          wrappers: input.wrappers.map((wrapper) => ({
+            credential_id_b64: wrapper.credentialIdB64,
+            label: wrapper.label,
+            version: wrapper.record.version,
+            algorithm: wrapper.record.algorithm,
+            key_source: wrapper.record.key_source,
+            salt_b64: wrapper.record.salt_b64,
+            iv_b64: wrapper.record.iv_b64,
+            wrapped_root_key_b64: wrapper.record.wrapped_root_key_b64,
+          })),
+        }),
+      },
+    );
+  } catch {
+    throw new RecoveryClientError("recovery_unavailable");
+  }
+  if (!response.ok) return classify(response);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new RecoveryClientError("recovery_malformed");
+  }
+  return parseWorkspaceIdentity(body);
 }

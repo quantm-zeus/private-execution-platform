@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
+  WORKSPACE_ROOT_CONTEXT_B64,
   WorkspaceUnlockRuntime,
   assertArtifactBinding,
   loadWasm,
@@ -14,8 +15,9 @@ import {
 import { isUnlockError, type UnlockReason, type UnlockStage } from "./unlock-stages.ts";
 import type { WorkspaceDescriptor } from "./descriptor.ts";
 
-// A real KID (16 non-zero bytes) so the runtime reaches the network boundary.
-const VALID_KID_B64 = "AQIDBAUGBwgJCgsMDQ4PEA==";
+// Releases are sealed under the fixed stable workspace context, so the
+// descriptor KID is that constant (never a per-release random value).
+const VALID_KID_B64 = WORKSPACE_ROOT_CONTEXT_B64;
 const WASM_BYTES = readFileSync(
   fileURLToPath(new URL("./wasm/crypto-envelope-wasm_bg.wasm", import.meta.url)),
 );
@@ -24,7 +26,7 @@ function descriptor(overrides: Partial<WorkspaceDescriptor> = {}): WorkspaceDesc
   return {
     protocol_version: 1,
     artifact_version: 1,
-    artifact_kid_b64: "AAAAAAAAAAAAAAAAAAAAAA==",
+    artifact_kid_b64: WORKSPACE_ROOT_CONTEXT_B64,
     artifact_size: 0,
     artifact_sha256_hex: "",
     package_format_version: 1,
@@ -100,7 +102,7 @@ test("an incompatible shell protocol fails as U5", async () => {
   );
 });
 
-test("a malformed or all-zero descriptor KID fails as U5", async () => {
+test("a malformed, all-zero or non-stable descriptor KID fails as U5", async () => {
   const runtime = new WorkspaceUnlockRuntime();
   const secret = new Uint8Array(32).fill(1);
   await expectStage(
@@ -117,6 +119,16 @@ test("a malformed or all-zero descriptor KID fails as U5", async () => {
     "U5_ARTIFACT",
     "descriptor_invalid",
   );
+  // A release sealed under a different KID cannot be opened by the stable root.
+  await expectStage(
+    () =>
+      runtime.unlock(
+        secret,
+        descriptor({ artifact_kid_b64: "AQIDBAUGBwgJCgsMDQ4PEA==" }),
+      ),
+    "U5_ARTIFACT",
+    "artifact_incompatible",
+  );
 });
 
 test("a WASM loader failure is classified as U1", async () => {
@@ -124,7 +136,7 @@ test("a WASM loader failure is classified as U1", async () => {
   const secret = new Uint8Array(32).fill(1);
   await expectStage(
     () =>
-      runtime.unlock(secret, descriptor({ artifact_kid_b64: "AQIDBAUGBwgJCgsMDQ4PEA==" }), {
+      runtime.unlock(secret, descriptor(), {
         wasmLoader: async () => {
           throw new Error("wasm unavailable /secret-path");
         },
@@ -134,7 +146,7 @@ test("a WASM loader failure is classified as U1", async () => {
   );
   // The classification must not carry the loader's message.
   try {
-    await runtime.unlock(secret, descriptor({ artifact_kid_b64: "AQIDBAUGBwgJCgsMDQ4PEA==" }), {
+    await runtime.unlock(secret, descriptor(), {
       wasmLoader: async () => {
         throw new Error("wasm unavailable /secret-path");
       },

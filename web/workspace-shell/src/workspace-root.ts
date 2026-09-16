@@ -22,7 +22,13 @@
 // The legacy release-bound model (`unlock_secret_v1`) remains parseable only as
 // bounded migration code; the normal flow never uses it.
 
-import { fromBase64, loadWasm, toBase64 } from "./unlock-runtime.ts";
+import {
+  WORKSPACE_ROOT_CONTEXT_B64,
+  WORKSPACE_ROOT_VERSION,
+  fromBase64,
+  loadWasm,
+  toBase64,
+} from "./unlock-runtime.ts";
 import {
   RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
   RecoveryWrappingError,
@@ -33,17 +39,25 @@ import {
 import { WasmWorkspaceKey } from "./wasm/crypto-envelope-wasm.js";
 
 export const WORKSPACE_ROOT_SECRET_BYTES = 32;
-export const WORKSPACE_ROOT_VERSION = 1;
+export { WORKSPACE_ROOT_CONTEXT_B64, WORKSPACE_ROOT_VERSION };
 /** Wrapper key source for the stable root; never reinterpreted as `unlock_secret_v1`. */
 export const WORKSPACE_ROOT_KEY_SOURCE = RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2;
-/**
- * Fixed 16-byte derivation context for the stable workspace recipient keypair.
- * `base64(sha256("evergreen/workspace-root-key/v2")[0..16])`. It is a protocol
- * constant and MUST NOT be derived from a release id, KID or artifact.
- */
-export const WORKSPACE_ROOT_CONTEXT_B64 = "St8tQ/Ednd6gbvtkRXZJsQ==";
 /** High-entropy offline recovery code length in bytes. */
 export const RECOVERY_CODE_BYTES = 32;
+
+/**
+ * Stable identifier for the offline-recovery wrapper. It is not a WebAuthn
+ * credential; it marks the record the recovery-code form unwraps. Losing the
+ * recovery code and every passkey is intentionally unrecoverable.
+ */
+export const OFFLINE_RECOVERY_CREDENTIAL_B64 = toBase64(
+  new TextEncoder().encode("evergreen-offline-recovery/v2"),
+);
+
+/** Is this the offline recovery wrapper's reserved credential identifier? */
+export function isOfflineRecoveryCredential(credentialIdB64: string): boolean {
+  return credentialIdB64 === OFFLINE_RECOVERY_CREDENTIAL_B64;
+}
 
 export type WorkspaceRootErrorCode =
   | "crypto_unavailable"

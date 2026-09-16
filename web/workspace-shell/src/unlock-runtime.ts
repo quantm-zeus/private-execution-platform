@@ -29,6 +29,17 @@ import { UnlockError, asUnlockError, type UnlockStage } from "./unlock-stages.ts
 
 export type { ShellSessionKeys } from "./handoff-gate.ts";
 
+/**
+ * Fixed 16-byte stable workspace derivation context (standard base64). It is
+ * `sha256("evergreen/workspace-root-key/v2")[0..16]`, a protocol constant that
+ * MUST NOT be derived from a release id or KID. It is the `kid` used for the
+ * stable Workspace Root Key and for every artifact sealed to it, so the
+ * workspace recipient identity is identical across releases.
+ */
+export const WORKSPACE_ROOT_CONTEXT_B64 = "St8tQ/Ednd6gbvtkRXZJsQ==";
+/** Protocol version of the stable workspace key derivation. */
+export const WORKSPACE_ROOT_VERSION = 1;
+
 let wasmReady: Promise<unknown> | undefined;
 
 export function loadWasm(moduleOrPath?: unknown): Promise<unknown> {
@@ -351,7 +362,29 @@ async function readErrorCode(response: Response): Promise<string | null> {
   }
 }
 
-function artifactKidBytes(descriptor: WorkspaceDescriptor): Uint8Array {
+/**
+ * The fixed stable workspace derivation context as raw bytes. Fails closed if
+ * the embedded constant is ever malformed.
+ */
+function workspaceContextKidBytes(): Uint8Array {
+  let kidBytes: Uint8Array;
+  try {
+    kidBytes = fromBase64(WORKSPACE_ROOT_CONTEXT_B64);
+  } catch {
+    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
+  }
+  if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) {
+    throw new UnlockError("U5_ARTIFACT", "descriptor_invalid");
+  }
+  return kidBytes;
+}
+
+/**
+ * The descriptor's artifact KID is protocol/release metadata, not the workspace
+ * identity. It must still be the stable context the artifact was sealed under;
+ * a release sealed to any other KID is incompatible with this stable root.
+ */
+function descriptorKidBytes(descriptor: WorkspaceDescriptor): Uint8Array {
   let kidBytes: Uint8Array;
   try {
     kidBytes = fromBase64(descriptor.artifact_kid_b64);
@@ -474,7 +507,14 @@ export class WorkspaceUnlockRuntime {
       ) {
         throw new UnlockError("U5_ARTIFACT", "protocol_incompatible");
       }
-      const kidBytes = artifactKidBytes(descriptor);
+      const kidBytes = workspaceContextKidBytes();
+      // The release descriptor must be sealed under the stable workspace
+      // context. A descriptor KID that differs means this release was bound to a
+      // different identity, so the stable root could never open it.
+      const descriptorKid = descriptorKidBytes(descriptor);
+      if (toBase64(descriptorKid) !== toBase64(kidBytes)) {
+        throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+      }
 
       // U1: audited WASM boundary. Not a network await, but still classified.
       onStage("U1_WASM");
@@ -490,7 +530,7 @@ export class WorkspaceUnlockRuntime {
       // path.
       onStage("U2_ENROLL");
       try {
-        workspaceKey = new WasmWorkspaceKey(secretBytes, 1, kidBytes);
+        workspaceKey = new WasmWorkspaceKey(secretBytes, WORKSPACE_ROOT_VERSION, kidBytes);
       } catch {
         // Length/zero/KID/version are all validated in JS above and mirrored by
         // the audited WASM constructor, so a throw here is an internal WASM/alloc

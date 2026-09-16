@@ -1,7 +1,7 @@
 import { render } from "solid-js/web";
 import { createSignal, onMount, onCleanup, Show, For } from "solid-js";
 import "./style.css";
-import { loadWasm, defaultRuntime, deriveWorkspaceFingerprint, fromBase64 } from "./unlock-runtime";
+import { defaultRuntime, loadWasm, toBase64 } from "./unlock-runtime";
 import {
   authenticateWithPasskey,
   enrollPasskey,
@@ -16,20 +16,34 @@ import {
   RecoveryClientError,
   addRecoveryWrapper,
   beginRecoveryProof,
+  bootstrapWorkspaceIdentity,
   fetchRecoveryWrappers,
+  fetchWorkspaceIdentity,
   fromBase64 as recoveryFromBase64,
   revokeRecoveryWrapper,
   touchRecoveryWrapper,
   unwrapWithPrfOutput,
+  type BootstrapWrapperInput,
   type RecoveryWrapperRecord,
+  type WorkspaceIdentity,
 } from "./recovery-client";
-import {
-  generateRecoverySalt,
-  wrapRootKey,
-} from "./recovery-wrapping";
 import { authenticateWithPrf } from "./recovery-passkey";
 import {
-  isCredentialFailure,
+  OFFLINE_RECOVERY_CREDENTIAL_B64,
+  WORKSPACE_ROOT_KEY_SOURCE,
+  WORKSPACE_ROOT_VERSION,
+  decodeRecoveryCode,
+  deriveWorkspaceRootFingerprint,
+  deriveWorkspaceRootPublicKey,
+  generateRecoveryCode,
+  generateWorkspaceRootSecret,
+  isOfflineRecoveryCredential,
+  unwrapWorkspaceRootWithRecovery,
+  wrapWorkspaceRootForRecovery,
+  workspaceRootMatchesFingerprint,
+} from "./workspace-root";
+import { generateRecoverySalt, wrapRootKey } from "./recovery-wrapping";
+import {
   isUnlockError,
   recoveryFor,
   type RecoveryAction,
@@ -44,6 +58,12 @@ type AuthState =
   | "authenticated"
   | "unsupported";
 
+/**
+ * Initial-setup phases. `show_recovery` gates the workspace until the operator
+ * confirms the one-time recovery code is saved.
+ */
+type SetupPhase = "unconfigured" | "preparing" | "show_recovery" | "done";
+
 const ENROLLMENT_STATUS_URL = "/internal/auth/enrollment-status";
 const SESSION_URL = "/internal/auth/session";
 
@@ -57,11 +77,6 @@ const STAGES: { id: UnlockStage; label: string }[] = [
   { id: "U6_PACKAGE", label: "Release package" },
   { id: "U7_BOOT", label: "Workspace start" },
 ];
-
-function shortDigest(hex: string): string {
-  if (!hex) return "unavailable";
-  return hex.slice(0, 12).replace(/(.{4})(?=.)/g, "$1 ");
-}
 
 /** Textual status for one unlock stage, so progress is never color-only. */
 function stageStatusText(current: UnlockStage | null, id: UnlockStage): string {
@@ -91,31 +106,43 @@ function App() {
     "Checking whether an operator session already exists...",
   );
   const [enrollmentOpen, setEnrollmentOpen] = createSignal(false);
+  const [enrollSecret, setEnrollSecret] = createSignal("");
+  const [isEnrolling, setIsEnrolling] = createSignal(false);
+  const [enrollInvalid, setEnrollInvalid] = createSignal(false);
+
   const [descriptor, setDescriptor] = createSignal<WorkspaceDescriptor | null>(null);
   const [descriptorError, setDescriptorError] = createSignal("");
   const [descriptorLoading, setDescriptorLoading] = createSignal(false);
-  const [recoveryCode, setRecoveryCode] = createSignal("");
+
+  const [identity, setIdentity] = createSignal<WorkspaceIdentity | null>(null);
+  const [identityError, setIdentityError] = createSignal("");
+  const [wrappers, setWrappers] = createSignal<RecoveryWrapperRecord[]>([]);
+  const [setupPhase, setSetupPhase] = createSignal<SetupPhase>("unconfigured");
+  const [setupRecoveryCode, setSetupRecoveryCode] = createSignal("");
+  const [setupError, setSetupError] = createSignal("");
+  const [savedConfirmed, setSavedConfirmed] = createSignal(false);
+
+  const [isUnlocking, setIsUnlocking] = createSignal(false);
   const [unlockStage, setUnlockStage] = createSignal<UnlockStage | null>(null);
   const [unlockFailure, setUnlockFailure] = createSignal<UnlockRecovery | null>(null);
-  const [isUnlocking, setIsUnlocking] = createSignal(false);
-  const [cryptoReady, setCryptoReady] = createSignal(false);
-  const [cryptoError, setCryptoError] = createSignal(false);
   const [isUnlocked, setIsUnlocked] = createSignal(false);
   const [payloadUrl, setPayloadUrl] = createSignal("");
-  const [enrollSecret, setEnrollSecret] = createSignal("");
-  const [isEnrolling, setIsEnrolling] = createSignal(false);
-  // Field-level validity for the two credential inputs, so a screen reader is
-  // told which control failed instead of only hearing a live-region message.
-  const [enrollInvalid, setEnrollInvalid] = createSignal(false);
-  const [recoveryWrappers, setRecoveryWrappers] = createSignal<
-    RecoveryWrapperRecord[]
-  >([]);
-  const [recoveryAvailable, setRecoveryAvailable] = createSignal(false);
-  const [recoveryBusy, setRecoveryBusy] = createSignal(false);
+  const [autoUnlockRan, setAutoUnlockRan] = createSignal(false);
+
+  const [cryptoReady, setCryptoReady] = createSignal(false);
+  const [cryptoError, setCryptoError] = createSignal(false);
+
+  const [troubleOpen, setTroubleOpen] = createSignal(false);
+  const [recoveryCodeInput, setRecoveryCodeInput] = createSignal("");
+  const [recoveryInvalid, setRecoveryInvalid] = createSignal(false);
   const [recoveryMessage, setRecoveryMessage] = createSignal("");
+  const [recoveryBusy, setRecoveryBusy] = createSignal(false);
+
   const [deviceLabel, setDeviceLabel] = createSignal("This device");
   const [addRecoveryCode, setAddRecoveryCode] = createSignal("");
   const [addRecoveryInvalid, setAddRecoveryInvalid] = createSignal(false);
+  const [securityMessage, setSecurityMessage] = createSignal("");
+
   let frame: HTMLIFrameElement | undefined;
   let recoveryInput: HTMLInputElement | undefined;
   let alertRef: HTMLDivElement | undefined;
@@ -156,38 +183,99 @@ function App() {
     }
   };
 
-  const loadDescriptor = async () => {
+  const loadDescriptor = async (): Promise<boolean> => {
     setDescriptorError("");
     setDescriptor(null);
     setDescriptorLoading(true);
     try {
       const value = await fetchWorkspaceDescriptor();
       setDescriptor(value);
+      return true;
     } catch (error) {
       if (error instanceof DescriptorError && error.code === "descriptor_unauthorized") {
         setAuthState("signed_out");
-        setAuthMessage("Operator session required. Open the private workspace to verify your passkey.");
-        return;
+        setAuthMessage(
+          "Operator session required. Open the private workspace to verify your passkey.",
+        );
+        return false;
       }
       setDescriptorError(
         "The server did not publish a usable workspace release descriptor. Retry, or contact the operator.",
       );
+      return false;
     } finally {
       setDescriptorLoading(false);
     }
   };
 
-  const loadRecoveryWrappers = async () => {
+  const loadIdentity = async (): Promise<WorkspaceIdentity | null> => {
+    setIdentityError("");
     try {
-      const wrappers = await fetchRecoveryWrappers();
-      setRecoveryWrappers(wrappers);
-      setRecoveryAvailable(true);
+      const value = await fetchWorkspaceIdentity();
+      setIdentity(value);
+      return value;
     } catch {
-      // Passkey recovery is optional; a closed surface or transient failure
-      // leaves the mandatory offline recovery code as the only credential.
-      setRecoveryWrappers([]);
-      setRecoveryAvailable(false);
+      // A closed identity surface means this workspace cannot be set up or
+      // unlocked with the stable root; fail closed rather than silently fall
+      // back to the legacy release-bound path.
+      setIdentity(null);
+      setIdentityError(
+        "The workspace identity service is unavailable. Retry, or contact the operator.",
+      );
+      return null;
     }
+  };
+
+  const loadWrappers = async (): Promise<RecoveryWrapperRecord[]> => {
+    try {
+      const value = await fetchRecoveryWrappers();
+      setWrappers(value);
+      return value;
+    } catch {
+      setWrappers([]);
+      return [];
+    }
+  };
+
+  /**
+   * Copy the unlocked root into the runtime (which copies before its first
+   * await) and zeroize the caller's buffer immediately.
+   */
+  const finishUnlock = async (
+    root: Uint8Array,
+    activeDescriptor: WorkspaceDescriptor,
+  ): Promise<void> => {
+    let unlockPromise: ReturnType<typeof defaultRuntime.unlock> | null = null;
+    try {
+      unlockPromise = defaultRuntime.unlock(root, activeDescriptor, {
+        onStage: (stage) => setUnlockStage(stage),
+      });
+    } finally {
+      root.fill(0);
+    }
+    // `unlock` copies the root synchronously before its first await, so the
+    // caller's buffer is already zeroized. A synchronous throw propagates from
+    // the assignment above and is handled by the caller.
+    const result = await (unlockPromise as NonNullable<typeof unlockPromise>);
+    setPayloadUrl(result.htmlUrl);
+    setIsUnlocked(true);
+    setStatus("Private workspace opened.");
+    queueMicrotask(() => document.getElementById("workspace-region")?.focus());
+  };
+
+  /** Load everything a signed-in session needs, then auto-unlock if configured. */
+  const refreshAccess = async () => {
+    setAutoUnlockRan(false);
+    const descriptorOk = await loadDescriptor();
+    const loadedIdentity = await loadIdentity();
+    if (!descriptorOk || !loadedIdentity) return;
+    if (!loadedIdentity.configured) {
+      if (setupPhase() !== "show_recovery") setSetupPhase("unconfigured");
+      return;
+    }
+    setSetupPhase("done");
+    const activeWrappers = await loadWrappers();
+    void runAutoUnlock(loadedIdentity, activeWrappers);
   };
 
   const runAuthentication = async () => {
@@ -197,9 +285,8 @@ function App() {
     try {
       await authenticateWithPasskey();
       setAuthState("authenticated");
-      setAuthMessage("Operator identity verified.");
-      await loadDescriptor();
-      void loadRecoveryWrappers();
+      setAuthMessage("Passkey verified.");
+      await refreshAccess();
     } catch (error) {
       if (error instanceof PasskeyAuthError && error.code === "webauthn_unsupported") {
         setAuthState("unsupported");
@@ -212,10 +299,200 @@ function App() {
   };
 
   /**
-   * Run the concrete control a stage failure offers. `onStage`-only recovery
-   * (contact_operator / rollback_release) has no button, so its guidance stays
-   * text-only.
+   * Normal path: a passkey with a usable PRF output unwraps the same stable
+   * Workspace Root Secret, which is validated against the durable public
+   * identity before it is used to decrypt the current release.
    */
+  const runAutoUnlock = async (
+    identityValue: WorkspaceIdentity,
+    wrapperList: RecoveryWrapperRecord[],
+  ) => {
+    if (isUnlocking() || isUnlocked() || autoUnlockRan()) return;
+    setAutoUnlockRan(true);
+    const activeDescriptor = descriptor();
+    if (!activeDescriptor || !identityValue.fingerprintB64) return;
+    const active = wrapperList.filter(
+      (wrapper) => wrapper.revoked_at_ms === null && !isOfflineRecoveryCredential(wrapper.credential_id_b64),
+    );
+    if (active.length === 0) {
+      setTroubleOpen(true);
+      setStatus("No passkey unlock is registered for this workspace.");
+      return;
+    }
+    setIsUnlocking(true);
+    setUnlockFailure(null);
+    setUnlockStage("U1_WASM");
+    setStatus("Unlocking with your passkey...");
+    let lastFailure: UnlockRecovery | null = null;
+    try {
+      for (const wrapper of active) {
+        let salt: Uint8Array;
+        try {
+          salt = recoveryFromBase64(wrapper.salt_b64);
+        } catch {
+          continue;
+        }
+        let prfOutput: Uint8Array | null = null;
+        let credentialIdB64 = "";
+        try {
+          const result = await authenticateWithPrf({
+            allowCredentialB64: wrapper.credential_id_b64,
+            prfSalt: salt,
+          });
+          prfOutput = result.prfOutput;
+          credentialIdB64 = result.credentialIdB64;
+        } catch {
+          continue;
+        }
+        if (!prfOutput) continue;
+        let root: Uint8Array | null = null;
+        try {
+          root = await unwrapWithPrfOutput(prfOutput, wrapper);
+        } catch {
+          continue;
+        } finally {
+          prfOutput.fill(0);
+        }
+        if (!root) continue;
+        if (!(await workspaceRootMatchesFingerprint(root, identityValue.fingerprintB64))) {
+          root.fill(0);
+          continue;
+        }
+        try {
+          await finishUnlock(root, activeDescriptor);
+          // Best-effort last-used metadata; requires its own proof of possession.
+          void beginRecoveryProof((sealed) =>
+            defaultRuntime.decryptRecoveryChallenge(sealed),
+          )
+            .then((proof) =>
+              touchRecoveryWrapper({
+                challengeId: proof.challengeId,
+                proofB64: proof.proofB64,
+                credentialIdB64,
+              }),
+            )
+            .catch(() => {});
+          setTroubleOpen(false);
+          setRecoveryMessage("");
+          return;
+        } catch (error) {
+          defaultRuntime.lock();
+          lastFailure = isUnlockError(error)
+            ? recoveryFor(error.stage, error.reason)
+            : recoveryFor("U7_BOOT", "unknown");
+        }
+      }
+      setTroubleOpen(true);
+      setRecoveryMessage(
+        "Automatic passkey unlock was not available. Use your offline recovery code.",
+      );
+      if (lastFailure) setUnlockFailure(lastFailure);
+      setStatus("Passkey unlock did not complete.");
+    } finally {
+      setUnlockStage(null);
+      setIsUnlocking(false);
+    }
+  };
+
+  /**
+   * One-time initial setup. The browser generates the Workspace Root Secret and
+   * a separate recovery code locally, derives the stable public identity, wraps
+   * the root under a passkey-PRF wrapper and the recovery wrapper, and uploads
+   * only the public key plus the opaque wrappers.
+   */
+  const runInitialSetup = async () => {
+    if (setupPhase() === "preparing") return;
+    const activeDescriptor = descriptor();
+    if (!activeDescriptor) {
+      setSetupError("The workspace release is not ready yet.");
+      return;
+    }
+    setSetupPhase("preparing");
+    setSetupError("");
+    setStatus("Creating this workspace...");
+    let root: Uint8Array | null = null;
+    try {
+      root = generateWorkspaceRootSecret();
+      const publicKey = await deriveWorkspaceRootPublicKey(root);
+      const recoveryCode = generateRecoveryCode();
+      const recoveryBytes = decodeRecoveryCode(recoveryCode);
+      let recoveryRecord;
+      try {
+        recoveryRecord = await wrapWorkspaceRootForRecovery(root, recoveryBytes);
+      } finally {
+        recoveryBytes.fill(0);
+      }
+      const bootstrapWrappers: BootstrapWrapperInput[] = [
+        {
+          credentialIdB64: OFFLINE_RECOVERY_CREDENTIAL_B64,
+          label: "Offline recovery code",
+          record: recoveryRecord,
+        },
+      ];
+      // Attempt a passkey-PRF wrapper for automatic future unlock. An
+      // authenticator without PRF is not fatal: the recovery code remains the
+      // mandatory fallback.
+      let prfAvailable = false;
+      const salt = generateRecoverySalt();
+      try {
+        const assertion = await authenticateWithPrf({ prfSalt: salt });
+        if (assertion.prfOutput) {
+          const record = await wrapRootKey(
+            assertion.prfOutput,
+            root,
+            salt,
+            undefined,
+            assertion.credentialIdB64,
+            WORKSPACE_ROOT_KEY_SOURCE,
+          );
+          assertion.prfOutput.fill(0);
+          prfAvailable = true;
+          bootstrapWrappers.push({
+            credentialIdB64: assertion.credentialIdB64,
+            label: deviceLabel().trim() || "This device",
+            record,
+          });
+        }
+      } catch {
+        // PRF unavailable: keep the recovery wrapper only.
+      }
+      const created = await bootstrapWorkspaceIdentity({
+        version: WORKSPACE_ROOT_VERSION,
+        publicKeyB64: toBase64(publicKey),
+        wrappers: bootstrapWrappers,
+      });
+      setIdentity(created);
+      await finishUnlock(root, activeDescriptor);
+      root = null;
+      setSetupRecoveryCode(recoveryCode);
+      setSetupPhase("show_recovery");
+      setStatus(
+        prfAvailable
+          ? "Workspace created. Save your recovery code."
+          : "Workspace created. Save your recovery code; this authenticator has no passkey unlock.",
+      );
+    } catch (error) {
+      setSetupError(
+        error instanceof RecoveryClientError && error.code === "recovery_conflict"
+          ? "This workspace is already set up. Reload to unlock it."
+          : "Workspace setup did not complete. Retry, or contact the operator.",
+      );
+      setSetupPhase("unconfigured");
+      setStatus("Workspace setup failed.");
+    } finally {
+      if (root) root.fill(0);
+    }
+  };
+
+  const confirmRecoverySaved = () => {
+    // Drop the recovery code from every reactive/UI reference before revealing
+    // the workspace. It is never persisted and never sent to the server.
+    setSetupRecoveryCode("");
+    setSavedConfirmed(false);
+    setSetupPhase("done");
+    setStatus("Private workspace ready.");
+  };
+
   const runRecoveryAction = (action: RecoveryAction) => {
     switch (action) {
       case "resume_authentication":
@@ -226,9 +503,8 @@ function App() {
         return;
       case "retry":
       case "reenter_recovery":
-        // The secret is cleared before the first await by design, so recovery
-        // always requires re-entry; do not leave a stale value behind.
-        setRecoveryCode("");
+        setRecoveryCodeInput("");
+        setTroubleOpen(true);
         if (recoveryInput) {
           recoveryInput.value = "";
           recoveryInput.focus();
@@ -249,8 +525,7 @@ function App() {
       if (response.status === 204) {
         setAuthState("authenticated");
         setAuthMessage("Existing operator session restored.");
-        await loadDescriptor();
-        void loadRecoveryWrappers();
+        await refreshAccess();
         return;
       }
     } catch {
@@ -283,7 +558,7 @@ function App() {
     setEnrollSecret("");
     if (!secretValue) {
       setEnrollInvalid(true);
-      setAuthMessage("Enrollment secret required.");
+      setAuthMessage("Operator enrollment secret required.");
       return;
     }
     setIsEnrolling(true);
@@ -312,8 +587,6 @@ function App() {
       setCryptoError(false);
       setStatus("Crypto boundary ready.");
     } catch {
-      // A mount-time crypto failure must not leave the form permanently disabled
-      // with no explanation: surface a recoverable notice instead.
       setCryptoError(true);
       setStatus("Crypto boundary unavailable in this browser.");
     }
@@ -321,7 +594,6 @@ function App() {
     await checkExistingSession();
   });
 
-  /** Retry the audited WASM load after a mount-time failure. */
   const retryCrypto = async () => {
     setCryptoError(false);
     setStatus("Loading the crypto boundary...");
@@ -341,286 +613,156 @@ function App() {
     defaultRuntime.lock();
   });
 
-  const handleUnlock = async (e: Event) => {
+  /** Recovery fallback: recovery code -> local unwrap -> verify -> unlock. */
+  const handleRecoveryUnlock = async (e: Event) => {
     e.preventDefault();
-    if (isUnlocking()) return;
+    if (recoveryBusy()) return;
     const activeDescriptor = descriptor();
-    if (!activeDescriptor) {
-      setDescriptorError("The release descriptor is not available yet.");
+    const identityValue = identity();
+    if (!activeDescriptor || !identityValue?.configured || !identityValue.fingerprintB64) {
+      setRecoveryMessage("The workspace release is not ready yet.");
       return;
     }
-
-    // Read the recovery code, then clear the reactive signal *and* the DOM
-    // input before the first network await. JavaScript strings cannot be
-    // zeroized, so this is best-effort: the reference is dropped right after
-    // decoding and only zeroizable bytes cross the async boundary below.
-    let raw = recoveryCode();
-    setRecoveryCode("");
+    // Read the recovery code, then clear both the reactive signal and the DOM
+    // input before the first await. JavaScript strings cannot be zeroized, so
+    // this is best-effort; only zeroizable bytes cross the async boundary.
+    let raw = recoveryCodeInput();
+    setRecoveryCodeInput("");
     if (recoveryInput) recoveryInput.value = "";
-
-    let secretBytes: Uint8Array;
+    let codeBytes: Uint8Array;
     try {
-      secretBytes = fromBase64(raw.trim());
+      codeBytes = decodeRecoveryCode(raw);
     } catch {
-      setUnlockFailure(recoveryFor("U2_ENROLL", "invalid_secret"));
+      setRecoveryInvalid(true);
+      setRecoveryMessage("That recovery code is not valid.");
       return;
     } finally {
       raw = "";
     }
-    if (secretBytes.length !== 32 || secretBytes.every((b) => b === 0)) {
-      secretBytes.fill(0);
-      setUnlockFailure(recoveryFor("U2_ENROLL", "invalid_secret"));
-      return;
-    }
-
-    setIsUnlocking(true);
+    setRecoveryBusy(true);
+    setRecoveryInvalid(false);
+    setRecoveryMessage("Checking your recovery code...");
     setUnlockFailure(null);
-    setUnlockStage("U1_WASM");
-    setStatus("Decrypting the private workspace in memory...");
-
-    // The runtime copies the secret synchronously before its first await, so the
-    // caller's plaintext buffer is dropped immediately instead of surviving the
-    // whole network exchange.
-    const unlockPromise = defaultRuntime.unlock(secretBytes, activeDescriptor, {
-      onStage: (stage) => setUnlockStage(stage),
-    });
-    secretBytes.fill(0);
-
     try {
-      const result = await unlockPromise;
-      setPayloadUrl(result.htmlUrl);
-      setIsUnlocked(true);
-      setStatus("Private workspace opened.");
-      queueMicrotask(() => document.getElementById("workspace-region")?.focus());
+      const offline = wrappers().find(
+        (wrapper) =>
+          wrapper.revoked_at_ms === null &&
+          isOfflineRecoveryCredential(wrapper.credential_id_b64),
+      );
+      if (!offline) {
+        setRecoveryMessage("No offline recovery credential is registered for this workspace.");
+        return;
+      }
+      let root: Uint8Array;
+      try {
+        root = await unwrapWorkspaceRootWithRecovery(offline, codeBytes);
+      } catch {
+        setRecoveryInvalid(true);
+        setRecoveryMessage("That recovery code does not match this workspace.");
+        return;
+      } finally {
+        codeBytes.fill(0);
+      }
+      if (!(await workspaceRootMatchesFingerprint(root, identityValue.fingerprintB64))) {
+        root.fill(0);
+        setRecoveryInvalid(true);
+        setRecoveryMessage("That recovery code does not match this workspace.");
+        return;
+      }
+      setRecoveryMessage("Unlocking...");
+      await finishUnlock(root, activeDescriptor);
+      setRecoveryMessage("");
+      setTroubleOpen(false);
+      setSecurityMessage(
+        "Recovered with the offline code. Add this device's passkey from the security panel for faster unlock.",
+      );
     } catch (error) {
       const failure = isUnlockError(error)
         ? recoveryFor(error.stage, error.reason)
         : recoveryFor("U7_BOOT", "unknown");
       setUnlockFailure(failure);
-      setStatus("Workspace unlock failed.");
-      if (
-        isUnlockError(error) &&
-        error.stage === "U2_ENROLL" &&
-        error.reason === "enrollment_required"
-      ) {
-        // The cached descriptor claimed an enrollment the server no longer has
-        // for this session; refetch so a retry posts the enrollment again
-        // instead of deterministically skipping it.
-        void loadDescriptor();
-      }
       defaultRuntime.lock();
+      setStatus("Workspace unlock failed.");
       queueMicrotask(() => alertRef?.focus());
     } finally {
-      setUnlockStage(null);
-      setIsUnlocking(false);
+      setRecoveryBusy(false);
     }
   };
 
   /**
-   * New-device path: unwrap the workspace secret through a registered passkey
-   * (WebAuthn PRF) instead of typing the offline recovery code. Falls back to
-   * the code when the authenticator returns no PRF output.
+   * Post-unlock: add the current device's passkey as a stable-root wrapper. It
+   * requires the offline recovery code as a trusted factor and never rotates
+   * the workspace root.
    */
-  const unlockWithRecoveryPasskey = async () => {
-    if (isUnlocking()) return;
-    const activeDescriptor = descriptor();
-    if (!activeDescriptor) {
-      setDescriptorError("The release descriptor is not available yet.");
-      return;
-    }
-    const wrappers = recoveryWrappers().filter(
-      (wrapper) => wrapper.revoked_at_ms === null,
-    );
-    if (wrappers.length === 0) {
-      setRecoveryMessage("No recovery passkey is registered for this workspace.");
-      return;
-    }
-    setIsUnlocking(true);
-    setUnlockFailure(null);
-    setRecoveryMessage("Waiting for your recovery passkey...");
-    setUnlockStage("U1_WASM");
-    let lastFailure: UnlockRecovery | null = null;
-    try {
-      for (const wrapper of wrappers) {
-        let salt: Uint8Array;
-        try {
-          salt = recoveryFromBase64(wrapper.salt_b64);
-        } catch {
-          continue;
-        }
-        let prfOutput: Uint8Array | null = null;
-        let credentialIdB64 = "";
-        try {
-          const result = await authenticateWithPrf({
-            allowCredentialB64: wrapper.credential_id_b64,
-            prfSalt: salt,
-          });
-          prfOutput = result.prfOutput;
-          credentialIdB64 = result.credentialIdB64;
-        } catch {
-          continue;
-        }
-        if (!prfOutput) continue;
-        let secret: Uint8Array | null = null;
-        try {
-          secret = await unwrapWithPrfOutput(prfOutput, wrapper);
-        } catch {
-          continue;
-        } finally {
-          prfOutput.fill(0);
-        }
-        if (!secret) continue;
-        // The runtime copies the secret synchronously before its first await, so
-        // drop the caller's copy immediately instead of after the exchange.
-        let unlockPromise: ReturnType<typeof defaultRuntime.unlock>;
-        try {
-          unlockPromise = defaultRuntime.unlock(secret, activeDescriptor, {
-            onStage: (stage) => setUnlockStage(stage),
-          });
-        } finally {
-          secret.fill(0);
-        }
-        try {
-          const result = await unlockPromise;
-          setPayloadUrl(result.htmlUrl);
-          setIsUnlocked(true);
-          setStatus("Private workspace opened.");
-          setRecoveryMessage("");
-          queueMicrotask(() => document.getElementById("workspace-region")?.focus());
-          // Best-effort "last used" metadata; requires proof of possession like
-          // add/revoke, so it is issued as its own short-lived challenge.
-          void beginRecoveryProof((sealed) =>
-            defaultRuntime.decryptRecoveryChallenge(sealed),
-          )
-            .then((proof) =>
-              touchRecoveryWrapper({
-                challengeId: proof.challengeId,
-                proofB64: proof.proofB64,
-                credentialIdB64,
-              }),
-            )
-            .catch(() => {});
-          return;
-        } catch (error) {
-          const failure = isUnlockError(error)
-            ? recoveryFor(error.stage, error.reason)
-            : recoveryFor("U7_BOOT", "unknown");
-          defaultRuntime.lock();
-          // A wrapper that unwraps to the wrong value fails as a workspace-key
-          // mismatch or an inner artifact decrypt failure. Only those are
-          // wrapper-specific; a protocol/descriptor incompatibility is release-
-          // wide, so retrying every wrapper would just re-prompt for the same
-          // deterministic error.
-          if (
-            isUnlockError(error) &&
-            (error.reason === "workspace_key_mismatch" ||
-              error.reason === "artifact_decrypt_failed")
-          ) {
-            lastFailure = failure;
-            continue;
-          }
-          setRecoveryMessage("");
-          setUnlockFailure(failure);
-          setStatus("Workspace unlock failed.");
-          queueMicrotask(() => alertRef?.focus());
-          return;
-        }
-      }
-      if (lastFailure) {
-        // Clear the transient "Waiting for your recovery passkey..." live-region
-        // text so it is not read out after the failure alert.
-        setRecoveryMessage("");
-        setUnlockFailure(lastFailure);
-        setStatus("Workspace unlock failed.");
-        queueMicrotask(() => alertRef?.focus());
-      } else {
-        setRecoveryMessage(
-          "No recovery passkey on this device. Enter your offline recovery code.",
-        );
-      }
-    } finally {
-      setUnlockStage(null);
-      setIsUnlocking(false);
-    }
-  };
-
-  /**
-   * Add the current passkey as a recovery credential. Adding requires an
-   * existing trusted recovery factor, so the offline recovery code is
-   * re-entered once to authorize the wrap; the code never leaves the browser.
-   */
-  const addRecoveryPasskey = async (e: Event) => {
+  const addThisPasskey = async (e: Event) => {
     e.preventDefault();
     if (recoveryBusy()) return;
-    setAddRecoveryInvalid(false);
+    const identityValue = identity();
+    if (!identityValue?.configured || !identityValue.fingerprintB64) {
+      setSecurityMessage("This workspace has no stable identity yet.");
+      return;
+    }
     let raw = addRecoveryCode();
     setAddRecoveryCode("");
-    let secret: Uint8Array;
+    let codeBytes: Uint8Array;
     try {
-      secret = fromBase64(raw.trim());
+      codeBytes = decodeRecoveryCode(raw);
     } catch {
-      secret = new Uint8Array(0);
+      setAddRecoveryInvalid(true);
+      setSecurityMessage("Enter the recovery code to authorize adding this passkey.");
+      return;
     } finally {
       raw = "";
     }
-    if (secret.length !== 32 || secret.every((byte) => byte === 0)) {
-      secret.fill(0);
-      setAddRecoveryInvalid(true);
-      setRecoveryMessage(
-        "Enter the 32-byte offline recovery code to authorize adding this passkey.",
-      );
-      return;
-    }
     setRecoveryBusy(true);
-    setRecoveryMessage("Verifying your recovery code...");
-    let prfOutput: Uint8Array | null = null;
+    setAddRecoveryInvalid(false);
     try {
-      // Verify the re-entered code actually derives this workspace's key before
-      // wrapping it; otherwise a mistyped code would be stored as a trusted
-      // recovery credential that unwraps to the wrong value. Fail closed when no
-      // pinned fingerprint is available rather than storing an unverified wrap.
-      const activeDescriptor = descriptor();
-      const expectedFingerprint =
-        activeDescriptor?.expected_public_key_fingerprint_b64 ??
-        activeDescriptor?.enrolled_public_key_fingerprint_b64 ??
-        null;
-      if (!activeDescriptor || !expectedFingerprint) {
-        setRecoveryMessage(
-          "This workspace has no pinned release fingerprint, so a recovery passkey cannot be added. The offline recovery code remains the fallback.",
-        );
-        return;
-      }
-      const fingerprint = await deriveWorkspaceFingerprint(
-        secret,
-        activeDescriptor.artifact_kid_b64,
+      const offline = wrappers().find(
+        (wrapper) =>
+          wrapper.revoked_at_ms === null &&
+          isOfflineRecoveryCredential(wrapper.credential_id_b64),
       );
-      if (fingerprint === null || fingerprint !== expectedFingerprint) {
-        setAddRecoveryInvalid(true);
-        setRecoveryMessage(
-          "That recovery code does not match this workspace's active release.",
-        );
+      if (!offline) {
+        setSecurityMessage("No offline recovery credential is registered.");
         return;
       }
-      setRecoveryMessage("Waiting for your passkey...");
+      let root: Uint8Array;
+      try {
+        root = await unwrapWorkspaceRootWithRecovery(offline, codeBytes);
+      } catch {
+        setAddRecoveryInvalid(true);
+        setSecurityMessage("That recovery code does not match this workspace.");
+        return;
+      } finally {
+        codeBytes.fill(0);
+      }
+      if (!(await workspaceRootMatchesFingerprint(root, identityValue.fingerprintB64))) {
+        root.fill(0);
+        setAddRecoveryInvalid(true);
+        setSecurityMessage("That recovery code does not match this workspace.");
+        return;
+      }
+      setSecurityMessage("Waiting for your passkey...");
       const salt = generateRecoverySalt();
       const assertion = await authenticateWithPrf({ prfSalt: salt });
-      prfOutput = assertion.prfOutput;
+      const prfOutput = assertion.prfOutput;
       if (!prfOutput) {
-        setRecoveryMessage(
-          "This authenticator or browser does not support passkey recovery (WebAuthn PRF). Your offline recovery code remains the fallback.",
+        root.fill(0);
+        setSecurityMessage(
+          "This authenticator does not support passkey unlock (WebAuthn PRF). The recovery code remains the fallback.",
         );
         return;
       }
-      const wrapped = await wrapRootKey(prfOutput, secret, salt, undefined, assertion.credentialIdB64);
-      // The wrapping key was derived from the PRF output inside `wrapRootKey`,
-      // so the raw PRF bytes are no longer needed once the record exists. Drop
-      // them before the proof-of-possession network round trip instead of
-      // holding them across two awaits until the outer `finally`.
+      const record = await wrapRootKey(
+        prfOutput,
+        root,
+        salt,
+        undefined,
+        assertion.credentialIdB64,
+        WORKSPACE_ROOT_KEY_SOURCE,
+      );
       prfOutput.fill(0);
-      prfOutput = null;
-      // Drop the offline-code bytes before the proof-of-possession network
-      // round trip so they are not retained across it.
-      secret.fill(0);
+      root.fill(0);
       const proof = await beginRecoveryProof((sealed) =>
         defaultRuntime.decryptRecoveryChallenge(sealed),
       );
@@ -629,19 +771,17 @@ function App() {
         proofB64: proof.proofB64,
         credentialIdB64: assertion.credentialIdB64,
         label: deviceLabel().trim() || "Recovery passkey",
-        record: wrapped,
+        record,
       });
-      setRecoveryMessage("Recovery passkey added for this workspace.");
-      await loadRecoveryWrappers();
+      setSecurityMessage("This device's passkey was added.");
+      await loadWrappers();
     } catch (error) {
-      setRecoveryMessage(
+      setSecurityMessage(
         error instanceof RecoveryClientError && error.code === "recovery_conflict"
           ? "The workspace already has the maximum number of recovery credentials."
-          : "Could not add the recovery passkey.",
+          : "Could not add this passkey.",
       );
     } finally {
-      if (prfOutput) prfOutput.fill(0);
-      secret.fill(0);
       setRecoveryBusy(false);
     }
   };
@@ -658,10 +798,14 @@ function App() {
         proofB64: proof.proofB64,
         credentialIdB64,
       });
-      setRecoveryMessage("Recovery credential revoked.");
-      await loadRecoveryWrappers();
+      setSecurityMessage(
+        isOfflineRecoveryCredential(credentialIdB64)
+          ? "Offline recovery code revoked. If every passkey is also lost, this workspace is unrecoverable."
+          : "Recovery credential revoked.",
+      );
+      await loadWrappers();
     } catch {
-      setRecoveryMessage("Could not revoke that recovery credential.");
+      setSecurityMessage("Could not revoke that recovery credential.");
     } finally {
       setRecoveryBusy(false);
     }
@@ -673,11 +817,12 @@ function App() {
     setIsUnlocked(false);
     setUnlockFailure(null);
     setStatus("Workspace locked.");
-    // The lock control (and the payload frame) unmount, so return focus to the
-    // gateway heading; otherwise focus falls to <body> and keyboard users lose
-    // their place.
     queueMicrotask(() => document.getElementById("open-heading")?.focus());
   };
+
+  const needsSetup = () =>
+    authState() === "authenticated" && identity()?.configured === false;
+  const showSetupRecovery = () => setupPhase() === "show_recovery";
 
   return (
     <main class="gateway">
@@ -685,9 +830,8 @@ function App() {
         <p class="gateway__wordmark">Evergreen</p>
         <h1 class="gateway__title">Private Workspace Gateway</h1>
         <p class="gateway__lede">
-          Three independent checks stand between this browser and the private
-          trading workspace: the network perimeter, your passkey, and the local
-          decryption of the sealed release.
+          Cloudflare Access proves the network perimeter, your passkey proves the
+          operator, and the sealed release is decrypted locally in this browser.
         </p>
       </header>
 
@@ -709,9 +853,9 @@ function App() {
         >
           <span class="ledger__marker" aria-hidden="true">2</span>
           <span class="ledger__body">
-            <span class="ledger__label">Operator</span>
+            <span class="ledger__label">Passkey</span>
             <span class="ledger__value">
-              {authState() === "authenticated" ? "Passkey verified" : "Passkey pending"}
+              {authState() === "authenticated" ? "Verified" : "Pending"}
             </span>
           </span>
         </li>
@@ -726,7 +870,7 @@ function App() {
           <span class="ledger__body">
             <span class="ledger__label">Workspace</span>
             <span class="ledger__value">
-              {isUnlocked() ? "Decrypted locally" : "Sealed"}
+              {isUnlocked() ? "Unlocked locally" : "Locked"}
             </span>
           </span>
         </li>
@@ -771,15 +915,30 @@ function App() {
 
       <Show when={descriptorError()}>
         <div class="notice notice--error" role="alert">
-          <p class="notice__title">Release descriptor unavailable</p>
+          <p class="notice__title">Release unavailable</p>
           <p class="notice__detail">{descriptorError()}</p>
           <button
             type="button"
             class="button"
-            onClick={loadDescriptor}
+            onClick={refreshAccess}
             disabled={descriptorLoading() || authState() !== "authenticated"}
           >
             {descriptorLoading() ? "Checking release..." : "Retry release check"}
+          </button>
+        </div>
+      </Show>
+
+      <Show when={identityError()}>
+        <div class="notice notice--error" role="alert">
+          <p class="notice__title">Workspace identity unavailable</p>
+          <p class="notice__detail">{identityError()}</p>
+          <button
+            type="button"
+            class="button"
+            onClick={refreshAccess}
+            disabled={authState() !== "authenticated"}
+          >
+            Retry
           </button>
         </div>
       </Show>
@@ -797,6 +956,8 @@ function App() {
         </div>
       </Show>
 
+      {/* Normal login: Cloudflare Access -> Passkey -> Workspace. No KID, key,
+          fingerprint, release-compatibility or recovery-code input is shown. */}
       <Show when={!isUnlocked()}>
         <section class="panel" aria-labelledby="open-heading">
           <h2 id="open-heading" class="panel__heading" tabindex={-1}>
@@ -826,14 +987,14 @@ function App() {
               }
             >
               <p id="auth-status" class="panel__verified" role="status">
-                Operator session established. Release metadata loaded automatically.
+                {needsSetup() ? "Workspace setup required." : "Passkey verified."}
               </p>
             </Show>
           </div>
 
           <Show when={enrollmentOpen()}>
             <details class="advanced">
-              <summary>First-run passkey enrollment</summary>
+              <summary>First-run operator enrollment</summary>
               <form class="form" onSubmit={handleEnroll}>
                 <label class="field" for="enroll-secret">
                   <span class="field__label">Operator enrollment secret</span>
@@ -858,73 +1019,98 @@ function App() {
           </Show>
         </section>
 
-        <Show when={authState() === "authenticated" && descriptor()}>
-          {(active) => (
-            <section class="panel" aria-labelledby="unlock-heading">
-              <h2 id="unlock-heading" class="panel__heading">
-                Unlock the sealed release
-              </h2>
-              <p class="panel__copy">
-                Enter your high-entropy offline recovery code. It is decoded to
-                bytes locally, cleared from this form before any network call,
-                and never sent to the server.
+        {/* Initial setup: generate the stable root + recovery code locally. */}
+        <Show when={needsSetup() && descriptor()}>
+          <section class="panel" aria-labelledby="setup-heading">
+            <h2 id="setup-heading" class="panel__heading">
+              Set up this workspace
+            </h2>
+            <p class="panel__copy">
+              This workspace has no root key yet. This browser will generate a
+              stable workspace root and a one-time recovery code locally; only
+              the public identity and encrypted wrappers are uploaded.
+            </p>
+            <Show when={setupError()}>
+              <p class="notice notice--error" role="alert">
+                <span class="notice__detail">{setupError()}</span>
               </p>
-              <p class="panel__note">
-                Passkey-bound recovery is offered only once this workspace
-                publishes a wrapped root key and your authenticator verifies
-                WebAuthn PRF support. Until then the offline recovery code is
-                the only unlock credential.
-              </p>
+            </Show>
+            <button
+              type="button"
+              class="button button--primary"
+              onClick={runInitialSetup}
+              disabled={setupPhase() === "preparing" || !cryptoReady()}
+            >
+              {setupPhase() === "preparing"
+                ? "Creating workspace..."
+                : "Create this workspace"}
+            </button>
+          </section>
+        </Show>
 
-              <section
-                class="fingerprint"
-                aria-labelledby="release-fingerprint-heading"
+        {/* Unlocking progress and the trouble/recovery entry point. */}
+        <Show
+          when={
+            authState() === "authenticated" &&
+            identity()?.configured === true &&
+            !needsSetup()
+          }
+        >
+          <section class="panel" aria-labelledby="unlock-heading">
+            <h2 id="unlock-heading" class="panel__heading">
+              Unlock the sealed release
+            </h2>
+            <p class="panel__copy">
+              Your passkey unwraps this workspace's root key locally. The sealed
+              release is decrypted in memory and never leaves this browser.
+            </p>
+
+            <Show when={isUnlocking() || unlockStage()}>
+              <div role="status" aria-live="polite">
+                <ol class="stages" aria-label="Unlock progress">
+                  <For each={STAGES}>
+                    {(stage) => (
+                      <li
+                        class="stages__item"
+                        classList={{
+                          "stages__item--done":
+                            unlockStage() !== null &&
+                            STAGES.findIndex((s) => s.id === stage.id) <
+                              STAGES.findIndex((s) => s.id === unlockStage()),
+                          "stages__item--active": unlockStage() === stage.id,
+                          "stages__item--pending":
+                            unlockStage() !== null &&
+                            STAGES.findIndex((s) => s.id === stage.id) >
+                              STAGES.findIndex((s) => s.id === unlockStage()),
+                        }}
+                      >
+                        <span class="stages__dot" aria-hidden="true" />
+                        <span class="stages__label">{stage.label}</span>
+                        <span class="stages__state">
+                          {stageStatusText(unlockStage(), stage.id)}
+                        </span>
+                      </li>
+                    )}
+                  </For>
+                </ol>
+              </div>
+            </Show>
+
+            <Show when={!troubleOpen() && !isUnlocking()}>
+              <button
+                type="button"
+                class="button"
+                onClick={() => {
+                  setTroubleOpen(true);
+                  queueMicrotask(() => recoveryInput?.focus());
+                }}
               >
-                <h3 id="release-fingerprint-heading" class="sr-only">
-                  Active release
-                </h3>
-                <div class="fingerprint__row">
-                  <span class="fingerprint__key">Release</span>
-                  <span class="fingerprint__value">
-                    {active().release_id ?? "unversioned"}
-                  </span>
-                </div>
-                <div class="fingerprint__row">
-                  <span class="fingerprint__key">Artifact digest</span>
-                  <span class="fingerprint__value fingerprint__value--mono">
-                    {shortDigest(active().artifact_sha256_hex)}
-                  </span>
-                </div>
-                <div class="fingerprint__row">
-                  <span class="fingerprint__key">Key binding</span>
-                  <span class="fingerprint__value">
-                    {active().expected_public_key_fingerprint_b64
-                      ? "Pinned to this release"
-                      : "Not pinned (legacy)"}
-                  </span>
-                </div>
-                <details class="advanced">
-                  <summary>Protocol metadata</summary>
-                  <dl class="meta">
-                    <div class="meta__row">
-                      <dt>Artifact version</dt>
-                      <dd>{active().artifact_version}</dd>
-                    </div>
-                    <div class="meta__row">
-                      <dt>Package format</dt>
-                      <dd>{active().package_format_version}</dd>
-                    </div>
-                    <div class="meta__row">
-                      <dt>Workspace protocol</dt>
-                      <dd>
-                        {active().min_shell_protocol}–{active().max_shell_protocol}
-                      </dd>
-                    </div>
-                  </dl>
-                </details>
-              </section>
+                Having trouble signing in?
+              </button>
+            </Show>
 
-              <form class="form" onSubmit={handleUnlock}>
+            <Show when={troubleOpen()}>
+              <form class="form" onSubmit={handleRecoveryUnlock}>
                 <label class="field" for="recovery-code">
                   <span class="field__label">Offline recovery code</span>
                   <input
@@ -935,12 +1121,12 @@ function App() {
                     autocapitalize="off"
                     autocorrect="off"
                     spellcheck={false}
-                    placeholder="32-byte base64 recovery code"
-                    value={recoveryCode()}
-                    onInput={(e) => setRecoveryCode(e.currentTarget.value)}
-                    disabled={isUnlocking()}
-                    aria-invalid={isCredentialFailure(unlockFailure()) ? "true" : "false"}
-                    aria-describedby={unlockFailure() ? "unlock-failure" : undefined}
+                    placeholder="Recovery code"
+                    value={recoveryCodeInput()}
+                    onInput={(e) => setRecoveryCodeInput(e.currentTarget.value)}
+                    disabled={recoveryBusy()}
+                    aria-invalid={recoveryInvalid() ? "true" : "false"}
+                    aria-describedby={recoveryMessage() ? "recovery-message" : undefined}
                     ref={(element) => {
                       recoveryInput = element;
                     }}
@@ -949,82 +1135,56 @@ function App() {
                 <button
                   class="button button--primary"
                   type="submit"
-                  disabled={isUnlocking() || !cryptoReady()}
+                  disabled={recoveryBusy() || !cryptoReady()}
                 >
-                  {!cryptoReady()
-                    ? "Preparing crypto..."
-                    : isUnlocking()
-                      ? "Unlocking..."
-                      : "Unlock Workspace"}
+                  {recoveryBusy() ? "Checking..." : "Unlock with recovery code"}
                 </button>
               </form>
-
-              <Show
-                when={recoveryWrappers().some(
-                  (wrapper) => wrapper.revoked_at_ms === null,
-                )}
-              >
-                <div class="recovery-passkey">
-                  <p class="panel__copy">
-                    A recovery passkey is registered for this workspace. Verify it
-                    to unwrap the release without typing the offline code.
-                  </p>
-                  <button
-                    type="button"
-                    class="button"
-                    onClick={unlockWithRecoveryPasskey}
-                    disabled={isUnlocking() || !cryptoReady()}
-                  >
-                    Unlock with a recovery passkey
-                  </button>
-                </div>
-              </Show>
-
               <Show when={recoveryMessage()}>
-                <p class="panel__note" role="status">
+                <p id="recovery-message" class="panel__note" role="status" aria-live="polite">
                   {recoveryMessage()}
                 </p>
               </Show>
-
-              <Show when={isUnlocking() || unlockStage()}>
-                {/* The live region wraps the list so stage changes are
-                    announced; putting role="status" on the <ol> itself would
-                    strip its list semantics and break axe. */}
-                <div role="status" aria-live="polite">
-                  <ol class="stages" aria-label="Unlock progress">
-                    <For each={STAGES}>
-                      {(stage) => (
-                        <li
-                          class="stages__item"
-                          classList={{
-                            "stages__item--done":
-                              unlockStage() !== null &&
-                              STAGES.findIndex((s) => s.id === stage.id) <
-                                STAGES.findIndex((s) => s.id === unlockStage()),
-                            "stages__item--active": unlockStage() === stage.id,
-                            "stages__item--pending":
-                              unlockStage() !== null &&
-                              STAGES.findIndex((s) => s.id === stage.id) >
-                                STAGES.findIndex((s) => s.id === unlockStage()),
-                          }}
-                        >
-                          <span class="stages__dot" aria-hidden="true" />
-                          <span class="stages__label">{stage.label}</span>
-                          <span class="stages__state">
-                            {stageStatusText(unlockStage(), stage.id)}
-                          </span>
-                        </li>
-                      )}
-                    </For>
-                  </ol>
-                </div>
-              </Show>
-            </section>
-          )}
+            </Show>
+          </section>
         </Show>
       </Show>
 
-      <Show when={isUnlocked()}>
+      {/* Recovery code is shown exactly once, gated on explicit confirmation. */}
+      <Show when={showSetupRecovery()}>
+        <section class="panel" aria-labelledby="recovery-code-heading">
+          <h2 id="recovery-code-heading" class="panel__heading">
+            Save your offline recovery code
+          </h2>
+          <p class="panel__copy">
+            This code is shown once. It is the only way to recover this workspace
+            if you lose every passkey. It is never sent to the server.
+          </p>
+          <p class="fingerprint__value fingerprint__value--mono" data-testid="recovery-code">
+            {setupRecoveryCode()}
+          </p>
+          <label class="field">
+            <input
+              type="checkbox"
+              checked={savedConfirmed()}
+              onChange={(event) => setSavedConfirmed(event.currentTarget.checked)}
+            />
+            <span class="field__label">
+              I have saved this recovery code somewhere safe.
+            </span>
+          </label>
+          <button
+            type="button"
+            class="button button--primary"
+            onClick={confirmRecoverySaved}
+            disabled={!savedConfirmed()}
+          >
+            Continue to workspace
+          </button>
+        </section>
+      </Show>
+
+      <Show when={isUnlocked() && !showSetupRecovery()}>
         <section class="workspace" id="workspace-region" tabindex={-1} aria-label="Private workspace">
           <div class="workspace__bar">
             <p class="workspace__state" role="status">
@@ -1047,21 +1207,25 @@ function App() {
           />
         </section>
 
-        <Show when={recoveryAvailable()}>
-          <section class="panel" aria-labelledby="devices-heading">
-            <h2 id="devices-heading" class="panel__heading">
-              Trusted recovery credentials
-            </h2>
-            <p class="panel__copy">
-              Each credential wraps this workspace's root key locally. Revoking a
-              credential never rotates the key; the offline recovery code always
-              remains a fallback.
-            </p>
+        <section class="panel" aria-labelledby="security-heading">
+          <h2 id="security-heading" class="panel__heading">
+            Workspace security
+          </h2>
+          <p class="panel__copy">
+            Each credential wraps this workspace's stable root key locally. Revoking
+            a credential never rotates the root; the offline recovery code remains
+            the fallback.
+          </p>
+          <Show when={wrappers().length > 0}>
             <ul class="devices">
-              <For each={recoveryWrappers()}>
+              <For each={wrappers()}>
                 {(wrapper) => (
                   <li class="devices__row">
-                    <span class="devices__label">{wrapper.label}</span>
+                    <span class="devices__label">
+                      {isOfflineRecoveryCredential(wrapper.credential_id_b64)
+                        ? "Offline recovery code"
+                        : wrapper.label}
+                    </span>
                     <span class="devices__meta">
                       {wrapper.revoked_at_ms !== null
                         ? "Revoked"
@@ -1083,10 +1247,13 @@ function App() {
                 )}
               </For>
             </ul>
-            <Show when={recoveryWrappers().length === 0}>
-              <p class="panel__note">No recovery passkey is registered yet.</p>
-            </Show>
-            <form class="form" onSubmit={addRecoveryPasskey}>
+          </Show>
+          <Show when={wrappers().length === 0}>
+            <p class="panel__note">No recovery credentials are registered yet.</p>
+          </Show>
+          <details class="advanced">
+            <summary>Add this device's passkey</summary>
+            <form class="form" onSubmit={addThisPasskey}>
               <label class="field" for="device-label">
                 <span class="field__label">Device label</span>
                 <input
@@ -1113,29 +1280,27 @@ function App() {
                   onInput={(event) => setAddRecoveryCode(event.currentTarget.value)}
                   disabled={recoveryBusy()}
                   aria-invalid={addRecoveryInvalid() ? "true" : "false"}
-                  aria-describedby={
-                    addRecoveryInvalid() ? "recovery-device-message" : undefined
-                  }
+                  aria-describedby={addRecoveryInvalid() ? "security-message" : undefined}
                 />
               </label>
               <button class="button" type="submit" disabled={recoveryBusy()}>
                 {recoveryBusy() ? "Working..." : "Add this passkey"}
               </button>
             </form>
-            <Show when={recoveryMessage()}>
-              <p id="recovery-device-message" class="panel__note" role="status" aria-live="polite">
-                {recoveryMessage()}
-              </p>
-            </Show>
-          </section>
-        </Show>
+          </details>
+          <Show when={securityMessage()}>
+            <p id="security-message" class="panel__note" role="status" aria-live="polite">
+              {securityMessage()}
+            </p>
+          </Show>
+        </section>
       </Show>
 
       <footer class="gateway__footer">
         <p>
           The perimeter and your passkey prove identity. The release is decrypted
-          locally, either by your offline recovery code or by a recovery passkey
-          on this device; neither leaves this browser.
+          locally from this workspace's stable root key; no key material leaves
+          this browser.
         </p>
       </footer>
     </main>
