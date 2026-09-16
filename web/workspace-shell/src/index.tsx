@@ -38,6 +38,7 @@ import {
   generateRecoveryCode,
   generateWorkspaceRootSecret,
   isOfflineRecoveryCredential,
+  selectPasskeyUnlockWrappers,
   unwrapWorkspaceRootWithRecovery,
   wrapWorkspaceRootForRecovery,
   workspaceRootMatchesFingerprint,
@@ -311,9 +312,7 @@ function App() {
     setAutoUnlockRan(true);
     const activeDescriptor = descriptor();
     if (!activeDescriptor || !identityValue.fingerprintB64) return;
-    const active = wrapperList.filter(
-      (wrapper) => wrapper.revoked_at_ms === null && !isOfflineRecoveryCredential(wrapper.credential_id_b64),
-    );
+    const active = selectPasskeyUnlockWrappers(wrapperList);
     if (active.length === 0) {
       setTroubleOpen(true);
       setStatus("No passkey unlock is registered for this workspace.");

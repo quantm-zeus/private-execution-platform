@@ -59,6 +59,21 @@ export function isOfflineRecoveryCredential(credentialIdB64: string): boolean {
   return credentialIdB64 === OFFLINE_RECOVERY_CREDENTIAL_B64;
 }
 
+/**
+ * The passkey wrappers a normal login may try. Revoked credentials are excluded
+ * (a revoked passkey can never unlock), as is the offline recovery record, which
+ * is used only by the explicit recovery-code path.
+ */
+export function selectPasskeyUnlockWrappers<
+  T extends { credential_id_b64: string; revoked_at_ms: number | null },
+>(records: readonly T[]): T[] {
+  return records.filter(
+    (record) =>
+      record.revoked_at_ms === null &&
+      !isOfflineRecoveryCredential(record.credential_id_b64),
+  );
+}
+
 export type WorkspaceRootErrorCode =
   | "crypto_unavailable"
   | "invalid_root"

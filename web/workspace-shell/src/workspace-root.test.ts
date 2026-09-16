@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   RECOVERY_CODE_BYTES,
+  OFFLINE_RECOVERY_CREDENTIAL_B64,
   WORKSPACE_ROOT_CONTEXT_B64,
   WORKSPACE_ROOT_KEY_SOURCE,
   WORKSPACE_ROOT_SECRET_BYTES,
@@ -13,11 +14,15 @@ import {
   deriveWorkspaceRootPublicKey,
   generateRecoveryCode,
   generateWorkspaceRootSecret,
+  isOfflineRecoveryCredential,
   isValidWorkspaceRootSecret,
+  selectPasskeyUnlockWrappers,
+  unwrapWorkspaceRootWithPrf,
   unwrapWorkspaceRootWithRecovery,
   wrapWorkspaceRootForRecovery,
   workspaceRootMatchesFingerprint,
 } from "./workspace-root.ts";
+import { generateRecoverySalt, wrapWithPrf } from "./recovery-wrapping.ts";
 import { initSync } from "./wasm/crypto-envelope-wasm.js";
 
 // Initialize the real audited WASM derivation once for this file.
@@ -157,6 +162,49 @@ test("a legacy v1 wrapper is never accepted by the v2 unwrap path", async () => 
     (error: unknown) =>
       error instanceof WorkspaceRootError && error.code === "unwrap_failed",
   );
+});
+
+test("a passkey-PRF wrapper round-trips the stable root and binds the credential", async () => {
+  const credentialId = Buffer.from(new Uint8Array(32).fill(7)).toString("base64");
+  const prf = new Uint8Array(32).fill(0x42);
+  const credential = {
+    getClientExtensionResults: () => ({ prf: { results: { first: prf } } }),
+  };
+  const record = await wrapWithPrf(
+    FIXED_ROOT,
+    credential,
+    credentialId,
+    generateRecoverySalt(),
+    WORKSPACE_ROOT_KEY_SOURCE,
+  );
+  assert.ok(record);
+  assert.equal(record!.key_source, WORKSPACE_ROOT_KEY_SOURCE);
+
+  const reopened = await unwrapWorkspaceRootWithPrf(record!, prf, credentialId);
+  assert.deepEqual(reopened, FIXED_ROOT);
+
+  // A different credential id is not authenticated into the tag.
+  await assert.rejects(
+    unwrapWorkspaceRootWithPrf(
+      record!,
+      prf,
+      Buffer.from(new Uint8Array(32).fill(8)).toString("base64"),
+    ),
+    (error: unknown) => error instanceof WorkspaceRootError,
+  );
+});
+
+test("a revoked passkey is never selected for normal unlock", () => {
+  const offline = {
+    credential_id_b64: OFFLINE_RECOVERY_CREDENTIAL_B64,
+    revoked_at_ms: null,
+  };
+  const live = { credential_id_b64: "live-passkey", revoked_at_ms: null };
+  const revoked = { credential_id_b64: "revoked-passkey", revoked_at_ms: 123 };
+  const selected = selectPasskeyUnlockWrappers([offline, live, revoked]);
+  assert.deepEqual(selected, [live]);
+  assert.equal(isOfflineRecoveryCredential(offline.credential_id_b64), true);
+  assert.equal(isOfflineRecoveryCredential(live.credential_id_b64), false);
 });
 
 test("the root modules never touch browser persistent storage", () => {
