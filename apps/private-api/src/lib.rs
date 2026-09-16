@@ -764,7 +764,29 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     let manifest_result = state.load_manifest().await;
     let manifest_configured = !matches!(&manifest_result, Ok(None));
     let (artifact_ok, manifest_ok) = match state.verified_artifact().await {
-        Ok(_) => (true, true),
+        Ok(verified) => {
+            // The cached verdict proves the artifact bytes were read and hashed.
+            // Re-check the *fresh* manifest against that verdict on every probe,
+            // so a manifest that is corrupted, deleted or swapped after startup
+            // can never keep `/ready` green.
+            let manifest_ok = match &manifest_result {
+                Ok(None) => true,
+                Ok(Some(manifest)) => {
+                    manifest
+                        .validate_header_against(
+                            &release::ArtifactHeader {
+                                version: verified.version,
+                                kid: verified.kid,
+                            },
+                            verified.size,
+                        )
+                        .is_ok()
+                        && manifest.artifact.sha256_hex == verified.sha256_hex
+                }
+                Err(_) => false,
+            };
+            (true, manifest_ok)
+        }
         // A verified-artifact failure means the artifact/immutable binding is
         // unusable; the manifest check is only healthy in the explicit
         // no-manifest mode.
@@ -1509,6 +1531,7 @@ struct RecoveryChallengeResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryWrapperUpsertRequest {
     challenge_id: String,
     proof_b64: String,
@@ -1516,6 +1539,7 @@ struct RecoveryWrapperUpsertRequest {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryRevokeRequest {
     challenge_id: String,
     proof_b64: String,
@@ -1523,6 +1547,7 @@ struct RecoveryRevokeRequest {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryTouchRequest {
     challenge_id: String,
     proof_b64: String,
@@ -1894,6 +1919,9 @@ async fn get_workspace_identity(
 /// Secret locally and uploads only the derived public key plus the opaque
 /// passkey-PRF and offline-recovery wrappers. Create-once: a second bootstrap is
 /// refused, so the workspace identity can never be replaced or rotated here.
+/// Requires the operator enrollment secret, like passkey registration, so the
+/// create-once identity cannot be squatted by an arbitrary authenticated
+/// session.
 async fn bootstrap_workspace_identity(
     State(state): State<PrivateApiState>,
     headers: HeaderMap,
@@ -1928,6 +1956,20 @@ async fn bootstrap_workspace_identity(
             Ok(identity) => identity,
             Err(_) => return generic_error(StatusCode::BAD_REQUEST),
         };
+    // Once a release has been sealed to the stable workspace context, the
+    // create-once identity must match that release's recipient fingerprint.
+    // Otherwise an authenticated session could squat the identity with a key it
+    // controls and every future release would be sealed to it. A legacy manifest
+    // (still sealed under a per-release KID) predates the stable root and does
+    // not constrain the one-time migration bootstrap.
+    if let Ok(Some(manifest)) = state.load_manifest().await {
+        let stable_context_kid_b64 = base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID);
+        if manifest.artifact.kid_b64 == stable_context_kid_b64
+            && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
+        {
+            return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
+        }
+    }
     if request.wrappers.is_empty() || request.wrappers.len() > recovery::MAX_RECOVERY_WRAPPERS {
         return generic_error(StatusCode::BAD_REQUEST);
     }
@@ -5620,6 +5662,35 @@ mod tests {
         assert_eq!(parsed["manifest_configured"], true);
         assert_eq!(parsed["checks"]["release_manifest"], true);
 
+        // Manifest swap after startup: the artifact verdict is cached, so a
+        // manifest that is corrupted *after* the artifact was verified must
+        // still fail readiness on the next probe (no stale-green).
+        let manifest_cell: Arc<std::sync::Mutex<Option<release::ReleaseManifest>>> = Arc::new(
+            std::sync::Mutex::new(Some(test_manifest(&artifact, &keypair))),
+        );
+        let cell = manifest_cell.clone();
+        let swap_state = state
+            .clone()
+            .with_manifest_loader(Arc::new(move || Ok(cell.lock().unwrap().clone())));
+        assert_eq!(
+            get(router(swap_state.clone()), "/ready").await.status(),
+            StatusCode::OK
+        );
+        {
+            let mut guard = manifest_cell.lock().unwrap();
+            let mut corrupt = guard.as_ref().unwrap().clone();
+            corrupt.artifact.sha256_hex = "00".repeat(32);
+            *guard = Some(corrupt);
+        }
+        let ready = get(router(swap_state), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["checks"]["release_manifest"], false,
+            "a manifest corrupted after startup must not keep readiness green"
+        );
+
         // Relay required but not yet bound: not ready, while liveness stays 200.
         let relay_flag = Arc::new(AtomicBool::new(false));
         let degraded = state.clone().with_relay_readiness(true, relay_flag.clone());
@@ -5941,7 +6012,7 @@ mod tests {
             "public_key": base64_encode(&keypair.public_key_bytes()),
             "wrappers": [v2_wrapper_json(0x10)],
         });
-        post_json(state, session_cookie, "/internal/workspace/identity", body).await
+        post_bootstrap(state, session_cookie, body).await
     }
 
     async fn get_identity(
@@ -5990,6 +6061,15 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Same as [`post_json`] for the workspace-identity bootstrap URI.
+    async fn post_bootstrap(
+        state: &PrivateApiState,
+        session_cookie: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        post_json(state, session_cookie, "/internal/workspace/identity", body).await
     }
 
     #[tokio::test]
@@ -6200,10 +6280,9 @@ mod tests {
 
         // A second bootstrap with a different key cannot replace the identity.
         let attacker = test_root_keypair(0xA1);
-        let replace = post_json(
+        let replace = post_bootstrap(
             &state,
             &session_cookie,
-            "/internal/workspace/identity",
             serde_json::json!({
                 "version": recovery::WORKSPACE_IDENTITY_VERSION,
                 "public_key": base64_encode(&attacker.public_key_bytes()),
@@ -6252,13 +6331,7 @@ mod tests {
                 "wrappers": [v2_wrapper_json(0x11)],
             });
             body[field] = value;
-            let response = post_json(
-                &state,
-                &session_cookie,
-                "/internal/workspace/identity",
-                body,
-            )
-            .await;
+            let response = post_bootstrap(&state, &session_cookie, body).await;
             assert_eq!(
                 response.status(),
                 StatusCode::BAD_REQUEST,
@@ -6269,10 +6342,9 @@ mod tests {
         // A legacy `unlock_secret_v1` wrapper is never part of a new workspace root.
         let mut legacy = v2_wrapper_json(0x11);
         legacy["key_source"] = serde_json::json!(recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1);
-        let response = post_json(
+        let response = post_bootstrap(
             &state,
             &session_cookie,
-            "/internal/workspace/identity",
             serde_json::json!({
                 "version": recovery::WORKSPACE_IDENTITY_VERSION,
                 "public_key": public_key.clone(),
@@ -6283,10 +6355,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // An all-zero public key is refused.
-        let response = post_json(
+        let response = post_bootstrap(
             &state,
             &session_cookie,
-            "/internal/workspace/identity",
             serde_json::json!({
                 "version": recovery::WORKSPACE_IDENTITY_VERSION,
                 "public_key": base64_encode(&[0u8; recovery::WORKSPACE_PUBLIC_KEY_BYTES]),
@@ -6295,6 +6366,53 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Once a release is sealed to the stable context, the create-once identity
+    /// must match that release's recipient fingerprint, so an authenticated
+    /// session cannot squat the identity with a key it controls.
+    #[tokio::test]
+    async fn workspace_identity_bootstrap_binds_to_a_stable_release_manifest() {
+        let clock = Arc::new(FixedClock(AtomicI64::new(1_000)));
+        let (state, client, _directory) = recovery_state(clock);
+        let (session_cookie, _grant_cookie, _grant_id, _offer) =
+            establish_session_and_grant(&state, &client).await;
+        let released = test_root_keypair(0x95);
+        let package = pack_test_files(&[("index.html", b"ok")]);
+        let artifact = crypto_envelope::seal_artifact(
+            &released.public_key(),
+            auth::ARTIFACT_VERSION,
+            &recovery::WORKSPACE_ROOT_CONTEXT_KID,
+            &package,
+        )
+        .unwrap();
+        // `test_manifest` records the keypair's context KID and fingerprint, so
+        // this is a release already bound to the stable workspace identity.
+        let manifest = test_manifest(&artifact, &released);
+        assert_eq!(
+            manifest.artifact.kid_b64,
+            base64_encode(&recovery::WORKSPACE_ROOT_CONTEXT_KID)
+        );
+        let manifest_clone = manifest.clone();
+        let state = state.with_manifest_loader(Arc::new(move || Ok(Some(manifest_clone.clone()))));
+
+        // A key that does not match the published release fingerprint is refused.
+        let attacker = test_root_keypair(0xA1);
+        let refused = bootstrap_identity(&state, &session_cookie, &attacker).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let body = refused.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["code"], "workspace_identity_mismatch");
+        let (_, identity_body) = get_identity(&state, &session_cookie).await;
+        assert_eq!(identity_body["configured"], false);
+
+        // The matching stable key bootstraps.
+        assert_eq!(
+            bootstrap_identity(&state, &session_cookie, &released)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

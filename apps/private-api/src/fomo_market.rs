@@ -458,6 +458,15 @@ impl FomoBarsClient {
             .map_err(|_| FomoMarketError::Unavailable)?
             .map_err(|_| FomoMarketError::Unavailable)?;
         if !response.status().is_success() {
+            // A determinate per-request 4xx rejection (for example an unknown
+            // token) must not let any authenticated caller flip the shared
+            // `/ready` dependency. Auth/permission failures (401/403) are an
+            // operator/access outage, and 5xx/transport failures are real
+            // outages, so those stay `Unavailable`.
+            let code = response.status().as_u16();
+            if (400..500).contains(&code) && code != 401 && code != 403 {
+                return Err(FomoMarketError::InvalidRequest);
+            }
             return Err(FomoMarketError::Unavailable);
         }
         // Bound the body explicitly *and* on a deadline: a compromised loopback
@@ -1791,6 +1800,23 @@ mod tests {
                 .bars(bars_query("base", "0xabc", "5", 10, false))
                 .await,
             Err(FomoMarketError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn client_maps_a_non_auth_4xx_to_a_determinate_rejection() {
+        // A 404 (unknown target) is a per-request client error, not an outage:
+        // it must not demote the shared chart readiness flag.
+        let missing = spawn_bridge(BridgeState {
+            status: axum::http::StatusCode::NOT_FOUND,
+            body: json!({"error": "unknown"}).to_string(),
+        })
+        .await;
+        assert_eq!(
+            test_client(&missing)
+                .bars(bars_query("base", "0xabc", "5", 10, false))
+                .await,
+            Err(FomoMarketError::InvalidRequest)
         );
     }
 

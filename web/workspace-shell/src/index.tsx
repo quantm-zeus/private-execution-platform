@@ -267,15 +267,20 @@ function App() {
   /** Load everything a signed-in session needs, then auto-unlock if configured. */
   const refreshAccess = async () => {
     setAutoUnlockRan(false);
-    const descriptorOk = await loadDescriptor();
+    // The durable workspace identity is independent of any release, so it is
+    // loaded even when no descriptor/artifact is published yet: initial setup
+    // must remain reachable on a clean deployment where no release exists.
     const loadedIdentity = await loadIdentity();
-    if (!descriptorOk || !loadedIdentity) return;
+    if (!loadedIdentity) return;
     if (!loadedIdentity.configured) {
       if (setupPhase() !== "show_recovery") setSetupPhase("unconfigured");
+      void loadDescriptor();
       return;
     }
     setSetupPhase("done");
+    const descriptorOk = await loadDescriptor();
     const activeWrappers = await loadWrappers();
+    if (!descriptorOk) return;
     void runAutoUnlock(loadedIdentity, activeWrappers);
   };
 
@@ -401,11 +406,6 @@ function App() {
    */
   const runInitialSetup = async () => {
     if (setupPhase() === "preparing") return;
-    const activeDescriptor = descriptor();
-    if (!activeDescriptor) {
-      setSetupError("The workspace release is not ready yet.");
-      return;
-    }
     setSetupPhase("preparing");
     setSetupError("");
     setStatus("Creating this workspace...");
@@ -461,15 +461,36 @@ function App() {
         wrappers: bootstrapWrappers,
       });
       setIdentity(created);
-      await finishUnlock(root, activeDescriptor);
-      root = null;
+      // Reveal and gate the recovery code BEFORE attempting to decrypt any
+      // release. A migration/unlock failure must never leave the bootstrap
+      // complete (create-once) with the recovery code unseen.
       setSetupRecoveryCode(recoveryCode);
+      setSavedConfirmed(false);
       setSetupPhase("show_recovery");
-      setStatus(
-        prfAvailable
-          ? "Workspace created. Save your recovery code."
-          : "Workspace created. Save your recovery code; this authenticator has no passkey unlock.",
-      );
+      const activeDescriptor = descriptor();
+      if (!activeDescriptor) {
+        setStatus(
+          "Workspace created. Save your recovery code; no release is published yet.",
+        );
+        return;
+      }
+      try {
+        await finishUnlock(root, activeDescriptor);
+        root = null;
+        setStatus(
+          prfAvailable
+            ? "Workspace created. Save your recovery code."
+            : "Workspace created. Save your recovery code; this authenticator has no passkey unlock.",
+        );
+      } catch {
+        // The current release may not yet be sealed to the new stable key (the
+        // documented one-time migration step). The recovery code is already
+        // shown and gated, so this is recoverable once a matching release ships.
+        defaultRuntime.lock();
+        setStatus(
+          "Workspace created. Save your recovery code; the current release is not sealed to this workspace yet.",
+        );
+      }
     } catch (error) {
       setSetupError(
         error instanceof RecoveryClientError && error.code === "recovery_conflict"
@@ -1018,8 +1039,11 @@ function App() {
           </Show>
         </section>
 
-        {/* Initial setup: generate the stable root + recovery code locally. */}
-        <Show when={needsSetup() && descriptor()}>
+        {/* Initial setup: generate the stable root + recovery code locally.
+            This intentionally does not require a published release: the stable
+            identity must be creatable on a clean deployment, and the release is
+            then sealed to it. */}
+        <Show when={needsSetup()}>
           <section class="panel" aria-labelledby="setup-heading">
             <h2 id="setup-heading" class="panel__heading">
               Set up this workspace

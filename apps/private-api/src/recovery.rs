@@ -27,14 +27,15 @@
 //! Mutating a wrapper (add/rotate/revoke) requires a **proof of possession of
 //! the workspace private key** — that is, an existing trusted recovery factor,
 //! not perimeter identity alone. The server seals a fresh random nonce to the
-//! enrolled workspace public key (HPKE base mode, the same primitive that seals
-//! the artifact) and accepts the mutation only when the client returns the
-//! decrypted nonce. The server never learns the secret and never validates a
-//! guess at it: it only checks that the client could open a challenge the
-//! server itself produced. The challenge is single-use, session-bound and
-//! TTL-bounded. Because the enrolled key must also match the release manifest's
-//! recipient fingerprint before a challenge is issued, an attacker cannot
-//! enroll a key they control and self-approve.
+//! **durable, create-once workspace public identity** (HPKE base mode, the same
+//! primitive that seals the artifact) and accepts the mutation only when the
+//! client returns the decrypted nonce. The server never learns the secret and
+//! never validates a guess at it: it only checks that the client could open a
+//! challenge the server itself produced. The challenge is single-use,
+//! session-bound and TTL-bounded. Because the identity is create-once and its
+//! bootstrap is bound to the stable release fingerprint once a release is
+//! sealed to the stable context, an attacker cannot replace it with a key they
+//! control and self-approve.
 //!
 //! A normal WebAuthn assertion signature is never used as key material.
 
