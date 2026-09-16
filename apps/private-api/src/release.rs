@@ -213,7 +213,9 @@ impl ReleaseManifest {
 /// descriptor then falls back to artifact-derived public metadata. The binary
 /// treats that as the explicit, opt-in weaker mode (`WORKSPACE_ALLOW_NO_MANIFEST=true`),
 /// so the normal production mode always has a manifest. A configured-but-broken
-/// manifest is an error and must not be silently ignored.
+/// manifest is an error and must not be silently ignored. Because there is no
+/// reference digest in the weaker mode, `/ready` fails closed there (while
+/// `/health` stays live) rather than reporting an unverifiable artifact ready.
 pub fn load_release_manifest_from_env() -> Result<Option<ReleaseManifest>, DescriptorError> {
     match std::env::var(RELEASE_MANIFEST_ENV) {
         Ok(value) if !value.trim().is_empty() => {

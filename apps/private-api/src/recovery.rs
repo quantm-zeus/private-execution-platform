@@ -1,9 +1,10 @@
-//! Additive, operator-owned passkey-bound workspace recovery wrappers.
+//! Durable, public workspace identity plus client-wrapped Workspace Root Key
+//! recovery wrappers.
 //!
-//! This module is deliberately *additive*: it does not change the existing
-//! artifact, KID, unlock-secret derivation, or offline recovery-code path. A
-//! workspace remains fully recoverable with the offline code alone; passkey
-//! recovery is an optional convenience layered on top.
+//! The normal product path is the stable `workspace_root_v2` root: the server
+//! stores only the public workspace identity and opaque passkey-PRF / offline
+//! recovery wrappers, and never the root secret, recovery code, PRF output or
+//! unwrap key. Legacy `unlock_secret_v1` records are bounded migration data.
 //!
 //! ## Model
 //!

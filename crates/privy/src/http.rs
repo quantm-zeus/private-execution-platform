@@ -18,6 +18,7 @@
 //! client is injected.
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::{PrivyError, ProviderIdempotencyId, SigningRequest, SigningTransport};
 
@@ -99,16 +100,16 @@ impl<C: PrivyHttpClient> SigningTransport for PrivyHttpSigningTransport<C> {
 
 /// Operator-supplied Privy credentials.
 ///
-/// The value is held opaquely: `Debug` is redacted and there is no `Display`.
-/// The credentials are only exposed to an injected [`PrivyHttpClient`] through
-/// [`PrivyCredentials::expose`], which is crate-visible so no other code path can
-/// read them.
-pub struct PrivyCredentials(String);
+/// The value is held opaquely and zeroized on drop: `Debug` is redacted and
+/// there is no `Display`. The credentials are only exposed to an injected
+/// [`PrivyHttpClient`] through [`PrivyCredentials::expose`], which is
+/// crate-visible so no other code path can read them.
+pub struct PrivyCredentials(Zeroizing<String>);
 
 impl PrivyCredentials {
     /// Wraps a credential string supplied by the operator at startup.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(Zeroizing::new(value.into()))
     }
 
     /// Borrows the secret for the injected client.
@@ -118,7 +119,7 @@ impl PrivyCredentials {
     /// build its authorization header. The value must never be logged,
     /// serialized, or included in an error, and `Debug` is redacted.
     pub fn expose(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 

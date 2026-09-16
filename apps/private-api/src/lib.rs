@@ -652,9 +652,9 @@ impl PrivateApiState {
         let _ = self.verified_artifact().await;
     }
 
-    /// Attach an optional durable recovery wrapper store. Additive: without it
-    /// the recovery surface stays closed and the offline recovery code is the
-    /// only credential.
+    /// Attach the durable workspace identity / recovery wrapper store. Without
+    /// it the whole identity and recovery surface stays closed (503), so the
+    /// stable-root workspace cannot be set up or unlocked.
     pub fn with_recovery_store(mut self, store: Arc<dyn RecoveryWrapperStore>) -> Self {
         self.recovery_store = Some(store);
         self
@@ -764,33 +764,34 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     let manifest_result = state.load_manifest().await;
     let manifest_configured = !matches!(&manifest_result, Ok(None));
     let (artifact_ok, manifest_ok) = match state.verified_artifact().await {
-        Ok(verified) => {
-            // The cached verdict proves the artifact bytes were read and hashed.
-            // Re-check the *fresh* manifest against that verdict on every probe,
-            // so a manifest that is corrupted, deleted or swapped after startup
-            // can never keep `/ready` green.
-            let manifest_ok = match &manifest_result {
-                Ok(None) => true,
-                Ok(Some(manifest)) => {
-                    manifest
-                        .validate_header_against(
-                            &release::ArtifactHeader {
-                                version: verified.version,
-                                kid: verified.kid,
-                            },
-                            verified.size,
-                        )
-                        .is_ok()
-                        && manifest.artifact.sha256_hex == verified.sha256_hex
-                }
-                Err(_) => false,
-            };
-            (true, manifest_ok)
-        }
+        Ok(verified) => match &manifest_result {
+            Ok(Some(manifest)) => {
+                // The cached verdict proves the artifact bytes were read and
+                // hashed; re-bind the *fresh* manifest to that verdict on every
+                // probe, so a manifest that is corrupted, deleted or swapped
+                // after startup can never keep `/ready` green.
+                let manifest_ok = manifest
+                    .validate_header_against(
+                        &release::ArtifactHeader {
+                            version: verified.version,
+                            kid: verified.kid,
+                        },
+                        verified.size,
+                    )
+                    .is_ok()
+                    && manifest.artifact.sha256_hex == verified.sha256_hex;
+                (manifest_ok, manifest_ok)
+            }
+            // No immutable release manifest means there is no reference digest
+            // to bind the artifact bytes, so the artifact cannot be reported
+            // verified. `/ready` fails closed even in the explicit
+            // `WORKSPACE_ALLOW_NO_MANIFEST` mode; `/health` stays live.
+            Ok(None) => (false, false),
+            Err(_) => (false, false),
+        },
         // A verified-artifact failure means the artifact/immutable binding is
-        // unusable; the manifest check is only healthy in the explicit
-        // no-manifest mode.
-        Err(_) => (false, matches!(manifest_result, Ok(None))),
+        // unusable; readiness is never green without it.
+        Err(_) => (false, false),
     };
     // A configured passkey store that cannot be read is not ready; an absent
     // authenticator in production means every auth route is 503, so it is also
@@ -1772,6 +1773,12 @@ async fn add_recovery_wrapper(
         Ok(record) => record,
         Err(_) => return generic_error(StatusCode::BAD_REQUEST),
     };
+    // The normal write path only ever creates stable-root wrappers. Legacy
+    // `unlock_secret_v1` records are bounded migration data and must not leak
+    // back into the v2 store through add/rotate.
+    if record.key_source != recovery::RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2 {
+        return generic_error(StatusCode::BAD_REQUEST);
+    }
     if !consume_recovery_proof(
         &state,
         now,
@@ -1964,16 +1971,22 @@ async fn bootstrap_workspace_identity(
     // not constrain the one-time migration bootstrap.
     match state.load_manifest().await {
         Ok(Some(manifest)) => {
-            // Decode the manifest KID canonically before comparing, so a
-            // non-canonical-but-equal encoding cannot skip the binding.
-            let manifest_kid_is_stable =
-                release::decode_canonical_b64_variable(&manifest.artifact.kid_b64)
-                    .map(|kid| kid == recovery::WORKSPACE_ROOT_CONTEXT_KID)
-                    .unwrap_or(false);
-            if manifest_kid_is_stable
-                && manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64
-            {
-                return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
+            // Decode the manifest KID canonically so a non-canonical-but-equal
+            // encoding cannot skip the recipient binding, and an undecodable KID
+            // fails closed instead of silently disabling the binding.
+            match release::decode_canonical_b64_variable(&manifest.artifact.kid_b64) {
+                Some(kid) if kid == recovery::WORKSPACE_ROOT_CONTEXT_KID => {
+                    if manifest.recipient.public_key_fingerprint_b64 != identity.fingerprint_b64 {
+                        return typed_error(StatusCode::CONFLICT, "workspace_identity_mismatch");
+                    }
+                }
+                // A legacy per-release KID predates the stable root and does not
+                // constrain the one-time migration bootstrap.
+                Some(_) => {}
+                // A configured manifest whose KID cannot be decoded is a server
+                // misconfiguration; fail the bootstrap closed rather than
+                // skipping the recipient binding.
+                None => return generic_error(StatusCode::SERVICE_UNAVAILABLE),
             }
         }
         Ok(None) => {}
@@ -5627,11 +5640,16 @@ mod tests {
         )
         .unwrap();
         let artifact_copy = artifact.clone();
-        // Pin the manifest loader so `manifest_configured` is not racy against
-        // other tests that mutate `WORKSPACE_RELEASE_MANIFEST`.
+        // A matching manifest is the healthy baseline; pin the loader so
+        // `manifest_configured` is not racy against other tests that mutate
+        // `WORKSPACE_RELEASE_MANIFEST`.
+        let baseline_manifest = test_manifest(&artifact, &keypair);
         let state = state
             .with_artifact_loader(Arc::new(move || Ok(artifact_copy.clone())))
-            .with_manifest_loader(Arc::new(|| Ok(None)));
+            .with_manifest_loader(Arc::new(move || Ok(Some(baseline_manifest.clone()))));
+        // The explicit no-manifest mode has no reference digest, so it is never
+        // reported ready; it is asserted separately below.
+        let no_manifest = state.clone().with_manifest_loader(Arc::new(|| Ok(None)));
 
         let get = |app: Router, path: &'static str| async move {
             app.oneshot(
@@ -5645,28 +5663,24 @@ mod tests {
             .unwrap()
         };
 
-        // Liveness is unconditional; readiness reflects dependencies.
+        // Liveness is unconditional; readiness reflects dependencies. Without an
+        // immutable release manifest there is no reference digest, so readiness
+        // fails closed: even the explicit no-manifest mode is never "ready".
         assert_eq!(
-            get(router(state.clone()), "/health").await.status(),
+            get(router(no_manifest.clone()), "/health").await.status(),
             StatusCode::OK
         );
-        let ready = get(router(state.clone()), "/ready").await;
-        assert_eq!(ready.status(), StatusCode::OK);
+        let ready = get(router(no_manifest), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = ready.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["ready"], true);
-        assert_eq!(parsed["checks"]["relay"], true);
-        // No immutable release manifest is configured, so the response says so
-        // explicitly: the preflight is in the weaker version/KID-only mode.
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["artifact"], false);
+        assert_eq!(parsed["checks"]["release_manifest"], false);
         assert_eq!(parsed["manifest_configured"], false);
 
-        // A configured manifest that matches the artifact header flips the flag
-        // and keeps readiness healthy.
-        let manifest = test_manifest(&artifact, &keypair);
-        let configured = state
-            .clone()
-            .with_manifest_loader(Arc::new(move || Ok(Some(manifest.clone()))));
-        let ready = get(router(configured), "/ready").await;
+        // The healthy baseline carries a matching manifest and is ready.
+        let ready = get(router(state.clone()), "/ready").await;
         assert_eq!(ready.status(), StatusCode::OK);
         let body = ready.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -5725,8 +5739,8 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        // Malformed artifact with no manifest configured: the header parse fails,
-        // so readiness stays false rather than trusting an unparseable file.
+        // Malformed artifact: the header parse fails, so readiness stays false
+        // rather than trusting an unparseable file.
         let malformed = state
             .clone()
             .with_artifact_loader(Arc::new(|| Ok(b"not-an-artifact".to_vec())));
@@ -6170,6 +6184,22 @@ mod tests {
         )
         .await;
         assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+
+        // A legacy `unlock_secret_v1` wrapper must never be accepted back into
+        // the stable-root store through add/rotate, even with a valid proof.
+        let (challenge_id, sealed) = issue_recovery(&state, &session_cookie).await;
+        let nonce = crypto_envelope::decrypt_artifact(&keypair, &sealed).unwrap();
+        let mut legacy = wrapper_body(&challenge_id, &base64_encode(&nonce));
+        legacy["wrapper"]["key_source"] =
+            serde_json::json!(recovery::RECOVERY_KEY_SOURCE_UNLOCK_SECRET_V1);
+        let rejected = post_json(
+            &state,
+            &session_cookie,
+            "/internal/workspace/recovery",
+            legacy,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -6416,6 +6446,20 @@ mod tests {
         assert_eq!(parsed["code"], "workspace_identity_mismatch");
         let (_, identity_body) = get_identity(&state, &session_cookie).await;
         assert_eq!(identity_body["configured"], false);
+
+        // A configured manifest whose KID cannot be decoded fails the bootstrap
+        // closed rather than silently skipping the recipient binding.
+        let mut garbled_manifest = manifest.clone();
+        garbled_manifest.artifact.kid_b64 = "not-canonical!".to_string();
+        let garbled_state = state
+            .clone()
+            .with_manifest_loader(Arc::new(move || Ok(Some(garbled_manifest.clone()))));
+        assert_eq!(
+            bootstrap_identity(&garbled_state, &session_cookie, &attacker)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         // The matching stable key bootstraps.
         assert_eq!(

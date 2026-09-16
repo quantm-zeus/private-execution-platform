@@ -13,6 +13,7 @@ domain.workspace = true
 policy.workspace = true
 sha2 = "0.11"
 thiserror.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 market-types.workspace = true
