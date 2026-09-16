@@ -20,7 +20,10 @@ use crate::error::RelayError;
 use crate::health::{ChainHealth, ChainHealthBreaker};
 use crate::plan::{SignedPayloadSource, SubmitRequest};
 use crate::signing_health::SigningFailureBreaker;
-use crate::state::{AttemptReservationStore, RelayOutcome, Reservation, SubmissionState};
+use crate::state::{
+    AttemptBinding, AttemptReservationStore, DurableAttemptStore, RelayOutcome, Reservation,
+    SubmissionState,
+};
 
 /// Trusted inputs for a single relay execution attempt.
 ///
@@ -52,7 +55,11 @@ pub struct ExecutionRelay<S, A, P, G> {
     signing: G,
     breaker: ChainHealthBreaker,
     signing_breaker: SigningFailureBreaker,
-    journal: Mutex<HashMap<IdempotencyKey, SubmitRequest>>,
+    /// Process-local submission cache for the current process. Keyed by the full
+    /// `(owner, workspace, idempotency_key)` identity so two owners reusing a key
+    /// can never overwrite each other's entry; `reconcile` fails closed on an
+    /// ambiguous key rather than reconciling the wrong attempt.
+    journal: Mutex<HashMap<(String, String, IdempotencyKey), SubmitRequest>>,
 }
 
 impl<S, A, P, G> ExecutionRelay<S, A, P, G>
@@ -146,14 +153,38 @@ where
         .map_err(|_| RelayError::SigningFailed)?;
         let request_digest = *signing_request.request_digest();
         let key = &input.intent.idempotency_key;
+        let binding = AttemptBinding::new(
+            input.intent.user_id.clone(),
+            input.intent.wallet_ref.clone(),
+            input.intent.idempotency_key.clone(),
+            input.intent.id.clone(),
+            input.intent.chain.clone(),
+        );
 
         // 5. Claim the attempt BEFORE signing. Duplicates return their stored
-        //    outcome and never sign; a conflicting digest is rejected.
-        match self.store.reserve(key, &request_digest) {
+        //    outcome and never sign; a conflicting digest is rejected. The claim
+        //    is bound to the full owner/workspace/idempotency-key identity so a
+        //    durable store can enforce the unique constraint.
+        match self.store.reserve_bound(&binding, &request_digest).await {
             Ok(Reservation::Reserved) => {}
             Ok(Reservation::AlreadyReserved(outcome)) => return Ok(outcome),
             Ok(Reservation::Conflict) => return Err(RelayError::IdempotencyConflict),
             Err(_) => return Err(RelayError::ReservationUnavailable),
+        }
+
+        // 5b. Durably record SIGN_REQUESTED, with a stable provider idempotency
+        //     identifier, BEFORE the signing boundary is invoked. A store failure
+        //     aborts fail-closed with no signer call.
+        let provider_idempotency = signing_request.provider_idempotency_id();
+        if self
+            .store
+            .record_sign_requested(key, &request_digest, &provider_idempotency)
+            .await
+            .is_err()
+        {
+            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                .await;
+            return Err(RelayError::StoreUnavailable);
         }
 
         // 6. Admit a signing attempt through the signing-failure breaker, then
@@ -167,7 +198,8 @@ where
         let guard = match self.signing_breaker.admit_probe(input.now_ms) {
             Some(guard) => guard,
             None => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                    .await;
                 return Err(RelayError::SigningUnavailable);
             }
         };
@@ -175,7 +207,8 @@ where
             Ok(signed) => signed,
             Err(_) => {
                 guard.failure(input.now_ms);
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                    .await;
                 return Err(RelayError::SigningFailed);
             }
         };
@@ -184,14 +217,22 @@ where
             || signed.idempotency_key() != signing_request.idempotency_key()
         {
             guard.failure(input.now_ms);
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                .await;
             return Err(RelayError::SigningRequestMismatch);
         }
         guard.success();
 
-        // 7. Mark the signing success durably.
-        if self.store.record_signed(key, &request_digest).is_err() {
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+        // 7. Mark the signing success durably, including the opaque signed
+        //    reference, so a restart can reconcile without re-signing.
+        if self
+            .store
+            .record_signed_reference(key, &request_digest, signed.reference())
+            .await
+            .is_err()
+        {
+            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                .await;
             return Ok(RelayOutcome::FailedBeforeSubmit);
         }
 
@@ -199,7 +240,8 @@ where
         let signed_payload = match self.payload_source.signed_payload(&signed).await {
             Ok(payload) => payload,
             Err(_) => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                    .await;
                 return Err(RelayError::MissingSignedPayload);
             }
         };
@@ -208,11 +250,27 @@ where
         let request = match SubmitRequest::bind(&signing_request, &signed, &signed_payload, chain) {
             Ok(request) => request,
             Err(error) => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                    .await;
                 return Err(error);
             }
         };
-        self.journal_insert(key, &request);
+        self.journal_insert(&binding, &request);
+
+        // 9b. Durably persist the fully bound submission BEFORE any submit, so a
+        //     crash after broadcast but before the receipt is persisted can be
+        //     reconciled from storage on restart instead of resubmitted. A
+        //     persistence failure aborts before the adapter is called.
+        if self
+            .store
+            .record_submission(key, &request_digest, &request)
+            .await
+            .is_err()
+        {
+            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                .await;
+            return Err(RelayError::StoreUnavailable);
+        }
 
         // 10. Admit the submit exactly once. `check_allowed` above is a
         //     read-only gate, so any failure before this point leaves the
@@ -225,7 +283,8 @@ where
                 // A concurrent attempt consumed the probe between the gate and
                 // the submit: fail closed without sending. No chain call
                 // occurred, so this is a definitive pre-send failure.
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit);
+                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                    .await;
                 return Err(RelayError::ChainHealthUnavailable);
             }
         };
@@ -236,15 +295,22 @@ where
         match self.adapter.submit(&request).await {
             Ok(receipt) => {
                 probe.success();
+                if !receipt.reference.trim().is_empty() {
+                    // Cache the broadcast reference so an in-process reconcile
+                    // queries the chain by its own hash, not the signer ref.
+                    self.journal_set_chain_reference(&binding, &receipt.reference);
+                }
                 if receipt.reference.trim().is_empty() {
-                    self.record_outcome(key, &request_digest, RelayOutcome::Unknown);
+                    self.record_outcome(key, &request_digest, RelayOutcome::Unknown)
+                        .await;
                     return Ok(RelayOutcome::Unknown);
                 }
                 let outcome = RelayOutcome::Submitted {
                     reference: receipt.reference,
                     state: SubmissionState::Unknown,
                 };
-                self.record_outcome(key, &request_digest, outcome.clone());
+                self.record_outcome(key, &request_digest, outcome.clone())
+                    .await;
                 Ok(outcome)
             }
             Err(RelayError::AdapterRejected) => {
@@ -252,7 +318,8 @@ where
                 let outcome = RelayOutcome::Rejected {
                     final_reason: "adapter rejected submission".to_string(),
                 };
-                self.record_outcome(key, &request_digest, outcome.clone());
+                self.record_outcome(key, &request_digest, outcome.clone())
+                    .await;
                 Ok(outcome)
             }
             Err(_) => {
@@ -261,7 +328,8 @@ where
                 // before failing, so the relay cannot assume "no send". Store
                 // and return Unknown: reconciliation is required, never a retry.
                 probe.failure(input.now_ms);
-                self.record_outcome(key, &request_digest, RelayOutcome::Unknown);
+                self.record_outcome(key, &request_digest, RelayOutcome::Unknown)
+                    .await;
                 Ok(RelayOutcome::Unknown)
             }
         }
@@ -287,12 +355,32 @@ where
     }
 
     /// Reconciles a previously executed attempt. NEVER submits.
+    ///
+    /// The bound submission is taken from the in-process journal when present,
+    /// and otherwise rehydrated from the durable store, so a restart that lost
+    /// the process-local journal can still reconcile a broadcast attempt. An
+    /// absent durable submission is [`RelayError::InvalidTransition`] (which
+    /// callers treat as ambiguous: never retry); a store failure is
+    /// [`RelayError::StoreUnavailable`].
     pub async fn reconcile(
         &self,
         key: &IdempotencyKey,
         now_ms: i64,
     ) -> Result<RelayOutcome, RelayError> {
-        let request = self.journal_get(key).ok_or(RelayError::InvalidTransition)?;
+        // A terminal outcome is never downgraded by a later ambiguous chain read.
+        if let Ok(Some(outcome)) = self.store.load_outcome(key).await {
+            if outcome.attempt_status().is_terminal() {
+                return Ok(outcome);
+            }
+        }
+        let request = match self.journal_get(key)? {
+            Some(request) => request,
+            None => match self.store.load_submission(key).await {
+                Ok(Some(submission)) => SubmitRequest::restore(&submission)?,
+                Ok(None) => return Err(RelayError::InvalidTransition),
+                Err(_) => return Err(RelayError::StoreUnavailable),
+            },
+        };
 
         let observation = match self.adapter.query(&request, now_ms).await {
             Ok(ChainObservation::Unknown) | Err(_) => self
@@ -310,7 +398,8 @@ where
             ChainObservation::Rejected { final_reason } => RelayOutcome::Rejected { final_reason },
             ChainObservation::Pending | ChainObservation::Unknown => RelayOutcome::Unknown,
         };
-        self.record_outcome(key, request.request_digest(), outcome.clone());
+        self.record_outcome(key, request.request_digest(), outcome.clone())
+            .await;
         Ok(outcome)
     }
 
@@ -353,24 +442,59 @@ where
     /// same `(key, digest)`. A duplicate may therefore observe a stale in-memory
     /// outcome, but it can never reach the signing boundary or the chain adapter
     /// again.
-    fn record_outcome(&self, key: &IdempotencyKey, digest: &RequestDigest, outcome: RelayOutcome) {
-        let _ = self.store.record_outcome(key, digest, outcome);
+    async fn record_outcome(
+        &self,
+        key: &IdempotencyKey,
+        digest: &RequestDigest,
+        outcome: RelayOutcome,
+    ) {
+        let _ = self.store.record_outcome(key, digest, outcome).await;
     }
 
-    fn journal_insert(&self, key: &IdempotencyKey, request: &SubmitRequest) {
+    fn journal_key(binding: &AttemptBinding) -> (String, String, IdempotencyKey) {
+        (
+            binding.owner().as_str().to_string(),
+            binding.workspace().as_str().to_string(),
+            binding.idempotency_key().clone(),
+        )
+    }
+
+    fn journal_insert(&self, binding: &AttemptBinding, request: &SubmitRequest) {
         let mut journal = crate::lock(&self.journal);
-        journal.insert(key.clone(), request.clone());
+        journal.insert(Self::journal_key(binding), request.clone());
     }
 
-    fn journal_get(&self, key: &IdempotencyKey) -> Option<SubmitRequest> {
+    fn journal_set_chain_reference(&self, binding: &AttemptBinding, reference: &str) {
+        let mut journal = crate::lock(&self.journal);
+        if let Some(request) = journal.get_mut(&Self::journal_key(binding)) {
+            *request = request.clone().with_chain_reference(reference.to_string());
+        }
+    }
+
+    /// Looks up the journaled submission by idempotency key.
+    ///
+    /// Fails closed when more than one owner/workspace shares the key, rather
+    /// than reconciling an arbitrary attempt.
+    fn journal_get(&self, key: &IdempotencyKey) -> Result<Option<SubmitRequest>, RelayError> {
         let journal = crate::lock(&self.journal);
-        journal.get(key).cloned()
+        let mut found: Option<&SubmitRequest> = None;
+        let mut count = 0usize;
+        for ((_, _, stored_key), request) in journal.iter() {
+            if stored_key == key {
+                count += 1;
+                found = Some(request);
+            }
+        }
+        if count > 1 {
+            return Err(RelayError::StoreUnavailable);
+        }
+        Ok(found.cloned())
     }
 }
 
 impl<S, P> ExecutionRelay<S, UnavailableChainAdapter, P, PrivySigningBoundaryAdapter>
 where
-    S: AttemptReservationStore,
+    S: DurableAttemptStore,
     P: SignedPayloadSource,
 {
     /// **Production entry point.**
@@ -380,6 +504,17 @@ where
     /// wraps the real P40 Privy boundary (whose public constructor installs an
     /// always-unavailable transport). Use this rather than
     /// [`ExecutionRelay::new_with_seams`] for any non-test wiring.
+    ///
+    /// # Durable requirement
+    ///
+    /// The store must implement [`DurableAttemptStore`], so the exactly-once
+    /// guarantee does not depend on process-local bookkeeping: the reservation,
+    /// the `SIGN_REQUESTED` record, the signed reference, the bound submission,
+    /// and every outcome are persisted before the corresponding consequential
+    /// boundary. Process-local stores ([`InMemoryReservationStore`]) are rejected
+    /// at compile time on this path.
+    ///
+    /// [`InMemoryReservationStore`]: crate::InMemoryReservationStore
     pub fn production(
         policy: PolicyEngine,
         store: S,
@@ -392,6 +527,42 @@ where
             UnavailableChainAdapter::new(),
             payload_source,
             PrivySigningBoundaryAdapter::new(),
+            breaker,
+        )
+    }
+}
+
+impl<S, A, P> ExecutionRelay<S, A, P, PrivySigningBoundaryAdapter>
+where
+    S: DurableAttemptStore,
+    A: ChainSubmissionAdapter,
+    P: SignedPayloadSource,
+{
+    /// **Production path with an injected chain adapter and Privy transport.**
+    ///
+    /// This is the one-chain live composition constructor: a real chain
+    /// adapter is injected, and signing still flows through the real
+    /// [`PrivySigningBoundaryAdapter`] over an operator-supplied
+    /// [`privy::SigningTransport`]. The store must be durable, so the
+    /// exactly-once lifecycle is persisted before every consequential boundary.
+    /// Nothing here enables trading: capability remains [`TRADING_ENABLED`]
+    /// gated by the policy engine.
+    ///
+    /// [`TRADING_ENABLED`]: PolicyEngine
+    pub fn production_with_chain(
+        policy: PolicyEngine,
+        store: S,
+        adapter: A,
+        payload_source: P,
+        privy_transport: Box<dyn privy::SigningTransport>,
+        breaker: ChainHealthBreaker,
+    ) -> Self {
+        Self::new_with_seams(
+            policy,
+            store,
+            adapter,
+            payload_source,
+            PrivySigningBoundaryAdapter::with_transport(privy_transport),
             breaker,
         )
     }

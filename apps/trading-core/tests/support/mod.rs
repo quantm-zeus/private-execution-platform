@@ -25,7 +25,9 @@ use domain::{
     TradeIntent, TradeSide, TradeSource, UserId, WalletRef,
 };
 use execution_preview::NetDelta;
-use execution_relay::{AttemptReservationStore, InMemoryReservationStore, RelayError, Reservation};
+use execution_relay::{
+    AttemptReservationStore, DurableAttemptStore, InMemoryReservationStore, RelayError, Reservation,
+};
 use limit_engine::{
     BlindIndexKey, LimitEngineError, OrderKeyMaterial, OrderKeyProvider, RecoveryReport,
 };
@@ -469,33 +471,36 @@ impl RecordingReservationStore {
     }
 }
 
+#[async_trait]
 impl AttemptReservationStore for RecordingReservationStore {
-    fn reserve(
+    async fn reserve(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<Reservation, RelayError> {
         self.reserve_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.reserve(key, digest)
+        self.inner.reserve(key, digest).await
     }
 
-    fn record_signed(
+    async fn record_signed(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        self.inner.record_signed(key, digest)
+        self.inner.record_signed(key, digest).await
     }
 
-    fn record_outcome(
+    async fn record_outcome(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
         outcome: execution_relay::RelayOutcome,
     ) -> Result<(), RelayError> {
-        self.inner.record_outcome(key, digest, outcome)
+        self.inner.record_outcome(key, digest, outcome).await
     }
 }
+
+impl DurableAttemptStore for RecordingReservationStore {}
 
 /// Minimal positive wallet config bound to Base.
 pub fn config() -> CompositionConfig {

@@ -1,0 +1,24 @@
+[package]
+name = "chain-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+chain-types.workspace = true
+domain.workspace = true
+execution-relay.workspace = true
+market-types.workspace = true
+privy.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+policy.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -484,8 +484,9 @@ pub struct ScriptedStore {
     pub outcome: RelayOutcome,
 }
 
+#[async_trait]
 impl AttemptReservationStore for ScriptedStore {
-    fn reserve(
+    async fn reserve(
         &self,
         _key: &IdempotencyKey,
         _digest: &RequestDigest,
@@ -493,7 +494,7 @@ impl AttemptReservationStore for ScriptedStore {
         Ok(Reservation::AlreadyReserved(self.outcome.clone()))
     }
 
-    fn record_signed(
+    async fn record_signed(
         &self,
         _key: &IdempotencyKey,
         _digest: &RequestDigest,
@@ -501,7 +502,7 @@ impl AttemptReservationStore for ScriptedStore {
         Ok(())
     }
 
-    fn record_outcome(
+    async fn record_outcome(
         &self,
         _key: &IdempotencyKey,
         _digest: &RequestDigest,

@@ -14,9 +14,10 @@ use domain::{
     WalletRef,
 };
 use execution_relay::{
-    AttemptReservationStore, ChainHealth, ChainObservation, ChainSubmissionAdapter, ExecutionRelay,
-    InMemoryReservationStore, RelayError, RelayExecutionInput, RelayOutcome, Reservation,
-    SignedExecutionRef, SignedPayload, SignedPayloadSource, SigningBoundary, SubmissionReceipt,
+    AttemptReservationStore, ChainHealth, ChainObservation, ChainSubmissionAdapter,
+    DurableAttemptStore, ExecutionRelay, InMemoryReservationStore, RelayError, RelayExecutionInput,
+    RelayOutcome, Reservation, SignedExecutionRef, SignedPayload, SignedPayloadSource,
+    SigningBoundary, SubmissionReceipt,
 };
 use market_types::{AssetAmount, AtomicAmount, Bps, Freshness, Sequence};
 use policy::{
@@ -255,8 +256,9 @@ impl MockStore {
     }
 }
 
+#[async_trait]
 impl AttemptReservationStore for MockStore {
-    fn reserve(
+    async fn reserve(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
@@ -265,10 +267,10 @@ impl AttemptReservationStore for MockStore {
         if self.conflict {
             return Ok(Reservation::Conflict);
         }
-        self.inner.reserve(key, digest)
+        self.inner.reserve(key, digest).await
     }
 
-    fn record_signed(
+    async fn record_signed(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
@@ -277,18 +279,20 @@ impl AttemptReservationStore for MockStore {
         if self.fail_record_signed {
             return Err(RelayError::StoreUnavailable);
         }
-        self.inner.record_signed(key, digest)
+        self.inner.record_signed(key, digest).await
     }
 
-    fn record_outcome(
+    async fn record_outcome(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
-        self.inner.record_outcome(key, digest, outcome)
+        self.inner.record_outcome(key, digest, outcome).await
     }
 }
+
+impl DurableAttemptStore for MockStore {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MockBehavior {
@@ -667,8 +671,9 @@ impl Default for MapStore {
     }
 }
 
+#[async_trait]
 impl AttemptReservationStore for MapStore {
-    fn reserve(
+    async fn reserve(
         &self,
         key: &IdempotencyKey,
         digest: &RequestDigest,
@@ -686,7 +691,7 @@ impl AttemptReservationStore for MapStore {
         }
     }
 
-    fn record_signed(
+    async fn record_signed(
         &self,
         _key: &IdempotencyKey,
         _digest: &RequestDigest,
@@ -694,7 +699,7 @@ impl AttemptReservationStore for MapStore {
         Ok(())
     }
 
-    fn record_outcome(
+    async fn record_outcome(
         &self,
         _key: &IdempotencyKey,
         _digest: &RequestDigest,

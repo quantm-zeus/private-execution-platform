@@ -436,6 +436,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chain-adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chain-types",
+ "domain",
+ "execution-relay",
+ "market-types",
+ "policy",
+ "privy",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "chain-types"
 version = "0.1.0"
 dependencies = [
@@ -802,6 +817,23 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "execution-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chain-types",
+ "domain",
+ "execution-relay",
+ "market-types",
+ "policy",
+ "privy",
+ "storage",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

@@ -22,9 +22,9 @@ use domain::{
 };
 use execution_preview::{AllowanceObservation, NetDelta, WalletBalance};
 use execution_relay::{
-    ChainHealth, ChainHealthBreaker, ChainObservation, ChainSubmissionAdapter, ExecutionRelay,
-    InMemoryReservationStore, ObservedFill, RelayError, SignedExecutionRef, SignedPayload,
-    SignedPayloadSource, SigningBoundary, SubmissionReceipt,
+    ChainHealth, ChainHealthBreaker, ChainObservation, ChainSubmissionAdapter,
+    DeterministicDurableStore, ExecutionRelay, InMemoryReservationStore, ObservedFill, RelayError,
+    SignedExecutionRef, SignedPayload, SignedPayloadSource, SigningBoundary, SubmissionReceipt,
 };
 use limit_engine::{
     attempt_intent_id, attempt_key, attempt_prepared_reference, AttemptExecutor, AttemptLimits,
@@ -627,7 +627,7 @@ async fn production_wiring_fails_closed_before_signer_or_adapter() {
     let source = Arc::new(CountingSource::new());
     let executor = RelayAttemptExecutor::production(
         policy(true),
-        InMemoryReservationStore::new(),
+        DeterministicDurableStore::new(),
         Arc::clone(&source),
         ChainHealthBreaker::new(2, 5_000),
         context(),

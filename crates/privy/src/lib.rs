@@ -2,11 +2,17 @@
 //!
 //! Callers can only submit a fully bound [`SigningRequest`]. There is no method
 //! that signs arbitrary bytes or calldata, and this crate never receives raw
-//! transaction bytes. Production construction always installs an unavailable
-//! transport, so the boundary fails closed until a real signer is wired in
-//! under review.
+//! transaction bytes. [`PrivySigningBoundary::new`] always installs an
+//! unavailable transport, so the boundary fails closed until an operator injects
+//! a real transport under review via
+//! [`PrivySigningBoundary::with_signing_transport`].
 
+pub mod http;
 pub mod signing;
+
+pub use http::{
+    PrivyCredentials, PrivyHttpClient, PrivyHttpSigningTransport, UnavailablePrivyHttpClient,
+};
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -15,7 +21,10 @@ use async_trait::async_trait;
 use domain::{IdempotencyKey, IntentId};
 use thiserror::Error;
 
-pub use signing::{PayloadDigest, RequestDigest, SignedExecutionRef, SigningRequest};
+pub use signing::{
+    canonical_chain_tag, chain_from_canonical_tag, PayloadDigest, ProviderIdempotencyId,
+    RequestDigest, SignedExecutionRef, SigningRequest,
+};
 
 /// Opaque reference to a prepared execution. This is not a signing capability;
 /// it only carries the policy intent/idempotency binding for later validation.
@@ -56,10 +65,29 @@ impl PreparedExecutionRef {
     }
 }
 
-/// Crate-private signing transport. Test doubles live in [`signing::test_support`].
+/// Signing transport.
+///
+/// The transport receives the request **and** its stable provider-side
+/// idempotency identifier so a provider that supports idempotent signing can
+/// collapse a transport-level retry of the same bound request. The identifier is
+/// derived from the canonical request digest, never from key material.
+///
+/// # Production wiring
+///
+/// Implementations are injected through
+/// [`PrivySigningBoundary::with_signing_transport`]. The public `new()`
+/// constructor always installs [`UnavailableTransport`], so the boundary fails
+/// closed until an operator injects a real transport under review.
 #[async_trait]
-pub(crate) trait SigningTransport: Send + Sync {
-    async fn submit_signing_request(&self, request: &SigningRequest) -> Result<String, PrivyError>;
+pub trait SigningTransport: Send + Sync {
+    /// Sends a fully bound signing request, returning the opaque provider
+    /// reference. Implementations must never receive or produce raw private key
+    /// material.
+    async fn submit_signing_request(
+        &self,
+        request: &SigningRequest,
+        idempotency: &ProviderIdempotencyId,
+    ) -> Result<String, PrivyError>;
 }
 
 /// Production transport: no live signer is wired in, so every request fails closed.
@@ -71,6 +99,7 @@ impl SigningTransport for UnavailableTransport {
     async fn submit_signing_request(
         &self,
         _request: &SigningRequest,
+        _idempotency: &ProviderIdempotencyId,
     ) -> Result<String, PrivyError> {
         Err(PrivyError::SigningUnavailable)
     }
@@ -79,8 +108,9 @@ impl SigningTransport for UnavailableTransport {
 /// Concrete, non-heritable signing boundary.
 ///
 /// It enforces exactly-once submission per idempotency key and holds the only
-/// transport handle. Production code can only build the unavailable transport;
-/// there is no public constructor that installs a real one.
+/// transport handle. [`Self::new`] installs an always-unavailable transport;
+/// a real one is installed only through the explicit, operator-reviewable
+/// [`Self::with_signing_transport`] seam.
 pub struct PrivySigningBoundary {
     transport: Box<dyn SigningTransport>,
     seen: Mutex<HashMap<IdempotencyKey, RequestDigest>>,
@@ -105,6 +135,25 @@ impl PrivySigningBoundary {
     pub fn new() -> Self {
         Self {
             transport: Box::new(UnavailableTransport),
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Builds a boundary over an operator-injected signing transport.
+    ///
+    /// This is the production seam: the caller supplies a transport that
+    /// performs the real provider call (for example
+    /// [`crate::PrivyHttpSigningTransport`]). All of this boundary's guarantees
+    /// remain in force: only a fully bound [`SigningRequest`] can be submitted,
+    /// the exactly-once `seen` ledger is consulted **before** the transport runs,
+    /// and the stable provider idempotency identifier is forwarded. There is
+    /// still no generic signing/transfer surface.
+    ///
+    /// Callers must not construct this with an untrusted transport; the default
+    /// [`Self::new`] remains fail-closed.
+    pub fn with_signing_transport(transport: Box<dyn SigningTransport>) -> Self {
+        Self {
+            transport,
             seen: Mutex::new(HashMap::new()),
         }
     }
@@ -152,7 +201,11 @@ impl PrivySigningBoundary {
             }
         }
 
-        let reference = self.transport.submit_signing_request(request).await?;
+        let idempotency = request.provider_idempotency_id();
+        let reference = self
+            .transport
+            .submit_signing_request(request, &idempotency)
+            .await?;
         SignedExecutionRef::new(
             reference,
             *request.request_digest(),

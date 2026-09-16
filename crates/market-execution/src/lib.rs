@@ -68,8 +68,8 @@ use execution_preview::{
     RouteBinding, WalletBalance,
 };
 use execution_relay::{
-    AttemptReservationStore, ChainHealthBreaker, ChainSubmissionAdapter, ExecutionRelay,
-    PrivySigningBoundaryAdapter, RelayError, RelayExecutionInput, RelayOutcome,
+    AttemptReservationStore, ChainHealthBreaker, ChainSubmissionAdapter, DurableAttemptStore,
+    ExecutionRelay, PrivySigningBoundaryAdapter, RelayError, RelayExecutionInput, RelayOutcome,
     SignedPayloadSource, SigningBoundary, UnavailableChainAdapter,
 };
 use market_types::{AssetAmount, AtomicAmount, FreshnessPolicy};
@@ -171,7 +171,7 @@ where
 impl<S, P, T, R>
     RelayMarketExecutionPort<S, UnavailableChainAdapter, P, PrivySigningBoundaryAdapter, T, R>
 where
-    S: AttemptReservationStore,
+    S: DurableAttemptStore,
     P: SignedPayloadSource,
 {
     /// **Production entry point**: [`ExecutionRelay::production`]
@@ -180,7 +180,8 @@ where
     /// No network, key material, or live signing exists on this path until a
     /// real chain adapter and Privy transport are installed under review: the
     /// adapter reports `Unavailable`, so every `execute` fails closed before a
-    /// reservation is claimed.
+    /// reservation is claimed. The store must implement [`DurableAttemptStore`],
+    /// so a live path cannot be composed over process-local bookkeeping.
     pub fn production(
         policy: PolicyEngine,
         store: S,

@@ -26,6 +26,8 @@ members = [
     "crates/risk-engine",
     "crates/execution-preview",
     "crates/execution-relay",
+    "crates/execution-store",
+    "crates/chain-adapters",
     "crates/audit",
     "crates/limit-engine",
     "crates/agent-commands",
@@ -71,6 +73,8 @@ routing = { path = "crates/routing" }
 risk-engine = { path = "crates/risk-engine" }
 execution-preview = { path = "crates/execution-preview" }
 execution-relay = { path = "crates/execution-relay" }
+execution-store = { path = "crates/execution-store" }
+chain-adapters = { path = "crates/chain-adapters" }
 audit = { path = "crates/audit" }
 limit-engine = { path = "crates/limit-engine" }
 agent-commands = { path = "crates/agent-commands" }

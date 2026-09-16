@@ -56,8 +56,8 @@ use domain::{
     IdempotencyKey, IntentId, RiskConstraints, TradeIntent, TradeSide, UserId, WalletRef,
 };
 use execution_relay::{
-    AttemptReservationStore, ChainHealthBreaker, InMemoryReservationStore, RelayError,
-    SignedExecutionRef, SignedPayload, SignedPayloadSource,
+    AttemptBinding, AttemptReservationStore, ChainHealthBreaker, DurableAttemptStore,
+    DurableSubmission, RelayError, SignedExecutionRef, SignedPayload, SignedPayloadSource,
 };
 use limit_engine::{
     AttemptExecutor, DurableLimitOrderStore, LimitEngineError, LimitOrderStore, Orchestrator,
@@ -71,6 +71,7 @@ use market_types::AtomicAmount;
 use mcp_server::{AgentBackend, BackendOutcome};
 use policy::{PolicyEngine, PolicyError, PolicyLimits, TradingGate};
 use privy::PreparedExecutionRef;
+use privy::ProviderIdempotencyId;
 use routing::GasEstimator;
 
 use crate::benchmark::{
@@ -212,6 +213,88 @@ impl OpaqueStore for UnavailableOpaqueStore {
     }
 }
 
+/// Fail-closed [`DurableAttemptStore`]: every operation errors.
+///
+/// It is the default when no durable attempt store is injected, so the composed
+/// relay can never sign or submit on process-local bookkeeping and
+/// [`TradingCore::capabilities`] cannot advertise execution. A real Postgres
+/// adapter (or another durable store) is injected through
+/// [`TradingCoreSeams::attempt_store`] before live capability can exist.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableDurableAttemptStore;
+
+#[async_trait]
+impl AttemptReservationStore for UnavailableDurableAttemptStore {
+    async fn reserve(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+    ) -> Result<execution_relay::Reservation, RelayError> {
+        Err(RelayError::ReservationUnavailable)
+    }
+
+    async fn reserve_bound(
+        &self,
+        _binding: &AttemptBinding,
+        _digest: &privy::RequestDigest,
+    ) -> Result<execution_relay::Reservation, RelayError> {
+        Err(RelayError::ReservationUnavailable)
+    }
+
+    async fn record_sign_requested(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+        _provider_idempotency: &ProviderIdempotencyId,
+    ) -> Result<(), RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+
+    async fn record_signed(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+    ) -> Result<(), RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+
+    async fn record_signed_reference(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+        _signed_reference: &str,
+    ) -> Result<(), RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+
+    async fn record_submission(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+        _request: &execution_relay::SubmitRequest,
+    ) -> Result<(), RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+
+    async fn load_submission(
+        &self,
+        _key: &IdempotencyKey,
+    ) -> Result<Option<DurableSubmission>, RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+
+    async fn record_outcome(
+        &self,
+        _key: &IdempotencyKey,
+        _digest: &privy::RequestDigest,
+        _outcome: execution_relay::RelayOutcome,
+    ) -> Result<(), RelayError> {
+        Err(RelayError::StoreUnavailable)
+    }
+}
+
+impl DurableAttemptStore for UnavailableDurableAttemptStore {}
+
 /// Fail-closed [`SignedPayloadSource`]: no payload can be built or retrieved.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnavailablePayloadSource;
@@ -270,14 +353,17 @@ impl PreparedExecutionRefSource for UnavailablePreparedRefSource {
 /// closed before a reservation is claimed: no sign, submit, or reserve occurs.
 ///
 /// The reservation store is generic so tests can pass a recording store; the
-/// canonical call passes an [`InMemoryReservationStore`].
+/// canonical call passes an [`UnavailableDurableAttemptStore`] until a real
+/// durable adapter is injected. The store must implement
+/// [`DurableAttemptStore`], so this production path cannot be composed over
+/// process-local bookkeeping.
 pub fn build_fail_closed_market_port<S>(
     policy: PolicyEngine,
     store: S,
     breaker: ChainHealthBreaker,
 ) -> Arc<dyn MarketExecutionPort>
 where
-    S: AttemptReservationStore + 'static,
+    S: DurableAttemptStore + 'static,
 {
     Arc::new(RelayMarketExecutionPort::production(
         policy,
@@ -309,6 +395,12 @@ pub struct TradingCoreSeams {
     pub okx_quote_source: Option<Arc<dyn OkxQuoteSource>>,
     /// Concrete market-execution port (defaults to the fail-closed relay port).
     pub market_execution: Option<Arc<dyn MarketExecutionPort>>,
+    /// Durable exactly-once attempt store used by the default market port.
+    ///
+    /// Defaults to [`UnavailableDurableAttemptStore`]; the composed relay then
+    /// fails closed on every reservation. A real durable adapter (Postgres)
+    /// must be injected before live signing/submission capability can exist.
+    pub attempt_store: Option<Arc<dyn DurableAttemptStore>>,
     /// Full limit-orchestrator recovery, operator-injected.
     pub limit_recovery: Option<Arc<dyn LimitRecovery>>,
     /// Observational provider-benchmark evaluator (P93).
@@ -332,6 +424,7 @@ impl std::fmt::Debug for TradingCoreSeams {
             .field("gas", &self.gas.is_some())
             .field("okx_quote_source", &self.okx_quote_source.is_some())
             .field("market_execution", &self.market_execution.is_some())
+            .field("attempt_store", &self.attempt_store.is_some())
             .field("limit_recovery", &self.limit_recovery.is_some())
             .field("provider_benchmark", &self.provider_benchmark.is_some())
             .field(
@@ -1038,6 +1131,7 @@ impl<S: OpaqueStore> TradingCore<S> {
             gas,
             okx_quote_source,
             market_execution,
+            attempt_store,
             limit_recovery,
             provider_benchmark,
             provider_benchmark_sink,
@@ -1073,9 +1167,10 @@ impl<S: OpaqueStore> TradingCore<S> {
             backend = backend.with_okx_quote_source(source);
         }
         let execution = market_execution.unwrap_or_else(|| {
+            let store = attempt_store.unwrap_or_else(|| Arc::new(UnavailableDurableAttemptStore));
             build_fail_closed_market_port(
                 policy,
-                InMemoryReservationStore::new(),
+                store,
                 ChainHealthBreaker::new(CHAIN_HEALTH_FAILURE_THRESHOLD, CHAIN_HEALTH_COOLDOWN_MS),
             )
         });
