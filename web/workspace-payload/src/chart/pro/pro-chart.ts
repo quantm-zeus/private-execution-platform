@@ -12,6 +12,7 @@
 import { KLineChartPro } from "@klinecharts/pro";
 import type { ChartProOptions } from "@klinecharts/pro";
 import { PRO_PERIODS, proPeriodForTimeframe, proSymbolFor } from "./pro-datafeed";
+import { normalizePositiveTabindex } from "./vendor-a11y";
 import type { ChartSubject } from "../chart-datafeed";
 
 export interface CreateProChartOptions {
@@ -127,6 +128,20 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
       entry.target === window && entry.type === "resize" && typeof entry.listener === "function",
   )?.listener as ((event: Event) => void) | undefined;
 
+  // Pro marks its crosshair layer `tabindex="1"`; normalize now and keep
+  // watching because the vendor can recreate it on symbol/period changes.
+  normalizePositiveTabindex(container);
+  let tabindexObserver: MutationObserver | null = null;
+  if (typeof MutationObserver !== "undefined") {
+    tabindexObserver = new MutationObserver(() => normalizePositiveTabindex(container));
+    tabindexObserver.observe(container, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["tabindex"],
+    });
+  }
+
   let disposed = false;
   let observer: ResizeObserver | null = null;
   const triggerResize = (): void => {
@@ -158,6 +173,8 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
       disposed = true;
       observer?.disconnect();
       observer = null;
+      tabindexObserver?.disconnect();
+      tabindexObserver = null;
       // Remove every listener Pro registered on window/document during
       // construction; Pro 0.1.1 never runs its own Solid cleanup.
       for (const { target, type, listener, options } of captured) {
