@@ -28,10 +28,23 @@ export const RECOVERY_WRAP_ALGORITHM = "HKDF-SHA256/AES-256-GCM";
 export const RECOVERY_KDF_INFO = "evergreen/workspace-recovery/v1";
 export const RECOVERY_AAD = "evergreen/workspace-recovery/v1";
 /**
- * The only wrapper key source this build can unwrap. A future random-root-key
- * migration introduces a new value; existing records are never reinterpreted.
+ * Legacy release-bound wrapper key source. Records written under this value
+ * protect the operator-held release unlock secret and are retained only for
+ * bounded migration: the stable Workspace Root Key flow never writes them and
+ * ignores them when selecting a credential.
  */
 export const RECOVERY_KEY_SOURCE = "unlock_secret_v1";
+/**
+ * Stable Workspace Root Key wrapper key source (v2). Every wrapper created by
+ * the workspace-root flow protects the client-generated 32-byte Workspace Root
+ * Secret under this key source, so v1 records are never reinterpreted.
+ */
+export const RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2 = "workspace_root_v2";
+/** Key sources this build can unwrap, newest first. */
+export const RECOVERY_KEY_SOURCES: readonly string[] = [
+  RECOVERY_KEY_SOURCE_WORKSPACE_ROOT_V2,
+  RECOVERY_KEY_SOURCE,
+];
 export const RECOVERY_SALT_BYTES = 32;
 export const RECOVERY_IV_BYTES = 12;
 export const ROOT_KEY_BYTES = 32;
@@ -204,15 +217,19 @@ export async function wrapRootKey(
   salt: Uint8Array = generateRecoverySalt(),
   info: string = RECOVERY_KDF_INFO,
   credentialIdB64: string = "",
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<WrappedRootKey> {
   requireRootKey(rootKey);
   if (salt.length !== RECOVERY_SALT_BYTES) throw new RecoveryWrappingError("invalid_record");
+  if (!RECOVERY_KEY_SOURCES.includes(keySource)) {
+    throw new RecoveryWrappingError("invalid_record");
+  }
   const wrappingKey = await deriveRecoveryWrappingKey(ikm, salt, info);
   const iv = randomBytes(RECOVERY_IV_BYTES);
   const recordBase = {
     version: RECOVERY_WRAPPER_VERSION,
     algorithm: RECOVERY_WRAP_ALGORITHM,
-    key_source: RECOVERY_KEY_SOURCE,
+    key_source: keySource,
   };
   const ciphertext = await subtleCrypto().encrypt(
     {
@@ -243,12 +260,14 @@ export async function unwrapRootKey(
   record: WrappedRootKey,
   info: string = RECOVERY_KDF_INFO,
   credentialIdB64: string = "",
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<Uint8Array> {
   if (
     !record ||
     record.version !== RECOVERY_WRAPPER_VERSION ||
     record.algorithm !== RECOVERY_WRAP_ALGORITHM ||
-    record.key_source !== RECOVERY_KEY_SOURCE
+    record.key_source !== keySource ||
+    !RECOVERY_KEY_SOURCES.includes(keySource)
   ) {
     throw new RecoveryWrappingError("invalid_record");
   }
@@ -310,15 +329,17 @@ export async function wrapWithRecoverySecret(
   rootKey: Uint8Array,
   recoverySecret: Uint8Array,
   salt: Uint8Array = generateRecoverySalt(),
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<WrappedRootKey> {
-  return wrapRootKey(recoverySecret, rootKey, salt);
+  return wrapRootKey(recoverySecret, rootKey, salt, undefined, "", keySource);
 }
 
 export async function unwrapWithRecoverySecret(
   record: WrappedRootKey,
   recoverySecret: Uint8Array,
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<Uint8Array> {
-  return unwrapRootKey(recoverySecret, record);
+  return unwrapRootKey(recoverySecret, record, undefined, "", keySource);
 }
 
 /**
@@ -334,13 +355,14 @@ export async function wrapWithPrf(
   credential: unknown,
   credentialIdB64: string,
   salt: Uint8Array = generateRecoverySalt(),
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<WrappedRootKey | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
   try {
     // `deriveRecoveryWrappingKey` imports the PRF bytes into WebCrypto before
     // the async boundary returns, so the local copy can be zeroized here.
-    return await wrapRootKey(prf, rootKey, salt, undefined, credentialIdB64);
+    return await wrapRootKey(prf, rootKey, salt, undefined, credentialIdB64, keySource);
   } finally {
     prf.fill(0);
   }
@@ -350,11 +372,12 @@ export async function unwrapWithPrf(
   record: WrappedRootKey,
   credential: unknown,
   credentialIdB64: string,
+  keySource: string = RECOVERY_KEY_SOURCE,
 ): Promise<Uint8Array | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
   try {
-    return await unwrapRootKey(prf, record, undefined, credentialIdB64);
+    return await unwrapRootKey(prf, record, undefined, credentialIdB64, keySource);
   } finally {
     prf.fill(0);
   }
