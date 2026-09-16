@@ -1,0 +1,29 @@
+FINAL_READY — Evergreen PEP final release candidate
+================================================================
+
+Repository:   quantm-zeus/private-execution-platform
+Branch:       worker/deepseek-final-release
+Exact SHA:    a0ee01b914253d030c72757f031ee5d60091864a
+Base:         fc725aa (reviewed UX/KLine/FOMO 51f7445 + durable core 89a80ed)
+
+CI (exact SHA, authoritative):
+  https://github.com/quantm-zeus/private-execution-platform/actions/runs/35109740599
+  conclusion: success  (rust, web-boundary, web-e2e)
+
+Local gates (serialized under /tmp/deepseek-global-heavy-gate.lock):
+  15/16 PASS. playwright test 73/74 on the local no-sudo sandbox; the single
+  local miss is the chromium shell-spec "artifact grant observed" assertion
+  (grant request not observed locally; the DOM-clearing security assertion
+  passed). The same spec is green in CI on both engines and on local Firefox.
+  No web/shell application code changed in this candidate.
+
+Review:
+  2 independent read-only adversarial reviews + 1 delta review.
+  No CRITICAL and no HIGH findings. Fixes applied; see FINAL_RELEASE_CANDIDATE.md.
+
+Safety:
+  TRADING_ENABLED=false. No live signing or chain submission is composed.
+  execute is never advertised. No real funds touched. Not deployed by this lane.
+
+Evidence: FINAL_RELEASE_CANDIDATE.md
+Date:     2026-09-16
