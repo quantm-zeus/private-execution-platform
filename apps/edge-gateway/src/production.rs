@@ -75,9 +75,24 @@ pub const FORBIDDEN_ASSERTION_HEADERS: [&str; 16] = [
 /// it must not match the accepted oauth2-proxy `x-forwarded-access-token` family.
 pub const FORBIDDEN_ASSERTION_PREFIXES: [&str; 2] = ["cf-connecting-ip", "cf-ip"];
 
-/// Whether `name` (already lowercased by [`HeaderName`]) is a forwarding or
-/// proxy-metadata header that can never be the perimeter assertion.
+/// The only `cf-` header that may be the perimeter access assertion.
+///
+/// Cloudflare stamps many `cf-*` headers on every proxied request (`cf-ray`,
+/// `cf-worker`, `cf-cache-status`, `cf-request-id`, …), so accepting any `cf-`
+/// header as the assertion would authorize ordinary traffic that merely reached
+/// Cloudflare. The Access JWT assertion is the one header Cloudflare Access adds
+/// for an authenticated identity and strips from client input, so it is the only
+/// accepted `cf-` seam.
+pub const ALLOWED_CF_ASSERTION_HEADERS: [&str; 1] = ["cf-access-jwt-assertion"];
+
+/// Whether `name` (already lowercased by [`HeaderName`]) may be the perimeter
+/// assertion. `x-` headers keep the denylist (so the oauth2-proxy
+/// `x-auth-request-*` and identity seams stay accepted), while `cf-` headers are
+/// restricted to the single Access assertion name.
 fn is_forbidden_assertion_header(name: &str) -> bool {
+    if name.starts_with("cf-") {
+        return !ALLOWED_CF_ASSERTION_HEADERS.contains(&name);
+    }
     FORBIDDEN_ASSERTION_HEADERS.contains(&name)
         || FORBIDDEN_ASSERTION_PREFIXES
             .iter()
@@ -417,6 +432,31 @@ mod tests {
                 "{name} is a valid perimeter assertion header"
             );
         }
+    }
+
+    #[test]
+    fn always_present_cf_headers_can_never_be_the_assertion() {
+        // Cloudflare stamps these on ordinary proxied requests, so naming one as
+        // the assertion would authorize every request that merely reached
+        // Cloudflare with no Access authentication.
+        for name in [
+            "cf-ray",
+            "cf-worker",
+            "cf-cache-status",
+            "cf-request-id",
+            "cf-access-client-id",
+            "cf-access-client-secret",
+            "cf-visitor",
+            "cf-ew-via",
+        ] {
+            assert!(
+                HeaderAssertionAuthorization::new(name).is_err(),
+                "{name} must not be configurable as the access assertion"
+            );
+            assert!(is_forbidden_assertion_header(name), "{name}");
+        }
+        // The single Access identity assertion is the only accepted `cf-` seam.
+        assert!(HeaderAssertionAuthorization::new("cf-access-jwt-assertion").is_ok());
     }
 
     fn s(value: &str) -> Option<String> {

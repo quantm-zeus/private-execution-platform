@@ -31,6 +31,7 @@ import { authenticateWithPrf } from "./recovery-passkey";
 import {
   isUnlockError,
   recoveryFor,
+  type RecoveryAction,
   type UnlockRecovery,
   type UnlockStage,
 } from "./unlock-stages";
@@ -70,6 +71,17 @@ function stageStatusText(current: UnlockStage | null, id: UnlockStage): string {
   if (index === currentIndex) return "in progress";
   return "pending";
 }
+
+/**
+ * Recoverable actions that have a concrete control. `contact_operator` and
+ * `rollback_release` are handled by the operator, so they stay text-only.
+ */
+const RECOVERY_ACTION_LABELS: Partial<Record<RecoveryAction, string>> = {
+  resume_authentication: "Verify passkey again",
+  reload: "Reload page",
+  retry: "Try again",
+  reenter_recovery: "Re-enter recovery code",
+};
 
 function App() {
   const [status, setStatus] = createSignal("Security gateway ready.");
@@ -190,6 +202,28 @@ function App() {
       }
       setAuthState("signed_out");
       setAuthMessage("Passkey verification did not complete. Try again when ready.");
+    }
+  };
+
+  /**
+   * Run the concrete control a stage failure offers. `onStage`-only recovery
+   * (contact_operator / rollback_release) has no button, so its guidance stays
+   * text-only.
+   */
+  const runRecoveryAction = (action: RecoveryAction) => {
+    switch (action) {
+      case "resume_authentication":
+        void runAuthentication();
+        return;
+      case "reload":
+        window.location.reload();
+        return;
+      case "retry":
+      case "reenter_recovery":
+        recoveryInput?.focus();
+        return;
+      default:
+        return;
     }
   };
 
@@ -657,6 +691,7 @@ function App() {
       <Show when={unlockFailure()}>
         {(failure) => (
           <div
+            id="unlock-failure"
             class="notice"
             classList={{
               "notice--error": failure().severity === "error",
@@ -671,6 +706,17 @@ function App() {
             <p class="notice__stage">{failure().stageLabel}</p>
             <p class="notice__title">{failure().title}</p>
             <p class="notice__detail">{failure().detail}</p>
+            <Show when={RECOVERY_ACTION_LABELS[failure().action]}>
+              {(label) => (
+                <button
+                  type="button"
+                  class="button"
+                  onClick={() => runRecoveryAction(failure().action)}
+                >
+                  {label()}
+                </button>
+              )}
+            </Show>
           </div>
         )}
       </Show>
@@ -830,6 +876,8 @@ function App() {
                     value={recoveryCode()}
                     onInput={(e) => setRecoveryCode(e.currentTarget.value)}
                     disabled={isUnlocking()}
+                    aria-invalid={unlockFailure() ? "true" : "false"}
+                    aria-describedby={unlockFailure() ? "unlock-failure" : undefined}
                     ref={(element) => {
                       recoveryInput = element;
                     }}

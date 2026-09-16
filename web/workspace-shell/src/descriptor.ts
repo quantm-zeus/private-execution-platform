@@ -91,6 +91,12 @@ export function parseWorkspaceDescriptor(input: unknown): WorkspaceDescriptor {
   if (!Number.isInteger(protocol) || !Number.isInteger(artifactVersion)) {
     throw new DescriptorError("descriptor_malformed");
   }
+  // The descriptor schema version is a hard binding: an unknown version could
+  // carry fields this shell would silently misread. Fail closed rather than
+  // accept a future/foreign schema whose ranges happen to include ours.
+  if (protocol !== WORKSPACE_PROTOCOL_VERSION) {
+    throw new DescriptorError("descriptor_incompatible");
+  }
   if (!Number.isInteger(packageFormat)) {
     throw new DescriptorError("descriptor_malformed");
   }
@@ -105,7 +111,9 @@ export function parseWorkspaceDescriptor(input: unknown): WorkspaceDescriptor {
   // malformed value must be rejected, never silently downgraded to "skip the
   // check". The production descriptor always carries both fields.
   const artifactSize = input.artifact_size;
-  if (!Number.isInteger(artifactSize) || (artifactSize as number) < 0) {
+  // The production descriptor always carries a positive artifact size; a zero or
+  // missing value must not silently disable the size binding.
+  if (!Number.isInteger(artifactSize) || (artifactSize as number) <= 0) {
     throw new DescriptorError("descriptor_malformed");
   }
   const artifactDigest = input.artifact_sha256_hex;

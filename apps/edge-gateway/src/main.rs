@@ -69,15 +69,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edge_bind_refuses_public_interfaces() {
+    fn edge_bind_refuses_public_and_non_address_forms() {
         assert!(resolve_edge_bind("127.0.0.1:8080", false).is_ok());
         assert!(resolve_edge_bind("[::1]:8080", false).is_ok());
         // Public bind without JWT validation is refused.
         assert!(resolve_edge_bind("0.0.0.0:8080", false).is_err());
+        assert!(resolve_edge_bind("[::]:8080", false).is_err());
         assert!(resolve_edge_bind("192.0.2.10:8080", false).is_err());
+        // An IPv4-mapped IPv6 loopback is not `is_loopback` and must be refused.
+        assert!(resolve_edge_bind("[::ffff:127.0.0.1]:8080", false).is_err());
         // The flag cannot enable unimplemented cryptographic validation, so a
         // public bind is refused even when set.
         assert!(resolve_edge_bind("0.0.0.0:8080", true).is_err());
+        assert!(resolve_edge_bind("[::ffff:127.0.0.1]:8080", true).is_err());
+        // A DNS name, a whitespace-padded value, a missing port and an empty
+        // value are configuration errors, not a silent public bind.
+        for bad in [
+            "internal.example:8080",
+            " 127.0.0.1:8080 ",
+            "127.0.0.1",
+            "",
+            "localhost:8080",
+        ] {
+            assert!(
+                resolve_edge_bind(bad, false).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     #[test]

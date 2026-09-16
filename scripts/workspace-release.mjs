@@ -653,8 +653,15 @@ async function linkTarget(linkPath) {
 async function atomicSymlink(linkPath, target) {
   const parent = dirname(linkPath);
   const tmp = join(parent, `.${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
-  await symlink(target, tmp);
-  await rename(tmp, linkPath);
+  try {
+    await symlink(target, tmp);
+    await rename(tmp, linkPath);
+  } catch (error) {
+    // A failed symlink/rename (e.g. a read-only releases root) must not leak a
+    // half-created temp link into the releases directory.
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
   // Make the rename durable before the caller proceeds to the paired symlink.
   await syncDirectory(parent);
 }

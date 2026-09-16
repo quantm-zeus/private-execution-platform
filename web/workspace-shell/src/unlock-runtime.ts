@@ -127,6 +127,31 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string | null> {
 }
 
 /**
+ * Enforce the authenticated descriptor's size and digest binding against the
+ * bytes the transport delivered, before the inner artifact decrypt. Exported so
+ * a focused test can prove a substituted-but-well-formed artifact is rejected
+ * with `U5_ARTIFACT/artifact_incompatible` rather than silently trusted.
+ *
+ * A legacy descriptor with neither field skips the local check and relies on the
+ * server preflight; a present digest `null` result (no WebCrypto) is a hard
+ * failure, never a skip.
+ */
+export async function assertArtifactBinding(
+  descriptor: Pick<WorkspaceDescriptor, "artifact_size" | "artifact_sha256_hex">,
+  sealedArtifactBytes: Uint8Array,
+): Promise<void> {
+  if (descriptor.artifact_size > 0 && sealedArtifactBytes.length !== descriptor.artifact_size) {
+    throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+  }
+  if (descriptor.artifact_sha256_hex) {
+    const actualDigest = await sha256Hex(sealedArtifactBytes);
+    if (actualDigest === null || actualDigest !== descriptor.artifact_sha256_hex) {
+      throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
+    }
+  }
+}
+
+/**
  * Derive the workspace public-key fingerprint for a candidate secret, using the
  * audited WASM key path. Returns `null` when the KID is malformed, the secret is
  * rejected, or WebCrypto is unavailable. The caller's `secret` is not mutated.
@@ -219,6 +244,19 @@ export function unpackPackageFromMemory(
     throw new Error("invalid artifact package");
   }
   return files;
+}
+
+/**
+ * Unpack the decrypted payload, classifying any malformed package as the typed
+ * `U6_PACKAGE/package_invalid` stage. Exported for a focused stage test; the
+ * caller owns zeroizing the input buffer, so this never mutates it.
+ */
+export function unpackPayloadOrThrow(buffer: Uint8Array): Map<string, Uint8Array> {
+  try {
+    return unpackPackageFromMemory(buffer);
+  } catch {
+    throw new UnlockError("U6_PACKAGE", "package_invalid");
+  }
 }
 
 function getMimeType(path: string): string {
@@ -677,15 +715,7 @@ export class WorkspaceUnlockRuntime {
       // the local check and rely on the server preflight. The stage is announced
       // first so the ledger reflects U5 even when this check throws.
       onStage("U5_ARTIFACT");
-      if (descriptor.artifact_size > 0 && sealedArtifactBytes.length !== descriptor.artifact_size) {
-        throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
-      }
-      if (descriptor.artifact_sha256_hex) {
-        const actualDigest = await sha256Hex(sealedArtifactBytes);
-        if (actualDigest === null || actualDigest !== descriptor.artifact_sha256_hex) {
-          throw new UnlockError("U5_ARTIFACT", "artifact_incompatible");
-        }
-      }
+      await assertArtifactBinding(descriptor, sealedArtifactBytes);
 
       // U5: decrypt the inner workspace artifact with the in-memory key.
       let decryptedPayloadBytes: Uint8Array;
@@ -700,12 +730,12 @@ export class WorkspaceUnlockRuntime {
       let unpackedFiles: Map<string, Uint8Array>;
       try {
         try {
-          unpackedFiles = unpackPackageFromMemory(decryptedPayloadBytes);
+          unpackedFiles = unpackPayloadOrThrow(decryptedPayloadBytes);
         } finally {
           decryptedPayloadBytes.fill(0);
         }
-      } catch {
-        throw new UnlockError("U6_PACKAGE", "package_invalid");
+      } catch (error) {
+        throw asUnlockError(error, "U6_PACKAGE", "package_invalid");
       }
       this.currentPayloadFiles = unpackedFiles;
 

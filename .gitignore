@@ -16,6 +16,9 @@ web/workspace/dist/
 web/workspace-shell/dist/
 web/workspace-payload/dist/
 web/workspace-artifact/
+# Default immutable release root (`scripts/workspace-release.mjs`): it holds the
+# sealed artifact and a full shell build and must never be committed.
+web/workspace-releases/
 web/e2e/test-results/
 web/e2e/playwright-report/
 

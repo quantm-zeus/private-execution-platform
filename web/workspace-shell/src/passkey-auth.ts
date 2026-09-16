@@ -217,9 +217,16 @@ export function buildCreationOptions(
     source.extensions && typeof source.extensions === "object"
       ? (source.extensions as Record<string, unknown>)
       : {};
+  const serverPrf = serverExtensions.prf;
   options.extensions = {
     ...serverExtensions,
-    prf: {},
+    // Preserve any server-supplied PRF configuration (for example evaluation
+    // salts) rather than clobbering it, while still enabling PRF when the server
+    // did not request it (`prf: {}` enables without evaluating).
+    prf:
+      serverPrf && typeof serverPrf === "object" && !Array.isArray(serverPrf)
+        ? serverPrf
+        : {},
   } as unknown as AuthenticationExtensionsClientInputs;
   return options;
 }

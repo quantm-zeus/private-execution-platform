@@ -231,16 +231,22 @@ pub fn load_release_manifest_from_env() -> Result<Option<ReleaseManifest>, Descr
 fn load_release_manifest_from(path: &std::path::Path) -> Result<ReleaseManifest, DescriptorError> {
     use std::io::Read;
 
-    let metadata = std::fs::metadata(path).map_err(|_| DescriptorError::ManifestInvalid)?;
-    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+    // Hardened open: the manifest is the only trusted binding for the recipient
+    // public-key fingerprint that authorizes recovery mutation, so a symlinked,
+    // swapped, foreign-owned or group/world-writable manifest must be refused.
+    let opened = crate::hardened_file::open_hardened(path)
+        .map_err(|_| DescriptorError::ManifestInvalid)?
+        .ok_or(DescriptorError::ManifestInvalid)?;
+    if opened.metadata.len() > MAX_MANIFEST_BYTES {
         return Err(DescriptorError::ManifestInvalid);
     }
     // Bound the read with `take` as well as the metadata check, so a file that
     // grows between the metadata call and the read cannot force an unbounded
     // allocation.
-    let file = std::fs::File::open(path).map_err(|_| DescriptorError::ManifestInvalid)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_MANIFEST_BYTES + 1)
+    let mut bytes = Vec::with_capacity(opened.metadata.len() as usize);
+    opened
+        .file
+        .take(MAX_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| DescriptorError::ManifestInvalid)?;
     if bytes.len() as u64 > MAX_MANIFEST_BYTES {
@@ -339,14 +345,22 @@ pub fn parse_artifact_header(header: &[u8]) -> Result<ArtifactHeader, Descriptor
 }
 
 impl ReleaseManifest {
-    /// Lightweight manifest/artifact-header consistency check for the readiness
-    /// probe: validates the manifest shape and the artifact version/KID without
-    /// reading or hashing the ciphertext. Full byte-level validation still runs
-    /// on the authenticated descriptor and before delivery.
-    pub fn validate_header_against(&self, header: &ArtifactHeader) -> Result<(), DescriptorError> {
+    /// Lightweight manifest/artifact consistency check for the readiness
+    /// probe: validates the manifest shape, the artifact version/KID and the
+    /// exact file length without reading or hashing the ciphertext. Full
+    /// byte-level validation still runs on the authenticated descriptor and
+    /// before delivery. The size check catches the common truncation/swapped
+    /// artifact case that would otherwise report ready while every delivery is
+    /// rejected.
+    pub fn validate_header_against(
+        &self,
+        header: &ArtifactHeader,
+        artifact_len: u64,
+    ) -> Result<(), DescriptorError> {
         self.validate_shape()?;
         if header.version != self.artifact.version
             || base64_encode(&header.kid) != self.artifact.kid_b64
+            || artifact_len != self.artifact.size
         {
             return Err(DescriptorError::ManifestInvalid);
         }
@@ -668,5 +682,53 @@ mod tests {
         assert!(decode_canonical_b64("AAA", 3).is_none());
         assert!(decode_canonical_b64("A===", 1).is_none());
         assert!(decode_canonical_b64("!!!!", 3).is_none());
+    }
+
+    #[test]
+    fn readiness_header_check_binds_the_exact_file_size() {
+        let (artifact, snapshot) = sealed_artifact();
+        let manifest = manifest_for(&artifact, &snapshot);
+        let header = parse_artifact_header(&artifact).expect("header");
+        let exact = artifact.len() as u64;
+        assert!(manifest.validate_header_against(&header, exact).is_ok());
+        // A truncated (or swapped) artifact with a matching header must not be
+        // reported ready while every delivery would be rejected.
+        assert!(manifest
+            .validate_header_against(&header, exact - 1)
+            .is_err());
+        assert!(manifest
+            .validate_header_against(&header, exact + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_an_unsupported_package_format() {
+        let (artifact, snapshot) = sealed_artifact();
+        let mut manifest = manifest_for(&artifact, &snapshot);
+        manifest.artifact.package_format_version = PACKAGE_FORMAT_VERSION + 1;
+        assert_eq!(
+            manifest.validate_shape(),
+            Err(DescriptorError::ManifestInvalid)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_loader_refuses_a_symlink_and_a_group_writable_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (artifact, snapshot) = sealed_artifact();
+        let manifest = manifest_for(&artifact, &snapshot);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("manifest.json");
+        std::fs::write(&real, &bytes).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("link.json");
+        symlink(&real, &link).unwrap();
+        assert!(load_release_manifest_from(&link).is_err());
+        assert!(load_release_manifest_from(&real).is_ok());
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(load_release_manifest_from(&real).is_err());
     }
 }

@@ -17,6 +17,14 @@ import {
   artifactKidFromEnv,
   unlockSecretFromEnv,
 } from "./workspace-artifact.mjs";
+// The production release-manifest writer, so the real-loader proof is exercised
+// against the SAME manifest schema the operator tooling publishes (no
+// hand-written fixture that can drift from `apps/private-api/src/release.rs`).
+import {
+  computeReleaseManifest,
+  digestDirectory,
+  releaseIdFor,
+} from "./workspace-release.mjs";
 
 function run(args, env = process.env) {
   const result = spawnSync("pnpm", args, { stdio: "inherit", env });
@@ -1133,63 +1141,81 @@ try {
   // also drives the real per-grant HPKE routes, the inner artifact decrypt and
   // the production package unpack.
   {
-    // Also write the immutable release manifest so the ignored test exercises
-    // the real manifest-vs-artifact and recipient-fingerprint preflight, not
-    // only version/KID compatibility.
+    // Write the immutable release manifest with the PRODUCTION writer for
+    // exactly these artifact bytes, so the ignored test exercises the real
+    // manifest-vs-artifact and recipient-fingerprint preflight against the same
+    // schema the operator tooling emits. A hand-written fixture could drift from
+    // `apps/private-api/src/release.rs` unnoticed.
+    const shellAssetDigest = await digestDirectory(shellDist);
+    const sourceSha =
+      process.env.GITHUB_SHA && /^[0-9a-f]{7,40}$/i.test(process.env.GITHUB_SHA)
+        ? process.env.GITHUB_SHA
+        : "0123456789abcdef0123456789abcdef01234567";
     const manifestPath = `${artifactPath}.fixture.manifest.json`;
-    await writeFile(
-      manifestPath,
-      JSON.stringify({
-        manifest_version: 1,
-        release_id: "prod-build-script-fixture",
-        source_sha: "verify-web-boundary",
-        artifact: {
-          version: ARTIFACT_VERSION,
-          kid_b64: kid.toString("base64"),
-          sha256_hex: createHash("sha256").update(rawArtifact).digest("hex"),
-          size: rawArtifact.length,
-          package_format_version: 1,
-        },
-        recipient: {
-          public_key_fingerprint_b64: createHash("sha256").update(publicKey).digest("base64"),
-        },
-        workspace_protocol: { min: 1, max: 1 },
-      }),
-    );
+    const manifest = computeReleaseManifest({
+      releaseId: releaseIdFor(sourceSha, digest(rawArtifact)),
+      sourceSha,
+      artifact: rawArtifact,
+      publicKeyB64: publicKey.toString("base64"),
+      kidB64: kid.toString("base64"),
+      shellAssetDigest,
+    });
+    await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
     const fixturePath = `${artifactPath}.fixture.json`;
-    await writeFile(
-      fixturePath,
-      JSON.stringify({
-        artifactPath,
-        secretB64: unlockSecret.toString("base64"),
-        kidB64: kid.toString("base64"),
-        manifestPath,
-      }),
-    );
-    const result = spawnSync(
-      "cargo",
-      [
-        "test",
-        "-p",
-        "private-api",
-        "production_build_script_artifact_loads_delivers_and_unpacks",
-        "--",
-        "--ignored",
-      ],
-      {
-        stdio: "inherit",
-        env: { ...process.env, WORKSPACE_BUILD_SCRIPT_FIXTURE: fixturePath },
-      },
-    );
-    await rm(fixturePath, { force: true });
-    await rm(manifestPath, { force: true });
-    if (result.error) {
-      throw new Error(`production loader test could not run: ${result.error.message}`);
-    }
-    if (result.status !== 0) {
-      throw new Error(
-        "production build-script artifact did not pass the real private-api loader test",
+    try {
+      // The fixture carries the test-only unlock secret; owner-only mode and a
+      // finally cleanup keep it off a shared filesystem.
+      await writeFile(
+        fixturePath,
+        JSON.stringify({
+          artifactPath,
+          secretB64: unlockSecret.toString("base64"),
+          kidB64: kid.toString("base64"),
+          manifestPath,
+        }),
+        { mode: 0o600 },
       );
+      const result = spawnSync(
+        "cargo",
+        [
+          "test",
+          "-p",
+          "private-api",
+          "production_build_script_artifact_loads_delivers_and_unpacks",
+          "--",
+          "--ignored",
+        ],
+        {
+          // Capture output: a renamed/deleted `#[ignore]` test makes cargo exit
+          // 0 with "running 0 tests", so the gate must assert the exact proof
+          // actually ran and passed rather than trusting the exit status.
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, WORKSPACE_BUILD_SCRIPT_FIXTURE: fixturePath },
+        },
+      );
+      const stdout = result.stdout ? result.stdout.toString() : "";
+      const stderr = result.stderr ? result.stderr.toString() : "";
+      process.stdout.write(stdout);
+      if (stderr) process.stderr.write(stderr);
+      if (result.error) {
+        throw new Error(`production loader test could not run: ${result.error.message}`);
+      }
+      if (result.status !== 0) {
+        throw new Error(
+          "production build-script artifact did not pass the real private-api loader test",
+        );
+      }
+      if (
+        !/running 1 test/.test(stdout) ||
+        !/test result: ok\. 1 passed/.test(stdout)
+      ) {
+        throw new Error(
+          "production loader proof did not execute exactly one passing test (vacuous run)",
+        );
+      }
+    } finally {
+      await rm(fixturePath, { force: true });
+      await rm(manifestPath, { force: true });
     }
   }
 

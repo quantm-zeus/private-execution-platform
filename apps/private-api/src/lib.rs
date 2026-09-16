@@ -31,6 +31,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use subtle::ConstantTimeEq;
 
+mod hardened_file;
 pub mod opaque;
 pub mod passkey_store;
 pub mod production;
@@ -264,9 +265,17 @@ impl TransportState {
 
 type ArtifactLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
 
+/// Bounded artifact probe returned by the cheap header loader: the public header
+/// bytes plus the file length, so the readiness check can compare the manifest's
+/// declared size without reading or hashing the ciphertext.
+pub struct ArtifactHeaderProbe {
+    pub header: Vec<u8>,
+    pub size: u64,
+}
+
 /// Cheap header-only artifact loader used by the unauthenticated readiness probe
 /// so a health check never reads, copies, or hashes the whole artifact.
-type ArtifactHeaderLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
+type ArtifactHeaderLoader = Arc<dyn Fn() -> Result<ArtifactHeaderProbe, StatusCode> + Send + Sync>;
 
 /// Injectable release-manifest loader. Production reads the operator-configured
 /// path; tests inject a hermetic manifest instead of mutating process env.
@@ -465,7 +474,7 @@ impl PrivateApiState {
     }
 
     /// Read only the bounded artifact header for the readiness probe.
-    async fn load_artifact_header(&self) -> Result<Vec<u8>, StatusCode> {
+    async fn load_artifact_header(&self) -> Result<ArtifactHeaderProbe, StatusCode> {
         let loader = self.artifact_header_loader.clone();
         tokio::task::spawn_blocking(move || loader())
             .await
@@ -501,7 +510,10 @@ impl PrivateApiState {
             if bytes.len() < crypto_envelope::ARTIFACT_HEADER_LEN {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
-            Ok(bytes[..crypto_envelope::ARTIFACT_HEADER_LEN].to_vec())
+            Ok(ArtifactHeaderProbe {
+                header: bytes[..crypto_envelope::ARTIFACT_HEADER_LEN].to_vec(),
+                size: bytes.len() as u64,
+            })
         });
         self
     }
@@ -590,9 +602,14 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     let manifest_result = state.load_manifest().await;
     let manifest_configured = !matches!(&manifest_result, Ok(None));
     let (artifact_ok, manifest_ok) = match state.load_artifact_header().await {
-        Ok(header) => match release::parse_artifact_header(&header) {
+        Ok(probe) => match release::parse_artifact_header(&probe.header) {
             Ok(parsed) => match &manifest_result {
-                Ok(Some(manifest)) => (true, manifest.validate_header_against(&parsed).is_ok()),
+                Ok(Some(manifest)) => (
+                    true,
+                    manifest
+                        .validate_header_against(&parsed, probe.size)
+                        .is_ok(),
+                ),
                 Ok(None) => (true, true),
                 Err(_) => (true, false),
             },
@@ -1771,12 +1788,17 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     if path.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let metadata = std::fs::metadata(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if !metadata.is_file() || metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+    // Hardened open: reject a symlink, a non-regular file, a path swapped
+    // between stat and open, a file owned by another user, and a
+    // group/world-writable file or world-writable parent. Without this a local
+    // writer could replace the artifact the browser is told to decrypt.
+    let opened = crate::hardened_file::open_hardened(std::path::Path::new(&path))
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if opened.metadata.len() > MAX_ARTIFACT_BYTES as u64 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let file = std::fs::File::open(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let bytes = read_bounded_bytes(file, MAX_ARTIFACT_BYTES)
+    let bytes = read_bounded_bytes(opened.file, MAX_ARTIFACT_BYTES)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1795,7 +1817,7 @@ fn artifact_length_is_deliverable(len: u64) -> bool {
 /// Read only the bounded artifact header (version + KID + encapsulated key) for
 /// the unauthenticated readiness probe. This never allocates or hashes the full
 /// ciphertext, so a probe cannot be used to amplify memory/CPU.
-fn load_workspace_artifact_header() -> Result<Vec<u8>, StatusCode> {
+fn load_workspace_artifact_header() -> Result<ArtifactHeaderProbe, StatusCode> {
     use std::io::Read;
 
     let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
@@ -1804,19 +1826,25 @@ fn load_workspace_artifact_header() -> Result<Vec<u8>, StatusCode> {
     if path.is_empty() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let metadata = std::fs::metadata(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let opened = crate::hardened_file::open_hardened(std::path::Path::new(&path))
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let header_len = crypto_envelope::ARTIFACT_HEADER_LEN as u64;
     // A file too short to hold a header plus the AEAD tag can never be delivered,
     // so it must not make readiness report a healthy artifact.
-    if !metadata.is_file() || !artifact_length_is_deliverable(metadata.len()) {
+    if !artifact_length_is_deliverable(opened.metadata.len()) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let file = std::fs::File::open(&path).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut header = vec![0u8; crypto_envelope::ARTIFACT_HEADER_LEN];
-    file.take(header_len)
+    opened
+        .file
+        .take(header_len)
         .read_exact(&mut header)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(header)
+    Ok(ArtifactHeaderProbe {
+        header,
+        size: opened.metadata.len(),
+    })
 }
 
 async fn deliver_artifact(
@@ -4966,6 +4994,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let artifact_path = dir.path().join("workspace.artifact");
         std::fs::write(&artifact_path, &artifact).unwrap();
+        // The real loader requires an owner/world-non-writable trust file; make
+        // the fixture match the production artifact mode (0600).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&artifact_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
 
         let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
         std::env::set_var("WORKSPACE_ARTIFACT_PATH", &artifact_path);
@@ -5047,6 +5083,37 @@ mod tests {
 
         assert_eq!(oversized, Err(StatusCode::SERVICE_UNAVAILABLE));
         assert_eq!(directory, Err(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    /// The real loader refuses a symlinked or group-writable artifact. The
+    /// manifest binds the recipient fingerprint the browser trusts, so a local
+    /// writer must not be able to redirect or replace the artifact bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_loader_refuses_symlinked_and_group_writable_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let _guard = WORKSPACE_ARTIFACT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.artifact");
+        std::fs::write(&real, vec![0x11u8; crypto_envelope::MIN_ARTIFACT_LEN]).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.artifact");
+        symlink(&real, &link).unwrap();
+
+        let previous = std::env::var("WORKSPACE_ARTIFACT_PATH").ok();
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &link);
+        let symlinked = load_workspace_artifact();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o660)).unwrap();
+        std::env::set_var("WORKSPACE_ARTIFACT_PATH", &real);
+        let group_writable = load_workspace_artifact();
+        match previous {
+            Some(value) => std::env::set_var("WORKSPACE_ARTIFACT_PATH", value),
+            None => std::env::remove_var("WORKSPACE_ARTIFACT_PATH"),
+        }
+
+        assert_eq!(symlinked, Err(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(group_writable, Err(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     /// The bounded read is capped at `max + 1` bytes even when the underlying

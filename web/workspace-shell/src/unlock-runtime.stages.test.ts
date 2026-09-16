@@ -3,7 +3,14 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { WorkspaceUnlockRuntime, loadWasm, toBase64 } from "./unlock-runtime.ts";
+import {
+  WorkspaceUnlockRuntime,
+  assertArtifactBinding,
+  loadWasm,
+  sha256Hex,
+  toBase64,
+  unpackPayloadOrThrow,
+} from "./unlock-runtime.ts";
 import { isUnlockError, type UnlockReason, type UnlockStage } from "./unlock-stages.ts";
 import type { WorkspaceDescriptor } from "./descriptor.ts";
 
@@ -252,5 +259,86 @@ test("a 403 on grant or deliver stays a generic rejection, not session expiry", 
     () => deliverRuntime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn: deliverFetch }),
     "U4_TRANSPORT",
     "transport_rejected",
+  );
+});
+
+test("a malformed grant body is classified as U3/grant_invalid", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const runtime = new WorkspaceUnlockRuntime();
+  const fetchFn = (async (url: string) => {
+    if (String(url).includes("/artifact/grant")) {
+      return new Response("not json", { status: 200 });
+    }
+    return new Response(null, { status: 204 });
+  }) as unknown as typeof fetch;
+
+  await expectStage(
+    () => runtime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn }),
+    "U3_GRANT",
+    "grant_invalid",
+  );
+});
+
+test("a typed compatibility refusal from delivery maps to its stage", async () => {
+  await loadWasm({ module_or_path: WASM_BYTES });
+  const codes: [string, UnlockStage, UnlockReason][] = [
+    ["artifact_incompatible", "U5_ARTIFACT", "artifact_incompatible"],
+    ["enrollment_required", "U2_ENROLL", "enrollment_required"],
+  ];
+  for (const [code, stage, reason] of codes) {
+    const runtime = new WorkspaceUnlockRuntime();
+    const fetchFn = (async (url: string) => {
+      const target = String(url);
+      if (target.includes("/artifact/grant")) return grantResponse();
+      if (target === "/internal/artifact") {
+        return new Response(JSON.stringify({ code }), {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof fetch;
+    await expectStage(
+      () => runtime.unlock(new Uint8Array(32).fill(7), netDescriptor(), { fetchFn }),
+      stage,
+      reason,
+    );
+  }
+});
+
+test("the artifact size and digest binding is enforced before decrypt", async () => {
+  const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const digest = await sha256Hex(bytes);
+  assert.ok(digest, "WebCrypto must be available in the test runner");
+  // A matching binding passes.
+  await assertArtifactBinding({ artifact_size: bytes.length, artifact_sha256_hex: digest }, bytes);
+  // A size mismatch and a digest mismatch are both U5/artifact_incompatible.
+  await expectStage(
+    () => assertArtifactBinding({ artifact_size: bytes.length + 1, artifact_sha256_hex: digest }, bytes),
+    "U5_ARTIFACT",
+    "artifact_incompatible",
+  );
+  await expectStage(
+    () => assertArtifactBinding({ artifact_size: bytes.length, artifact_sha256_hex: "00".repeat(32) }, bytes),
+    "U5_ARTIFACT",
+    "artifact_incompatible",
+  );
+});
+
+test("a malformed decrypted package is classified as U6/package_invalid", async () => {
+  // A zero file count is a structurally invalid package.
+  await expectStage(
+    async () => unpackPayloadOrThrow(new Uint8Array([0, 0, 0, 0])),
+    "U6_PACKAGE",
+    "package_invalid",
+  );
+});
+
+test("a missing unlocked workspace key is classified as U7/handoff_unavailable", async () => {
+  const runtime = new WorkspaceUnlockRuntime();
+  await expectStage(
+    async () => runtime.decryptRecoveryChallenge(new Uint8Array([1, 2, 3])),
+    "U7_BOOT",
+    "handoff_unavailable",
   );
 });
