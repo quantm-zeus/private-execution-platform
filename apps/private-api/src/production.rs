@@ -275,7 +275,10 @@ pub fn build_opaque(composition: OpaqueComposition) -> Result<OpaqueProduction, 
     let execution_proven = live && readiness.execute();
     wired.market &= readiness.market();
     wired.execute &= execution_proven;
-    wired.limits &= live && readiness.limits();
+    // A limit order is a capital-committing mutation: it needs the limit-engine
+    // proof *and* the full execution proof, so a limit engine with no chain or
+    // signer can never disengage the kill switch on its own.
+    wired.limits &= execution_proven && readiness.limits();
     wired.realtime &= readiness.realtime();
     wired.wallet_limits &= execution_proven;
     wired.twap &= execution_proven;
@@ -614,6 +617,50 @@ mod tests {
                 "a disabled gate must not advertise mutating capability {name}"
             );
         }
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
+    }
+
+    #[test]
+    fn build_opaque_does_not_advertise_limits_without_the_execution_proof() {
+        // A healthy limit engine alone is not enough: a limit order is a
+        // capital-committing mutation, so it also requires the full execution
+        // proof (durable store + chain + signer), never the limit store alone.
+        let limit_only = TradingSeams::new()
+            .with_market_probe(healthy(COMPONENT_MARKET))
+            .with_limit_probe(healthy(COMPONENT_LIMIT))
+            .with_realtime_probe(healthy(COMPONENT_REALTIME))
+            .readiness(true);
+        assert!(limit_only.limits());
+        assert!(!limit_only.execute());
+        let sessions = Arc::new(std::sync::Mutex::new(
+            session_transport::SessionRegistry::new(),
+        ));
+        let produced = build_opaque(OpaqueComposition {
+            sessions,
+            clock: Arc::new(crate::OpaqueSystemClock),
+            session_ttl_ms: 60_000,
+            gate: TradingGate::Enabled,
+            dispatcher: Some(Arc::new(FailClosedDispatcher)),
+            wired: WiredCapabilities {
+                market: true,
+                limits: true,
+                realtime: true,
+                ..WiredCapabilities::default()
+            },
+            stream_source: Some(Arc::new(FailClosedStreamSource)),
+            chains: Vec::new(),
+            readiness: limit_only,
+        })
+        .expect("compose");
+        let document = produced.state.bootstrap().document();
+        assert!(
+            !document.capabilities.limits,
+            "limits must also require the execution proof"
+        );
+        assert!(!document.capabilities.execute);
+        assert!(document.capabilities.market);
+        assert!(document.capabilities.realtime);
         assert!(!document.trading_enabled);
         assert!(document.kill_switch_enabled);
     }

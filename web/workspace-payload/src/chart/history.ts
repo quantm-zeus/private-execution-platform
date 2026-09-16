@@ -1,7 +1,7 @@
 // Chart history providers.
 //
 // The primary path is the PEP authenticated/encrypted command channel
-// (`get_chart`), which is capability-gated server-side on `market`. When that
+// (`get_chart`), which is capability-gated server-side on `chart`. When that
 // capability is absent, the command channel is not ready, or the response is
 // malformed, the provider falls back to the bounded local buffer from the
 // already-decrypted realtime frames. It never fabricates a candle.

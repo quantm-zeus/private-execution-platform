@@ -276,7 +276,7 @@ fn optional_fomo_market_config(
         100,
         30_000,
     )?;
-    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 1_000, 60_000)?;
+    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 5_000, 60_000)?;
     let stream_count_back = parse_u32_env("PRIVATE_FOMO_STREAM_COUNT_BACK", 300, 1, 1_500)?;
     let target = match stream_target {
         Some(value) => Some(parse_stream_target(&value)?),
@@ -358,7 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| std::io::Error::other("TRADING_ENABLED must be true or false"))?;
     // Live trading wiring is presence-only and explicitly opt-in; it never reads
     // a credential value. A partial configuration (opted in but missing an
-    // endpoint) refuses startup rather than running as if it were complete.
+    // endpoint) refuses startup regardless of the trading gate, so a
+    // half-configured live path is a determinate operator error rather than a
+    // silently inert one.
     let live_opted_in =
         private_api::trading::parse_live_opt_in(read_env("TRADING_CORE_LIVE")?.as_deref())
             .map_err(|_| std::io::Error::other("TRADING_CORE_LIVE must be 1 or 0"))?;
@@ -368,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         read_env("BASE_RPC_ENDPOINT")?.as_deref(),
         read_env("PRIVY_HTTP_ENDPOINT")?.as_deref(),
     );
-    if gate.is_enabled() && live_wiring.partial() {
+    if live_wiring.partial() {
         return Err(std::io::Error::other(
             "live trading wiring requires TRADING_CORE_LIVE=1 together with \
              EXECUTION_DATABASE_DSN, BASE_RPC_ENDPOINT and PRIVY_HTTP_ENDPOINT",

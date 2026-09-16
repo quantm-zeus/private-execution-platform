@@ -819,9 +819,10 @@ truncated or wrong-version file is never reported healthy; the `dispatcher`
 check reflects whether the opaque command surface is configured (the production
 binary always wires a fail-closed dispatcher before serving and refuses startup
 without one), and a future composition that can lose its dispatcher clears it.
-The `stream` check is required only when the composition advertises `realtime`
-(that is, when a FOMO stream source is configured); without a source it is not a
-dependency. `apps/edge-gateway`
+The `stream` check is required only when the composition advertises `realtime`,
+that is when a FOMO stream source is configured **and** the bounded startup
+reachability probe observed it healthy; a configured-but-unreachable source is
+not advertised, so it is not a required dependency. `apps/edge-gateway`
 refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
 validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
 bypass that, so the loopback deployment mitigation cannot be widened silently.
@@ -1098,7 +1099,8 @@ with the bridge's own bearer key.
   provider's newest bar changed (the browser replaces the last bar in place or
   appends a new one); a provider outage emits nothing rather than a fabricated
   or interpolated bar. `realtime` is advertised only when a target is
-  configured. The stream has no client-supplied subscription target yet, so this
+  configured **and** the bounded startup reachability probe observed it healthy.
+  The stream has no client-supplied subscription target yet, so this
   first implementation is single-target by construction.
 - **Provenance and bounds.** The client accepts a bridge payload only when
   `source.provenance == "polling"` and `wsPromoted` is not true, refuses

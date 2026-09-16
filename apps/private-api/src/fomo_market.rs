@@ -67,8 +67,10 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ADDRESS_LEN: usize = 128;
 /// Requests are bounded so a hung loopback bridge cannot stall the stream.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bounds for the realtime poll cadence.
-pub const MIN_STREAM_POLL: Duration = Duration::from_secs(1);
+/// Bounds for the realtime poll cadence. The floor matches the approved
+/// `>=5s` REST cadence (the `fomo-mcp` bridge also enforces a 5s server-side
+/// cache), so a misconfigured faster interval is clamped up, never honoured.
+pub const MIN_STREAM_POLL: Duration = Duration::from_secs(5);
 pub const MAX_STREAM_POLL: Duration = Duration::from_secs(60);
 /// Consecutive provider failures before a polled stream ends (so the driver can
 /// release its hub slot and the client can reconnect with a fresh snapshot).
@@ -569,7 +571,7 @@ fn optional_u32(payload: &Value, key: &str) -> Result<Option<u32>, CommandDenial
 ///
 /// This sits outermost so it receives the browser-shaped payload
 /// `{chain, address, window, from?, to?, countBack?}`; the server-side
-/// capability gate still enforces the advertised `market` capability before
+/// capability gate still enforces the advertised `chart` capability before
 /// dispatch.
 pub struct FomoChartDispatcher {
     inner: Arc<dyn CommandDispatcher>,
@@ -1240,6 +1242,10 @@ mod tests {
         };
         // A reachable provider (even empty) is healthy; a failing one is not.
         assert!(probe_realtime(fake(vec![bar(1_000, 1.0)]).as_ref(), &config).await);
+        assert!(
+            probe_realtime(fake(Vec::new()).as_ref(), &config).await,
+            "a reachable-but-empty response is a success, matching the stream source"
+        );
         let down = Arc::new(FakeProvider::new(vec![Err(FomoMarketError::Unavailable)]));
         assert!(!probe_realtime(down.as_ref(), &config).await);
     }

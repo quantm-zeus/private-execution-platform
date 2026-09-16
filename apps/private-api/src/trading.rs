@@ -23,7 +23,7 @@
 //! cannot prove.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use execution_relay::DurableAttemptStore;
 use storage::{ComponentHealth, HealthProbe};
@@ -54,6 +54,14 @@ pub const LIVE_ENV: &[&str] = &[
 
 /// Smallest connection pool the durable store will open.
 pub const DURABLE_STORE_POOL_SIZE: usize = 2;
+
+/// Upper bound on a single durable-store connect or health read at startup.
+///
+/// `tokio_postgres`'s `connect_timeout` defaults to none, so a black-holed DSN
+/// (TCP accepted but the handshake never completes) would otherwise hang
+/// startup indefinitely. A bounded startup read becomes a determinate refusal,
+/// never an unbounded hang.
+pub const DURABLE_STORE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn wall_clock_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -288,12 +296,21 @@ impl std::fmt::Debug for TradingSeams {
 pub async fn connect_durable_attempt_store(
     dsn: &str,
 ) -> Result<(Arc<dyn DurableAttemptStore>, HealthProbe), execution_store::ExecutionStoreError> {
-    let store = execution_store::PostgresExecutionAttemptStore::connect_with_system_clock(
+    let connect = execution_store::PostgresExecutionAttemptStore::connect_with_system_clock(
         dsn,
         DURABLE_STORE_POOL_SIZE,
-    )
-    .await?;
-    let probe = store.health().await;
+    );
+    let store = match tokio::time::timeout(DURABLE_STORE_STARTUP_TIMEOUT, connect).await {
+        Ok(result) => result?,
+        Err(_) => return Err(execution_store::ExecutionStoreError::Unavailable),
+    };
+    // The store connected, but a black-holed health read must not hang either:
+    // an unobservable store is reported unavailable, so execution stays
+    // unproven rather than the process blocking on readiness.
+    let probe = match tokio::time::timeout(DURABLE_STORE_STARTUP_TIMEOUT, store.health()).await {
+        Ok(probe) => probe,
+        Err(_) => unavailable(COMPONENT_DURABLE_STORE),
+    };
     Ok((Arc::new(store), probe))
 }
 

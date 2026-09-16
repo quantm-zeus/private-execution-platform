@@ -73,8 +73,10 @@ Implemented and composed (exact-SHA CI green):
   operator deployment; until then a configured PEP fails closed with
   `Unavailable` and the chart renders only the local decrypted frame buffer —
   never fabricated data. The startup reachability probe leaves `realtime`
-  unadvertised and the `/ready` `stream` check fails while the bridge is
-  unreachable, so the browser is never told a dead stream is live.
+  unadvertised while the bridge is unreachable, so the browser is never told a
+  dead stream is live; a configured-but-unreachable stream is therefore not an
+  advertised dependency, and `/ready`'s `stream` check only reports a failure
+  once a reachable source was advertised and later stops producing.
 - Perimeter trust at the edge is header-presence only; cryptographic Cloudflare
   Access JWT validation is not implemented (loopback binding is the mitigation).
 - The immutable release manifest is the normal production mode:
