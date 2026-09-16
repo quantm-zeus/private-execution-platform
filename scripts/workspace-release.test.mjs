@@ -1435,6 +1435,27 @@ test("stable release tooling seals to the fixed context and rejects a foreign KI
   );
 });
 
+test("the Rust workspace root context bytes match the TS/tooling constant", async () => {
+  // Cross-language drift pin: the shell, the release tooling and the Rust
+  // server must use a byte-identical stable protocol context. Only the TS side
+  // was pinned; a silent Rust drift would break recovery proof decryption and
+  // could rotate the workspace recipient identity.
+  const rust = await readFile(resolve("apps/private-api/src/recovery.rs"), "utf8");
+  const match = rust.match(
+    /WORKSPACE_ROOT_CONTEXT_KID\s*:\s*\[u8;\s*auth::WORKSPACE_KID_BYTES\]\s*=\s*\[([\s\S]*?)\];/,
+  );
+  assert.ok(match, "recovery.rs must declare WORKSPACE_ROOT_CONTEXT_KID");
+  const bytes = (match[1].match(/0x[0-9a-fA-F]{2}/g) ?? []).map((hex) =>
+    parseInt(hex, 16),
+  );
+  assert.equal(bytes.length, 16, "the stable context must be 16 bytes");
+  assert.equal(
+    Buffer.from(bytes).toString("base64"),
+    WORKSPACE_ROOT_CONTEXT_B64,
+    "Rust WORKSPACE_ROOT_CONTEXT_KID must equal the TS/tooling constant",
+  );
+});
+
 test("operational: N and N+1 built from the stable public key decrypt with one root", async () => {
   const rootSecret = randomBytes(32);
   const publicKey = derivePublicKey(

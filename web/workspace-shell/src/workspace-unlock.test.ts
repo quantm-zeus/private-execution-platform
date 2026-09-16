@@ -364,3 +364,71 @@ test("wrapper creation and unlock evaluate the SAME stable PRF eval salt", async
   const unwrapped = await unwrapRootFromAssertion(login, [record], fingerprint);
   assert.deepEqual(unwrapped, root);
 });
+
+test("a pre-fix per-wrapper eval-salt wrapper fails closed, and the documented re-add migrates it", async () => {
+  // The single-ceremony fix moved the PRF eval salt from each record's random
+  // `salt_b64` to the stable workspace constant. A wrapper written by an
+  // earlier pre-release candidate therefore cannot unwrap under the constant
+  // salt: the login must fail closed (never unlock with the wrong key), and the
+  // documented recovery-then-"Add this device's passkey" path must rewrite a
+  // working wrapper under the same root. This pins docs/workspace-recovery.md.
+  const root = new Uint8Array(32).fill(0x7a);
+  const fingerprint = await deriveWorkspaceRootFingerprint(root);
+  const credentialIdB64 = "AQID";
+  const legacyPerWrapperPrf = new Uint8Array(32).fill(0x0a);
+  const stableConstantPrf = new Uint8Array(32).fill(0x0b);
+
+  const legacyWrapped = await wrapRootKey(
+    legacyPerWrapperPrf,
+    root,
+    generateRecoverySalt(),
+    undefined,
+    credentialIdB64,
+    WORKSPACE_ROOT_KEY_SOURCE,
+  );
+  const legacyRecord: RecoveryWrapperRecord = {
+    ...legacyWrapped,
+    credential_id_b64: credentialIdB64,
+    label: "legacy per-wrapper salt",
+    created_at_ms: 1,
+    last_used_at_ms: null,
+    revoked_at_ms: null,
+  };
+
+  // The fixed constant-salt login produces a different PRF, so unwrap fails
+  // closed rather than returning a wrong or partial root.
+  await assert.rejects(
+    unwrapRootFromAssertion(
+      { credentialIdB64, prfOutput: stableConstantPrf.slice() },
+      [legacyRecord],
+      fingerprint,
+    ),
+    (error: unknown) =>
+      error instanceof WorkspaceUnlockError && error.code === "unwrap_failed",
+  );
+
+  // Migration: recover with the offline code, then re-add the passkey, which
+  // writes a NEW wrapper under the same stable root and the constant-salt PRF.
+  const migratedWrapped = await wrapRootKey(
+    stableConstantPrf,
+    root,
+    generateRecoverySalt(),
+    undefined,
+    credentialIdB64,
+    WORKSPACE_ROOT_KEY_SOURCE,
+  );
+  const migratedRecord: RecoveryWrapperRecord = {
+    ...migratedWrapped,
+    credential_id_b64: credentialIdB64,
+    label: "migrated device",
+    created_at_ms: 2,
+    last_used_at_ms: null,
+    revoked_at_ms: null,
+  };
+  const migratedRoot = await unwrapRootFromAssertion(
+    { credentialIdB64, prfOutput: stableConstantPrf.slice() },
+    [migratedRecord],
+    fingerprint,
+  );
+  assert.deepEqual(migratedRoot, root);
+});

@@ -960,16 +960,56 @@ try {
   // example a per-wrapper loop that asks for PRF again after authentication)
   // reintroduces the audited second-ceremony defect, so it fails closed here at
   // the source level rather than relying only on a unit test. Comments are
-  // stripped first so prose cannot register as a call site. This is a
-  // defense-in-depth heuristic, not a taint analysis.
+  // stripped first so prose cannot register as a call site.
+  //
+  // Coverage: every non-test text source file under the shell `src` tree is
+  // scanned (not a hardcoded list), so a NEW file added by a future change
+  // cannot slip a second ceremony past the gate. The pattern also matches the
+  // optional-chained and computed-bracket spellings, and a self-test proves the
+  // matcher fires on those evasions while staying silent on `create()`. This is
+  // a defense-in-depth heuristic, not a taint analysis (an unrelated alias such
+  // as `const c = navigator.credentials; c.get(...)` is not statically
+  // distinguishable, which is why the behavioral unit/E2E tests remain
+  // authoritative).
   const stripJsComments = (text) =>
     text
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/(^|[^:])\/\/[^\n]*/gm, "$1");
+  const CREDENTIALS_GET_PATTERN =
+    /credentials\s*(?:\??\.\s*get|\??\.\s*\[\s*["'`]get["'`]\s*\]|\[\s*["'`]get["'`]\s*\])\s*\(\s*(?!\))/g;
+  const countCredentialsGetCalls = (text) =>
+    (stripJsComments(text).match(CREDENTIALS_GET_PATTERN) ?? []).length;
+  // Positive/negative controls: the matcher must catch every supported call
+  // shape and must not treat registration as an assertion ceremony.
+  for (const shape of [
+    "credentials.get({ publicKey })",
+    "credentials?.get({ publicKey })",
+    'credentials["get"]({ publicKey })',
+    "credentials?.['get']({ publicKey })",
+    "navigator.credentials . get ({ publicKey })",
+  ]) {
+    if (countCredentialsGetCalls(shape) !== 1) {
+      throw new Error(`credentials.get() guard failed to match call shape: ${shape}`);
+    }
+  }
+  if (countCredentialsGetCalls("credentials.create({ publicKey: x })") !== 0) {
+    throw new Error("credentials.get() guard must not match credentials.create()");
+  }
+  const isShellTestSource = (path) =>
+    /\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(path);
+  const isShellTextSource = (path) =>
+    /\.(?:ts|tsx|js|jsx|mjs|cjs|css|html)$/i.test(path);
+  const singleCeremonyScanSet = [
+    ...(await filesUnder(resolve("web/workspace-shell/src"))).filter(
+      (path) => isShellTextSource(path) && !isShellTestSource(path),
+    ),
+    // The shipped HTML entrypoint can hold an inline script, so keep it in
+    // scope too (the runtime header artifact cannot execute script).
+    shellHtmlPath,
+  ];
   const getSites = [];
-  for (const path of shellSourceFiles) {
-    const text = stripJsComments(await readFile(path, "utf8"));
-    const count = (text.match(/credentials\s*\.\s*get\s*\(\s*(?!\))/g) ?? []).length;
+  for (const path of singleCeremonyScanSet) {
+    const count = countCredentialsGetCalls(await readFile(path, "utf8"));
     if (count > 0) getSites.push({ path, count });
   }
   const canonicalGetSite = resolve("web/workspace-shell/src/passkey-auth.ts");
@@ -983,7 +1023,7 @@ try {
         `passkey-auth.ts; found ${JSON.stringify(getSites)}`,
     );
   }
-  for (const path of shellSourceFiles) {
+  for (const path of singleCeremonyScanSet) {
     const text = stripJsComments(await readFile(path, "utf8"));
     if (text.includes("authenticateWithPrf")) {
       throw new Error(
