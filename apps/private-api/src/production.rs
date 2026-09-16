@@ -83,6 +83,8 @@ impl std::error::Error for TradingGateError {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WiredCapabilities {
     pub market: bool,
+    /// Read-only chart history (`get_chart`), independent of token `market` reads.
+    pub chart: bool,
     pub quotes: bool,
     pub preview: bool,
     pub portfolio: bool,
@@ -120,6 +122,7 @@ pub fn document_for(gate: TradingGate, wired: WiredCapabilities) -> BootstrapDoc
     let mut document = BootstrapDocument::fail_closed();
     let capabilities = CapabilitySet {
         market: wired.market,
+        chart: wired.chart,
         realtime: wired.realtime,
         quotes: wired.quotes,
         preview: wired.preview,

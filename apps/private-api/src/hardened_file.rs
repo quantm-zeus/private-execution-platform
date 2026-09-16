@@ -109,6 +109,35 @@ fn check_file_permissions(metadata: &fs::Metadata) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Open a *secret* file (an API key or bearer token) with the same hardening as
+/// [`open_hardened`] plus an owner-only read check. A mapped trust anchor may be
+/// world-readable; a secret may not, because any local user could then read it.
+pub fn open_hardened_secret(path: &Path) -> std::io::Result<Option<HardenedFile>> {
+    let opened = open_hardened(path)?;
+    if let Some(file) = &opened {
+        check_secret_permissions(&file.metadata)?;
+    }
+    Ok(opened)
+}
+
+#[cfg(unix)]
+fn check_secret_permissions(metadata: &fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Owner-only: no group/other read, write or execute bits.
+    if metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(
+            "secret file must be owner-only (0600)",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_secret_permissions(_metadata: &fs::Metadata) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn check_file_permissions(_metadata: &fs::Metadata) -> std::io::Result<()> {
     Ok(())

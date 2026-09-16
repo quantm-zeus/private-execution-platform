@@ -32,7 +32,7 @@ missing backend contract (recorded in `.dsh/web-product/BACKEND_REQUESTS.md`), U
 |----|-------|--------|
 | W1 | App shell, navigation, responsive terminal layout, typed state architecture, error/loading/offline states | DONE |
 | W2 | Encrypted realtime client + Web Worker + snapshot/delta sequencing + gap/resync + reconnect/backpressure | DONE (fail-closed) |
-| W3 | Local realtime chart/OHLCV/depth with Canvas/WebGL, zoom/pan/timeframes, bounded buffers | DONE (fail-closed) |
+| W3 | Local realtime chart/OHLCV/depth with KLineChart Pro, zoom/pan/timeframes, bounded buffers | DONE (fail-closed) |
 | W4 | Token search/detail + market stats + risk/intelligence evidence surfaces | DONE (fail-closed) |
 | W5 | Quote + market preview + buy/sell ticket with full net economics, route, taxes, gas, slippage, freshness | DONE (fail-closed) |
 | W6 | Limit-order create/cancel + partial-fill/order lifecycle + recovery/unknown-state UX | DONE (fail-closed) |
@@ -47,11 +47,15 @@ missing backend contract (recorded in `.dsh/web-product/BACKEND_REQUESTS.md`), U
 | W15 | Reconcile the W13 router wire contract with the landed canonical P84A–P84C `RouterSource` (canonical string + object forms, strict parsing, conformance tests) | DONE (fail-closed) |
 
 **Read `DONE (fail-closed)` precisely.** Every slice above is implemented, unit/browser-tested and
-fails closed, but W2/W4–W9 are **not live end-to-end** because the private API, encrypted stream and
-encrypted command channel do not exist on `main` yet (BR-1…BR-5). With no backend those surfaces
-render explicit `unavailable`/`offline`/`empty` state and every mutation is disabled with a reason;
-nothing is fabricated. Treating a fail-closed surface as "live product complete" would be an
-overstatement — the remaining integration is a backend contract dependency, not UI work.
+fails closed. The private API, encrypted realtime stream and encrypted command channel have since
+landed (BR-1…BR-5), so W2/W4–W9 are wired end-to-end against the fail-closed seams; but the shipped
+private-api binary still composes no Trading Core backend, instrument registry, provider transports
+or authoritative market feeds, so most data surfaces render an explicit
+`unavailable`/`stale`/`empty` state and every mutation is a determinate `capability_missing` denial.
+The chart now uses KLineChart Pro over a read-only FOMO market bridge; its history read fails closed
+until the `fomo-mcp` `/market/bars` bridge is deployed. Treating a fail-closed surface as "live
+product complete" would be an overstatement — the remaining integration is a backend/operator
+contract dependency, not UI work.
 
 ### Progress notes
 

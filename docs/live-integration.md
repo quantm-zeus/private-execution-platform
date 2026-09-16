@@ -997,3 +997,97 @@ must list it); `/ready` validates the manifest shape/KID/size but not the full
 artifact digest on every unauthenticated probe; and edge perimeter trust stays
 presence-only with the loopback bind as the compensating control.
 
+## KLineChart Pro private chart (frontend slice)
+
+The handwritten canvas chart is replaced by KLineChart Pro behind a small local
+adapter boundary. Pinned to the mutually compatible pair
+`@klinecharts/pro@0.1.1` + `klinecharts@9.1.1` (exact versions). Pro 0.1.1's own
+upstream dependency is unresolved against klinecharts v10 (the v10 production
+build fails with missing exports `FormatDateType`, `DomPosition`, `ActionType`,
+`TooltipIconPosition`), so the v9 pair is the only tested combination; v10 must
+not be used under Pro 0.1.1.
+
+- **Boundary.** `chart/chart-datafeed.ts` defines the renderer-agnostic
+  `ChartHistoryProvider` / `ChartRealtimeSource` contract and the bounded
+  `ChartFrameRouter`. `chart/pro/pro-datafeed.ts` is the only module that maps
+  Pro's `Period`/`KLineData` vocabulary; `chart/pro/pro-chart.ts` owns the Pro
+  lifecycle. No Pro type reaches session/domain/realtime code.
+- **History.** `getHistoryKLineData` calls the authenticated/encrypted
+  `get_chart` command (capability-gated on `market`) and normalizes the
+  response defensively; when the capability is absent, the channel is not ready,
+  the timeframe has no canonical window, or the response is malformed it falls
+  back to the bounded local buffer. It never fabricates a candle.
+- **Realtime.** `subscribe` consumes the already-decrypted local frame bus
+  (`ChartFrameRouter`, fed by the worker's decoded `ohlcv` frames) and
+  `unsubscribe`/`dispose` tear every subscription down. Pro may re-subscribe
+  without an intervening unsubscribe, so re-subscribe drops the previous handler.
+- **Pro lifecycle.** Pro 0.1.1 has no public `dispose()` and registers a
+  `window` resize listener while rendering its Solid tree. The adapter captures
+  that listener during construction, drives resize from a `ResizeObserver` on
+  the host, removes the listener and detaches the host on dispose, and degrades
+  to a visible "Chart unavailable" state if a runtime cannot start the canvas.
+- **CSP/assets.** The vendor layout CSS is bundled (no external stylesheet/CDN).
+  Its iconfont is a `data:` URL that `font-src 'self'` blocks in both the payload
+  and the inheriting shell policy, so the four icon slots are re-rendered with
+  first-party glyphs instead of requesting the blocked font. The final payload
+  still passes the URL/storage/tracker/console boundary scans.
+- **Non-authoritative.** Chart data is visual only. Limits and trades continue to
+  depend on exact route simulation/net executable economics, never on a chart
+  crossing.
+
+Tests: `chart/chart-datafeed.test.ts`, `chart/history.test.ts` and
+`chart/pro/pro-datafeed.test.ts` cover normalization/dedup/bounding, malformed
+frames, replay and broadcast, subscribe/unsubscribe/re-subscribe/dispose,
+capability and outage fallback, and that no path fabricates a candle.
+`web/e2e/specs/chart.spec.ts` adds a real-browser smoke (mounted canvas with real
+dimensions, Pro period switch, container resize, malformed-frame resilience, no
+chart-related page errors) without canvas pixel snapshots.
+
+**FOMO market bridge (backend, read-only).** The backend serves chart history
+and realtime OHLCV from the local, read-only `fomo-mcp` bridge behind a small PEP
+adapter (`apps/private-api/src/fomo_market.rs`). PEP never holds FOMO
+credentials: `fomo-mcp` owns the FOMO session, and PEP calls its loopback
+`GET /market/bars` (fresh) and `GET /market/latest` (bounded cadence) endpoints
+with the bridge's own bearer key.
+
+- **Configuration (all-or-none).** `PRIVATE_FOMO_MARKET_URL` (loopback
+  `http://…`) plus `PRIVATE_FOMO_MARKET_API_KEY_FILE` (owner-only, non-symlink,
+  read through the hardened reader) enable the chart read. `market` is
+  advertised only when this is wired; `search_token`/`get_token` remain
+  determinate `capability_missing` denials because they are not backed by FOMO —
+  an accepted capability-truth residual (audit F6).
+- **History.** `get_chart` accepts
+  `{chain,address,window,countBack?,from?,to?}`. Both the frontend timeframe ids
+  and the canonical `m5/m15/h1/h4/d1` windows map through a closed table to a
+  FOMO resolution; only `solana`/`base`/`ethereum`/`bnb_chain` have a verified
+  FOMO network id, and anything else is refused. `from`/`to` are unix seconds
+  and `countBack` is clamped to 1 500. The dispatcher validates the range and
+  normalizes every page itself (ascending, unique-millisecond, OHLC-envelope
+  valid, capped) so an injected provider cannot return an unordered or duplicate
+  series to a renderer.
+- **Realtime.** `FomoOhlcvStreamSource` implements the PEP `StreamSource` at a
+  bounded poll cadence for one operator-configured target
+  (`PRIVATE_FOMO_STREAM_TARGET=chain:address:timeframe`, plus optional
+  `PRIVATE_FOMO_STREAM_POLL_MS` and `PRIVATE_FOMO_STREAM_COUNT_BACK`). It emits
+  the full normalized series as the snapshot and one latest-bar delta when the
+  provider's newest bar changed (the browser replaces the last bar in place or
+  appends a new one); a provider outage emits nothing rather than a fabricated
+  or interpolated bar. `realtime` is advertised only when a target is
+  configured. The stream has no client-supplied subscription target yet, so this
+  first implementation is single-target by construction.
+- **Provenance and bounds.** The client accepts a bridge payload only when
+  `source.provenance == "polling"` and `wsPromoted` is not true, refuses
+  non-2xx / oversized (>2 MiB) / malformed bodies, and maps every failure to a
+  fixed, privacy-safe denial or `U`-typed error — never upstream text, the key,
+  a path or ciphertext.
+- **Non-authoritative.** Chart data stays visual only; limits and trades still
+  depend on exact route simulation / net executable economics, never a chart
+  crossing.
+
+**Residual (operator / FOMO-lane owned).** The currently deployed `fomo-mcp`
+image does not yet expose `/market/bars`; a separate read-only lane is landing
+that bridge. Until it is deployed, a configured PEP fails closed with
+`Unavailable` and the chart renders only the local decrypted frame buffer —
+never fabricated data. PEP does not modify `fomo-mcp` (the sole FOMO upstream
+owner) and carries no FOMO auth tokens.
+

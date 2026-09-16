@@ -44,6 +44,10 @@ use crate::stream::{
 #[derive(Clone, Debug, Serialize)]
 pub struct CapabilitySet {
     pub market: bool,
+    /// Read-only chart history (`get_chart`). Separate from `market` so a
+    /// deployment that only wires the FOMO chart does not advertise token
+    /// search/detail, which it does not serve.
+    pub chart: bool,
     pub realtime: bool,
     pub quotes: bool,
     pub preview: bool,
@@ -65,6 +69,7 @@ impl CapabilitySet {
     pub fn none() -> Self {
         Self {
             market: false,
+            chart: false,
             realtime: false,
             quotes: false,
             preview: false,
@@ -102,7 +107,8 @@ impl CapabilitySet {
             "request_withdrawal" => "withdraw",
             "get_wallet_limits" | "set_wallet_limits" => "wallet_limits",
             "get_intelligence" | "get_provider_health" | "get_alerts" => "intelligence",
-            "search_token" | "get_token" | "get_chart" => "market",
+            "search_token" | "get_token" => "market",
+            "get_chart" => "chart",
             _ => return None,
         };
         Some(capabilities)
@@ -123,6 +129,7 @@ impl CapabilitySet {
     fn flag(&self, capability: &str) -> bool {
         match capability {
             "market" => self.market,
+            "chart" => self.chart,
             "realtime" => self.realtime,
             "quotes" => self.quotes,
             "preview" => self.preview,

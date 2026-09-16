@@ -15,9 +15,13 @@ agent-commands.workspace = true
 async-trait.workspace = true
 auth.workspace = true
 axum.workspace = true
+bytes = "1"
 chain-types.workspace = true
 crypto-envelope.workspace = true
 getrandom = "0.2"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2"
 mcp-server.workspace = true
 rpc-contracts.workspace = true
@@ -27,6 +31,7 @@ service-identity.workspace = true
 sha2 = "0.11"
 session-transport.workspace = true
 subtle = "2"
+thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
@@ -34,7 +39,6 @@ zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 auth = { workspace = true, features = ["private-test-support"] }
-http-body-util = "0.1"
 rcgen = { version = "=0.14.5", features = ["x509-parser"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }

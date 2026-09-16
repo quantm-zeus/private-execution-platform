@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use auth::passkey::PasskeyCredentialStore;
 use private_api::opaque::{self};
@@ -137,6 +138,141 @@ fn optional_recovery_store(
     Ok(Some(Arc::new(store)))
 }
 
+/// Parse a bounded milliseconds env var (`min..=max`), defaulting when unset.
+fn parse_millis_env(
+    name: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<Duration, std::io::Error> {
+    let value = match read_env(name)? {
+        None => default,
+        Some(raw) if raw.trim().is_empty() => default,
+        Some(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| std::io::Error::other(format!("{name} must be an integer")))?,
+    };
+    if value < min || value > max {
+        return Err(std::io::Error::other(format!(
+            "{name} must be between {min} and {max}"
+        )));
+    }
+    Ok(Duration::from_millis(value))
+}
+
+/// Parse a bounded `u32` env var (`min..=max`), defaulting when unset.
+fn parse_u32_env(name: &str, default: u32, min: u32, max: u32) -> Result<u32, std::io::Error> {
+    let value = match read_env(name)? {
+        None => default,
+        Some(raw) if raw.trim().is_empty() => default,
+        Some(raw) => raw
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| std::io::Error::other(format!("{name} must be an integer")))?,
+    };
+    if value < min || value > max {
+        return Err(std::io::Error::other(format!(
+            "{name} must be between {min} and {max}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Parse `chain:address:timeframe` for the single configured realtime target.
+fn parse_stream_target(value: &str) -> Result<(String, String, String), std::io::Error> {
+    let mut parts = value.split(':');
+    let chain = parts.next().unwrap_or("");
+    let address = parts.next().unwrap_or("");
+    let timeframe = parts.next().unwrap_or("");
+    if parts.next().is_some() || chain.is_empty() || address.is_empty() || timeframe.is_empty() {
+        return Err(std::io::Error::other(
+            "PRIVATE_FOMO_STREAM_TARGET must be chain:address:timeframe",
+        ));
+    }
+    if private_api::fomo_market::fomo_symbol(chain, address).is_none() {
+        return Err(std::io::Error::other(
+            "PRIVATE_FOMO_STREAM_TARGET chain/address is not supported",
+        ));
+    }
+    if private_api::fomo_market::fomo_resolution(timeframe).is_none() {
+        return Err(std::io::Error::other(
+            "PRIVATE_FOMO_STREAM_TARGET timeframe is not supported",
+        ));
+    }
+    Ok((
+        chain.to_string(),
+        address.to_string(),
+        timeframe.to_string(),
+    ))
+}
+
+/// Resolve the optional FOMO market bridge configuration.
+///
+/// All-or-none: any FOMO market variable requires `PRIVATE_FOMO_MARKET_URL` and
+/// `PRIVATE_FOMO_MARKET_API_KEY_FILE`. With none set the chart stays on its
+/// bounded local buffer and neither `market` nor `realtime` is advertised.
+fn optional_fomo_market_config(
+) -> Result<Option<(private_api::FomoMarketConfig, Zeroizing<String>)>, std::io::Error> {
+    let base = read_env("PRIVATE_FOMO_MARKET_URL")?.filter(|value| !value.trim().is_empty());
+    let key_file =
+        read_env("PRIVATE_FOMO_MARKET_API_KEY_FILE")?.filter(|value| !value.trim().is_empty());
+    let stream_target =
+        read_env("PRIVATE_FOMO_STREAM_TARGET")?.filter(|value| !value.trim().is_empty());
+    // Any FOMO variable counts as a supplied (partial) configuration, so a lone
+    // timeout/poll/count refuses startup instead of being silently ignored.
+    let timeout =
+        read_env("PRIVATE_FOMO_MARKET_TIMEOUT_MS")?.filter(|value| !value.trim().is_empty());
+    let poll = read_env("PRIVATE_FOMO_STREAM_POLL_MS")?.filter(|value| !value.trim().is_empty());
+    let count =
+        read_env("PRIVATE_FOMO_STREAM_COUNT_BACK")?.filter(|value| !value.trim().is_empty());
+    if base.is_none()
+        && key_file.is_none()
+        && stream_target.is_none()
+        && timeout.is_none()
+        && poll.is_none()
+        && count.is_none()
+    {
+        return Ok(None);
+    }
+    let base = base.ok_or_else(|| {
+        std::io::Error::other(
+            "PRIVATE_FOMO_MARKET_URL is required when any FOMO market variable is set",
+        )
+    })?;
+    let key_file = key_file.ok_or_else(|| {
+        std::io::Error::other(
+            "PRIVATE_FOMO_MARKET_API_KEY_FILE is required with PRIVATE_FOMO_MARKET_URL",
+        )
+    })?;
+    // The bearer key is read through the hardened, owner-only path and never
+    // logged; the buffer zeroizes on drop.
+    let api_key = private_api::read_operator_secret_file(std::path::Path::new(&key_file))?;
+    let request_timeout = parse_millis_env(
+        "PRIVATE_FOMO_MARKET_TIMEOUT_MS",
+        private_api::fomo_market::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64,
+        100,
+        30_000,
+    )?;
+    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 1_000, 60_000)?;
+    let stream_count_back = parse_u32_env("PRIVATE_FOMO_STREAM_COUNT_BACK", 300, 1, 1_500)?;
+    let target = match stream_target {
+        Some(value) => Some(parse_stream_target(&value)?),
+        None => None,
+    };
+    Ok(Some((
+        private_api::FomoMarketConfig {
+            base_url: base,
+            api_key_file: std::path::PathBuf::from(key_file),
+            request_timeout,
+            stream_target: target,
+            stream_poll,
+            stream_count_back,
+        },
+        api_key,
+    )))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rp_id = std::env::var("PRIVATE_RP_ID")?;
@@ -190,15 +326,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // denial — never a fabricated success.
     let gate = private_api::production::TradingGate::from_env()
         .map_err(|_| std::io::Error::other("TRADING_ENABLED must be true or false"))?;
+    // Optional read-only FOMO market bridge. With no configuration the chart
+    // stays on its bounded local buffer and no capability is advertised; the
+    // chart dispatcher wraps the fail-closed default for every non-chart op.
+    let fomo = optional_fomo_market_config()?;
+    let (fomo_dispatcher, fomo_stream, fomo_wired) = match fomo {
+        Some((config, api_key)) => {
+            let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
+                private_api::FomoBarsClient::new(&config.base_url, api_key, config.request_timeout)
+                    .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
+            );
+            let wiring = private_api::build_fomo_market_wiring(
+                &config,
+                provider,
+                Arc::new(private_api::FailClosedDispatcher),
+            )
+            .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
+            let wired = private_api::production::WiredCapabilities {
+                // Chart history only: `search_token`/`get_token` stay denied
+                // because FOMO does not back them (capability truth, audit F6).
+                chart: true,
+                realtime: wiring.stream_source.is_some(),
+                ..private_api::production::WiredCapabilities::default()
+            };
+            (Some(wiring.dispatcher), wiring.stream_source, wired)
+        }
+        None => (
+            None,
+            None,
+            private_api::production::WiredCapabilities::default(),
+        ),
+    };
     let production =
         private_api::production::build_opaque(private_api::production::OpaqueComposition {
             sessions: state.sessions(),
             clock: Arc::new(OpaqueSystemClock),
             session_ttl_ms,
             gate,
-            dispatcher: None,
-            wired: private_api::production::WiredCapabilities::default(),
-            stream_source: None,
+            dispatcher: fomo_dispatcher,
+            wired: fomo_wired,
+            stream_source: fomo_stream,
             chains: Vec::new(),
         })
         .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
@@ -328,6 +495,35 @@ mod tests {
         assert!(!strict_bool_env(name, true).unwrap());
         std::env::set_var(name, "1");
         assert!(strict_bool_env(name, false).is_err());
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn fomo_stream_target_is_strictly_validated() {
+        assert_eq!(
+            parse_stream_target("base:0xabc:1m").unwrap(),
+            ("base".to_string(), "0xabc".to_string(), "1m".to_string())
+        );
+        // Unknown chain, unknown window, missing field and extra field refuse.
+        assert!(parse_stream_target("unknown:0xabc:1m").is_err());
+        assert!(parse_stream_target("base:0xabc:1s").is_err());
+        assert!(parse_stream_target("base:0xabc").is_err());
+        assert!(parse_stream_target("base:0xabc:1m:extra").is_err());
+        assert!(parse_stream_target("").is_err());
+    }
+
+    #[test]
+    fn bounded_millis_env_uses_default_and_rejects_out_of_range() {
+        let name = "PRIVATE_FOMO_TEST_MILLIS";
+        std::env::remove_var(name);
+        assert_eq!(
+            parse_millis_env(name, 5_000, 100, 30_000).unwrap(),
+            Duration::from_millis(5_000)
+        );
+        std::env::set_var(name, "42");
+        assert!(parse_millis_env(name, 5_000, 100, 30_000).is_err());
+        std::env::set_var(name, "notanumber");
+        assert!(parse_millis_env(name, 5_000, 100, 30_000).is_err());
         std::env::remove_var(name);
     }
 }

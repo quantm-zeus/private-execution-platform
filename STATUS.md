@@ -34,6 +34,14 @@ Implemented and composed (exact-SHA CI green):
 - Dependency readiness distinct from liveness, strict all-or-none relay
   configuration, and an edge-gateway refusal to bind a non-loopback address
   while perimeter assertion trust is presence-only.
+- Read-only FOMO market bridge for the browser chart: PEP calls the local
+  read-only `fomo-mcp` `/market/bars` / `/market/latest` endpoints with the
+  bridge's own bearer key (PEP holds no FOMO tokens), serves `get_chart` history
+  through a closed chain/window→resolution map with server-side normalization
+  and range/bounds validation, and provides a bounded-polling realtime OHLCV
+  `StreamSource`. Chart data is visual/non-authoritative. The KLineChart Pro
+  renderer sits behind a renderer-agnostic local datafeed boundary. See
+  `docs/live-integration.md`.
 
 ## Not composed / residual (do not overstate)
 
@@ -45,8 +53,12 @@ Implemented and composed (exact-SHA CI green):
   stay `false`.
 - Durable exactly-once execution (reservation/journal and Privy idempotency) is
   process-local and is not release-safe for live funds.
-- Live signing, chain submission, authoritative market feeds/balances,
-  persistence and provider transports remain unwired.
+- Live signing, chain submission, balances, persistence and most provider
+  transports remain unwired. The PEP-side FOMO market bridge is implemented and
+  tested, but the currently deployed `fomo-mcp` image does not yet expose
+  `/market/bars` (a separate read-only lane is landing it); until then a
+  configured PEP fails closed with `Unavailable` and the chart renders only the
+  local decrypted frame buffer — never fabricated data.
 - Perimeter trust at the edge is header-presence only; cryptographic Cloudflare
   Access JWT validation is not implemented (loopback binding is the mitigation).
 - With no `WORKSPACE_RELEASE_MANIFEST` configured, the server has no trusted

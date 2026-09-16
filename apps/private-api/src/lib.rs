@@ -31,6 +31,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use subtle::ConstantTimeEq;
 
+pub mod fomo_market;
 mod hardened_file;
 pub mod opaque;
 pub mod passkey_store;
@@ -48,6 +49,11 @@ pub use release::{
     RELEASE_MANIFEST_ENV, WORKSPACE_PROTOCOL_VERSION,
 };
 
+pub use fomo_market::{
+    build_wiring as build_fomo_market_wiring, Bar, BarsProvider, FomoBarsClient,
+    FomoChartDispatcher, FomoMarketConfig, FomoMarketError, FomoMarketWiring,
+    FomoOhlcvStreamSource,
+};
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
     CommandDispatcher, FailClosedBootstrap, FailClosedDispatcher, OpaqueClock, OpaqueRoute,
@@ -70,6 +76,44 @@ pub use agent_commands::{
 };
 pub use chain_types::ChainId;
 pub use mcp_server::{AgentBackend, BackendOutcome};
+
+/// Read a small operator secret file through the hardened (non-symlink,
+/// owner-only `0600`, not group/world writable) path and return its trimmed
+/// contents in a zeroizing buffer.
+///
+/// Used for the local `fomo-mcp` bridge bearer key. The value is never logged,
+/// the intermediate buffers are zeroized, and the returned buffer zeroizes on
+/// drop.
+pub fn read_operator_secret_file(path: &std::path::Path) -> std::io::Result<Zeroizing<String>> {
+    use std::io::Read;
+
+    let opened = hardened_file::open_hardened_secret(path)?
+        .ok_or_else(|| std::io::Error::other("secret file is missing"))?;
+    let mut raw = Vec::new();
+    // Read at most one byte past the limit so an over-long file is rejected
+    // rather than silently truncated.
+    opened.file.take(4097).read_to_end(&mut raw)?;
+    if raw.len() > 4096 {
+        raw.zeroize();
+        return Err(std::io::Error::other("secret file is too large"));
+    }
+    let mut text = match String::from_utf8(raw) {
+        Ok(text) => text,
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            return Err(std::io::Error::other("secret file must be valid UTF-8"));
+        }
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        text.zeroize();
+        return Err(std::io::Error::other("secret file is empty"));
+    }
+    let value = Zeroizing::new(trimmed.to_string());
+    text.zeroize();
+    Ok(value)
+}
 
 /// Compose the full private web command surface for an injected Trading Core.
 ///
@@ -5844,5 +5888,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod operator_secret_file_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[cfg(unix)]
+    fn write_secret(dir: &std::path::Path, name: &str, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"  secret-value\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_and_trims_an_owner_only_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_secret(dir.path(), "key", 0o600);
+        let value = read_operator_secret_file(&path).unwrap();
+        assert_eq!(value.as_str(), "secret-value");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_group_or_world_readable_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o640, 0o604, 0o644] {
+            let path = write_secret(dir.path(), &format!("key-{mode:o}"), mode);
+            assert!(
+                read_operator_secret_file(&path).is_err(),
+                "mode {mode:o} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_missing_empty_or_oversized_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_operator_secret_file(&dir.path().join("absent")).is_err());
+        for (name, bytes) in [("empty", vec![b' '; 4]), ("big", vec![b'a'; 5000])] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert!(read_operator_secret_file(&path).is_err(), "{name}");
+        }
     }
 }
