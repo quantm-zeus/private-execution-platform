@@ -79,9 +79,21 @@ function stageStatusText(current: UnlockStage | null, id: UnlockStage): string {
 const RECOVERY_ACTION_LABELS: Partial<Record<RecoveryAction, string>> = {
   resume_authentication: "Verify passkey again",
   reload: "Reload page",
-  retry: "Try again",
+  retry: "Re-enter code and retry",
   reenter_recovery: "Re-enter recovery code",
 };
+
+/**
+ * Whether the failure is about the entered recovery credential, so the field is
+ * marked invalid. A transport/grant/boot failure must not be announced as an
+ * invalid field.
+ */
+function isCredentialFailure(failure: UnlockRecovery | null): boolean {
+  return (
+    failure?.reason === "invalid_secret" ||
+    failure?.reason === "workspace_key_mismatch"
+  );
+}
 
 function App() {
   const [status, setStatus] = createSignal("Security gateway ready.");
@@ -220,7 +232,13 @@ function App() {
         return;
       case "retry":
       case "reenter_recovery":
-        recoveryInput?.focus();
+        // The secret is cleared before the first await by design, so recovery
+        // always requires re-entry; do not leave a stale value behind.
+        setRecoveryCode("");
+        if (recoveryInput) {
+          recoveryInput.value = "";
+          recoveryInput.focus();
+        }
         return;
       default:
         return;
@@ -876,7 +894,7 @@ function App() {
                     value={recoveryCode()}
                     onInput={(e) => setRecoveryCode(e.currentTarget.value)}
                     disabled={isUnlocking()}
-                    aria-invalid={unlockFailure() ? "true" : "false"}
+                    aria-invalid={isCredentialFailure(unlockFailure()) ? "true" : "false"}
                     aria-describedby={unlockFailure() ? "unlock-failure" : undefined}
                     ref={(element) => {
                       recoveryInput = element;

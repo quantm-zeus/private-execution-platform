@@ -1151,7 +1151,11 @@ try {
       process.env.GITHUB_SHA && /^[0-9a-f]{7,40}$/i.test(process.env.GITHUB_SHA)
         ? process.env.GITHUB_SHA
         : "0123456789abcdef0123456789abcdef01234567";
-    const manifestPath = `${artifactPath}.fixture.manifest.json`;
+    // The manifest is read through the hardened loader, which refuses a
+    // world-writable parent; a private temp dir is robust regardless of the
+    // runner's umask (the shell dir itself may be group- or world-writable).
+    const manifestDir = await mkdtemp(join(tmpdir(), "workspace-manifest-"));
+    const manifestPath = join(manifestDir, "manifest.json");
     const manifest = computeReleaseManifest({
       releaseId: releaseIdFor(sourceSha, digest(rawArtifact)),
       sourceSha,
@@ -1206,6 +1210,9 @@ try {
         );
       }
       if (
+        !/^test tests::production_build_script_artifact_loads_delivers_and_unpacks \.\.\. ok\s*$/m.test(
+          stdout,
+        ) ||
         !/running 1 test/.test(stdout) ||
         !/test result: ok\. 1 passed/.test(stdout)
       ) {
@@ -1215,7 +1222,7 @@ try {
       }
     } finally {
       await rm(fixturePath, { force: true });
-      await rm(manifestPath, { force: true });
+      await rm(manifestDir, { recursive: true, force: true });
     }
   }
 

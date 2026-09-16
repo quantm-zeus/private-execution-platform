@@ -507,7 +507,10 @@ impl PrivateApiState {
         self.artifact_loader = loader.clone();
         self.artifact_header_loader = Arc::new(move || {
             let bytes = loader()?;
-            if bytes.len() < crypto_envelope::ARTIFACT_HEADER_LEN {
+            // Match the production loader's deliverability predicate so a
+            // test-injected header-only artifact cannot report ready when the
+            // real path would reject it.
+            if !artifact_length_is_deliverable(bytes.len() as u64) {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
             Ok(ArtifactHeaderProbe {

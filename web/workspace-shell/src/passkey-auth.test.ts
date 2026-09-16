@@ -108,6 +108,37 @@ test("buildCreationOptions requests PRF at registration and preserves server ext
   assert.deepEqual((bare.extensions as { prf?: unknown } | undefined)?.prf, {});
 });
 
+test("buildCreationOptions preserves a server-supplied PRF configuration", () => {
+  const serverPrf = { eval: { first: "AQIDBAUGBwgJCgsMDQ4PEA" } };
+  const options = buildCreationOptions({
+    rp: { id: "evergreen.foresift.tech" },
+    user: { id: "AQID", name: "owner", displayName: "Owner" },
+    challenge: "BwgJ",
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+    extensions: { credProps: true, prf: serverPrf },
+  });
+  const extensions = options.extensions as
+    | { prf?: unknown; credProps?: unknown }
+    | undefined;
+  // A server-supplied evaluation salt must round-trip unchanged and PRF must
+  // stay enabled; clobbering it would silently drop the server's PRF config.
+  assert.deepEqual(extensions?.prf, serverPrf);
+  assert.equal(extensions?.credProps, true);
+
+  // A malformed (non-object) server value must not disable PRF.
+  const malformed = buildCreationOptions({
+    rp: { id: "evergreen.foresift.tech" },
+    user: { id: "AQID", name: "owner", displayName: "Owner" },
+    challenge: "BwgJ",
+    pubKeyCredParams: [],
+    extensions: { prf: "nonsense" },
+  });
+  assert.deepEqual(
+    (malformed.extensions as { prf?: unknown } | undefined)?.prf,
+    {},
+  );
+});
+
 test("buildRequestOptions rejects a malformed challenge", () => {
   assert.throws(
     () => buildRequestOptions({ challenge: 42 }),

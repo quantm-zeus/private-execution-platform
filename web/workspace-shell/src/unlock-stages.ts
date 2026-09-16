@@ -83,6 +83,8 @@ export interface UnlockRecovery {
   readonly action: RecoveryAction;
   /** `error` for hard failures, `warning` for recoverable ones. */
   readonly severity: "error" | "warning";
+  /** Machine reason, so the UI can distinguish an invalid credential. */
+  readonly reason: UnlockReason;
 }
 
 const STAGE_LABELS: Record<UnlockStage, string> = {
@@ -103,6 +105,13 @@ export function recoveryFor(
   stage: UnlockStage,
   reason: UnlockReason,
 ): UnlockRecovery {
+  return { ...guidanceFor(stage, reason), reason };
+}
+
+function guidanceFor(
+  stage: UnlockStage,
+  reason: UnlockReason,
+): Omit<UnlockRecovery, "reason"> {
   const stageLabel = STAGE_LABELS[stage];
   switch (stage) {
     case "U1_WASM":

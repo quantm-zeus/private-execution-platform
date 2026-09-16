@@ -15,6 +15,17 @@
 //! by the service user (or root), and refuse a world-writable parent directory.
 //! The file's *read* bits are not constrained: the manifest is public metadata
 //! and is published `0644`, while the artifact is `0600`.
+//!
+//! Scope and deployment notes:
+//! - The symlink/owner/mode checks are Unix-only; on non-Unix the module falls
+//!   back to a plain `File::open`.
+//! - Only the *final* path component is refused when it is a symlink. An
+//!   intermediate symlink is followed, so the documented
+//!   `<releases-root>/current/workspace.artifact` layout works; the operator must
+//!   point the env vars at a real final file, not a symlink to one.
+//! - A group-writable parent is deliberately tolerated (matching the passkey
+//!   store). That tolerance depends on the owner check rejecting a foreign-owned
+//!   replacement file; do not relax the owner check independently.
 
 use std::fs;
 use std::path::Path;
