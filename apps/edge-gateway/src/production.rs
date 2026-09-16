@@ -284,12 +284,15 @@ pub fn edge_state(config: &EdgeProductionConfig) -> Result<EdgeState, EdgeError>
     let relay = PrivateRelay::new(config.relay.clone())?;
     let stream_relay = PrivateStreamRelay::new(relay.clone());
     // The relay and the stream share one validated config and one mTLS channel.
+    // Readiness requires both a real authorization backend and the loaded
+    // relay identity, then a bounded private-api probe over that identity.
     EdgeState::with_stream_relay(
         authorization,
-        relay,
+        relay.clone(),
         stream_relay,
         DEFAULT_MAX_OPAQUE_BODY_BYTES,
     )
+    .map(|state| state.with_readiness(true, true, relay))
 }
 
 /// Resolve the production router, failing closed to the unavailable edge when no

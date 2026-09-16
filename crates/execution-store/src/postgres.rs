@@ -9,8 +9,10 @@
 //!   digest yields [`execution_relay::Reservation::Conflict`];
 //! - each transition `UPDATE ... WHERE request_digest = $n AND status IN (...)` so
 //!   a stale or conflicting writer affects zero rows and fails closed;
-//! - `record_outcome` updates only when `(idempotency_key, request_digest)` names
-//!   exactly one row, so an ambiguous key across owners fails closed.
+//! - `record_outcome` updates only when the full
+//!   `(owner_id, workspace_ref, idempotency_key, request_digest)` primary key
+//!   names exactly one non-terminal row, so neither an ambiguous key across
+//!   owners nor a terminal outcome can be overwritten.
 //!
 //! No logging, no plaintext, no DSN in errors.
 
@@ -274,10 +276,13 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
 
     async fn record_sign_requested(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
         let digest_bytes: &[u8] = digest.as_bytes();
         let bucket = self.bucket();
         let updated = self
@@ -285,16 +290,18 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
             .execute(
                 "UPDATE execution_attempts
                  SET status = 'SIGN_REQUESTED',
-                     provider_idempotency_id = $3,
+                     provider_idempotency_id = $5,
                      attempt_version = attempt_version + 1,
-                     updated_bucket = $4
-                 WHERE idempotency_key = $1
-                   AND request_digest = $2
-                   AND status IN ('RESERVED', 'SIGN_REQUESTED')
-                   AND (SELECT count(*) FROM execution_attempts
-                        WHERE idempotency_key = $1 AND request_digest = $2) = 1",
+                     updated_bucket = $6
+                 WHERE owner_id = $1
+                   AND workspace_ref = $2
+                   AND idempotency_key = $3
+                   AND request_digest = $4
+                   AND status IN ('RESERVED', 'SIGN_REQUESTED')",
                 &[
-                    &key.as_str(),
+                    &owner,
+                    &workspace,
+                    &key,
                     &digest_bytes,
                     &provider_idempotency.as_str(),
                     &bucket,
@@ -310,11 +317,14 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
         // `record_signed` carries no reference; production always uses
         // `record_signed_reference`. Persist the status without a reference.
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
         let digest_bytes: &[u8] = digest.as_bytes();
         let bucket = self.bucket();
         let updated = self
@@ -323,13 +333,13 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
                 "UPDATE execution_attempts
                  SET status = 'SIGNED',
                      attempt_version = attempt_version + 1,
-                     updated_bucket = $3
-                 WHERE idempotency_key = $1
-                   AND request_digest = $2
-                   AND status IN ('SIGN_REQUESTED', 'SIGNED')
-                   AND (SELECT count(*) FROM execution_attempts
-                        WHERE idempotency_key = $1 AND request_digest = $2) = 1",
-                &[&key.as_str(), &digest_bytes, &bucket],
+                     updated_bucket = $5
+                 WHERE owner_id = $1
+                   AND workspace_ref = $2
+                   AND idempotency_key = $3
+                   AND request_digest = $4
+                   AND status IN ('SIGN_REQUESTED', 'SIGNED')",
+                &[&owner, &workspace, &key, &digest_bytes, &bucket],
             )
             .await
             .map_err(map_error)?;
@@ -341,13 +351,16 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
 
     async fn record_signed_reference(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         signed_reference: &str,
     ) -> Result<(), RelayError> {
         if signed_reference.trim().is_empty() {
             return Err(RelayError::SigningFailed);
         }
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
         let digest_bytes: &[u8] = digest.as_bytes();
         let bucket = self.bucket();
         let updated = self
@@ -355,15 +368,22 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
             .execute(
                 "UPDATE execution_attempts
                  SET status = 'SIGNED',
-                     signed_reference = $3,
+                     signed_reference = $5,
                      attempt_version = attempt_version + 1,
-                     updated_bucket = $4
-                 WHERE idempotency_key = $1
-                   AND request_digest = $2
-                   AND status IN ('SIGN_REQUESTED', 'SIGNED')
-                   AND (SELECT count(*) FROM execution_attempts
-                        WHERE idempotency_key = $1 AND request_digest = $2) = 1",
-                &[&key.as_str(), &digest_bytes, &signed_reference, &bucket],
+                     updated_bucket = $6
+                 WHERE owner_id = $1
+                   AND workspace_ref = $2
+                   AND idempotency_key = $3
+                   AND request_digest = $4
+                   AND status IN ('SIGN_REQUESTED', 'SIGNED')",
+                &[
+                    &owner,
+                    &workspace,
+                    &key,
+                    &digest_bytes,
+                    &signed_reference,
+                    &bucket,
+                ],
             )
             .await
             .map_err(map_error)?;
@@ -375,13 +395,16 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
 
     async fn record_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         request: &execution_relay::SubmitRequest,
     ) -> Result<(), RelayError> {
         // Reuse the canonical validation (payload non-empty, bounded, digest
         // consistent) before any database contact.
         let submission = DurableSubmission::from_request(request)?;
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
         let digest_bytes: &[u8] = digest.as_bytes();
         let payload_digest: &[u8] = submission.payload_digest().as_bytes();
         let payload: &[u8] = submission.payload();
@@ -391,17 +414,19 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
             .execute(
                 "UPDATE execution_attempts
                  SET status = 'SUBMISSION_UNKNOWN',
-                     payload_digest = $3,
-                     payload = $4,
+                     payload_digest = $5,
+                     payload = $6,
                      attempt_version = attempt_version + 1,
-                     updated_bucket = $5
-                 WHERE idempotency_key = $1
-                   AND request_digest = $2
-                   AND status IN ('SIGNED', 'SUBMISSION_UNKNOWN', 'SUBMITTED')
-                   AND (SELECT count(*) FROM execution_attempts
-                        WHERE idempotency_key = $1 AND request_digest = $2) = 1",
+                     updated_bucket = $7
+                 WHERE owner_id = $1
+                   AND workspace_ref = $2
+                   AND idempotency_key = $3
+                   AND request_digest = $4
+                   AND status IN ('SIGNED', 'SUBMISSION_UNKNOWN', 'SUBMITTED')",
                 &[
-                    &key.as_str(),
+                    &owner,
+                    &workspace,
+                    &key,
                     &digest_bytes,
                     &payload_digest,
                     &payload,
@@ -418,27 +443,25 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
 
     async fn load_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
-        let rows = self
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
+        let row = self
             .next_client()
-            .query(
+            .query_opt(
                 "SELECT intent_id, chain_tag, request_digest, payload_digest,
                         signed_reference, submission_reference, payload
                  FROM execution_attempts
-                 WHERE idempotency_key = $1",
-                &[&key.as_str()],
+                 WHERE owner_id = $1 AND workspace_ref = $2 AND idempotency_key = $3",
+                &[&owner, &workspace, &key],
             )
             .await
             .map_err(map_error)?;
-        if rows.is_empty() {
+        let Some(row) = row else {
             return Ok(None);
-        }
-        if rows.len() > 1 {
-            // Ambiguous across owners/workspaces: fail closed.
-            return Err(RelayError::StoreUnavailable);
-        }
-        let row = &rows[0];
+        };
         let payload: Option<Vec<u8>> = row
             .try_get("payload")
             .map_err(|_| RelayError::StoreUnavailable)?;
@@ -475,7 +498,7 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
             .map_err(|_| RelayError::StoreUnavailable)?;
         let submission = DurableSubmission::new(
             intent_id,
-            key.clone(),
+            binding.idempotency_key().clone(),
             chain,
             RequestDigest::from_bytes(request_digest),
             PayloadDigest::from_bytes(payload_digest),
@@ -486,32 +509,34 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
         Ok(Some(submission))
     }
 
-    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
-        let rows = self
+    async fn load_outcome(
+        &self,
+        binding: &AttemptBinding,
+    ) -> Result<Option<RelayOutcome>, RelayError> {
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
+        let row = self
             .next_client()
-            .query(
+            .query_opt(
                 "SELECT status, signed_reference, submission_reference, final_reason,
                         CAST(net_input AS TEXT) AS net_input,
                         CAST(net_output AS TEXT) AS net_output
                  FROM execution_attempts
-                 WHERE idempotency_key = $1",
-                &[&key.as_str()],
+                 WHERE owner_id = $1 AND workspace_ref = $2 AND idempotency_key = $3",
+                &[&owner, &workspace, &key],
             )
             .await
             .map_err(map_error)?;
-        if rows.is_empty() {
-            return Ok(None);
+        match row {
+            Some(row) => Ok(Some(decode_existing_outcome(&row)?)),
+            None => Ok(None),
         }
-        if rows.len() > 1 {
-            // Ambiguous across owners/workspaces: fail closed.
-            return Err(RelayError::StoreUnavailable);
-        }
-        Ok(Some(decode_existing_outcome(&rows[0])?))
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
@@ -539,26 +564,34 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
             | RelayOutcome::Unknown
             | RelayOutcome::FailedBeforeSubmit => (None, None, None, None),
         };
+        let owner = binding.owner().as_str();
+        let workspace = binding.workspace().as_str();
+        let key = binding.idempotency_key().as_str();
         let digest_bytes: &[u8] = digest.as_bytes();
         let bucket = self.bucket();
+        // `FAILED_BEFORE_SUBMIT` is terminal in the Rust state machine; the SQL
+        // monotonic guard must therefore exclude it too, so a later ambiguous
+        // observation can never overwrite a definitively pre-send failure.
         let updated = self
             .next_client()
             .execute(
                 "UPDATE execution_attempts
-                 SET status = $3,
-                     submission_reference = COALESCE($4, submission_reference),
-                     final_reason = $5,
-                     net_input = CAST($6 AS NUMERIC),
-                     net_output = CAST($7 AS NUMERIC),
+                 SET status = $5,
+                     submission_reference = COALESCE($6, submission_reference),
+                     final_reason = $7,
+                     net_input = CAST($8 AS NUMERIC),
+                     net_output = CAST($9 AS NUMERIC),
                      attempt_version = attempt_version + 1,
-                     updated_bucket = $8
-                 WHERE idempotency_key = $1
-                   AND request_digest = $2
-                   AND status NOT IN ('CONFIRMED', 'REJECTED')
-                   AND (SELECT count(*) FROM execution_attempts
-                        WHERE idempotency_key = $1 AND request_digest = $2) = 1",
+                     updated_bucket = $10
+                 WHERE owner_id = $1
+                   AND workspace_ref = $2
+                   AND idempotency_key = $3
+                   AND request_digest = $4
+                   AND status NOT IN ('CONFIRMED', 'REJECTED', 'FAILED_BEFORE_SUBMIT')",
                 &[
-                    &key.as_str(),
+                    &owner,
+                    &workspace,
+                    &key,
                     &digest_bytes,
                     &status.as_str(),
                     &submission_reference,
@@ -576,9 +609,10 @@ impl AttemptReservationStore for PostgresExecutionAttemptStore {
                 .next_client()
                 .query_opt(
                     "SELECT 1 FROM execution_attempts
-                     WHERE idempotency_key = $1 AND request_digest = $2
-                       AND status IN ('CONFIRMED', 'REJECTED')",
-                    &[&key.as_str(), &digest_bytes],
+                     WHERE owner_id = $1 AND workspace_ref = $2 AND idempotency_key = $3
+                       AND request_digest = $4
+                       AND status IN ('CONFIRMED', 'REJECTED', 'FAILED_BEFORE_SUBMIT')",
+                    &[&owner, &workspace, &key, &digest_bytes],
                 )
                 .await
                 .map_err(map_error)?;

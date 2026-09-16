@@ -115,14 +115,17 @@ pub trait MarketExecutionPort: Send + Sync {
         request: MarketExecutionRequest,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError>;
 
-    /// Reconciles a previously delegated market attempt by its idempotency key.
+    /// Reconciles a previously delegated market attempt by its full durable
+    /// `(owner, workspace, idempotency_key)` binding.
     ///
     /// Reconciliation is read-only: an implementation must never sign or submit.
-    /// The default has no observation capability and fails closed to `Unknown`; a
-    /// `Filled` may only be produced from exact observed amounts.
+    /// The full binding is required so a caller can never reconcile another
+    /// tenant's attempt that happens to share the idempotency key. The default
+    /// has no observation capability and fails closed to `Unknown`; a `Filled`
+    /// may only be produced from exact observed amounts.
     async fn reconcile(
         &self,
-        _idempotency_key: &domain::IdempotencyKey,
+        _binding: &execution_relay::AttemptBinding,
         _now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         Ok(MarketExecutionOutcome::Unknown)

@@ -33,6 +33,7 @@ use subtle::ConstantTimeEq;
 
 pub mod fomo_market;
 mod hardened_file;
+pub mod live;
 pub mod opaque;
 pub mod passkey_store;
 pub mod production;
@@ -52,9 +53,10 @@ pub use release::{
 
 pub use fomo_market::{
     build_wiring as build_fomo_market_wiring,
-    build_wiring_with_health as build_fomo_market_wiring_with_health, probe_realtime, Bar,
-    BarsProvider, FomoBarsClient, FomoChartDispatcher, FomoMarketConfig, FomoMarketError,
-    FomoMarketWiring, FomoOhlcvStreamSource,
+    build_wiring_with_health as build_fomo_market_wiring_with_health,
+    build_wiring_with_health_flags as build_fomo_market_wiring_with_health_flags, probe_history,
+    probe_realtime, Bar, BarsProvider, FomoBarsClient, FomoChartDispatcher, FomoMarketConfig,
+    FomoMarketError, FomoMarketWiring, FomoOhlcvStreamSource,
 };
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -311,17 +313,25 @@ impl TransportState {
 
 type ArtifactLoader = Arc<dyn Fn() -> Result<Vec<u8>, StatusCode> + Send + Sync>;
 
-/// Bounded artifact probe returned by the cheap header loader: the public header
-/// bytes plus the file length, so the readiness check can compare the manifest's
-/// declared size without reading or hashing the ciphertext.
-pub struct ArtifactHeaderProbe {
-    pub header: Vec<u8>,
+/// Fully validated immutable artifact metadata, computed once at startup.
+///
+/// `/ready` consumes this verified state instead of a header/size-only probe:
+/// the full ciphertext is read and (when a release manifest is configured) its
+/// SHA-256 must equal the manifest digest, so a same-size corruption is not
+/// reported ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedArtifact {
+    pub version: u8,
+    pub kid: [u8; auth::WORKSPACE_KID_BYTES],
     pub size: u64,
+    pub sha256_hex: String,
 }
 
-/// Cheap header-only artifact loader used by the unauthenticated readiness probe
-/// so a health check never reads, copies, or hashes the whole artifact.
-type ArtifactHeaderLoader = Arc<dyn Fn() -> Result<ArtifactHeaderProbe, StatusCode> + Send + Sync>;
+/// Process-wide, first-computation-wins cache of [`VerifiedArtifact`].
+///
+/// Clones of [`PrivateApiState`] share the cell (via `Arc`); the loader-mutating
+/// test seams reset it so a later loader can never observe a stale verdict.
+type VerifiedArtifactCache = Arc<tokio::sync::Mutex<Option<Result<VerifiedArtifact, StatusCode>>>>;
 
 /// Injectable release-manifest loader. Production reads the operator-configured
 /// path; tests inject a hermetic manifest instead of mutating process env.
@@ -336,8 +346,8 @@ pub struct PrivateApiState {
     authenticator: Option<Arc<WebAuthnPasskeyAuthenticator>>,
     clock: Arc<dyn Clock>,
     artifact_loader: ArtifactLoader,
-    /// Header-only artifact read for the readiness probe.
-    artifact_header_loader: ArtifactHeaderLoader,
+    /// First-computation-wins cache of the fully verified immutable artifact.
+    verified_artifact: VerifiedArtifactCache,
     /// Release-manifest loader (production reads the operator path).
     manifest_loader: ManifestLoader,
     /// Optional durable passkey-bound recovery wrapper store. `None` keeps the
@@ -375,6 +385,20 @@ pub struct PrivateApiState {
     /// not required, so the fail-closed default does not fail readiness.
     stream_required: bool,
     stream_ready: Arc<AtomicBool>,
+    /// Whether a configured FOMO market source is a required dependency and
+    /// whether its chart-history proof is currently healthy. A configured
+    /// source fails `/ready` until the bounded authenticated `/market/bars`
+    /// probe observes it healthy, so an expired bridge session is reported
+    /// truthfully rather than masked by a live process.
+    fomo_required: bool,
+    fomo_ready: Arc<AtomicBool>,
+    /// Whether a live execution path was configured (`TRADING_CORE_LIVE=1`) and
+    /// whether every concrete dependency (durable store, Base RPC, Privy HTTP
+    /// signer, payload builder) was proven healthy at composition time. A
+    /// configured-but-unproven live path fails `/ready` instead of reporting a
+    /// half-wired dependency (for example a missing credential) as healthy.
+    live_required: bool,
+    live_ready: bool,
 }
 
 impl PrivateApiState {
@@ -392,7 +416,7 @@ impl PrivateApiState {
             authenticator: None,
             clock: Arc::new(SystemClock),
             artifact_loader: Arc::new(load_workspace_artifact),
-            artifact_header_loader: Arc::new(load_workspace_artifact_header),
+            verified_artifact: Arc::new(tokio::sync::Mutex::new(None)),
             manifest_loader: Arc::new(release::load_release_manifest_from_env),
             recovery_store: None,
             recovery_challenges: Arc::new(Mutex::new(recovery::RecoveryChallengeState::default())),
@@ -405,6 +429,10 @@ impl PrivateApiState {
             dispatcher_ready: Arc::new(AtomicBool::new(true)),
             stream_required: false,
             stream_ready: Arc::new(AtomicBool::new(true)),
+            fomo_required: false,
+            fomo_ready: Arc::new(AtomicBool::new(true)),
+            live_required: false,
+            live_ready: false,
         })
     }
 
@@ -492,6 +520,30 @@ impl PrivateApiState {
         self
     }
 
+    /// Attach the FOMO market source's readiness contract. `required` records
+    /// that a FOMO source was configured (so it is a deployment dependency);
+    /// `ready` is set true only after a bounded authenticated `/market/bars`
+    /// history proof succeeds. A configured-but-auth-rejected source therefore
+    /// fails `/ready` even while the process stays live on `/health`.
+    pub fn with_fomo_readiness(mut self, required: bool, ready: Arc<AtomicBool>) -> Self {
+        self.fomo_required = required;
+        self.fomo_ready = ready;
+        self
+    }
+
+    /// Attach the live execution path's readiness contract. `required` records
+    /// that the operator explicitly opted into live composition
+    /// (`TRADING_CORE_LIVE=1`); `ready` is true only when the durable store and
+    /// all concrete transports (Base RPC, Privy HTTP signer, payload builder)
+    /// were proven healthy. A configured-but-unproven live path therefore fails
+    /// `/ready` — a missing credential is a determinate readiness denial, never a
+    /// healthy process with a half-wired execution dependency.
+    pub fn with_live_readiness(mut self, required: bool, ready: bool) -> Self {
+        self.live_required = required;
+        self.live_ready = ready;
+        self
+    }
+
     #[cfg(test)]
     fn with_test_dependencies(
         config: PrivateApiConfig,
@@ -511,7 +563,7 @@ impl PrivateApiState {
             authenticator,
             clock,
             artifact_loader: Arc::new(load_workspace_artifact),
-            artifact_header_loader: Arc::new(load_workspace_artifact_header),
+            verified_artifact: Arc::new(tokio::sync::Mutex::new(None)),
             manifest_loader: Arc::new(release::load_release_manifest_from_env),
             recovery_store: None,
             recovery_challenges: Arc::new(Mutex::new(recovery::RecoveryChallengeState::default())),
@@ -524,6 +576,10 @@ impl PrivateApiState {
             dispatcher_ready: Arc::new(AtomicBool::new(true)),
             stream_required: false,
             stream_ready: Arc::new(AtomicBool::new(true)),
+            fomo_required: false,
+            fomo_ready: Arc::new(AtomicBool::new(true)),
+            live_required: false,
+            live_ready: false,
         })
     }
 
@@ -539,20 +595,61 @@ impl PrivateApiState {
             .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
     }
 
-    /// Read only the bounded artifact header for the readiness probe.
-    async fn load_artifact_header(&self) -> Result<ArtifactHeaderProbe, StatusCode> {
-        let loader = self.artifact_header_loader.clone();
-        tokio::task::spawn_blocking(move || loader())
-            .await
-            .unwrap_or(Err(StatusCode::SERVICE_UNAVAILABLE))
-    }
-
     /// Load the optional release manifest off the async runtime.
     async fn load_manifest(&self) -> Result<Option<ReleaseManifest>, DescriptorError> {
         let loader = self.manifest_loader.clone();
         tokio::task::spawn_blocking(move || loader())
             .await
             .unwrap_or(Err(DescriptorError::ManifestInvalid))
+    }
+
+    /// Return the fully verified immutable artifact, computing it once.
+    ///
+    /// The first caller reads the whole bounded ciphertext, validates it against
+    /// the configured release manifest (including the full SHA-256 digest), and
+    /// caches the verdict for the process. `/ready` therefore consumes verified
+    /// state, so a same-size corruption that keeps the header and length intact
+    /// is not reported ready.
+    async fn verified_artifact(&self) -> Result<VerifiedArtifact, StatusCode> {
+        let mut guard = self.verified_artifact.lock().await;
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+        let verdict = self.compute_verified_artifact().await;
+        *guard = Some(verdict.clone());
+        verdict
+    }
+
+    /// Reads, validates, and digests the immutable artifact exactly once.
+    async fn compute_verified_artifact(&self) -> Result<VerifiedArtifact, StatusCode> {
+        let manifest = self
+            .load_manifest()
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let artifact = self.load_artifact().await?;
+        let header = release::parse_artifact_header(&artifact)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if let Some(manifest) = manifest.as_ref() {
+            // Full byte-level validation: version, KID, exact size, and the
+            // SHA-256 digest. A same-size corruption therefore fails here.
+            manifest
+                .validate_against(&artifact)
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        }
+        Ok(VerifiedArtifact {
+            version: header.version,
+            kid: header.kid,
+            size: artifact.len() as u64,
+            sha256_hex: release::sha256_hex(&artifact),
+        })
+    }
+
+    /// Eagerly validate and cache the immutable artifact during startup.
+    ///
+    /// Best-effort: a failure is cached and surfaced by `/ready` (never a
+    /// startup abort), so an operator can see the precise readiness verdict.
+    pub async fn warm_artifact_readiness(&self) {
+        let _ = self.verified_artifact().await;
     }
 
     /// Attach an optional durable recovery wrapper store. Additive: without it
@@ -570,26 +667,16 @@ impl PrivateApiState {
 
     #[cfg(test)]
     fn with_artifact_loader(mut self, loader: ArtifactLoader) -> Self {
-        self.artifact_loader = loader.clone();
-        self.artifact_header_loader = Arc::new(move || {
-            let bytes = loader()?;
-            // Match the production loader's deliverability predicate so a
-            // test-injected header-only artifact cannot report ready when the
-            // real path would reject it.
-            if !artifact_length_is_deliverable(bytes.len() as u64) {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            Ok(ArtifactHeaderProbe {
-                header: bytes[..crypto_envelope::ARTIFACT_HEADER_LEN].to_vec(),
-                size: bytes.len() as u64,
-            })
-        });
+        self.artifact_loader = loader;
+        // A new loader invalidates any verdict computed from the previous one.
+        self.verified_artifact = Arc::new(tokio::sync::Mutex::new(None));
         self
     }
 
     #[cfg(test)]
     fn with_manifest_loader(mut self, loader: ManifestLoader) -> Self {
         self.manifest_loader = loader;
+        self.verified_artifact = Arc::new(tokio::sync::Mutex::new(None));
         self
     }
 }
@@ -659,10 +746,11 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
-    // Read only the bounded artifact header (never the full ciphertext) and any
-    // configured manifest, then compare the public version/KID binding. The full
-    // byte-level manifest digest is enforced on the authenticated descriptor and
-    // before delivery, so the unauthenticated probe stays cheap.
+    // Consume the fully verified immutable artifact computed once at startup:
+    // the whole ciphertext was read and, when a release manifest is configured,
+    // its SHA-256 digest was validated. The unauthenticated probe therefore
+    // cannot report ready for a same-size-corrupted artifact that keeps the
+    // header and length intact.
     //
     // `manifest_configured` is reported separately: without an immutable release
     // manifest the preflight enforces only version/KID and cannot compare the
@@ -670,21 +758,12 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     // fail-closed) mode from the readiness response.
     let manifest_result = state.load_manifest().await;
     let manifest_configured = !matches!(&manifest_result, Ok(None));
-    let (artifact_ok, manifest_ok) = match state.load_artifact_header().await {
-        Ok(probe) => match release::parse_artifact_header(&probe.header) {
-            Ok(parsed) => match &manifest_result {
-                Ok(Some(manifest)) => (
-                    true,
-                    manifest
-                        .validate_header_against(&parsed, probe.size)
-                        .is_ok(),
-                ),
-                Ok(None) => (true, true),
-                Err(_) => (true, false),
-            },
-            Err(_) => (false, false),
-        },
-        Err(_) => (false, false),
+    let (artifact_ok, manifest_ok) = match state.verified_artifact().await {
+        Ok(_) => (true, true),
+        // A verified-artifact failure means the artifact/immutable binding is
+        // unusable; the manifest check is only healthy in the explicit
+        // no-manifest mode.
+        Err(_) => (false, matches!(manifest_result, Ok(None))),
     };
     // A configured passkey store that cannot be read is not ready; an absent
     // authenticator in production means every auth route is 503, so it is also
@@ -710,11 +789,30 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
+    // A configured FOMO market source is a dependency even when its startup
+    // probe failed (for example an expired bridge session): readiness is only
+    // true once the bounded authenticated history proof observed it healthy.
+    let fomo_ok = if state.fomo_required {
+        state.fomo_ready.load(Ordering::SeqCst)
+    } else {
+        true
+    };
+    // A configured live execution path is a dependency even when a concrete
+    // transport or credential could not be proven: `/ready` fails rather than
+    // reporting a half-wired execution dependency as healthy. Without the
+    // explicit live opt-in the dependency is absent and readiness is unaffected.
+    let live_ok = if state.live_required {
+        state.live_ready
+    } else {
+        true
+    };
     let ready = relay_ok
         && artifact_ok
         && manifest_ok
         && dispatcher_ok
         && stream_ok
+        && fomo_ok
+        && live_ok
         && passkey_store_ok
         && recovery_ok;
     let body = serde_json::json!({
@@ -726,6 +824,8 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
             "release_manifest": manifest_ok,
             "dispatcher": dispatcher_ok,
             "stream": stream_ok,
+            "fomo_market": fomo_ok,
+            "live_execution": live_ok,
             "passkey_store": passkey_store_ok,
             "recovery_store": recovery_ok,
         }
@@ -1877,12 +1977,15 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
     let opened = crate::hardened_file::open_hardened(std::path::Path::new(&path))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    if opened.metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+    // A file too short to hold a header plus the AEAD tag can never be
+    // delivered; a file over the bound cannot be read. Both are refused before
+    // the read, and the read is capped again below.
+    if !artifact_length_is_deliverable(opened.metadata.len()) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let bytes = read_bounded_bytes(opened.file, MAX_ARTIFACT_BYTES)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if bytes.len() > MAX_ARTIFACT_BYTES {
+    if !artifact_length_is_deliverable(bytes.len() as u64) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     Ok(bytes)
@@ -1891,42 +1994,9 @@ fn load_workspace_artifact() -> Result<Vec<u8>, StatusCode> {
 /// A workspace artifact file is deliverable only when it is long enough to hold
 /// the header plus the AEAD tag and no larger than the hard bound. Kept as a
 /// named predicate so the exact boundary is unit-tested independently of the
-/// readiness probe's test seam.
+/// readiness probe.
 fn artifact_length_is_deliverable(len: u64) -> bool {
     (crypto_envelope::MIN_ARTIFACT_LEN as u64..=MAX_ARTIFACT_BYTES as u64).contains(&len)
-}
-
-/// Read only the bounded artifact header (version + KID + encapsulated key) for
-/// the unauthenticated readiness probe. This never allocates or hashes the full
-/// ciphertext, so a probe cannot be used to amplify memory/CPU.
-fn load_workspace_artifact_header() -> Result<ArtifactHeaderProbe, StatusCode> {
-    use std::io::Read;
-
-    let Ok(path) = std::env::var("WORKSPACE_ARTIFACT_PATH") else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    if path.is_empty() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let opened = crate::hardened_file::open_hardened(std::path::Path::new(&path))
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let header_len = crypto_envelope::ARTIFACT_HEADER_LEN as u64;
-    // A file too short to hold a header plus the AEAD tag can never be delivered,
-    // so it must not make readiness report a healthy artifact.
-    if !artifact_length_is_deliverable(opened.metadata.len()) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let mut header = vec![0u8; crypto_envelope::ARTIFACT_HEADER_LEN];
-    opened
-        .file
-        .take(header_len)
-        .read_exact(&mut header)
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(ArtifactHeaderProbe {
-        header,
-        size: opened.metadata.len(),
-    })
 }
 
 async fn deliver_artifact(
@@ -5443,6 +5513,34 @@ mod tests {
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["artifact"], false);
 
+        // Same-size corruption: a flipped ciphertext byte that keeps the header
+        // and length intact must fail the full manifest SHA-256 validation, so
+        // `/ready` cannot report the corrupted artifact as ready.
+        let corrupted = {
+            let mut bytes = artifact.clone();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0x01;
+            bytes
+        };
+        let manifest_for_original = test_manifest(&artifact, &keypair);
+        let tampered = state
+            .clone()
+            .with_artifact_loader(Arc::new({
+                let corrupted = corrupted.clone();
+                move || Ok(corrupted.clone())
+            }))
+            .with_manifest_loader(Arc::new(move || Ok(Some(manifest_for_original.clone()))));
+        let ready = get(router(tampered), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(
+            parsed["checks"]["artifact"], false,
+            "a same-size corrupted artifact must not be reported ready"
+        );
+        assert_eq!(parsed["manifest_configured"], true);
+
         // A header-length file whose public header is undeliverable (wrong
         // version / all-zero KID / all-zero encapsulated key) must not be
         // reported as a healthy artifact. The file is padded to
@@ -5498,6 +5596,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["checks"]["stream"], true);
 
+        // An unconfigured FOMO source is not a dependency.
+        assert_eq!(parsed["checks"]["fomo_market"], true);
+
         // When the composition advertises realtime, a dead stream fails `/ready`
         // while `/health` stays live (liveness is not readiness).
         let dead_stream = state
@@ -5513,6 +5614,55 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["stream"], false);
+
+        // A configured FOMO market source is a dependency even when its startup
+        // auth/probe failed: `/health` stays live but `/ready` fails until the
+        // bounded `/market/bars` history proof succeeds.
+        let dead_fomo = state
+            .clone()
+            .with_fomo_readiness(true, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            get(router(dead_fomo.clone()), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(router(dead_fomo), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["fomo_market"], false);
+
+        // A configured live execution path is a required dependency: an
+        // unproven live path (for example a missing credential or unreachable
+        // transport) fails `/ready` while `/health` stays live, and a proven one
+        // passes. Without the explicit opt-in the dependency is absent.
+        let unproven_live = state.clone().with_live_readiness(true, false);
+        assert_eq!(
+            get(router(unproven_live.clone()), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(router(unproven_live), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["live_execution"], false);
+
+        let proven_live = state.clone().with_live_readiness(true, true);
+        let ready = get(router(proven_live), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], true);
+        assert_eq!(parsed["checks"]["live_execution"], true);
+
+        // Not opted in: the live dependency is absent and does not gate readiness.
+        let not_required = state.clone().with_live_readiness(false, false);
+        let ready = get(router(not_required), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["checks"]["live_execution"], true);
     }
 
     #[test]

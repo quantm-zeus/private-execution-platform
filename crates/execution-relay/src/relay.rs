@@ -152,7 +152,6 @@ where
         )
         .map_err(|_| RelayError::SigningFailed)?;
         let request_digest = *signing_request.request_digest();
-        let key = &input.intent.idempotency_key;
         let binding = AttemptBinding::new(
             input.intent.user_id.clone(),
             input.intent.wallet_ref.clone(),
@@ -178,11 +177,11 @@ where
         let provider_idempotency = signing_request.provider_idempotency_id();
         if self
             .store
-            .record_sign_requested(key, &request_digest, &provider_idempotency)
+            .record_sign_requested(&binding, &request_digest, &provider_idempotency)
             .await
             .is_err()
         {
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+            self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                 .await;
             return Err(RelayError::StoreUnavailable);
         }
@@ -198,7 +197,7 @@ where
         let guard = match self.signing_breaker.admit_probe(input.now_ms) {
             Some(guard) => guard,
             None => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                     .await;
                 return Err(RelayError::SigningUnavailable);
             }
@@ -207,7 +206,7 @@ where
             Ok(signed) => signed,
             Err(_) => {
                 guard.failure(input.now_ms);
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                     .await;
                 return Err(RelayError::SigningFailed);
             }
@@ -217,7 +216,7 @@ where
             || signed.idempotency_key() != signing_request.idempotency_key()
         {
             guard.failure(input.now_ms);
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+            self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                 .await;
             return Err(RelayError::SigningRequestMismatch);
         }
@@ -227,11 +226,11 @@ where
         //    reference, so a restart can reconcile without re-signing.
         if self
             .store
-            .record_signed_reference(key, &request_digest, signed.reference())
+            .record_signed_reference(&binding, &request_digest, signed.reference())
             .await
             .is_err()
         {
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+            self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                 .await;
             return Ok(RelayOutcome::FailedBeforeSubmit);
         }
@@ -240,7 +239,7 @@ where
         let signed_payload = match self.payload_source.signed_payload(&signed).await {
             Ok(payload) => payload,
             Err(_) => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                     .await;
                 return Err(RelayError::MissingSignedPayload);
             }
@@ -250,7 +249,7 @@ where
         let request = match SubmitRequest::bind(&signing_request, &signed, &signed_payload, chain) {
             Ok(request) => request,
             Err(error) => {
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                     .await;
                 return Err(error);
             }
@@ -263,11 +262,11 @@ where
         //     persistence failure aborts before the adapter is called.
         if self
             .store
-            .record_submission(key, &request_digest, &request)
+            .record_submission(&binding, &request_digest, &request)
             .await
             .is_err()
         {
-            self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+            self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                 .await;
             return Err(RelayError::StoreUnavailable);
         }
@@ -283,7 +282,7 @@ where
                 // A concurrent attempt consumed the probe between the gate and
                 // the submit: fail closed without sending. No chain call
                 // occurred, so this is a definitive pre-send failure.
-                self.record_outcome(key, &request_digest, RelayOutcome::FailedBeforeSubmit)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::FailedBeforeSubmit)
                     .await;
                 return Err(RelayError::ChainHealthUnavailable);
             }
@@ -301,7 +300,7 @@ where
                     self.journal_set_chain_reference(&binding, &receipt.reference);
                 }
                 if receipt.reference.trim().is_empty() {
-                    self.record_outcome(key, &request_digest, RelayOutcome::Unknown)
+                    self.record_outcome(&binding, &request_digest, RelayOutcome::Unknown)
                         .await;
                     return Ok(RelayOutcome::Unknown);
                 }
@@ -309,7 +308,7 @@ where
                     reference: receipt.reference,
                     state: SubmissionState::Unknown,
                 };
-                self.record_outcome(key, &request_digest, outcome.clone())
+                self.record_outcome(&binding, &request_digest, outcome.clone())
                     .await;
                 Ok(outcome)
             }
@@ -318,7 +317,7 @@ where
                 let outcome = RelayOutcome::Rejected {
                     final_reason: "adapter rejected submission".to_string(),
                 };
-                self.record_outcome(key, &request_digest, outcome.clone())
+                self.record_outcome(&binding, &request_digest, outcome.clone())
                     .await;
                 Ok(outcome)
             }
@@ -328,7 +327,7 @@ where
                 // before failing, so the relay cannot assume "no send". Store
                 // and return Unknown: reconciliation is required, never a retry.
                 probe.failure(input.now_ms);
-                self.record_outcome(key, &request_digest, RelayOutcome::Unknown)
+                self.record_outcome(&binding, &request_digest, RelayOutcome::Unknown)
                     .await;
                 Ok(RelayOutcome::Unknown)
             }
@@ -356,26 +355,28 @@ where
 
     /// Reconciles a previously executed attempt. NEVER submits.
     ///
-    /// The bound submission is taken from the in-process journal when present,
-    /// and otherwise rehydrated from the durable store, so a restart that lost
-    /// the process-local journal can still reconcile a broadcast attempt. An
-    /// absent durable submission is [`RelayError::InvalidTransition`] (which
-    /// callers treat as ambiguous: never retry); a store failure is
+    /// The full `(owner, workspace, idempotency_key)` binding is required, so a
+    /// caller without its own row can never select another tenant's attempt. The
+    /// bound submission is taken from the in-process journal when present, and
+    /// otherwise rehydrated from the durable store, so a restart that lost the
+    /// process-local journal can still reconcile a broadcast attempt. An absent
+    /// durable submission is [`RelayError::InvalidTransition`] (which callers
+    /// treat as ambiguous: never retry); a store failure is
     /// [`RelayError::StoreUnavailable`].
     pub async fn reconcile(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         now_ms: i64,
     ) -> Result<RelayOutcome, RelayError> {
         // A terminal outcome is never downgraded by a later ambiguous chain read.
-        if let Ok(Some(outcome)) = self.store.load_outcome(key).await {
+        if let Ok(Some(outcome)) = self.store.load_outcome(binding).await {
             if outcome.attempt_status().is_terminal() {
                 return Ok(outcome);
             }
         }
-        let request = match self.journal_get(key)? {
+        let request = match self.journal_get(binding)? {
             Some(request) => request,
-            None => match self.store.load_submission(key).await {
+            None => match self.store.load_submission(binding).await {
                 Ok(Some(submission)) => SubmitRequest::restore(&submission)?,
                 Ok(None) => return Err(RelayError::InvalidTransition),
                 Err(_) => return Err(RelayError::StoreUnavailable),
@@ -398,7 +399,7 @@ where
             ChainObservation::Rejected { final_reason } => RelayOutcome::Rejected { final_reason },
             ChainObservation::Pending | ChainObservation::Unknown => RelayOutcome::Unknown,
         };
-        self.record_outcome(key, request.request_digest(), outcome.clone())
+        self.record_outcome(binding, request.request_digest(), outcome.clone())
             .await;
         Ok(outcome)
     }
@@ -439,16 +440,16 @@ where
     /// transient journal error must not turn a completed attempt into an error a
     /// caller might retry. The at-most-once submit invariant is unaffected — the
     /// reservation claimed *before* signing still blocks any resubmission for the
-    /// same `(key, digest)`. A duplicate may therefore observe a stale in-memory
-    /// outcome, but it can never reach the signing boundary or the chain adapter
-    /// again.
+    /// same `(owner, workspace, key, digest)`. A duplicate may therefore observe
+    /// a stale in-memory outcome, but it can never reach the signing boundary or
+    /// the chain adapter again.
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) {
-        let _ = self.store.record_outcome(key, digest, outcome).await;
+        let _ = self.store.record_outcome(binding, digest, outcome).await;
     }
 
     fn journal_key(binding: &AttemptBinding) -> (String, String, IdempotencyKey) {
@@ -471,24 +472,14 @@ where
         }
     }
 
-    /// Looks up the journaled submission by idempotency key.
+    /// Looks up the journaled submission by the full attempt binding.
     ///
-    /// Fails closed when more than one owner/workspace shares the key, rather
-    /// than reconciling an arbitrary attempt.
-    fn journal_get(&self, key: &IdempotencyKey) -> Result<Option<SubmitRequest>, RelayError> {
+    /// The lookup is exact on `(owner, workspace, idempotency_key)`, so a caller
+    /// can never reconcile another owner's attempt that happens to share the
+    /// same idempotency key.
+    fn journal_get(&self, binding: &AttemptBinding) -> Result<Option<SubmitRequest>, RelayError> {
         let journal = crate::lock(&self.journal);
-        let mut found: Option<&SubmitRequest> = None;
-        let mut count = 0usize;
-        for ((_, _, stored_key), request) in journal.iter() {
-            if stored_key == key {
-                count += 1;
-                found = Some(request);
-            }
-        }
-        if count > 1 {
-            return Err(RelayError::StoreUnavailable);
-        }
-        Ok(found.cloned())
+        Ok(journal.get(&Self::journal_key(binding)).cloned())
     }
 }
 

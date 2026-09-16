@@ -26,9 +26,9 @@ use domain::{
     ValidatedExecutionPreview, WalletRef,
 };
 use execution_relay::{
-    ChainHealth, ChainHealthBreaker, ChainSubmissionAdapter, DeterministicDurableStore,
-    ExecutionRelay, PrivySigningBoundaryAdapter, RelayError, RelayExecutionInput, RelayOutcome,
-    SignedPayload, SignedPayloadSource,
+    AttemptBinding, ChainHealth, ChainHealthBreaker, ChainSubmissionAdapter,
+    DeterministicDurableStore, ExecutionRelay, PrivySigningBoundaryAdapter, RelayError,
+    RelayExecutionInput, RelayOutcome, SignedPayload, SignedPayloadSource,
 };
 use market_types::{AssetAmount, AtomicAmount, Bps, Freshness, Sequence};
 use policy::{
@@ -378,7 +378,7 @@ async fn live_one_chain_signs_once_submits_once_and_reconciles() {
     // Reconciliation is read-only and observes the exact fill.
     let reconciled = h
         .relay
-        .reconcile(&h.fixtures.intent.idempotency_key, NOW_MS)
+        .reconcile(&AttemptBinding::from_intent(&h.fixtures.intent), NOW_MS)
         .await
         .expect("reconcile");
     assert!(matches!(
@@ -430,7 +430,10 @@ async fn restart_over_the_same_durable_store_reconciles_without_resubmit() {
     second.adapter.refresh_health().await;
     let reconciled = second
         .relay
-        .reconcile(&second.fixtures.intent.idempotency_key, NOW_MS)
+        .reconcile(
+            &AttemptBinding::from_intent(&second.fixtures.intent),
+            NOW_MS,
+        )
         .await
         .expect("reconcile");
     assert!(matches!(

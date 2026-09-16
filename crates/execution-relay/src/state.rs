@@ -13,7 +13,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use chain_types::ChainId;
-use domain::{IdempotencyKey, IntentId, OrderStatus, UserId, WalletRef};
+use domain::{IdempotencyKey, IntentId, OrderStatus, TradeIntent, UserId, WalletRef};
 use privy::{PayloadDigest, ProviderIdempotencyId, RequestDigest};
 use sha2::{Digest, Sha256};
 
@@ -109,6 +109,22 @@ impl AttemptBinding {
     /// The chain the attempt is bound to (stable chain reference data).
     pub fn chain(&self) -> &ChainId {
         &self.chain
+    }
+
+    /// Builds the full owner/workspace binding for a trade intent.
+    ///
+    /// This is the canonical way a caller (relay, executor, reconciler) derives
+    /// the exact durable identity, so every transition and read predicates the
+    /// same `(owner, workspace, idempotency_key)` primary key rather than a bare
+    /// key that two tenants could share.
+    pub fn from_intent(intent: &TradeIntent) -> Self {
+        Self::new(
+            intent.user_id.clone(),
+            intent.wallet_ref.clone(),
+            intent.idempotency_key.clone(),
+            intent.id.clone(),
+            intent.chain.clone(),
+        )
     }
 }
 
@@ -452,21 +468,22 @@ pub trait AttemptReservationStore: Send + Sync {
     ///
     /// The default is a no-op. A durable store must persist this **before** the
     /// signing boundary is invoked; a store error must abort the attempt
-    /// fail-closed without signing.
+    /// fail-closed without signing. The full owner/workspace binding is carried
+    /// so the transition can only ever land on the caller's own attempt.
     async fn record_sign_requested(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
-        let _ = (key, digest, provider_idempotency);
+        let _ = (binding, digest, provider_idempotency);
         Ok(())
     }
 
-    /// Records that the signing boundary produced a reference for `(key, digest)`.
+    /// Records that the signing boundary produced a reference for `binding`.
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError>;
 
@@ -476,12 +493,12 @@ pub trait AttemptReservationStore: Send + Sync {
     /// working; a durable store persists the reference for reconciliation.
     async fn record_signed_reference(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         signed_reference: &str,
     ) -> Result<(), RelayError> {
         let _ = signed_reference;
-        self.record_signed(key, digest).await
+        self.record_signed(binding, digest).await
     }
 
     /// Durably persists the fully bound submission **before** the chain adapter
@@ -491,23 +508,25 @@ pub trait AttemptReservationStore: Send + Sync {
     /// durable store error must abort before any submit.
     async fn record_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         request: &SubmitRequest,
     ) -> Result<(), RelayError> {
-        let _ = (key, digest, request);
+        let _ = (binding, digest, request);
         Ok(())
     }
 
     /// Loads the durable submission for restart reconciliation.
     ///
-    /// Returns `Ok(None)` when no durable submission exists (the default), and
-    /// fails closed if the lookup is ambiguous or the store is unavailable.
+    /// The lookup is scoped to the full `(owner, workspace, idempotency_key)`
+    /// binding, so a caller can never select another tenant's attempt. Returns
+    /// `Ok(None)` when no durable submission exists (the default), and fails
+    /// closed if the store is unavailable.
     async fn load_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
-        let _ = key;
+        let _ = binding;
         Ok(None)
     }
 
@@ -515,17 +534,20 @@ pub trait AttemptReservationStore: Send + Sync {
     ///
     /// Returns `Ok(None)` when no outcome is stored (the default). A terminal
     /// outcome ([`AttemptStatus::is_terminal`]) lets `reconcile` return it
-    /// directly, so a later ambiguous chain read can never downgrade a confirmed
-    /// or rejected attempt.
-    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
-        let _ = key;
+    /// directly, so a later ambiguous chain read can never downgrade a confirmed,
+    /// rejected, or definitively pre-send-failed attempt.
+    async fn load_outcome(
+        &self,
+        binding: &AttemptBinding,
+    ) -> Result<Option<RelayOutcome>, RelayError> {
+        let _ = binding;
         Ok(None)
     }
 
-    /// Records the terminal/in-flight outcome for `(key, digest)`.
+    /// Records the terminal/in-flight outcome for `binding`.
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError>;
@@ -570,61 +592,64 @@ impl<T: AttemptReservationStore + ?Sized> AttemptReservationStore for std::sync:
 
     async fn record_sign_requested(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
         (**self)
-            .record_sign_requested(key, digest, provider_idempotency)
+            .record_sign_requested(binding, digest, provider_idempotency)
             .await
     }
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        (**self).record_signed(key, digest).await
+        (**self).record_signed(binding, digest).await
     }
 
     async fn record_signed_reference(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         signed_reference: &str,
     ) -> Result<(), RelayError> {
         (**self)
-            .record_signed_reference(key, digest, signed_reference)
+            .record_signed_reference(binding, digest, signed_reference)
             .await
     }
 
     async fn record_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         request: &SubmitRequest,
     ) -> Result<(), RelayError> {
-        (**self).record_submission(key, digest, request).await
+        (**self).record_submission(binding, digest, request).await
     }
 
     async fn load_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
-        (**self).load_submission(key).await
+        (**self).load_submission(binding).await
     }
 
-    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
-        (**self).load_outcome(key).await
+    async fn load_outcome(
+        &self,
+        binding: &AttemptBinding,
+    ) -> Result<Option<RelayOutcome>, RelayError> {
+        (**self).load_outcome(binding).await
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
-        (**self).record_outcome(key, digest, outcome).await
+        (**self).record_outcome(binding, digest, outcome).await
     }
 }
 

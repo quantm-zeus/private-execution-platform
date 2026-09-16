@@ -269,13 +269,13 @@ impl MarketExecutionPort for RecordingExecution {
 
     async fn reconcile(
         &self,
-        idempotency_key: &IdempotencyKey,
+        binding: &execution_relay::AttemptBinding,
         now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         self.reconcile_seen
             .lock()
             .expect("lock")
-            .push((idempotency_key.clone(), now_ms));
+            .push((binding.idempotency_key().clone(), now_ms));
         self.reconcile_result
     }
 }

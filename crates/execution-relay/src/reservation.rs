@@ -27,10 +27,14 @@ struct StoreEntry {
     outcome: Option<RelayOutcome>,
 }
 
-/// Process-local reservation store keyed by idempotency key.
+/// Process-local reservation store keyed by the full attempt identity.
+///
+/// It is the minimal store used by unit tests, but it still scopes entries to
+/// `(owner, workspace, idempotency_key)` so a cross-owner key reuse cannot be
+/// mistaken for a duplicate of the same attempt.
 #[derive(Default)]
 pub struct InMemoryReservationStore {
-    entries: Mutex<HashMap<IdempotencyKey, StoreEntry>>,
+    entries: Mutex<HashMap<DurableKey, StoreEntry>>,
 }
 
 impl InMemoryReservationStore {
@@ -49,16 +53,26 @@ impl AttemptReservationStore for InMemoryReservationStore {
         key: &IdempotencyKey,
         digest: &RequestDigest,
     ) -> Result<Reservation, RelayError> {
+        let binding = legacy_binding(key)?;
+        self.reserve_bound(&binding, digest).await
+    }
+
+    async fn reserve_bound(
+        &self,
+        binding: &AttemptBinding,
+        digest: &RequestDigest,
+    ) -> Result<Reservation, RelayError> {
         let digest = *digest.as_bytes();
+        let key = DurableKey::from_binding(binding);
         let mut entries = crate::lock(&self.entries);
-        match entries.get(key) {
+        match entries.get(&key) {
             Some(entry) if entry.digest == digest => Ok(Reservation::AlreadyReserved(
                 entry.outcome.clone().unwrap_or(RelayOutcome::Reserved),
             )),
             Some(_) => Ok(Reservation::Conflict),
             None => {
                 entries.insert(
-                    key.clone(),
+                    key,
                     StoreEntry {
                         digest,
                         outcome: None,
@@ -71,12 +85,13 @@ impl AttemptReservationStore for InMemoryReservationStore {
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
         let digest = *digest.as_bytes();
+        let key = DurableKey::from_binding(binding);
         let mut entries = crate::lock(&self.entries);
-        match entries.get_mut(key) {
+        match entries.get_mut(&key) {
             Some(entry) if entry.digest == digest => {
                 if entry.outcome.is_none() {
                     entry.outcome = Some(RelayOutcome::Signed);
@@ -89,14 +104,24 @@ impl AttemptReservationStore for InMemoryReservationStore {
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
         let digest = *digest.as_bytes();
+        let key = DurableKey::from_binding(binding);
         let mut entries = crate::lock(&self.entries);
-        match entries.get_mut(key) {
+        match entries.get_mut(&key) {
             Some(entry) if entry.digest == digest => {
+                // A terminal outcome is never overwritten, matching the durable
+                // reference store and the Postgres monotonic guard.
+                if entry
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|existing| existing.attempt_status().is_terminal())
+                {
+                    return Ok(());
+                }
                 entry.outcome = Some(outcome);
                 Ok(())
             }
@@ -109,6 +134,24 @@ impl AttemptReservationStore for InMemoryReservationStore {
 /// entry point, which carries no owning identity.
 const LEGACY_OWNER: &str = "attempt-store-legacy-owner";
 const LEGACY_WORKSPACE: &str = "attempt-store-legacy-workspace";
+
+/// Synthetic binding for the legacy key-only entry point.
+///
+/// Durable production stores reject the bare-key path outright; this exists so
+/// the process-local test seam keeps working with an explicit, fixed identity.
+fn legacy_binding(key: &IdempotencyKey) -> Result<AttemptBinding, RelayError> {
+    let owner = UserId::new(LEGACY_OWNER).map_err(|_| RelayError::StoreUnavailable)?;
+    let workspace = WalletRef::new(LEGACY_WORKSPACE).map_err(|_| RelayError::StoreUnavailable)?;
+    let intent_id =
+        domain::IntentId::new(LEGACY_OWNER).map_err(|_| RelayError::StoreUnavailable)?;
+    Ok(AttemptBinding::new(
+        owner,
+        workspace,
+        key.clone(),
+        intent_id,
+        chain_types::ChainId::Base,
+    ))
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DurableKey {
@@ -158,34 +201,18 @@ impl DeterministicDurableStore {
     }
 
     fn legacy_binding(key: &IdempotencyKey) -> Result<AttemptBinding, RelayError> {
-        let owner = UserId::new(LEGACY_OWNER).map_err(|_| RelayError::StoreUnavailable)?;
-        let workspace =
-            WalletRef::new(LEGACY_WORKSPACE).map_err(|_| RelayError::StoreUnavailable)?;
-        let intent_id =
-            domain::IntentId::new(LEGACY_OWNER).map_err(|_| RelayError::StoreUnavailable)?;
-        Ok(AttemptBinding::new(
-            owner,
-            workspace,
-            key.clone(),
-            intent_id,
-            chain_types::ChainId::Base,
-        ))
+        legacy_binding(key)
     }
 
     /// Returns the persisted status for `binding`, when the attempt exists.
     pub fn status(&self, binding: &AttemptBinding) -> Option<AttemptStatus> {
-        let key = DurableKey::from_binding(binding);
-        crate::lock(&self.attempts)
-            .get(&key)
-            .map(|entry| entry.status)
+        self.entry_for(binding).map(|entry| entry.status)
     }
 
     /// Returns the persisted provider idempotency identifier, when present.
     pub fn provider_idempotency(&self, binding: &AttemptBinding) -> Option<String> {
-        let key = DurableKey::from_binding(binding);
-        crate::lock(&self.attempts)
-            .get(&key)
-            .and_then(|entry| entry.provider_idempotency.clone())
+        self.entry_for(binding)
+            .and_then(|entry| entry.provider_idempotency)
     }
 
     /// Number of distinct attempts retained (the primary key cardinality).
@@ -198,14 +225,14 @@ impl DeterministicDurableStore {
         self.len() == 0
     }
 
-    /// Applies `mutate` to the unique entry matching `key` + `digest`.
+    /// Applies `mutate` to the unique entry matching `binding` + `digest`.
     ///
-    /// Returns [`RelayError::ReservationUnavailable`] when no entry matches and
-    /// [`RelayError::StoreUnavailable`] when the match is ambiguous, so a
-    /// transition never lands on the wrong attempt.
+    /// The lookup is exact on the `(owner, workspace, idempotency_key)` primary
+    /// key, so a transition can never land on a different tenant's attempt.
+    /// Returns [`RelayError::ReservationUnavailable`] when no entry matches.
     fn with_entry<F>(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         mutate: F,
     ) -> Result<(), RelayError>
@@ -213,42 +240,21 @@ impl DeterministicDurableStore {
         F: FnOnce(&mut DurableEntry),
     {
         let digest = *digest.as_bytes();
+        let key = DurableKey::from_binding(binding);
         let mut attempts = crate::lock(&self.attempts);
-        let mut matched: Option<&mut DurableEntry> = None;
-        for (stored_key, entry) in attempts.iter_mut() {
-            if stored_key.idempotency_key == *key && entry.digest == digest {
-                if matched.is_some() {
-                    return Err(RelayError::StoreUnavailable);
-                }
-                matched = Some(entry);
-            }
-        }
-        match matched {
-            Some(entry) => {
+        match attempts.get_mut(&key) {
+            Some(entry) if entry.digest == digest => {
                 mutate(entry);
                 Ok(())
             }
-            None => Err(RelayError::ReservationUnavailable),
+            _ => Err(RelayError::ReservationUnavailable),
         }
     }
 
-    /// Finds the unique entry for `key` regardless of owner/workspace.
-    fn unique_by_key(&self, key: &IdempotencyKey) -> Result<Option<DurableEntry>, RelayError> {
-        let attempts = crate::lock(&self.attempts);
-        let mut matched: Option<&DurableEntry> = None;
-        let mut count = 0usize;
-        for (stored_key, entry) in attempts.iter() {
-            if stored_key.idempotency_key == *key {
-                count += 1;
-                matched = Some(entry);
-            }
-        }
-        if count > 1 {
-            // Ambiguous across owners/workspaces: fail closed rather than
-            // reconcile the wrong attempt.
-            return Err(RelayError::StoreUnavailable);
-        }
-        Ok(matched.cloned())
+    /// Finds the entry named by the full attempt binding.
+    fn entry_for(&self, binding: &AttemptBinding) -> Option<DurableEntry> {
+        let key = DurableKey::from_binding(binding);
+        crate::lock(&self.attempts).get(&key).cloned()
     }
 }
 
@@ -295,12 +301,17 @@ impl AttemptReservationStore for DeterministicDurableStore {
 
     async fn record_sign_requested(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
         let value = provider_idempotency.as_str().to_string();
-        self.with_entry(key, digest, |entry| {
+        self.with_entry(binding, digest, |entry| {
+            // A terminal attempt is immutable, matching the Postgres
+            // `status IN (...)` transition predicates.
+            if entry.status.is_terminal() {
+                return;
+            }
             entry.status = AttemptStatus::SignRequested;
             entry.provider_idempotency = Some(value);
         })
@@ -308,10 +319,13 @@ impl AttemptReservationStore for DeterministicDurableStore {
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        self.with_entry(key, digest, |entry| {
+        self.with_entry(binding, digest, |entry| {
+            if entry.status.is_terminal() {
+                return;
+            }
             entry.status = AttemptStatus::Signed;
             if entry.outcome.is_none() {
                 entry.outcome = Some(RelayOutcome::Signed);
@@ -321,12 +335,15 @@ impl AttemptReservationStore for DeterministicDurableStore {
 
     async fn record_signed_reference(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         signed_reference: &str,
     ) -> Result<(), RelayError> {
         let value = signed_reference.to_string();
-        self.with_entry(key, digest, |entry| {
+        self.with_entry(binding, digest, |entry| {
+            if entry.status.is_terminal() {
+                return;
+            }
             entry.status = AttemptStatus::Signed;
             entry.signed_reference = Some(value);
             if entry.outcome.is_none() {
@@ -337,12 +354,15 @@ impl AttemptReservationStore for DeterministicDurableStore {
 
     async fn record_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         request: &SubmitRequest,
     ) -> Result<(), RelayError> {
         let submission = DurableSubmission::from_request(request)?;
-        self.with_entry(key, digest, |entry| {
+        self.with_entry(binding, digest, |entry| {
+            if entry.status.is_terminal() {
+                return;
+            }
             entry.submission = Some(submission);
             entry.status = AttemptStatus::SubmissionUnknown;
             // A duplicate execute after this boundary must observe an ambiguous
@@ -353,22 +373,25 @@ impl AttemptReservationStore for DeterministicDurableStore {
 
     async fn load_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
-        Ok(self.unique_by_key(key)?.and_then(|entry| entry.submission))
+        Ok(self.entry_for(binding).and_then(|entry| entry.submission))
     }
 
-    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
-        Ok(self.unique_by_key(key)?.and_then(|entry| entry.outcome))
+    async fn load_outcome(
+        &self,
+        binding: &AttemptBinding,
+    ) -> Result<Option<RelayOutcome>, RelayError> {
+        Ok(self.entry_for(binding).and_then(|entry| entry.outcome))
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
-        self.with_entry(key, digest, |entry| {
+        self.with_entry(binding, digest, |entry| {
             // A terminal outcome is never downgraded by a later observation.
             if entry.status.is_terminal() {
                 return;
@@ -393,5 +416,155 @@ fn outcome_reference(outcome: &RelayOutcome) -> Option<&str> {
             Some(reference.as_str())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chain_types::ChainId;
+    use domain::IntentId;
+
+    fn binding(owner: &str, workspace: &str, key: &str) -> AttemptBinding {
+        AttemptBinding::new(
+            UserId::new(owner).expect("owner"),
+            WalletRef::new(workspace).expect("workspace"),
+            IdempotencyKey::new(key).expect("key"),
+            IntentId::new(format!("intent-{key}")).expect("intent"),
+            ChainId::Base,
+        )
+    }
+
+    fn digest(byte: u8) -> RequestDigest {
+        RequestDigest::from_bytes([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn cross_owner_same_key_is_distinct_and_never_crosses() {
+        let store = DeterministicDurableStore::new();
+        let alice = binding("owner-a", "wallet-a", "shared-key");
+        let bob = binding("owner-b", "wallet-b", "shared-key");
+        let digest = digest(7);
+
+        // The same idempotency key under two owners is two distinct attempts.
+        assert_eq!(
+            store.reserve_bound(&alice, &digest).await,
+            Ok(Reservation::Reserved)
+        );
+        assert_eq!(
+            store.reserve_bound(&bob, &digest).await,
+            Ok(Reservation::Reserved)
+        );
+        assert_eq!(store.len(), 2);
+
+        store
+            .record_signed_reference(&alice, &digest, "alice-signed")
+            .await
+            .expect("alice signed");
+        assert_eq!(store.status(&alice), Some(AttemptStatus::Signed));
+        assert_eq!(store.status(&bob), Some(AttemptStatus::Reserved));
+
+        // A transition on one owner never lands on the other, and a read for
+        // another owner never observes a foreign row.
+        store
+            .record_outcome(&alice, &digest, RelayOutcome::Unknown)
+            .await
+            .expect("alice outcome");
+        assert_eq!(store.status(&alice), Some(AttemptStatus::SubmissionUnknown));
+        assert_eq!(store.status(&bob), Some(AttemptStatus::Reserved));
+        assert_eq!(store.load_outcome(&bob).await, Ok(None));
+
+        // A third owner sharing the key has no row at all and reads `None`
+        // rather than the first matching attempt.
+        let carol = binding("owner-c", "wallet-c", "shared-key");
+        assert_eq!(store.load_submission(&carol).await, Ok(None));
+        assert_eq!(store.load_outcome(&carol).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn failed_before_submit_is_terminal_in_the_durable_store() {
+        let store = DeterministicDurableStore::new();
+        let binding = binding("owner", "wallet", "terminal-key");
+        let digest = digest(9);
+        store
+            .reserve_bound(&binding, &digest)
+            .await
+            .expect("reserve");
+        store
+            .record_outcome(&binding, &digest, RelayOutcome::FailedBeforeSubmit)
+            .await
+            .expect("failed before submit");
+
+        // A later ambiguous observation must never overwrite the terminal state.
+        store
+            .record_outcome(&binding, &digest, RelayOutcome::Unknown)
+            .await
+            .expect("late unknown");
+        store
+            .record_outcome(
+                &binding,
+                &digest,
+                RelayOutcome::Confirmed {
+                    reference: "late".to_string(),
+                    fill: None,
+                },
+            )
+            .await
+            .expect("late confirmation");
+        assert_eq!(
+            store.status(&binding),
+            Some(AttemptStatus::FailedBeforeSubmit)
+        );
+        assert_eq!(
+            store.load_outcome(&binding).await,
+            Ok(Some(RelayOutcome::FailedBeforeSubmit))
+        );
+
+        // A late signing/submission transition must not resurrect the attempt by
+        // flipping its status back to a non-terminal state, which would reopen
+        // the outcome guard and let a later ambiguous write downgrade it.
+        store
+            .record_sign_requested(
+                &binding,
+                &digest,
+                &ProviderIdempotencyId::from_string("late-idem"),
+            )
+            .await
+            .expect("late sign requested");
+        store
+            .record_signed_reference(&binding, &digest, "late-signed")
+            .await
+            .expect("late signed reference");
+        assert_eq!(
+            store.status(&binding),
+            Some(AttemptStatus::FailedBeforeSubmit)
+        );
+        store
+            .record_outcome(&binding, &digest, RelayOutcome::Unknown)
+            .await
+            .expect("late unknown after transitions");
+        assert_eq!(
+            store.load_outcome(&binding).await,
+            Ok(Some(RelayOutcome::FailedBeforeSubmit))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_key_only_reserve_uses_a_distinct_synthetic_identity() {
+        // The legacy key-only path uses a fixed synthetic identity; a real owner
+        // reusing the same key must remain a distinct attempt, never a replay.
+        let store = DeterministicDurableStore::new();
+        let key = IdempotencyKey::new("legacy-shared").expect("key");
+        let digest = digest(3);
+        assert_eq!(
+            store.reserve(&key, &digest).await,
+            Ok(Reservation::Reserved)
+        );
+        let real = binding("real-owner", "real-wallet", "legacy-shared");
+        assert_eq!(
+            store.reserve_bound(&real, &digest).await,
+            Ok(Reservation::Reserved)
+        );
+        assert_eq!(store.len(), 2);
     }
 }

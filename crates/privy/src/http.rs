@@ -52,6 +52,17 @@ impl PrivyHttpClient for UnavailablePrivyHttpClient {
     }
 }
 
+#[async_trait]
+impl<T: PrivyHttpClient + ?Sized> PrivyHttpClient for std::sync::Arc<T> {
+    async fn submit_signing_request(
+        &self,
+        request: &SigningRequest,
+        idempotency: &ProviderIdempotencyId,
+    ) -> Result<String, PrivyError> {
+        (**self).submit_signing_request(request, idempotency).await
+    }
+}
+
 /// Production signing transport over an injected HTTP client.
 pub struct PrivyHttpSigningTransport<C: PrivyHttpClient> {
     client: C,

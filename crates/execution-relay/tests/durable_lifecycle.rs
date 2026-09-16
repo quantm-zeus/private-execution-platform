@@ -87,7 +87,7 @@ impl AttemptReservationStore for FaultStore {
 
     async fn record_sign_requested(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
@@ -95,21 +95,21 @@ impl AttemptReservationStore for FaultStore {
             return Err(RelayError::StoreUnavailable);
         }
         self.inner
-            .record_sign_requested(key, digest, provider_idempotency)
+            .record_sign_requested(binding, digest, provider_idempotency)
             .await
     }
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        self.inner.record_signed(key, digest).await
+        self.inner.record_signed(binding, digest).await
     }
 
     async fn record_signed_reference(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         signed_reference: &str,
     ) -> Result<(), RelayError> {
@@ -117,43 +117,46 @@ impl AttemptReservationStore for FaultStore {
             return Err(RelayError::StoreUnavailable);
         }
         self.inner
-            .record_signed_reference(key, digest, signed_reference)
+            .record_signed_reference(binding, digest, signed_reference)
             .await
     }
 
     async fn record_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         request: &SubmitRequest,
     ) -> Result<(), RelayError> {
         if self.current() == FailPoint::Submission {
             return Err(RelayError::StoreUnavailable);
         }
-        self.inner.record_submission(key, digest, request).await
+        self.inner.record_submission(binding, digest, request).await
     }
 
     async fn load_submission(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
-        self.inner.load_submission(key).await
+        self.inner.load_submission(binding).await
     }
 
-    async fn load_outcome(&self, key: &IdempotencyKey) -> Result<Option<RelayOutcome>, RelayError> {
-        self.inner.load_outcome(key).await
+    async fn load_outcome(
+        &self,
+        binding: &AttemptBinding,
+    ) -> Result<Option<RelayOutcome>, RelayError> {
+        self.inner.load_outcome(binding).await
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
         if self.current() == FailPoint::Outcome {
             return Err(RelayError::StoreUnavailable);
         }
-        self.inner.record_outcome(key, digest, outcome).await
+        self.inner.record_outcome(binding, digest, outcome).await
     }
 }
 
@@ -356,7 +359,7 @@ async fn submission_timeout_is_unknown_and_reconciles_without_resubmit() {
     );
     let reconciled = after
         .relay
-        .reconcile(&after.intent.idempotency_key, support::NOW_MS)
+        .reconcile(&after.binding(), support::NOW_MS)
         .await;
     assert!(matches!(reconciled, Ok(RelayOutcome::Confirmed { .. })));
     assert_eq!(
@@ -411,7 +414,7 @@ async fn broadcast_before_receipt_reconciles_the_exact_submission() {
 
     let reconciled = after
         .relay
-        .reconcile(&after.intent.idempotency_key, support::NOW_MS)
+        .reconcile(&after.binding(), support::NOW_MS)
         .await;
     assert!(matches!(reconciled, Ok(RelayOutcome::Confirmed { .. })));
     assert_eq!(after.adapter.queries.load(Ordering::SeqCst), 1);
@@ -441,7 +444,7 @@ async fn restart_reconcile_reads_the_durable_submission_not_the_journal() {
     );
     let reconciled = after
         .relay
-        .reconcile(&after.intent.idempotency_key, support::NOW_MS)
+        .reconcile(&after.binding(), support::NOW_MS)
         .await;
     assert!(matches!(reconciled, Ok(RelayOutcome::Confirmed { .. })));
     assert_eq!(
@@ -508,4 +511,37 @@ async fn signed_reference_persisted_then_payload_failure_replays_signed() {
     assert!(matches!(replay, Ok(RelayOutcome::Signed)));
     assert_eq!(after.signing.calls.load(Ordering::SeqCst), 0);
     assert_eq!(after.adapter.submits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reconcile_never_crosses_the_owner_workspace_boundary() {
+    // Owner A executes and journals a submission.
+    let h = harness(MockBehavior::Accept, ChainObservation::Unknown);
+    assert!(matches!(
+        h.relay.execute(h.input()).await,
+        Ok(RelayOutcome::Submitted { .. })
+    ));
+    assert_eq!(h.adapter.submits.load(Ordering::SeqCst), 1);
+
+    // A different owner reusing the same idempotency key has no durable row and
+    // no journal entry. Reconcile must fail closed rather than select A's
+    // attempt, and must never touch the adapter.
+    let foreign = AttemptBinding::new(
+        domain::UserId::new("foreign-owner").expect("owner"),
+        h.intent.wallet_ref.clone(),
+        h.intent.idempotency_key.clone(),
+        h.intent.id.clone(),
+        h.intent.chain.clone(),
+    );
+    assert_eq!(
+        h.relay.reconcile(&foreign, support::NOW_MS).await,
+        Err(RelayError::InvalidTransition)
+    );
+    assert_eq!(h.adapter.queries.load(Ordering::SeqCst), 0);
+
+    // The true owner still reconciles its own attempt.
+    assert!(matches!(
+        h.relay.reconcile(&h.binding(), support::NOW_MS).await,
+        Ok(RelayOutcome::Confirmed { .. }) | Ok(RelayOutcome::Unknown)
+    ));
 }

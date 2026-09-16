@@ -8,7 +8,8 @@ use std::sync::Arc;
 use chain_types::ChainId;
 use domain::{IdempotencyKey, OrderStatus};
 use execution_relay::{
-    ChainHealth, ObservedFill, RelayError, RelayExecutionInput, RelayOutcome, SubmissionState,
+    AttemptBinding, ChainHealth, ObservedFill, RelayError, RelayExecutionInput, RelayOutcome,
+    SubmissionState,
 };
 use support::{
     other_payload, payload, MockAdapter, MockBehavior, MockSigning, MockSource, MockStore,
@@ -39,7 +40,7 @@ async fn happy_path_submits_once_then_reconciles_to_confirmed() {
 
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(
@@ -54,7 +55,7 @@ async fn happy_path_submits_once_then_reconciles_to_confirmed() {
     // Repeated reconciliation is idempotent and never submits.
     let again = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(again, confirmed);
@@ -81,7 +82,7 @@ async fn reconcile_carries_an_observed_fill_through_to_the_outcome() {
         });
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(
@@ -187,7 +188,7 @@ async fn timeout_yields_unknown_and_repeated_reconcile_never_submits() {
 
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(
@@ -199,7 +200,7 @@ async fn timeout_yields_unknown_and_repeated_reconcile_never_submits() {
     );
     let again = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(again, confirmed);
@@ -379,7 +380,13 @@ async fn unavailable_adapter_blocks_without_submit() {
 #[tokio::test]
 async fn reconcile_unknown_key_is_invalid_transition() {
     let harness = RelayHarness::standard();
-    let missing = IdempotencyKey::new("never-executed").unwrap();
+    let missing = AttemptBinding::new(
+        harness.intent.user_id.clone(),
+        harness.intent.wallet_ref.clone(),
+        IdempotencyKey::new("never-executed").unwrap(),
+        harness.intent.id.clone(),
+        harness.intent.chain.clone(),
+    );
     let result = harness.relay.reconcile(&missing, NOW_MS).await;
     assert_eq!(result, Err(RelayError::InvalidTransition));
     assert_eq!(harness.adapter.submits.load(Ordering::SeqCst), 0);
@@ -596,7 +603,7 @@ async fn reconcile_falls_through_when_query_returns_unknown() {
 
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(
@@ -633,7 +640,7 @@ async fn reconcile_falls_through_when_query_errors() {
 
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(
@@ -781,7 +788,7 @@ async fn definitive_query_observation_wins_and_reconcile_is_not_called() {
     // would have returned `Unknown`) must not even be called.
     let confirmed = harness
         .relay
-        .reconcile(&harness.intent.idempotency_key, NOW_MS)
+        .reconcile(&harness.binding(), NOW_MS)
         .await
         .expect("reconcile");
     assert_eq!(

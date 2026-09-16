@@ -60,9 +60,7 @@ use agent_backend::{
     RouterSource,
 };
 use async_trait::async_trait;
-use domain::{
-    cmp_u128_products, mul_u128_wide, IdempotencyKey, RoutePlan, TaxObservation, TradeIntent,
-};
+use domain::{cmp_u128_products, mul_u128_wide, RoutePlan, TaxObservation, TradeIntent};
 use execution_preview::{
     revalidate_pre_sign, AllowanceObservation, RevalidationInput, RevalidationOutcome,
     RouteBinding, WalletBalance,
@@ -298,7 +296,7 @@ where
         map_outcome(self.relay.execute(input).await)
     }
 
-    /// Reconciles a previously delegated attempt by its idempotency key.
+    /// Reconciles a previously delegated attempt by its full attempt binding.
     ///
     /// # Invariants
     /// - **MR-1 (no sign/submit).** This delegates to [`ExecutionRelay::reconcile`],
@@ -315,10 +313,10 @@ where
     ///   journal entry is `Unknown`, never a guessed fill.
     async fn reconcile(
         &self,
-        idempotency_key: &IdempotencyKey,
+        binding: &execution_relay::AttemptBinding,
         now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
-        map_outcome(self.relay.reconcile(idempotency_key, now_ms).await)
+        map_outcome(self.relay.reconcile(binding, now_ms).await)
     }
 }
 

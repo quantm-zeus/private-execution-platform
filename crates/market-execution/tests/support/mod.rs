@@ -16,7 +16,7 @@ use domain::{
 };
 use execution_preview::{AllowanceObservation, WalletBalance};
 use execution_relay::{
-    AttemptReservationStore, ChainHealth, ChainHealthBreaker, ChainObservation,
+    AttemptBinding, AttemptReservationStore, ChainHealth, ChainHealthBreaker, ChainObservation,
     ChainSubmissionAdapter, ExecutionRelay, InMemoryReservationStore, RelayError, RelayOutcome,
     Reservation, SignedExecutionRef, SignedPayload, SignedPayloadSource, SigningBoundary,
     SubmissionReceipt,
@@ -496,7 +496,7 @@ impl AttemptReservationStore for ScriptedStore {
 
     async fn record_signed(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &RequestDigest,
     ) -> Result<(), RelayError> {
         Ok(())
@@ -504,7 +504,7 @@ impl AttemptReservationStore for ScriptedStore {
 
     async fn record_outcome(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &RequestDigest,
         _outcome: RelayOutcome,
     ) -> Result<(), RelayError> {

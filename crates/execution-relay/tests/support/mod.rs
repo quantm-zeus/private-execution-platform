@@ -14,7 +14,7 @@ use domain::{
     WalletRef,
 };
 use execution_relay::{
-    AttemptReservationStore, ChainHealth, ChainObservation, ChainSubmissionAdapter,
+    AttemptBinding, AttemptReservationStore, ChainHealth, ChainObservation, ChainSubmissionAdapter,
     DurableAttemptStore, ExecutionRelay, InMemoryReservationStore, RelayError, RelayExecutionInput,
     RelayOutcome, Reservation, SignedExecutionRef, SignedPayload, SignedPayloadSource,
     SigningBoundary, SubmissionReceipt,
@@ -270,25 +270,37 @@ impl AttemptReservationStore for MockStore {
         self.inner.reserve(key, digest).await
     }
 
+    async fn reserve_bound(
+        &self,
+        binding: &AttemptBinding,
+        digest: &RequestDigest,
+    ) -> Result<Reservation, RelayError> {
+        self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+        if self.conflict {
+            return Ok(Reservation::Conflict);
+        }
+        self.inner.reserve_bound(binding, digest).await
+    }
+
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
         self.record_signed_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_record_signed {
             return Err(RelayError::StoreUnavailable);
         }
-        self.inner.record_signed(key, digest).await
+        self.inner.record_signed(binding, digest).await
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: RelayOutcome,
     ) -> Result<(), RelayError> {
-        self.inner.record_outcome(key, digest, outcome).await
+        self.inner.record_outcome(binding, digest, outcome).await
     }
 }
 
@@ -639,6 +651,11 @@ impl RelayHarness {
         }
     }
 
+    /// The full durable attempt binding for this harness's intent.
+    pub fn binding(&self) -> AttemptBinding {
+        AttemptBinding::from_intent(&self.intent)
+    }
+
     pub fn input(&self, now_ms: i64) -> RelayExecutionInput<'_> {
         RelayExecutionInput {
             intent: &self.intent,
@@ -693,7 +710,7 @@ impl AttemptReservationStore for MapStore {
 
     async fn record_signed(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &RequestDigest,
     ) -> Result<(), RelayError> {
         Ok(())
@@ -701,7 +718,7 @@ impl AttemptReservationStore for MapStore {
 
     async fn record_outcome(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &RequestDigest,
         _outcome: RelayOutcome,
     ) -> Result<(), RelayError> {

@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use chain_types::ChainId;
 use domain::{IdempotencyKey, IntentId, UserId, WalletRef};
-use execution_relay::{AttemptBinding, AttemptReservationStore, DurableAttemptStore, Reservation};
+use execution_relay::{
+    AttemptBinding, AttemptReservationStore, DurableAttemptStore, RelayOutcome, Reservation,
+};
 use execution_store::{AttemptClock, PostgresExecutionAttemptStore};
 
 /// Fixed clock so bucket values are deterministic.
@@ -96,21 +98,87 @@ async fn postgres_store_persists_reserve_replay_and_conflict() {
     // store handle over the same database (restart recovery).
     store
         .record_sign_requested(
-            binding.idempotency_key(),
+            &binding,
             &digest,
             &privy::ProviderIdempotencyId::from_string("integration-idem"),
         )
         .await
         .expect("sign requested");
     store
-        .record_signed_reference(binding.idempotency_key(), &digest, "integration-signed-ref")
+        .record_signed_reference(&binding, &digest, "integration-signed-ref")
         .await
         .expect("signed");
 
     let second = connect(&dsn).await;
     // No submission payload is stored, so load returns `None` (not an error).
-    assert_eq!(
-        second.load_submission(binding.idempotency_key()).await,
-        Ok(None)
+    assert_eq!(second.load_submission(&binding).await, Ok(None));
+}
+
+/// Owner/workspace are part of the primary key: the same idempotency key under
+/// two owners is two rows, each scoped to its own reader.
+fn scoped_binding(owner: &str, workspace: &str, key: &str) -> AttemptBinding {
+    AttemptBinding::new(
+        UserId::new(owner).expect("owner"),
+        WalletRef::new(workspace).expect("workspace"),
+        IdempotencyKey::new(key).expect("key"),
+        IntentId::new(format!("intent-{key}")).expect("intent"),
+        ChainId::Base,
+    )
+}
+
+#[tokio::test]
+async fn postgres_scopes_owner_workspace_and_treats_failed_before_submit_as_terminal() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let store = connect(&dsn).await;
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or_default()
     );
+    let shared_key = format!("integration-shared-{suffix}");
+    let alice = scoped_binding("integration-owner-a", "integration-ws-a", &shared_key);
+    let bob = scoped_binding("integration-owner-b", "integration-ws-b", &shared_key);
+    let digest = privy::RequestDigest::from_bytes([7u8; 32]);
+
+    assert_eq!(
+        store.reserve_bound(&alice, &digest).await,
+        Ok(Reservation::Reserved)
+    );
+    assert_eq!(
+        store.reserve_bound(&bob, &digest).await,
+        Ok(Reservation::Reserved)
+    );
+
+    // FAILED_BEFORE_SUBMIT is terminal: a later ambiguous write is a no-op.
+    store
+        .record_outcome(&alice, &digest, RelayOutcome::FailedBeforeSubmit)
+        .await
+        .expect("terminal outcome");
+    store
+        .record_outcome(&alice, &digest, RelayOutcome::Unknown)
+        .await
+        .expect("late downgrade is ignored");
+    assert_eq!(
+        store.load_outcome(&alice).await,
+        Ok(Some(RelayOutcome::FailedBeforeSubmit))
+    );
+
+    // Bob's row is untouched by Alice's writes and readable only through Bob's
+    // full identity.
+    assert_eq!(
+        store.load_outcome(&bob).await,
+        Ok(Some(RelayOutcome::Reserved))
+    );
+    let nobody = scoped_binding(
+        "integration-owner-nobody",
+        "integration-ws-none",
+        &shared_key,
+    );
+    assert_eq!(store.load_outcome(&nobody).await, Ok(None));
+    assert_eq!(store.load_submission(&nobody).await, Ok(None));
 }

@@ -229,6 +229,24 @@ fn parse_stream_target(value: &str) -> Result<(String, String, String), std::io:
     ))
 }
 
+/// Parse `chain:address` for the FOMO chart-history health proof.
+fn parse_history_target(value: &str) -> Result<(String, String), std::io::Error> {
+    let mut parts = value.split(':');
+    let chain = parts.next().unwrap_or("");
+    let address = parts.next().unwrap_or("");
+    if parts.next().is_some() || chain.is_empty() || address.is_empty() {
+        return Err(std::io::Error::other(
+            "PRIVATE_FOMO_HISTORY_TARGET must be chain:address",
+        ));
+    }
+    if private_api::fomo_market::fomo_symbol(chain, address).is_none() {
+        return Err(std::io::Error::other(
+            "PRIVATE_FOMO_HISTORY_TARGET chain/address is not supported",
+        ));
+    }
+    Ok((chain.to_string(), address.to_string()))
+}
+
 /// Resolve the optional FOMO market bridge configuration.
 ///
 /// All-or-none: any FOMO market variable requires `PRIVATE_FOMO_MARKET_URL` and
@@ -241,6 +259,8 @@ fn optional_fomo_market_config(
         read_env("PRIVATE_FOMO_MARKET_API_KEY_FILE")?.filter(|value| !value.trim().is_empty());
     let stream_target =
         read_env("PRIVATE_FOMO_STREAM_TARGET")?.filter(|value| !value.trim().is_empty());
+    let history_target =
+        read_env("PRIVATE_FOMO_HISTORY_TARGET")?.filter(|value| !value.trim().is_empty());
     // Any FOMO variable counts as a supplied (partial) configuration, so a lone
     // timeout/poll/count refuses startup instead of being silently ignored.
     let timeout =
@@ -251,6 +271,7 @@ fn optional_fomo_market_config(
     if base.is_none()
         && key_file.is_none()
         && stream_target.is_none()
+        && history_target.is_none()
         && timeout.is_none()
         && poll.is_none()
         && count.is_none()
@@ -282,12 +303,17 @@ fn optional_fomo_market_config(
         Some(value) => Some(parse_stream_target(&value)?),
         None => None,
     };
+    let history = match history_target {
+        Some(value) => Some(parse_history_target(&value)?),
+        None => None,
+    };
     Ok(Some((
         private_api::FomoMarketConfig {
             base_url: base,
             api_key_file: std::path::PathBuf::from(key_file),
             request_timeout,
             stream_target: target,
+            history_target: history,
             // Clamp, never reject, a faster-than-approved operator value: the
             // approved realtime source is REST polling at >=5s, so an existing
             // sub-5s setting becomes 5s instead of a startup failure.
@@ -296,6 +322,60 @@ fn optional_fomo_market_config(
         },
         api_key,
     )))
+}
+
+/// Read an optional owner-only operator secret file, if configured.
+fn read_optional_secret_file(name: &str) -> Result<Option<Zeroizing<String>>, std::io::Error> {
+    match read_env(name)?.filter(|value| !value.trim().is_empty()) {
+        Some(path) => Ok(Some(private_api::read_operator_secret_file(
+            std::path::Path::new(&path),
+        )?)),
+        None => Ok(None),
+    }
+}
+
+/// Resolve the concrete live transport configuration.
+///
+/// Presence-only opt-in is already enforced by `LiveWiring`; this additionally
+/// requires the operator credential files and the transaction-builder endpoint.
+/// It returns `Ok(None)` — a deterministically denied capability, not a startup
+/// error — when a credential or endpoint is absent, so a missing signing
+/// credential can never be replaced by an anonymous client.
+fn resolve_live_transport_config(
+    opted_in: bool,
+    base_rpc: Option<&str>,
+    privy: Option<&str>,
+) -> Result<Option<private_api::live::LiveTransportConfig>, std::io::Error> {
+    if !opted_in {
+        return Ok(None);
+    }
+    let (Some(base_rpc), Some(privy)) = (base_rpc, privy) else {
+        return Ok(None);
+    };
+    let (base_rpc, privy) = (base_rpc.trim(), privy.trim());
+    if base_rpc.is_empty() || privy.is_empty() {
+        return Ok(None);
+    }
+    let Some(privy_secret) = read_optional_secret_file("PRIVY_AUTH_TOKEN_FILE")? else {
+        return Ok(None);
+    };
+    let Some(payload_endpoint) =
+        read_env("PAYLOAD_SOURCE_ENDPOINT")?.filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let payload_bearer = read_optional_secret_file("PAYLOAD_SOURCE_AUTH_TOKEN_FILE")?;
+    let base_rpc_bearer = read_optional_secret_file("BASE_RPC_AUTH_TOKEN_FILE")?;
+    let request_timeout = parse_millis_env("LIVE_TRANSPORT_TIMEOUT_MS", 5_000, 100, 30_000)?;
+    Ok(Some(private_api::live::LiveTransportConfig {
+        base_rpc_endpoint: base_rpc.to_string(),
+        base_rpc_bearer,
+        privy_endpoint: privy.to_string(),
+        privy_credentials: privy::PrivyCredentials::new(privy_secret.to_string()),
+        payload_endpoint,
+        payload_bearer,
+        request_timeout,
+    }))
 }
 
 #[tokio::main]
@@ -367,11 +447,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live_opted_in =
         private_api::trading::parse_live_opt_in(read_env("TRADING_CORE_LIVE")?.as_deref())
             .map_err(|_| std::io::Error::other("TRADING_CORE_LIVE must be 1 or 0"))?;
+    let execution_dsn = read_env("EXECUTION_DATABASE_DSN")?;
+    let base_rpc_endpoint = read_env("BASE_RPC_ENDPOINT")?;
+    let privy_endpoint = read_env("PRIVY_HTTP_ENDPOINT")?;
     let live_wiring = private_api::trading::LiveWiring::from_presence(
         live_opted_in,
-        read_env("EXECUTION_DATABASE_DSN")?.as_deref(),
-        read_env("BASE_RPC_ENDPOINT")?.as_deref(),
-        read_env("PRIVY_HTTP_ENDPOINT")?.as_deref(),
+        execution_dsn.as_deref(),
+        base_rpc_endpoint.as_deref(),
+        privy_endpoint.as_deref(),
     );
     if live_wiring.partial() {
         return Err(std::io::Error::other(
@@ -382,14 +465,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Typed capability readiness. Every seam defaults absent, so the default
     // composition proves nothing and the bootstrap advertises no trading
-    // capability. Connecting the durable store is gated behind the explicit
-    // live opt-in, so the disabled deployment performs no trading I/O.
+    // capability. The durable store, concrete Base RPC transport, Privy HTTP
+    // client and payload source are all gated behind the explicit live opt-in,
+    // so the default deployment performs no trading I/O.
     let mut trading_seams = private_api::trading::TradingSeams::new();
-    if gate.is_enabled() && live_wiring.durable_store_configured() {
-        let dsn = read_env("EXECUTION_DATABASE_DSN")?.expect("checked present");
-        match private_api::trading::connect_durable_attempt_store(&dsn).await {
+    let mut live_store: Option<Arc<dyn execution_relay::DurableAttemptStore>> = None;
+    if live_wiring.durable_store_configured() {
+        let dsn = execution_dsn.as_deref().expect("checked present");
+        match private_api::trading::connect_durable_attempt_store(dsn).await {
             Ok((store, probe)) => {
-                trading_seams = trading_seams.with_durable_store(store, probe);
+                // Only a store that proves its ledger table is usable may back
+                // the live relay. An unhealthy probe (for example a reachable
+                // database missing migration 0003) still registers as an
+                // unhealthy seam and denies capability, but must never be
+                // composed into a live path that `/ready` reports as proven.
+                let store_healthy = probe.status == storage::ComponentHealth::Healthy;
+                trading_seams = trading_seams.with_durable_store(store.clone(), probe);
+                if store_healthy {
+                    live_store = Some(store);
+                }
             }
             Err(_) => {
                 // A configured live path without its durable store is a
@@ -398,15 +492,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Compose the concrete production execution transports behind the same
+    // explicit live opt-in, then probe them read-only. A missing credential or
+    // malformed endpoint is a deterministically denied capability (no probe is
+    // registered), never an anonymous or partially-wired live path.
+    let live_transport_config = resolve_live_transport_config(
+        live_opted_in,
+        base_rpc_endpoint.as_deref(),
+        privy_endpoint.as_deref(),
+    )?;
+    let mut live_execution: Option<private_api::live::LiveExecution> = None;
+    if let (Some(config), Some(store)) = (live_transport_config, live_store) {
+        match private_api::live::build_live_transports(config).await {
+            Ok(transports) => {
+                let probes = private_api::live::probe_live_transports(&transports).await;
+                if probes.chain {
+                    trading_seams = trading_seams.with_chain_probe(private_api::trading::healthy(
+                        private_api::trading::COMPONENT_CHAIN,
+                    ));
+                }
+                if probes.signer {
+                    trading_seams = trading_seams.with_signer_probe(private_api::trading::healthy(
+                        private_api::trading::COMPONENT_SIGNER,
+                    ));
+                }
+                // The relay needs every concrete dependency proven at once;
+                // compose it only when the chain, signer and payload probes all
+                // succeeded, so a partially-proven transport can never leave a
+                // half-usable relay alive. `TRADING_ENABLED` still gates every
+                // execution even when the relay is composed.
+                if probes.chain && probes.signer && probes.payload {
+                    let trading_raw = gate.is_enabled().then_some("true");
+                    if let Ok(policy) = private_api::live::build_live_policy(trading_raw) {
+                        live_execution = Some(private_api::live::build_live_execution(
+                            store, transports, policy,
+                        ));
+                    }
+                }
+            }
+            Err(_) => {
+                // A malformed concrete transport denies the capability; it is
+                // never a startup abort that would hide the readiness verdict.
+            }
+        }
+    }
     // Optional read-only FOMO market bridge. With no configuration the chart
     // stays on its bounded local buffer and no capability is advertised; the
     // chart dispatcher wraps the fail-closed default for every non-chart op.
     let fomo = optional_fomo_market_config()?;
-    // Observational health flag shared with the realtime stream source and
-    // `/ready`; it starts false and is only set true by an observed successful
-    // bridge read, so a configured-but-unreachable provider is never reported
-    // healthy.
+    // Observational health flags shared with `/ready`. The history flag is the
+    // chart capability proof; the stream flag is the realtime proof. Both start
+    // false and are only set true by an observed successful bridge read, so a
+    // configured-but-unreachable provider is never reported healthy.
+    let fomo_history_health = Arc::new(AtomicBool::new(false));
     let stream_health = Arc::new(AtomicBool::new(false));
+    let fomo_configured = fomo.is_some();
     let (fomo_dispatcher, fomo_stream, fomo_wired) = match fomo {
         Some((config, api_key)) => {
             let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
@@ -414,18 +554,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
             );
             let probe_provider = provider.clone();
-            let wiring = private_api::build_fomo_market_wiring_with_health(
+            let wiring = private_api::build_fomo_market_wiring_with_health_flags(
                 &config,
                 provider,
                 Arc::new(private_api::FailClosedDispatcher),
                 Some(stream_health.clone()),
+                Some(fomo_history_health.clone()),
             )
             .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
+            // Chart history proof: a bounded authenticated `/market/bars` read
+            // over the configured history (or realtime) target. An expired
+            // bridge session makes this fail, so `chart` stays unadvertised and
+            // the source remains a failed readiness dependency.
+            let history_healthy =
+                private_api::fomo_market::probe_history(probe_provider.as_ref(), &config).await;
+            fomo_history_health.store(history_healthy, Ordering::SeqCst);
             // Observe the configured realtime source once at startup. A
             // reachable bridge proves the realtime capability; an unavailable
-            // one leaves it unadvertised (fail closed) rather than claiming a
-            // stream that was never reached. The shared flag keeps `/ready`
-            // honest for later poll failures too.
+            // one leaves it unadvertised (fail closed). The shared flag keeps
+            // `/ready` honest for later poll failures too, and the configured
+            // stream stays a readiness dependency regardless of this probe.
             if wiring.stream_source.is_some() {
                 let reachable = private_api::probe_realtime(probe_provider.as_ref(), &config).await;
                 stream_health.store(reachable, Ordering::SeqCst);
@@ -437,8 +585,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let wired = private_api::production::WiredCapabilities {
                 // Chart history only: `search_token`/`get_token` stay denied
-                // because FOMO does not back them (capability truth, audit F6).
-                chart: true,
+                // because FOMO does not back them (capability truth, audit F6),
+                // and chart itself requires the healthy history proof above.
+                chart: history_healthy,
                 realtime: wiring.stream_source.is_some(),
                 ..private_api::production::WiredCapabilities::default()
             };
@@ -452,9 +601,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let fomo_stream_present = fomo_stream.is_some();
     let readiness = trading_seams.readiness(gate.is_enabled());
-    // The stream is a required readiness dependency only when the composition
-    // both advertises realtime and proved it reachable at startup.
-    let stream_required = fomo_stream_present && readiness.realtime();
+    // A configured realtime source is a required readiness dependency even when
+    // its startup probe failed: the shared flag starts false and fails `/ready`
+    // until the source is observed healthy.
+    let stream_required = fomo_stream_present;
     let production =
         private_api::production::build_opaque(private_api::production::OpaqueComposition {
             sessions: state.sessions(),
@@ -514,7 +664,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = state
         .with_relay_readiness(relay_required, relay_ready)
         .with_dispatcher_readiness(dispatcher_ready)
-        .with_stream_readiness(stream_required, stream_health);
+        .with_stream_readiness(stream_required, stream_health)
+        .with_fomo_readiness(fomo_configured, fomo_history_health)
+        // The explicit live opt-in makes the concrete execution dependencies a
+        // readiness requirement. `live_execution` exists only when the durable
+        // store and all of chain/signer/payload were proven, so a missing
+        // credential or unreachable transport fails `/ready` deterministically.
+        .with_live_readiness(live_opted_in, live_execution.is_some());
+
+    // Validate and cache the immutable artifact/release digest once at startup
+    // so `/ready` consumes verified immutable state rather than a header/size
+    // probe; a same-size corruption is therefore never reported ready.
+    state.warm_artifact_readiness().await;
+
+    // Hold the composed production relay for the process lifetime. Nothing
+    // dispatches through it yet, and `TRADING_ENABLED` still gates every
+    // execution, so it can neither sign nor submit while disabled.
+    let _live_execution = live_execution;
 
     let bind =
         std::env::var("PRIVATE_API_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
@@ -649,5 +815,41 @@ mod tests {
         std::env::set_var(name, "notanumber");
         assert!(parse_millis_env(name, 5_000, 100, 30_000).is_err());
         std::env::remove_var(name);
+    }
+
+    #[test]
+    fn fomo_history_target_is_strictly_validated() {
+        assert_eq!(
+            parse_history_target("base:0xabc").unwrap(),
+            ("base".to_string(), "0xabc".to_string())
+        );
+        // Unknown chain, missing address and extra field refuse.
+        assert!(parse_history_target("unknown:0xabc").is_err());
+        assert!(parse_history_target("base").is_err());
+        assert!(parse_history_target("base:0xabc:1m").is_err());
+        assert!(parse_history_target("").is_err());
+    }
+
+    #[test]
+    fn live_transport_config_is_only_resolved_under_the_explicit_opt_in() {
+        // Without the explicit opt-in the resolver never touches the
+        // environment or credential files.
+        assert!(resolve_live_transport_config(
+            false,
+            Some("http://127.0.0.1:8545"),
+            Some("http://127.0.0.1:9000")
+        )
+        .unwrap()
+        .is_none());
+        // Opted in but with a missing credential file is a denied capability,
+        // never an anonymous client.
+        std::env::remove_var("PRIVY_AUTH_TOKEN_FILE");
+        assert!(resolve_live_transport_config(
+            true,
+            Some("http://127.0.0.1:8545"),
+            Some("http://127.0.0.1:9000")
+        )
+        .unwrap()
+        .is_none());
     }
 }

@@ -14,6 +14,7 @@ agent-commands.workspace = true
 async-trait.workspace = true
 chain-types.workspace = true
 domain.workspace = true
+execution-relay.workspace = true
 limit-engine.workspace = true
 market-types.workspace = true
 mcp-server.workspace = true

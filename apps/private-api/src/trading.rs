@@ -17,10 +17,11 @@
 //! - Connecting the durable Postgres store is gated behind the explicit
 //!   `TRADING_CORE_LIVE=1` opt-in; the default binary performs no trading I/O.
 //!
-//! This is deliberately additive: it does not build a live relay itself (that
-//! needs a concrete RPC client, transaction builder, and Privy HTTP client the
-//! deployment owns) and it cannot make the private API claim execution it
-//! cannot prove.
+//! This is deliberately additive: it owns the typed readiness surface while the
+//! sibling `live` module composes the concrete relay (Base RPC, Privy HTTP, and
+//! payload builder) behind the same gates. Composing that relay does not enable
+//! trading — `TRADING_ENABLED` remains the authoritative policy kill switch — and
+//! nothing here can make the private API claim execution it cannot prove.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

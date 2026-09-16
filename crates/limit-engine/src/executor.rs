@@ -222,7 +222,8 @@ where
     /// (the orchestrator re-validates it before any ledger mutation); without
     /// them it maps to `Unknown` (RE-1, RE-2).
     async fn reconcile(&self, attempt: &BoundAttempt, now_ms: i64) -> AttemptResolution {
-        map_outcome(self.relay.reconcile(&attempt.attempt_key, now_ms).await)
+        let binding = execution_relay::AttemptBinding::from_intent(&attempt.intent);
+        map_outcome(self.relay.reconcile(&binding, now_ms).await)
     }
 }
 

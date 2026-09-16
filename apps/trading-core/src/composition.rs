@@ -243,7 +243,7 @@ impl AttemptReservationStore for UnavailableDurableAttemptStore {
 
     async fn record_sign_requested(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &privy::RequestDigest,
         _provider_idempotency: &ProviderIdempotencyId,
     ) -> Result<(), RelayError> {
@@ -252,7 +252,7 @@ impl AttemptReservationStore for UnavailableDurableAttemptStore {
 
     async fn record_signed(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &privy::RequestDigest,
     ) -> Result<(), RelayError> {
         Err(RelayError::StoreUnavailable)
@@ -260,7 +260,7 @@ impl AttemptReservationStore for UnavailableDurableAttemptStore {
 
     async fn record_signed_reference(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &privy::RequestDigest,
         _signed_reference: &str,
     ) -> Result<(), RelayError> {
@@ -269,7 +269,7 @@ impl AttemptReservationStore for UnavailableDurableAttemptStore {
 
     async fn record_submission(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &privy::RequestDigest,
         _request: &execution_relay::SubmitRequest,
     ) -> Result<(), RelayError> {
@@ -278,14 +278,14 @@ impl AttemptReservationStore for UnavailableDurableAttemptStore {
 
     async fn load_submission(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
     ) -> Result<Option<DurableSubmission>, RelayError> {
         Err(RelayError::StoreUnavailable)
     }
 
     async fn record_outcome(
         &self,
-        _key: &IdempotencyKey,
+        _binding: &AttemptBinding,
         _digest: &privy::RequestDigest,
         _outcome: execution_relay::RelayOutcome,
     ) -> Result<(), RelayError> {

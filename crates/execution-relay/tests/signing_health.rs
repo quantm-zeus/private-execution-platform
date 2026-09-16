@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use domain::{RoutePlan, TradeIntent, ValidatedExecutionPreview};
 use execution_relay::{
-    ChainHealth, ExecutionRelay, RelayError, RelayExecutionInput, RelayOutcome, SignedExecutionRef,
-    SigningBoundary, SigningFailureBreaker, SigningHealth,
+    AttemptBinding, ChainHealth, ExecutionRelay, RelayError, RelayExecutionInput, RelayOutcome,
+    SignedExecutionRef, SigningBoundary, SigningFailureBreaker, SigningHealth,
 };
 use policy::{ApprovedExecution, PolicyContext};
 use privy::{PreparedExecutionRef, SigningRequest};
@@ -262,6 +262,10 @@ impl AttemptFixture {
         }
     }
 
+    fn binding(&self) -> AttemptBinding {
+        AttemptBinding::from_intent(&self.intent)
+    }
+
     fn input(&self, now_ms: i64) -> RelayExecutionInput<'_> {
         RelayExecutionInput {
             intent: &self.intent,
@@ -489,7 +493,7 @@ async fn reconcile_never_touches_the_signing_breaker() {
     // would push the cooldown to 15_000, and a spurious `record_success` would
     // close the breaker, so the exact boundary assertions below are decisive.
     let reconciled = relay
-        .reconcile(&fixture.intent.idempotency_key, 5_000)
+        .reconcile(&fixture.binding(), 5_000)
         .await
         .expect("reconcile");
     assert!(matches!(reconciled, RelayOutcome::Confirmed { .. }));
@@ -512,7 +516,7 @@ async fn reconcile_never_touches_the_signing_breaker() {
     // would consume the single half-open probe, so this is decisive for that
     // branch too.
     let again = relay
-        .reconcile(&fixture.intent.idempotency_key, 11_000)
+        .reconcile(&fixture.binding(), 11_000)
         .await
         .expect("reconcile");
     assert!(matches!(again, RelayOutcome::Confirmed { .. }));

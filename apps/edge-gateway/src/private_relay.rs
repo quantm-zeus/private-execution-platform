@@ -144,6 +144,30 @@ impl PrivateRelay {
         let mut guard = self.channel.write().await;
         *guard = None;
     }
+
+    /// Bounded private-api readiness probe used by the edge `/ready` handler.
+    ///
+    /// Forces a fresh mTLS dial (dropping any cached channel) so a stale
+    /// connection cannot mask a dead backend, then completes a handshake within
+    /// [`PRIVATE_API_PROBE_TIMEOUT`]. The probe carries no payload and never
+    /// touches the relay ciphertext path.
+    pub async fn probe_private_api(&self) -> Result<(), EdgeError> {
+        self.reset_channel().await;
+        match tokio::time::timeout(PRIVATE_API_PROBE_TIMEOUT, self.channel()).await {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(EdgeError::BackendUnavailable),
+        }
+    }
+}
+
+/// Upper bound on one private-api readiness probe dial.
+const PRIVATE_API_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[async_trait]
+impl crate::PrivateApiReadinessProbe for PrivateRelay {
+    async fn probe(&self) -> Result<(), EdgeError> {
+        self.probe_private_api().await
+    }
 }
 
 fn endpoint_host(origin: &str) -> Result<&str, EdgeError> {

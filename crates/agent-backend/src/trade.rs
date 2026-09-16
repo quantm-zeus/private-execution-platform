@@ -629,9 +629,8 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             Err(BackendError::Denied) => return Err(MarketExecutionError::Denied),
             Err(BackendError::Unavailable) => return Err(MarketExecutionError::Unavailable),
         };
-        self.execution
-            .reconcile(&intent.idempotency_key, now_ms)
-            .await
+        let binding = execution_relay::AttemptBinding::from_intent(&intent);
+        self.execution.reconcile(&binding, now_ms).await
     }
 
     /// Reconciles an already-submitted market order identified by the same

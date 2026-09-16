@@ -26,7 +26,8 @@ use domain::{
 };
 use execution_preview::NetDelta;
 use execution_relay::{
-    AttemptReservationStore, DurableAttemptStore, InMemoryReservationStore, RelayError, Reservation,
+    AttemptBinding, AttemptReservationStore, DurableAttemptStore, InMemoryReservationStore,
+    RelayError, Reservation,
 };
 use limit_engine::{
     BlindIndexKey, LimitEngineError, OrderKeyMaterial, OrderKeyProvider, RecoveryReport,
@@ -247,11 +248,11 @@ impl MarketExecutionPort for CountingMarketPort {
 
     async fn reconcile(
         &self,
-        idempotency_key: &IdempotencyKey,
+        binding: &AttemptBinding,
         _now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
-        lock(&self.captured_keys).push(idempotency_key.as_str().to_string());
+        lock(&self.captured_keys).push(binding.idempotency_key().as_str().to_string());
         lock(&self.script)
             .pop_front()
             .unwrap_or(Ok(MarketExecutionOutcome::Unknown))
@@ -299,11 +300,11 @@ impl MarketExecutionPort for CountingPort {
 
     async fn reconcile(
         &self,
-        idempotency_key: &IdempotencyKey,
+        binding: &execution_relay::AttemptBinding,
         now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.reconcile(idempotency_key, now_ms).await
+        self.inner.reconcile(binding, now_ms).await
     }
 }
 
@@ -484,19 +485,19 @@ impl AttemptReservationStore for RecordingReservationStore {
 
     async fn record_signed(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
     ) -> Result<(), RelayError> {
-        self.inner.record_signed(key, digest).await
+        self.inner.record_signed(binding, digest).await
     }
 
     async fn record_outcome(
         &self,
-        key: &IdempotencyKey,
+        binding: &AttemptBinding,
         digest: &RequestDigest,
         outcome: execution_relay::RelayOutcome,
     ) -> Result<(), RelayError> {
-        self.inner.record_outcome(key, digest, outcome).await
+        self.inner.record_outcome(binding, digest, outcome).await
     }
 }
 

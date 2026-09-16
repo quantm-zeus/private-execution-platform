@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use agent_backend::{MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort};
 use execution_relay::{
-    ChainHealthBreaker, ChainObservation, DeterministicDurableStore, ObservedFill,
+    AttemptBinding, ChainHealthBreaker, ChainObservation, DeterministicDurableStore, ObservedFill,
     PrivySigningBoundaryAdapter, RelayOutcome, UnavailableChainAdapter,
 };
 use market_execution::RelayMarketExecutionPort;
@@ -422,7 +422,7 @@ async fn reconcile_maps_an_observed_fill_to_filled() {
 
     let outcome = h
         .port
-        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .reconcile(&AttemptBinding::from_intent(&request().intent), NOW_MS)
         .await;
 
     assert_eq!(
@@ -454,7 +454,7 @@ async fn reconcile_without_amounts_is_unknown() {
 
     let outcome = h
         .port
-        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .reconcile(&AttemptBinding::from_intent(&request().intent), NOW_MS)
         .await;
 
     assert_eq!(
@@ -475,7 +475,7 @@ async fn reconcile_with_an_unknown_journal_key_is_unknown() {
 
     let outcome = h
         .port
-        .reconcile(&request().intent.idempotency_key, NOW_MS)
+        .reconcile(&AttemptBinding::from_intent(&request().intent), NOW_MS)
         .await;
 
     assert_eq!(outcome, Ok(MarketExecutionOutcome::Unknown));
@@ -508,7 +508,7 @@ async fn reconcile_never_signs_or_submits() {
         journal_one_attempt(&h).await;
         let _ = h
             .port
-            .reconcile(&request().intent.idempotency_key, NOW_MS)
+            .reconcile(&AttemptBinding::from_intent(&request().intent), NOW_MS)
             .await;
         assert_eq!(
             h.signer.calls.load(Ordering::SeqCst),

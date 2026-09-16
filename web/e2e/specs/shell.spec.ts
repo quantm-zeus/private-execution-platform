@@ -50,9 +50,19 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
   // "cleared before the first await" claim. The grant request always fires on an
   // unlock (enrollment may be skipped once the host has bound the key).
   let valueAtFirstGrant: string | null = null;
+  // Resolved by the first intercepted grant request. `page.route` handlers run
+  // asynchronously, so reading `valueAtFirstGrant` straight after the clear
+  // assertion can observe `null` before the grant route has fired; awaiting this
+  // promise makes the observation deterministic without weakening the DOM-clear
+  // security assertion below.
+  let resolveFirstGrant: () => void = () => {};
+  const firstGrantSeen = new Promise<void>((resolve) => {
+    resolveFirstGrant = resolve;
+  });
   await page.route("**/internal/artifact/grant", async (route) => {
     if (valueAtFirstGrant === null) {
       valueAtFirstGrant = await page.locator("#recovery-code").inputValue();
+      resolveFirstGrant();
     }
     await route.continue();
   });
@@ -61,6 +71,7 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
   // network await, and the form stays mounted until the payload boots, so this
   // pins the secret-lifetime claim.
   await expect(page.locator("#recovery-code")).toHaveValue("");
+  await firstGrantSeen;
   expect(valueAtFirstGrant).toBe("");
   // The payload may announce readiness and overwrite the status text, so wait for
   // the instantiated frame itself rather than a transient status string.

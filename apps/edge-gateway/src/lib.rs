@@ -104,12 +104,43 @@ impl OpaqueStreamRelay for UnavailableStreamRelay {
     }
 }
 
+/// Bounded readiness probe for the private-api relay dependency.
+///
+/// The edge is a dependant on the private-api origin (and its hardened mTLS
+/// relay); `/ready` is only true when this probe observes the backend. A
+/// fail-closed default that always reports unavailable keeps the unconfigured
+/// edge not-ready.
+#[async_trait]
+pub trait PrivateApiReadinessProbe: Send + Sync {
+    /// Probes the private-api over the configured (mTLS) channel.
+    async fn probe(&self) -> Result<(), EdgeError>;
+}
+
+/// Fail-closed readiness probe used when no private-api relay is configured.
+#[derive(Debug, Default)]
+pub struct UnavailableReadinessProbe;
+
+#[async_trait]
+impl PrivateApiReadinessProbe for UnavailableReadinessProbe {
+    async fn probe(&self) -> Result<(), EdgeError> {
+        Err(EdgeError::BackendUnavailable)
+    }
+}
+
 #[derive(Clone)]
 pub struct EdgeState {
     authorization: Arc<dyn AuthorizationBackend>,
     relay: Arc<dyn OpaqueRelay>,
     stream_relay: Arc<dyn OpaqueStreamRelay>,
     max_body_bytes: usize,
+    /// Whether a real perimeter authorization backend is configured. The
+    /// fail-closed `UnavailableAuthorization` default is not.
+    authorization_configured: bool,
+    /// Whether a private-api relay identity is configured and loaded. The
+    /// fail-closed `UnavailableRelay` default is not.
+    relay_configured: bool,
+    /// Bounded private-api dependency probe consumed by `/ready`.
+    readiness_probe: Arc<dyn PrivateApiReadinessProbe>,
 }
 
 impl EdgeState {
@@ -140,6 +171,9 @@ impl EdgeState {
             relay,
             stream_relay,
             max_body_bytes,
+            authorization_configured: false,
+            relay_configured: false,
+            readiness_probe: Arc::new(UnavailableReadinessProbe),
         })
     }
 
@@ -149,13 +183,35 @@ impl EdgeState {
             relay: Arc::new(UnavailableRelay),
             stream_relay: Arc::new(UnavailableStreamRelay),
             max_body_bytes: DEFAULT_MAX_OPAQUE_BODY_BYTES,
+            authorization_configured: false,
+            relay_configured: false,
+            readiness_probe: Arc::new(UnavailableReadinessProbe),
         }
+    }
+
+    /// Attach the production readiness contract.
+    ///
+    /// `authorization_configured` records that a real perimeter authorization
+    /// backend is installed; `relay_configured` records that a private-api relay
+    /// identity was configured and its mTLS material loaded. `readiness_probe`
+    /// performs the bounded private-api dependency check.
+    pub fn with_readiness(
+        mut self,
+        authorization_configured: bool,
+        relay_configured: bool,
+        readiness_probe: Arc<dyn PrivateApiReadinessProbe>,
+    ) -> Self {
+        self.authorization_configured = authorization_configured;
+        self.relay_configured = relay_configured;
+        self.readiness_probe = readiness_probe;
+        self
     }
 }
 
 pub fn router(state: EdgeState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/v1/bootstrap", post(bootstrap))
         .route("/v1/sync", post(sync))
         .route("/v1/blob", post(blob))
@@ -168,8 +224,47 @@ pub fn default_router() -> Router {
     router(EdgeState::unavailable())
 }
 
+/// Liveness only: the process is running. Dependency health is reported by
+/// `/ready`, so a process whose backends are down stays live without ever
+/// claiming readiness.
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+/// Dependency readiness, distinct from liveness. The edge is ready only when a
+/// real perimeter authorization backend and a loaded mTLS relay identity are
+/// configured *and* the bounded private-api readiness probe succeeds. An
+/// unconfigured edge (the fail-closed default) is live but never ready.
+async fn readiness(State(state): State<EdgeState>) -> Response {
+    if !state.authorization_configured || !state.relay_configured {
+        return readiness_response(false, false, false);
+    }
+    let private_api_ok = state.readiness_probe.probe().await.is_ok();
+    readiness_response(true, true, private_api_ok)
+}
+
+/// Generic per-dependency readiness body; carries only booleans.
+fn readiness_response(
+    authorization_ok: bool,
+    mtls_identity_ok: bool,
+    private_api_ok: bool,
+) -> Response {
+    let ready = authorization_ok && mtls_identity_ok && private_api_ok;
+    let body = serde_json::json!({
+        "ready": ready,
+        "checks": {
+            "authorization": authorization_ok,
+            "mtls_identity": mtls_identity_ok,
+            "private_api": private_api_ok,
+        }
+    })
+    .to_string();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 async fn bootstrap(
@@ -932,5 +1027,129 @@ mod tests {
             headers.get(header::CONTENT_TYPE).unwrap(),
             OPAQUE_CONTENT_TYPE
         );
+    }
+
+    /// Deterministic private-api readiness probe double.
+    struct FakeProbe {
+        ok: bool,
+    }
+
+    #[async_trait]
+    impl PrivateApiReadinessProbe for FakeProbe {
+        async fn probe(&self) -> Result<(), EdgeError> {
+            if self.ok {
+                Ok(())
+            } else {
+                Err(EdgeError::BackendUnavailable)
+            }
+        }
+    }
+
+    async fn get_path(app: Router, path: &'static str) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unconfigured_edge_is_live_but_never_ready() {
+        let app = default_router();
+        let health = get_path(app.clone(), "/health").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let ready = get_path(app, "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["authorization"], false);
+        assert_eq!(parsed["checks"]["mtls_identity"], false);
+        assert_eq!(parsed["checks"]["private_api"], false);
+    }
+
+    #[tokio::test]
+    async fn configured_edge_readiness_follows_the_private_api_probe() {
+        let ready_state = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1024,
+        )
+        .unwrap()
+        .with_readiness(true, true, Arc::new(FakeProbe { ok: true }));
+        let ready = get_path(router(ready_state), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], true);
+        assert_eq!(parsed["checks"]["private_api"], true);
+
+        // A configured edge whose private-api probe fails is not ready, while
+        // liveness stays 200.
+        let dead_state = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1024,
+        )
+        .unwrap()
+        .with_readiness(true, true, Arc::new(FakeProbe { ok: false }));
+        assert_eq!(
+            get_path(router(dead_state.clone()), "/health")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let ready = get_path(router(dead_state), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["private_api"], false);
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_or_identity_keeps_readiness_false() {
+        // Authorization unconfigured even though a probe and relay are wired:
+        // the edge must not claim readiness.
+        let no_auth = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1024,
+        )
+        .unwrap()
+        .with_readiness(false, true, Arc::new(FakeProbe { ok: true }));
+        let ready = get_path(router(no_auth), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Relay identity not configured: also not ready.
+        let no_relay = EdgeState::new(
+            Arc::new(TestAuthorization {
+                mode: TestAuthMode::Bearer,
+            }),
+            Arc::new(EchoRelay {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1024,
+        )
+        .unwrap()
+        .with_readiness(true, false, Arc::new(FakeProbe { ok: true }));
+        let ready = get_path(router(no_relay), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

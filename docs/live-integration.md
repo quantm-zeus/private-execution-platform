@@ -430,23 +430,33 @@ and relevant MEDIUM findings were fixed with regression tests:
     `twap`/`rfq`/`withdraw`/`wallet_limits` ride the execution proof; a wired
     dispatcher with no proof cannot advertise them. `realtime` requires the FOMO
     stream source **and** a bounded startup reachability probe of the bridge
-    (`probe_realtime`); the shared health flag is updated by every later stream
-    read and drives the `/ready` `stream` check. The durable attempt store is a
-    real Postgres adapter (`execution_store`), connected only behind the
-    explicit `TRADING_CORE_LIVE=1` opt-in; a partial live configuration (opt-in
-    missing an endpoint) refuses startup, and `TRADING_CORE_LIVE` itself is
-    parsed strictly (`"1"`/`"0"`).
-  - Still residual: the concrete Trading Core composition (real `AgentBackend`,
+    (`probe_realtime`); a configured stream source is always a required
+    `/ready` dependency, and its shared health flag is updated by every later
+    stream read. `chart` requires a bounded authenticated `/market/bars` history
+    proof (`probe_history`), whose shared flag is refreshed by every later chart
+    read. The durable attempt store is a real Postgres adapter
+    (`execution_store`), connected only behind the explicit `TRADING_CORE_LIVE=1`
+    opt-in; a partial live configuration (opt-in missing an endpoint) refuses
+    startup, and `TRADING_CORE_LIVE` itself is parsed strictly (`"1"`/`"0"`).
+  - Concrete production transports now exist in `apps/private-api::live`: a
+    retry-free Base JSON-RPC transport (`BaseRpcChainTransport`), a Privy HTTP
+    signing client (`HttpPrivyClient`), and an HTTP signed-payload source
+    (`HttpSignedPayloadSource`). They are constructed and probed read-only only
+    behind the explicit `TRADING_CORE_LIVE=1` opt-in with every endpoint and
+    credential file present; each endpoint must be loopback `http://` so a
+    bearer credential is never sent off-host in the clear. The composed relay is
+    held fail-closed and never dispatched, `TRADING_ENABLED=false` keeps the
+    policy kill switch engaged, and the bootstrap still advertises no mutation
+    because no mutating `WiredCapabilities` flag is set. A missing credential or
+    unreachable transport is a determinate `/ready` denial (`live_execution`),
+    never a half-wired healthy process.
+  - Still residual: the broader Trading Core composition (real `AgentBackend`,
     authoritative `AgentCapabilities`, `InstrumentRegistry` backed by market
-    metadata, `WebContractBackend` for wallet limits/reconciliation, real
-    `StreamSource`) is injected through `web_command_dispatcher` /
-    `production::OpaqueComposition` but not built by the binary. Wiring it needs
-    genuinely operator-owned inputs (owner/wallet/chain/risk limits, Privy
-    signing, a Base chain transport, live market data), so with none supplied
-    the `FailClosed*` defaults remain. There is no concrete `BaseChainTransport`
-    or `PrivyHttpClient` in the repository, so the shipped binary can never prove
-    execution and every mutation is an authenticated `capability_missing`
-    denial — never a fabricated success.
+    metadata, `WebContractBackend` for wallet limits/reconciliation) is injected
+    through `web_command_dispatcher` / `production::OpaqueComposition` but not
+    built by the binary; with none supplied the `FailClosed*` defaults remain,
+    so every mutation is an authenticated `capability_missing` denial — never a
+    fabricated success.
 - **Accepted LOW hardening residuals (fresh-context adversarial review)**: the
   s2c AAD is not purpose-separated (the authenticated `request_id` echo blocks the
   substitution today; the cross-route c2s DoS is now fixed by validating before
@@ -810,22 +820,29 @@ remains best-effort; the byte copy is zeroized in a `finally`.
 `PRIVATE_API_RELAY_BIND_ADDR` with an incomplete identity (or any identity value
 without a bind) refuses startup. The relay listener is bound before it is
 spawned, so a bad address is a startup error, and `/ready` reports dependency
-readiness (relay bound, artifact and manifest header valid, configured command
-surface present, configured realtime stream usable, passkey store readable,
-optional recovery store readable) distinct from `/health` liveness. The artifact
-check requires a deliverable file
-(`MIN_ARTIFACT_LEN`, version 1, non-zero KID and encapsulated key), so a
-truncated or wrong-version file is never reported healthy; the `dispatcher`
-check reflects whether the opaque command surface is configured (the production
-binary always wires a fail-closed dispatcher before serving and refuses startup
-without one), and a future composition that can lose its dispatcher clears it.
-The `stream` check is required only when the composition advertises `realtime`,
-that is when a FOMO stream source is configured **and** the bounded startup
-reachability probe observed it healthy; a configured-but-unreachable source is
-not advertised, so it is not a required dependency. `apps/edge-gateway`
-refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic Cloudflare Access JWT
-validation is implemented; setting `EDGE_ACCESS_JWT_VALIDATION=true` cannot
-bypass that, so the loopback deployment mitigation cannot be widened silently.
+readiness (relay bound, immutable artifact and release manifest fully validated,
+configured command surface present, configured realtime stream usable,
+configured FOMO history proof healthy, configured live execution dependencies
+proven, passkey store readable, optional recovery store readable) distinct from
+`/health` liveness. The artifact is read, validated against the release manifest
+and its full SHA-256 cached once at startup, so a same-size corruption that keeps
+the header and length intact is never reported healthy (the manifest must be
+deliverable: `MIN_ARTIFACT_LEN`, version 1, non-zero KID and encapsulated key);
+the `dispatcher` check reflects whether the opaque command surface is configured
+(the production binary always wires a fail-closed dispatcher before serving and
+refuses startup without one), and a future composition that can lose its
+dispatcher clears it. A configured FOMO source (history and/or stream) is always
+a required dependency: the `fomo_market` check is only true after the bounded
+authenticated `/market/bars` history proof succeeds, and the `stream` check is
+required whenever a stream source is composed, so an expired bridge session
+fails readiness rather than being masked. Setting `TRADING_CORE_LIVE=1` makes the
+concrete execution transports a required dependency too: `live_execution` is only
+true when the durable store, Base RPC, Privy signer and payload builder were all
+proven, so a missing credential or unreachable transport fails readiness.
+`apps/edge-gateway` refuses a non-loopback `EDGE_BIND_ADDR` until cryptographic
+Cloudflare Access JWT validation is implemented; setting
+`EDGE_ACCESS_JWT_VALIDATION=true` cannot bypass that, so the loopback deployment
+mitigation cannot be widened silently.
 
 ## Post-review hardening (adversarial review of the unlock slice)
 
@@ -861,9 +878,9 @@ the valid findings were fixed with regression tests:
   `enrollment_required` delivery response refetches the descriptor so the retry
   re-enrolls rather than replaying a stale skip; the raw KID is no longer
   rendered; stage progress marks completed steps.
-- **Readiness.** `/ready` bounds the artifact and manifest reads from metadata
-  before reading, runs artifact I/O on the blocking pool, and clears the relay
-  readiness flag on any task exit (not only `Err`).
+- **Readiness.** `/ready` validates and caches the immutable artifact (including
+  its full manifest SHA-256) once at startup, runs artifact I/O on the blocking
+  pool, and clears the relay readiness flag on any task exit (not only `Err`).
 
 ## Second adversarial review pass (UX/auth/unlock lane)
 
@@ -884,9 +901,10 @@ The confirmed findings were fixed with regression tests:
   wrapper, and the pending proof-of-possession challenge set now has a
   per-session bound in addition to the global one.
 - **Readiness (MEDIUM).** `/ready` no longer reports a truncated or
-  wrong-version artifact as healthy: the header probe requires
-  `MIN_ARTIFACT_LEN` and mirrors the audited envelope's public-header validation
-  (version, non-zero KID, non-zero encapsulated key). The dispatcher is an
+  wrong-version artifact as healthy: the artifact is fully read and validated
+  against the release manifest (version, non-zero KID, non-zero encapsulated key,
+  exact size and full SHA-256) and cached at startup, so even a same-size
+  corruption is not reported ready. The dispatcher is an
   explicit readiness check. `apps/edge-gateway` eagerly loads and validates its
   certificate/key/CA at startup (instead of failing later as a permanent 503),
   trims whitespace-only identity values, and has a router-level forged/absent
@@ -1019,8 +1037,9 @@ Accepted residuals (unchanged): the recovery proof-of-possession challenge is
 single-use, session-bound and TTL-bounded but not bound to a specific operation;
 `list_recovery_wrappers` requires only an authenticated session (the wrapped
 ciphertext is AES-256-GCM under the PRF/offline secret, and the pre-unlock client
-must list it); `/ready` validates the manifest shape/KID/size but not the full
-artifact digest on every unauthenticated probe; and edge perimeter trust stays
+must list it); `/ready` validates the manifest shape/KID/size **and** the full
+artifact digest once at startup and caches the verdict, so a later on-disk change
+does not re-trigger a re-read until restart; and edge perimeter trust stays
 presence-only with the loopback bind as the compensating control.
 
 ## KLineChart Pro private chart (frontend slice)

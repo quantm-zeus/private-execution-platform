@@ -261,6 +261,11 @@ pub struct FomoMarketConfig {
     pub request_timeout: Duration,
     /// Optional single realtime target `(chain_slug, address, timeframe_id)`.
     pub stream_target: Option<(String, String, String)>,
+    /// Optional `(chain_slug, address)` used only by the chart-history health
+    /// proof. When absent the proof falls back to the realtime target's
+    /// chain/address; when both are absent the configured source cannot prove
+    /// chart history and `chart` is not advertised.
+    pub history_target: Option<(String, String)>,
     pub stream_poll: Duration,
     pub stream_count_back: u32,
 }
@@ -305,6 +310,20 @@ impl FomoMarketConfig {
 
     pub fn clamp_count_back(count: u32) -> u32 {
         count.clamp(1, FOMO_MAX_COUNT_BACK)
+    }
+
+    /// The `(chain_slug, address)` the bounded history health proof targets.
+    ///
+    /// Prefers the dedicated history target; otherwise reuses the realtime
+    /// target. `None` means the source has no provable history target and must
+    /// not advertise `chart`.
+    pub fn history_probe_pair(&self) -> Option<(&str, &str)> {
+        if let Some((chain, address)) = self.history_target.as_ref() {
+            return Some((chain.as_str(), address.as_str()));
+        }
+        self.stream_target
+            .as_ref()
+            .map(|(chain, address, _)| (chain.as_str(), address.as_str()))
     }
 }
 
@@ -576,6 +595,14 @@ fn optional_u32(payload: &Value, key: &str) -> Result<Option<u32>, CommandDenial
 pub struct FomoChartDispatcher {
     inner: Arc<dyn CommandDispatcher>,
     provider: Arc<dyn BarsProvider>,
+    /// Optional observational history-health flag.
+    ///
+    /// Set `true` on every successful `/market/bars` chart read and `false` when
+    /// the bridge refuses one. The composition shares it with `/ready`, so a
+    /// bridge session that expires *after* the startup history proof still flips
+    /// the FOMO readiness dependency to unhealthy rather than leaving a stale
+    /// `chart` capability advertised.
+    health: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for FomoChartDispatcher {
@@ -587,7 +614,23 @@ impl std::fmt::Debug for FomoChartDispatcher {
 
 impl FomoChartDispatcher {
     pub fn new(inner: Arc<dyn CommandDispatcher>, provider: Arc<dyn BarsProvider>) -> Self {
-        Self { inner, provider }
+        Self {
+            inner,
+            provider,
+            health: None,
+        }
+    }
+
+    /// Attaches the shared history-health flag updated on every chart read.
+    pub fn with_health_flag(mut self, health: Option<Arc<AtomicBool>>) -> Self {
+        self.health = health;
+        self
+    }
+
+    fn mark_health(&self, healthy: bool) {
+        if let Some(flag) = self.health.as_ref() {
+            flag.store(healthy, Ordering::SeqCst);
+        }
     }
 
     async fn get_chart(&self, request: &CommandRequest) -> Result<Value, CommandDenial> {
@@ -604,12 +647,17 @@ impl FomoChartDispatcher {
             .unwrap_or(FOMO_DEFAULT_COUNT_BACK);
         let from = optional_i64(&request.payload, "from")?;
         let to = optional_i64(&request.payload, "to")?;
+        // Mirror the provider's own validation so a determinate client error is
+        // refused here and can never reach the provider or demote readiness.
+        if from.is_some_and(|value| value < 0) || to.is_some_and(|value| value < 0) {
+            return Err(FomoMarketError::InvalidRequest.denial());
+        }
         if let (Some(from), Some(to)) = (from, to) {
             if from > to {
                 return Err(FomoMarketError::InvalidRequest.denial());
             }
         }
-        let bars = self
+        let bars = match self
             .provider
             .bars(BarsQuery {
                 chain_slug: &chain,
@@ -621,7 +669,22 @@ impl FomoChartDispatcher {
                 latest: false,
             })
             .await
-            .map_err(FomoMarketError::denial)?;
+        {
+            Ok(bars) => {
+                self.mark_health(true);
+                bars
+            }
+            // Only a real provider outage is the observable history failure the
+            // readiness dependency must report. A determinate client-side
+            // rejection (a bad address the provider refuses) must not let an
+            // authenticated caller force `/ready` false.
+            Err(error) => {
+                if !matches!(error, FomoMarketError::InvalidRequest) {
+                    self.mark_health(false);
+                }
+                return Err(error.denial());
+            }
+        };
         // Normalize regardless of provider: an injected implementation must not
         // be able to return an unordered or duplicate series to a renderer.
         let bars = normalize_bars(bars);
@@ -895,8 +958,27 @@ pub fn build_wiring_with_health(
     inner: Arc<dyn CommandDispatcher>,
     health: Option<Arc<AtomicBool>>,
 ) -> Result<FomoMarketWiring, FomoMarketError> {
-    let dispatcher: Arc<dyn CommandDispatcher> =
-        Arc::new(FomoChartDispatcher::new(inner, provider.clone()));
+    build_wiring_with_health_flags(config, provider, inner, health, None)
+}
+
+/// Build the FOMO market wiring with independent observational health flags for
+/// the realtime `/market/latest` source and the chart `/market/bars` dispatcher.
+///
+/// `stream_health` is updated by the realtime source on every bounded poll read;
+/// `history_health` is updated by the chart dispatcher on every history read.
+/// The composition shares each with `/ready` (and with the startup history
+/// proof) so a sustained outage of either route is observable rather than
+/// masked by a live process. Neither flag is a configuration assertion.
+pub fn build_wiring_with_health_flags(
+    config: &FomoMarketConfig,
+    provider: Arc<dyn BarsProvider>,
+    inner: Arc<dyn CommandDispatcher>,
+    stream_health: Option<Arc<AtomicBool>>,
+    history_health: Option<Arc<AtomicBool>>,
+) -> Result<FomoMarketWiring, FomoMarketError> {
+    let dispatcher: Arc<dyn CommandDispatcher> = Arc::new(
+        FomoChartDispatcher::new(inner, provider.clone()).with_health_flag(history_health),
+    );
     let stream_source: Option<Arc<dyn StreamSource>> = match &config.stream_target {
         None => None,
         Some((chain, address, timeframe)) => {
@@ -908,7 +990,7 @@ pub fn build_wiring_with_health(
                 config.stream_count_back,
                 config.stream_poll,
             )?;
-            let source = match health {
+            let source = match stream_health {
                 Some(flag) => source.with_health_flag(flag),
                 None => source,
             };
@@ -943,6 +1025,36 @@ pub async fn probe_realtime(provider: &dyn BarsProvider, config: &FomoMarketConf
             from_s: None,
             to_s: None,
             latest: true,
+        })
+        .await
+        .is_ok()
+}
+
+/// One bounded authenticated `/market/bars` read proving the configured FOMO
+/// source can actually serve chart history.
+///
+/// This is the capability proof behind `chart`: unlike the realtime probe, it
+/// exercises the *history* route (`latest: false`) the browser chart uses, so a
+/// source whose session is expired (HTTP 503 `auth_rejected`) can never be
+/// advertised as chart-capable. Returns `false` when no history/realtime target
+/// is configured or the bridge refuses the read.
+pub async fn probe_history(provider: &dyn BarsProvider, config: &FomoMarketConfig) -> bool {
+    let Some((chain, address)) = config.history_probe_pair() else {
+        return false;
+    };
+    let Some(resolution) = fomo_resolution("1m") else {
+        return false;
+    };
+    provider
+        .bars(BarsQuery {
+            chain_slug: chain,
+            address,
+            resolution,
+            count_back: 1,
+            from_s: None,
+            to_s: None,
+            // History, not the bounded-cadence `/market/latest` read.
+            latest: false,
         })
         .await
         .is_ok()
@@ -1230,6 +1342,7 @@ mod tests {
             api_key_file: PathBuf::from("/tmp/key"),
             request_timeout: Duration::from_millis(100),
             stream_target: None,
+            history_target: None,
             stream_poll: Duration::from_secs(5),
             stream_count_back: 10,
         };
@@ -1248,6 +1361,76 @@ mod tests {
         );
         let down = Arc::new(FakeProvider::new(vec![Err(FomoMarketError::Unavailable)]));
         assert!(!probe_realtime(down.as_ref(), &config).await);
+    }
+
+    #[tokio::test]
+    async fn history_probe_uses_the_history_route_and_fails_closed() {
+        /// Provider whose history and latest routes can fail independently.
+        struct RouteAware {
+            history: Result<Vec<Bar>, FomoMarketError>,
+            latest: Result<Vec<Bar>, FomoMarketError>,
+            history_calls: StdMutex<usize>,
+        }
+
+        #[async_trait]
+        impl BarsProvider for RouteAware {
+            async fn bars(&self, query: BarsQuery<'_>) -> Result<Vec<Bar>, FomoMarketError> {
+                if query.latest {
+                    self.latest.clone()
+                } else {
+                    *self.history_calls.lock().unwrap() += 1;
+                    self.history.clone()
+                }
+            }
+        }
+
+        let base = FomoMarketConfig {
+            base_url: "http://127.0.0.1:8787".into(),
+            api_key_file: PathBuf::from("/tmp/key"),
+            request_timeout: Duration::from_millis(100),
+            stream_target: None,
+            history_target: None,
+            stream_poll: Duration::from_secs(5),
+            stream_count_back: 10,
+        };
+
+        // No target at all: the proof cannot be made, so chart fails closed.
+        assert!(!probe_history(fake(vec![bar(1_000, 1.0)]).as_ref(), &base).await);
+
+        // A dedicated history target exercises the non-`latest` history route.
+        let provider = Arc::new(RouteAware {
+            history: Ok(vec![bar(1_000, 1.0)]),
+            latest: Err(FomoMarketError::Unavailable),
+            history_calls: StdMutex::new(0),
+        });
+        let config = FomoMarketConfig {
+            history_target: Some(("base".into(), "0xabc".into())),
+            ..base.clone()
+        };
+        assert!(probe_history(provider.as_ref(), &config).await);
+        assert_eq!(*provider.history_calls.lock().unwrap(), 1);
+
+        // An auth-rejected `/market/bars` read is not a healthy proof even when
+        // the bounded-cadence latest route would answer.
+        let expired = Arc::new(RouteAware {
+            history: Err(FomoMarketError::Unavailable),
+            latest: Ok(vec![bar(1_000, 1.0)]),
+            history_calls: StdMutex::new(0),
+        });
+        assert!(!probe_history(expired.as_ref(), &config).await);
+
+        // The realtime target is reused when no dedicated history target is set.
+        let reused = FomoMarketConfig {
+            stream_target: Some(("base".into(), "0xabc".into(), "1m".into())),
+            ..base
+        };
+        let provider = Arc::new(RouteAware {
+            history: Ok(Vec::new()),
+            latest: Err(FomoMarketError::Unavailable),
+            history_calls: StdMutex::new(0),
+        });
+        assert!(probe_history(provider.as_ref(), &reused).await);
+        assert_eq!(*provider.history_calls.lock().unwrap(), 1);
     }
 
     fn request(payload: Value) -> CommandRequest {
@@ -1322,6 +1505,74 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, "server");
         assert!(err.retryable);
+    }
+
+    #[tokio::test]
+    async fn chart_dispatcher_health_flag_tracks_history_reads() {
+        let health = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FakeProvider::new(vec![
+            Ok(vec![bar(1_000, 10.0)]),
+            Err(FomoMarketError::Unavailable),
+        ]));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider)
+                .with_health_flag(Some(health.clone()));
+
+        // A successful history read proves the source healthy.
+        assert!(dispatcher
+            .dispatch(&request(
+                json!({"chain": "base", "address": "0xabc", "window": "m5"}),
+            ))
+            .await
+            .is_ok());
+        assert!(health.load(Ordering::SeqCst));
+
+        // A later provider refusal flips the shared flag false, so `/ready` can
+        // report an expired bridge session rather than a stale healthy proof.
+        assert!(dispatcher
+            .dispatch(&request(
+                json!({"chain": "base", "address": "0xabc", "window": "m5"}),
+            ))
+            .await
+            .is_err());
+        assert!(!health.load(Ordering::SeqCst));
+
+        // A malformed request never reaches the provider and must not mark the
+        // source unhealthy.
+        health.store(true, Ordering::SeqCst);
+        assert!(dispatcher
+            .dispatch(&request(
+                json!({"chain": "unknown", "address": "0xabc", "window": "m5"}),
+            ))
+            .await
+            .is_err());
+        assert!(health.load(Ordering::SeqCst));
+
+        // A negative range is refused client-side too, so an authenticated
+        // caller cannot force the shared readiness flag false.
+        assert!(dispatcher
+            .dispatch(&request(json!({
+                "chain": "base", "address": "0xabc", "window": "m5", "from": -1
+            })))
+            .await
+            .is_err());
+        assert!(health.load(Ordering::SeqCst));
+
+        // A provider determinate rejection is likewise not an outage.
+        let rejecting = FomoChartDispatcher::new(
+            Arc::new(crate::opaque::FailClosedDispatcher),
+            Arc::new(FakeProvider::new(vec![Err(
+                FomoMarketError::InvalidRequest,
+            )])),
+        )
+        .with_health_flag(Some(health.clone()));
+        assert!(rejecting
+            .dispatch(&request(
+                json!({"chain": "base", "address": "0xabc", "window": "m5"}),
+            ))
+            .await
+            .is_err());
+        assert!(health.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
