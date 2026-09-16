@@ -167,45 +167,6 @@ export async function assertArtifactBinding(
   }
 }
 
-/**
- * Derive the workspace public-key fingerprint for a candidate secret, using the
- * audited WASM key path. Returns `null` when the KID is malformed, the secret is
- * rejected, or WebCrypto is unavailable. The caller's `secret` is not mutated.
- */
-export async function deriveWorkspaceFingerprint(
-  secret: Uint8Array,
-  kidB64: string,
-): Promise<string | null> {
-  let kidBytes: Uint8Array;
-  try {
-    kidBytes = fromBase64(kidB64);
-  } catch {
-    return null;
-  }
-  if (kidBytes.length !== 16 || kidBytes.every((b) => b === 0)) return null;
-  if (secret.length !== 32 || secret.every((b) => b === 0)) return null;
-  let key: WasmWorkspaceKey;
-  // Copy into an owned buffer so the caller's bytes are never mutated, and
-  // zeroize the copy once the key is derived (the WASM ctor does not retain it).
-  const secretCopy = new Uint8Array(secret);
-  try {
-    key = new WasmWorkspaceKey(secretCopy, 1, kidBytes);
-  } catch {
-    return null;
-  } finally {
-    secretCopy.fill(0);
-  }
-  try {
-    return await publicKeyFingerprintB64(new Uint8Array(key.public_key()));
-  } catch {
-    return null;
-  } finally {
-    try {
-      key.free();
-    } catch {}
-  }
-}
-
 export function unpackPackageFromMemory(
   buffer: Uint8Array,
 ): Map<string, Uint8Array> {

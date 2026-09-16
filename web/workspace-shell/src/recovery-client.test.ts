@@ -83,6 +83,13 @@ test("parseRecoveryWrappers rejects malformed containers and skips bad records",
     }),
     [],
   );
+
+  // Revocation must be explicit: a record that omits `revoked_at_ms` is
+  // malformed, never implicitly live, so a revoked passkey can never be
+  // resurrected into the normal unlock set by a null-stripping producer.
+  const omittedRevocation: Record<string, unknown> = { ...VALID_RECORD };
+  delete omittedRevocation.revoked_at_ms;
+  assert.deepEqual(parseRecoveryWrappers({ wrappers: [omittedRevocation] }), []);
 });
 
 test("parseRecoveryWrappers skips records with a wrong algorithm or decoded lengths", () => {

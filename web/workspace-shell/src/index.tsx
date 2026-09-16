@@ -74,7 +74,7 @@ const STAGES: { id: UnlockStage; label: string }[] = [
   { id: "U2_ENROLL", label: "Workspace identity" },
   { id: "U3_GRANT", label: "Artifact access" },
   { id: "U4_TRANSPORT", label: "Encrypted session" },
-  { id: "U5_ARTIFACT", label: "Release compatibility" },
+  { id: "U5_ARTIFACT", label: "Release" },
   { id: "U6_PACKAGE", label: "Release package" },
   { id: "U7_BOOT", label: "Workspace start" },
 ];
@@ -107,6 +107,7 @@ function App() {
     "Checking whether an operator session already exists...",
   );
   const [enrollmentOpen, setEnrollmentOpen] = createSignal(false);
+  const [operatorEnrollOpen, setOperatorEnrollOpen] = createSignal(false);
   const [enrollSecret, setEnrollSecret] = createSignal("");
   const [isEnrolling, setIsEnrolling] = createSignal(false);
   const [enrollInvalid, setEnrollInvalid] = createSignal(false);
@@ -319,8 +320,11 @@ function App() {
     if (!activeDescriptor || !identityValue.fingerprintB64) return;
     const active = selectPasskeyUnlockWrappers(wrapperList);
     if (active.length === 0) {
-      setTroubleOpen(true);
-      setStatus("No passkey unlock is registered for this workspace.");
+      // Recovery stays behind the explicit "Having trouble signing in?" action;
+      // do not auto-open the code input on the normal unlock surface.
+      setStatus(
+        "No passkey unlock is registered for this workspace. Use “Having trouble signing in?” and your recovery code.",
+      );
       return;
     }
     setIsUnlocking(true);
@@ -386,12 +390,13 @@ function App() {
             : recoveryFor("U7_BOOT", "unknown");
         }
       }
-      setTroubleOpen(true);
       setRecoveryMessage(
         "Automatic passkey unlock was not available. Use your offline recovery code.",
       );
       if (lastFailure) setUnlockFailure(lastFailure);
-      setStatus("Passkey unlock did not complete.");
+      setStatus(
+        "Automatic passkey unlock was not available. Use “Having trouble signing in?” and your recovery code.",
+      );
     } finally {
       setUnlockStage(null);
       setIsUnlocking(false);
@@ -439,21 +444,24 @@ function App() {
       try {
         const assertion = await authenticateWithPrf({ prfSalt: salt });
         if (assertion.prfOutput) {
-          const record = await wrapRootKey(
-            assertion.prfOutput,
-            root,
-            salt,
-            undefined,
-            assertion.credentialIdB64,
-            WORKSPACE_ROOT_KEY_SOURCE,
-          );
-          assertion.prfOutput.fill(0);
-          prfAvailable = true;
-          bootstrapWrappers.push({
-            credentialIdB64: assertion.credentialIdB64,
-            label: deviceLabel().trim() || "This device",
-            record,
-          });
+          try {
+            const record = await wrapRootKey(
+              assertion.prfOutput,
+              root,
+              salt,
+              undefined,
+              assertion.credentialIdB64,
+              WORKSPACE_ROOT_KEY_SOURCE,
+            );
+            prfAvailable = true;
+            bootstrapWrappers.push({
+              credentialIdB64: assertion.credentialIdB64,
+              label: deviceLabel().trim() || "This device",
+              record,
+            });
+          } finally {
+            assertion.prfOutput.fill(0);
+          }
         }
       } catch {
         // PRF unavailable: keep the recovery wrapper only.
@@ -798,16 +806,21 @@ function App() {
         );
         return;
       }
-      const record = await wrapRootKey(
-        prfOutput,
-        root,
-        salt,
-        undefined,
-        assertion.credentialIdB64,
-        WORKSPACE_ROOT_KEY_SOURCE,
-      );
-      prfOutput.fill(0);
-      root.fill(0);
+      let record: Awaited<ReturnType<typeof wrapRootKey>>;
+      try {
+        record = await wrapRootKey(
+          prfOutput,
+          root,
+          salt,
+          undefined,
+          assertion.credentialIdB64,
+          WORKSPACE_ROOT_KEY_SOURCE,
+        );
+      } finally {
+        // Zeroize both buffers even when wrapping throws.
+        prfOutput.fill(0);
+        root.fill(0);
+      }
       const proof = await beginRecoveryProof((sealed) =>
         defaultRuntime.decryptRecoveryChallenge(sealed),
       );
@@ -1036,10 +1049,32 @@ function App() {
               </p>
             </Show>
           </div>
+        </section>
 
-          <Show when={enrollmentOpen()}>
-            <details class="advanced">
-              <summary>First-run operator enrollment</summary>
+        {/* First-run operator bootstrap: deliberately a separate surface from the
+            normal login panel, and behind an explicit operator action, so the
+            login screen never exposes an enrollment secret. */}
+        <Show when={enrollmentOpen()}>
+          <section class="panel" aria-labelledby="operator-enroll-heading">
+            <h2 id="operator-enroll-heading" class="panel__heading">
+              First-run operator enrollment
+            </h2>
+            <p class="panel__copy">
+              No passkey is enrolled yet. An operator registers the first passkey
+              with the enrollment secret before the workspace can be opened.
+            </p>
+            <Show
+              when={operatorEnrollOpen()}
+              fallback={
+                <button
+                  type="button"
+                  class="button"
+                  onClick={() => setOperatorEnrollOpen(true)}
+                >
+                  Open operator enrollment
+                </button>
+              }
+            >
               <form class="form" onSubmit={handleEnroll}>
                 <label class="field" for="enroll-secret">
                   <span class="field__label">Operator enrollment secret</span>
@@ -1060,9 +1095,9 @@ function App() {
                   {isEnrolling() ? "Enrolling..." : "Enroll passkey"}
                 </button>
               </form>
-            </details>
-          </Show>
-        </section>
+            </Show>
+          </section>
+        </Show>
 
         {/* Initial setup: generate the stable root + recovery code locally.
             This intentionally does not require a published release: the stable

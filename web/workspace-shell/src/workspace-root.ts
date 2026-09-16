@@ -10,8 +10,8 @@
 //   * a future release is sealed to the same public key, with no reseal and no
 //     operator involvement;
 //   * per-artifact freshness comes from the HPKE envelope randomness plus the
-//     signed release metadata (release id, artifact digest), not from changing
-//     the workspace identity.
+//     release metadata (release id, artifact digest) bound to the artifact over
+//     the authenticated channel, not from changing the workspace identity.
 //
 // The root secret itself is never persisted anywhere. It is wrapped client-side
 // under (a) a passkey WebAuthn PRF output and (b) a separate high-entropy offline

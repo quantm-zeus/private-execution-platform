@@ -92,7 +92,7 @@ const STAGE_LABELS: Record<UnlockStage, string> = {
   U2_ENROLL: "Workspace identity",
   U3_GRANT: "Artifact access",
   U4_TRANSPORT: "Encrypted session",
-  U5_ARTIFACT: "Release compatibility",
+  U5_ARTIFACT: "Release",
   U6_PACKAGE: "Release package",
   U7_BOOT: "Workspace start",
 };

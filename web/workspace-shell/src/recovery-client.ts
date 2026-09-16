@@ -151,6 +151,12 @@ function parseWrapperRecord(value: unknown): RecoveryWrapperRecord {
   if (wrappedRootKey.length !== RECOVERY_WRAPPED_ROOT_KEY_BYTES) {
     throw new RecoveryClientError("recovery_malformed");
   }
+  // Revocation must be explicit: a record that omits `revoked_at_ms` is
+  // malformed, never a live credential. Otherwise a null-stripping producer
+  // could silently resurrect a revoked passkey into the normal unlock set.
+  if (!("revoked_at_ms" in value)) {
+    throw new RecoveryClientError("recovery_malformed");
+  }
   return {
     credential_id_b64: requireString(value.credential_id_b64, 2048),
     label: requireString(value.label, 64),

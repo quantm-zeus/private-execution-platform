@@ -1,27 +1,18 @@
-// Passkey-bound workspace recovery wrapping primitives.
+// Workspace Root Key wrapping primitives.
 //
-// Design: the workspace *root key material* is wrapped locally under each
-// recovery credential. In the wired production path that key material is the
-// existing 32-byte unlock secret (`key_source = "unlock_secret_v1"`), so the
-// artifact and its derivation are unchanged. For a passkey, the wrapping key is
+// Design: the client-generated 32-byte *Workspace Root Secret* is wrapped
+// locally under each recovery credential. The live wrapper key source is the
+// stable `workspace_root_v2`; the legacy `unlock_secret_v1` source is retained
+// only so bounded migration records parse. For a passkey, the wrapping key is
 // derived from the WebAuthn PRF extension output:
 //
 //   PRF output --HKDF-SHA256(salt, info)--> AES-256-GCM wrapping key
 //             --AES-GCM(key material)--> wrapped record (stored server-side)
 //
-// The PRF output, wrapping key and unwrapped key material never leave the browser
-// in plaintext. A normal passkey signature is NOT key material and is never used
+// The PRF output, wrapping key and unwrapped root never leave the browser in
+// plaintext. A normal passkey signature is NOT key material and is never used
 // here. PRF is optional in WebAuthn, so a mandatory high-entropy offline
-// recovery secret remains the fallback.
-//
-// ROLLOUT STATUS
-// Wired into the production unlock path as an ADDITIVE layer: a wrapper protects
-// the existing unlock secret (`key_source = "unlock_secret_v1"`), so no
-// artifact, KID or derivation changes and the mandatory offline recovery code
-// keeps working. PRF support is optional and per-authenticator:
-// `extractPrfOutput` returns `null` and the caller falls back to the offline
-// code. A future random root key would be a new, explicitly versioned key
-// source, not a change to these records. See docs/workspace-recovery.md.
+// recovery code remains the fallback. See docs/workspace-recovery.md.
 
 export const RECOVERY_WRAPPER_VERSION = 1;
 export const RECOVERY_WRAP_ALGORITHM = "HKDF-SHA256/AES-256-GCM";
@@ -359,6 +350,11 @@ export async function wrapWithPrf(
 ): Promise<WrappedRootKey | null> {
   const prf = extractPrfOutput(credential);
   if (!prf) return null;
+  // A passkey wrapper must bind a real credential id; the empty-id AAD is
+  // reserved for the offline recovery wrapper, so an empty id here would make
+  // the two wrapper kinds indistinguishable. Treat it as "no PRF" and let the
+  // caller fall back to the offline recovery code.
+  if (!credentialIdB64) return null;
   try {
     // `deriveRecoveryWrappingKey` imports the PRF bytes into WebCrypto before
     // the async boundary returns, so the local copy can be zeroized here.

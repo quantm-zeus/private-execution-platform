@@ -191,12 +191,15 @@ test.describe("shell artifact unlock", () => {
       "artifact digest",
       "protocol metadata",
       "key binding",
+      "enrollment secret",
       "recovery code",
     ]) {
       expect(body, `normal login must not mention ${forbidden}`).not.toContain(forbidden);
     }
-    // Bootstrap enrollment stays hidden while the server reports it closed.
+    // Bootstrap enrollment stays hidden while the server reports it closed, and
+    // can never be reached through the normal login panel.
     await expect(page.getByText("First-run operator enrollment")).toHaveCount(0);
+    await expect(page.locator("#enroll-secret")).toHaveCount(0);
     // No passkey pop-up on mount: exactly zero ceremonies until the user acts.
     expect(
       await page.evaluate(
@@ -227,10 +230,11 @@ test.describe("shell artifact unlock", () => {
     await expect(
       page.getByRole("heading", { name: "Unlock the sealed release" }),
     ).toBeVisible({ timeout: 20_000 });
-    // No passkey unlock is registered on this host, so the shell may have
-    // already surfaced the fallback; either way the recovery input is never on
-    // the initial login screen and only the explicit action controls it.
-    await openRecovery(page);
+    // This host has no passkey wrapper, so the shell may have attempted the
+    // normal path; the recovery input must still be absent until the explicit
+    // "Having trouble signing in?" action is used.
+    await expect(page.locator("#recovery-code")).toHaveCount(0);
+    await page.getByRole("button", { name: "Having trouble signing in?" }).click();
     await expect(page.locator("#recovery-code")).toBeVisible();
   });
 
@@ -248,7 +252,17 @@ test.describe("shell artifact unlock", () => {
       }),
     );
     await page.goto(`${SHELL_ORIGIN}/`);
-    await expect(page.getByText("First-run operator enrollment")).toBeVisible();
+    // The operator bootstrap is a separate surface, never part of the normal
+    // login panel, and behind an explicit operator action.
+    await expect(
+      page.getByRole("heading", { name: "First-run operator enrollment" }),
+    ).toBeVisible();
+    await expect(
+      page.locator('section[aria-labelledby="open-heading"] #enroll-secret'),
+    ).toHaveCount(0);
+    await expect(page.locator("#enroll-secret")).toHaveCount(0);
+    await page.getByRole("button", { name: "Open operator enrollment" }).click();
+    await expect(page.locator("#enroll-secret")).toBeVisible();
   });
 
   test("security gateway has no moderate-or-worse axe violations", async ({ page }) => {
