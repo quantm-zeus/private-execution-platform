@@ -10,7 +10,7 @@ export interface TerminalPanelProps {
 export const TerminalPanel: Component<TerminalPanelProps> = (props) => (
   <Panel
     title="Local chart & depth"
-    subtitle="Encrypted, sequenced frames are decrypted in the worker and rendered locally on Canvas"
+    subtitle="Encrypted, sequenced frames are decrypted in the worker and rendered locally by KLineChart Pro"
   >
     <ChartPanel entityKey={props.entityKey} />
   </Panel>

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { FrameBatcher } from "../realtime/batcher";
 import { decodeInnerFrame } from "../realtime/decoder";
 import { applyMarketFrame, createMarketFrameStores } from "../chart/frames";
-import { renderChart } from "../chart/renderer";
+import { normalizeCandles } from "../chart/chart-datafeed";
 import type { DecodedFrame, Priority } from "../realtime/types";
 
 const zeroFlush: Record<Priority, number> = { 0: 0, 1: 0, 2: 0, 3: 0 };
@@ -79,34 +79,23 @@ describe("performance budgets", () => {
     expect(duration).toBeLessThan(3_000);
   });
 
-  it("paints 2 000 candles well inside the visual-update budget", () => {
-    const calls = { n: 0 };
-    const ctx = new Proxy(
-      {},
-      {
-        get: () => () => {
-          calls.n += 1;
-        },
-        set: () => true,
-      },
-    ) as unknown as CanvasRenderingContext2D;
-    const candles = Array.from({ length: 2_000 }, (_, i) => ({
-      timeMs: i * 60_000,
-      open: 10 + (i % 7) * 0.01,
-      high: 10.5 + (i % 7) * 0.01,
+  it("normalizes 20 000 unordered bars into a bounded, ordered, deduped series", () => {
+    const raw = Array.from({ length: 20_000 }, (_, i) => ({
+      timeMs: ((i * 7919) % 20_000) * 60_000,
+      open: 10,
+      high: 10.5,
       low: 9.5,
       close: 10.2,
       volume: 100,
     }));
-    const duration = elapsed(() =>
-      renderChart(ctx, {
-        candles,
-        viewport: { startMs: 0, endMs: 2_000 * 60_000, minPrice: 9, maxPrice: 11 },
-        width: 1_200,
-        height: 600,
-      }),
-    );
-    expect(calls.n).toBeGreaterThan(2_000);
-    expect(duration).toBeLessThan(300);
+    const duration = elapsed(() => {
+      const normalized = normalizeCandles(raw);
+      // bounded by MAX_HISTORY_LIMIT and strictly ascending
+      expect(normalized.length).toBeLessThanOrEqual(4_096);
+      for (let i = 1; i < normalized.length; i++) {
+        expect(normalized[i]!.timeMs).toBeGreaterThan(normalized[i - 1]!.timeMs);
+      }
+    });
+    expect(duration).toBeLessThan(3_000);
   });
 });

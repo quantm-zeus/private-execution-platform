@@ -5,6 +5,7 @@ const ALL_TRUE_BOOTSTRAP = {
   protocol_version: 1,
   capabilities: {
     market: true,
+    chart: true,
     realtime: true,
     quotes: true,
     preview: true,

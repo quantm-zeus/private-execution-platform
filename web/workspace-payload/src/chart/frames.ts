@@ -22,8 +22,21 @@ export function parseCandle(raw: unknown): Candle | null {
   const low = num(record.low);
   const close = num(record.close);
   const volume = num(record.volume) ?? 0;
-  if (timeMs === null || open === null || high === null || low === null || close === null) return null;
-  if (high < low || volume < 0) return null;
+  if (timeMs === null || timeMs <= 0 || open === null || high === null || low === null || close === null) {
+    return null;
+  }
+  // Same envelope as the history parser: a bar whose open/close lies outside
+  // [low, high] is malformed, not a renderable candle.
+  if (
+    volume < 0 ||
+    high < low ||
+    high < open ||
+    high < close ||
+    low > open ||
+    low > close
+  ) {
+    return null;
+  }
   return { timeMs, open, high, low, close, volume };
 }
 
@@ -93,19 +106,23 @@ export function applyMarketFrame(stores: MarketFrameStores, frame: DecodedFrame)
     const timeframe = timeframeId ? timeframeById(timeframeId) : undefined;
     if (!timeframe) return { changed: false, kind: null, seriesKey: null };
     const key = `${frame.entityKey}#${timeframe.id}`;
-    const series = seriesFor(stores, key, timeframe.ms);
     if (frame.op === "snapshot") {
-      const rawCandles = Array.isArray(payload.candles) ? payload.candles : [];
+      // A malformed or empty snapshot must never wipe an existing series; keep
+      // the last good authoritative state and wait for the next snapshot.
+      if (!Array.isArray(payload.candles)) return { changed: false, kind: null, seriesKey: null };
       const candles: Candle[] = [];
-      for (const raw of rawCandles) {
+      for (const raw of payload.candles) {
         const candle = parseCandle(raw);
         if (candle) candles.push(candle);
       }
+      if (candles.length === 0) return { changed: false, kind: null, seriesKey: null };
+      const series = seriesFor(stores, key, timeframe.ms);
       series.applySnapshot(candles);
       return { changed: true, kind: "ohlcv", seriesKey: key };
     }
     const candle = parseCandle(payload.candle ?? payload);
     if (!candle) return { changed: false, kind: null, seriesKey: null };
+    const series = seriesFor(stores, key, timeframe.ms);
     const changed = series.upsert(candle);
     return { changed, kind: "ohlcv", seriesKey: key };
   }

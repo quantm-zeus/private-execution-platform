@@ -8,6 +8,7 @@
 /** Backend capability keys the workspace can probe via `/v1/bootstrap`. */
 export type CapabilityKey =
   | "market"
+  | "chart"
   | "realtime"
   | "quotes"
   | "preview"
@@ -25,6 +26,7 @@ export type CapabilityKey =
 
 export const CAPABILITY_KEYS: readonly CapabilityKey[] = [
   "market",
+  "chart",
   "realtime",
   "quotes",
   "preview",

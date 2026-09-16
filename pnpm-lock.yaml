@@ -56,6 +56,12 @@ importers:
 
   web/workspace-payload:
     dependencies:
+      '@klinecharts/pro':
+        specifier: 0.1.1
+        version: 0.1.1(klinecharts@9.1.1)
+      klinecharts:
+        specifier: 9.1.1
+        version: 9.1.1
       solid-js:
         specifier: 1.9.15
         version: 1.9.15
@@ -257,6 +263,11 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@klinecharts/pro@0.1.1':
+    resolution: {integrity: sha512-ChKW0/ra183CFKevzWSn1HwrLY3YOpERA8wfso+MMTyTYKEKx8Sd7gFTr5Hfn6R4MVru7xSlUHsqjlq/WpXrVA==}
+    peerDependencies:
+      klinecharts: '>=9.0.0'
 
   '@napi-rs/wasm-runtime@1.2.3':
     resolution: {integrity: sha512-UMduMbqO5s5zF2NkNacMT/yK5Y5QiKvWr2+50bzIIxFDwVJ2h49b+oyjaCGPhJxd2/gC2x39EHv/gHVuu36x2Q==}
@@ -921,6 +932,9 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
+  klinecharts@9.1.1:
+    resolution: {integrity: sha512-OnHeStm2zFf6iTPMPB720+gpD8psXmajZfd7eqZN+Z5FxnYF7sSsPE02J84JTJ0AVrXYOdLJShIdYkr7aNN5LA==}
+
   lightningcss-android-arm64@1.33.0:
     resolution: {integrity: sha512-gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg==}
     engines: {node: '>= 12.0.0'}
@@ -994,6 +1008,9 @@ packages:
   lightningcss@1.33.0:
     resolution: {integrity: sha512-WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA==}
     engines: {node: '>= 12.0.0'}
+
+  lodash@4.18.1:
+    resolution: {integrity: sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q==}
 
   lru-cache@11.5.2:
     resolution: {integrity: sha512-4pfM1Ff0x50o0tQwb5ucw/RzNyD0/YJME6IVcStalZuMWxdt3sR3huStTtxz4PUmvZfRguvDejasvQ2kifR11g==}
@@ -1677,6 +1694,12 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
+  '@klinecharts/pro@0.1.1(klinecharts@9.1.1)':
+    dependencies:
+      klinecharts: 9.1.1
+      lodash: 4.18.1
+      solid-js: 1.9.15
+
   '@napi-rs/wasm-runtime@1.2.3(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)':
     dependencies:
       '@emnapi/core': 1.11.2
@@ -2235,6 +2258,8 @@ snapshots:
 
   json5@2.2.3: {}
 
+  klinecharts@9.1.1: {}
+
   lightningcss-android-arm64@1.33.0:
     optional: true
 
@@ -2283,6 +2308,8 @@ snapshots:
       lightningcss-linux-x64-musl: 1.33.0
       lightningcss-win32-arm64-msvc: 1.33.0
       lightningcss-win32-x64-msvc: 1.33.0
+
+  lodash@4.18.1: {}
 
   lru-cache@11.5.2: {}
 

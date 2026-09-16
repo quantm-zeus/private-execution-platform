@@ -33,6 +33,14 @@ describe("parseCandle / parseDepthSnapshot", () => {
     expect(parseCandle({})).toBeNull();
   });
 
+  it("rejects a non-positive timestamp and an open/close outside [low, high]", () => {
+    expect(parseCandle(rawCandle(0, 10))).toBeNull();
+    expect(parseCandle(rawCandle(-5, 10))).toBeNull();
+    // open above high / close below low are malformed envelopes.
+    expect(parseCandle({ ...rawCandle(1_000, 10), open: 100 })).toBeNull();
+    expect(parseCandle({ ...rawCandle(1_000, 10), close: 0.5 })).toBeNull();
+  });
+
   it("parses depth and drops invalid levels", () => {
     const snapshot = parseDepthSnapshot({
       bids: [{ price: 10, size: 1 }, { price: 0, size: 1 }],
@@ -76,6 +84,27 @@ describe("applyMarketFrame", () => {
     expect(applyMarketFrame(stores, frame({ payload: { timeframe: "7m", candle: rawCandle(1, 1) } })).changed).toBe(false);
     expect(applyMarketFrame(stores, frame({ payload: {} })).changed).toBe(false);
     expect(applyMarketFrame(stores, frame({ channel: "depth", payload: { bids: "no" } })).changed).toBe(false);
+  });
+
+  it("a malformed or empty snapshot never wipes an existing series", () => {
+    const stores = createMarketFrameStores();
+    applyMarketFrame(
+      stores,
+      frame({ op: "snapshot", payload: { timeframe: "1m", candles: [rawCandle(1_000, 11)] } }),
+    );
+    // Non-array candles and an all-invalid snapshot are no-ops.
+    expect(
+      applyMarketFrame(stores, frame({ op: "snapshot", payload: { timeframe: "1m", candles: "nope" } })).changed,
+    ).toBe(false);
+    expect(
+      applyMarketFrame(stores, frame({ op: "snapshot", payload: { timeframe: "1m", candles: [{}] } })).changed,
+    ).toBe(false);
+    const empty = applyMarketFrame(
+      stores,
+      frame({ op: "snapshot", payload: { timeframe: "1m", candles: [] } }),
+    );
+    expect(empty.changed).toBe(false);
+    expect(stores.series.get("ohlcv:BASE:SOL#1m")!.toArray().map((c) => c.timeMs)).toEqual([1_000]);
   });
 
   it("applies depth snapshots and ignores depth deltas", () => {

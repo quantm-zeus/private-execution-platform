@@ -16,7 +16,7 @@ describe("TerminalPanel", () => {
       command: { async send<T>(): Promise<T> { throw new Error("unused"); } },
       session: parseWorkspaceSession({
         protocol_version: 1,
-        capabilities: { realtime: true, market: true },
+        capabilities: { realtime: true, market: true, chart: true },
         trading_enabled: false,
         kill_switch: { enabled: false, reason: null },
         chains: [],
@@ -33,6 +33,6 @@ describe("TerminalPanel", () => {
     ));
     expect(screen.getByText(/AWAITING FEED/)).toBeTruthy();
     expect(screen.getAllByText("No depth").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByRole("img", { name: /price chart/i })).toBeTruthy();
+    expect(screen.getByRole("group", { name: /price chart/i })).toBeTruthy();
   });
 });

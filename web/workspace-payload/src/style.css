@@ -679,15 +679,60 @@ select.input {
   padding: 0;
   overflow: hidden;
 }
-.chart-canvas {
-  display: block;
+.pep-pro-chart-host {
   width: 100%;
   height: 360px;
-  cursor: crosshair;
-  touch-action: none;
+  min-height: 320px;
 }
-.chart-canvas:focus-visible {
+.pep-pro-chart-host:focus-within {
   outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.pep-pro-chart {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+.chart-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+.chart-toolbar__label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.chart-timeframe {
+  width: auto;
+  min-width: 72px;
+}
+/* KLineChart Pro 0.1.1's period items are non-focusable spans. The first-party
+   `#chart-timeframe` select is the accessible keyboard/AT control, so the
+   vendor period bar is hidden to avoid two competing controls. */
+.pep-pro-chart .klinecharts-pro-period-bar {
+  display: none;
+}
+/* KLineChart Pro integration --------------------------------------------------
+   The vendor layout CSS is bundled into the encrypted payload (no external
+   stylesheet). Its iconfont is a `data:` URL, which `font-src 'self'` blocks in
+   both the payload and the inheriting shell CSP, so the four icon slots are
+   re-rendered with first-party glyphs instead of requesting the blocked font. */
+.klinecharts-pro [class^="icon-"],
+.klinecharts-pro [class*=" icon-"] {
+  font-family: inherit !important;
+}
+.klinecharts-pro .icon-icon-close::before {
+  content: "\00d7";
+}
+.klinecharts-pro .icon-icon-setting::before {
+  content: "\2699";
+}
+.klinecharts-pro .icon-icon-visible::before {
+  content: "\25c9";
+}
+.klinecharts-pro .icon-icon-invisible::before {
+  content: "\25cb";
 }
 .depth-list {
   list-style: none;
@@ -791,6 +836,16 @@ select.input {
   }
   .workspace__main {
     scroll-behavior: auto;
+  }
+  /* KLineChart Pro ships loading keyframes and `transition: all` on many
+     controls; neutralize both inside the chart host. */
+  .pep-pro-chart *,
+  .pep-pro-chart *::before,
+  .pep-pro-chart *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
   }
 }
 

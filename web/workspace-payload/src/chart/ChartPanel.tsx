@@ -1,21 +1,28 @@
 import {
+  For,
   Show,
   createEffect,
+  createMemo,
   createSignal,
   onCleanup,
   onMount,
   type Component,
 } from "solid-js";
-import { parseDepthSnapshot, applyMarketFrame, createMarketFrameStores } from "./frames";
-import { DEFAULT_CHART_THEME, renderChart } from "./renderer";
+import {
+  ChartFrameRouter,
+  DEFAULT_CHART_SUBJECT,
+  chartTicker,
+  createLocalHistoryProvider,
+  type ChartSubject,
+} from "./chart-datafeed";
+import { createPepHistoryProvider, createServerHistoryProvider } from "./history";
+import { createProChart, type ProChartHandle } from "./pro/pro-chart";
+import { DEFAULT_PRO_TIMEFRAME, PRO_PERIODS, createProDatafeed } from "./pro/pro-datafeed";
 import { formatAmount, formatBps, truncateAddress } from "../core/format";
 import type { InstrumentRef } from "../core/types";
-import { TIMEFRAMES, timeframeById } from "../market/ohlcv";
-import { computePriceRange, padRange, xToTime, zoomViewport, type Viewport } from "../market/scale";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
-import type { DecodedFrame } from "../realtime/types";
 import { useWorkspace } from "../state/session";
-import { Badge, Panel } from "../components/ui/primitives";
+import { Badge } from "../components/ui/primitives";
 import { EmptyBlock } from "../components/ui/states";
 
 export interface ChartPanelProps {
@@ -38,251 +45,181 @@ export function chartEntityKeyFor(
   return instrument === null ? "ohlcv:default" : `ohlcv:${instrument.chain}:${instrument.address}`;
 }
 
+function subjectFromInstrument(instrument: InstrumentRef | null): ChartSubject | null {
+  if (!instrument) return null;
+  return { chain: instrument.chain, address: instrument.address, symbol: instrument.symbol };
+}
+
+/** Parse an explicit `ohlcv:<chain>:<address>` override into a chart subject. */
+function subjectFromEntityKey(key: string): ChartSubject | null {
+  const parts = key.split(":");
+  if (parts.length !== 3 || parts[0] !== "ohlcv" || parts[1] === "" || parts[2] === "") return null;
+  return { chain: parts[1]!, address: parts[2]!, symbol: parts[2]! };
+}
+
 /**
- * Main-thread Canvas chart. The worker has already decrypted/normalized frames;
- * this component only applies them to bounded local buffers and paints.
+ * KLineChart Pro price chart. The worker has already decrypted and normalized
+ * frames; this component only routes them into bounded local buffers and the
+ * injected datafeed (authenticated history + the local realtime bar bus).
+ *
+ * Chart data is visual/non-authoritative: execution always depends on exact
+ * route simulation, never on a chart crossing.
  */
 export const ChartPanel: Component<ChartPanelProps> = (props) => {
   const ws = useWorkspace();
-  const entityKey = () => chartEntityKeyFor(ws.selectedInstrument(), props.entityKey);
-  const [timeframeId, setTimeframeId] = createSignal(props.initialTimeframe ?? "1m");
-  const [version, setVersion] = createSignal(0);
-  const [size, setSize] = createSignal({ width: 640, height: 360 });
-  const [endMs, setEndMs] = createSignal<number | null>(null);
-  const [spanMs, setSpanMs] = createSignal<number | null>(null);
-  const [follow, setFollow] = createSignal(true);
-  const stores = createMarketFrameStores();
-  const [dragging, setDragging] = createSignal(false);
   const feed = useRealtimeFeedContext();
-  let canvas: HTMLCanvasElement | undefined;
-  let container: HTMLDivElement | undefined;
-  let dragStartX = 0;
-  let dragStartEnd = 0;
-  let raf = 0;
+  const router = new ChartFrameRouter();
+  const [version, setVersion] = createSignal(0);
 
-  const currentTimeframe = () => timeframeById(timeframeId()) ?? TIMEFRAMES[3]!;
-
-  const series = () => stores.series.get(`${entityKey()}#${timeframeId()}`);
-
-  const scheduleRender = () => {
-    if (raf) return;
-    raf = requestAnimationFrame(() => {
-      raf = 0;
-      draw();
-    });
-  };
-
-  const draw = () => {
-    if (!canvas) return;
-    const dpr = typeof devicePixelRatio === "number" ? Math.min(devicePixelRatio, 2) : 1;
-    const { width, height } = size();
-    if (width <= 0 || height <= 0) return;
-    const targetWidth = Math.round(width * dpr);
-    const targetHeight = Math.round(height * dpr);
-    if (canvas.width !== targetWidth) canvas.width = targetWidth;
-    if (canvas.height !== targetHeight) canvas.height = targetHeight;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    const all = series()?.toArray() ?? [];
-    const tfMs = currentTimeframe().ms;
-    const bars = props.bars ?? 120;
-    const span = spanMs() ?? tfMs * bars;
-    const last = all[all.length - 1];
-    const end = endMs() ?? (last ? last.timeMs + tfMs : Date.now());
-    const start = end - span;
-    const visible = all.filter((candle) => candle.timeMs >= start && candle.timeMs <= end);
-    const rawRange = computePriceRange(visible);
-    const viewport: Viewport = rawRange
-      ? { startMs: start, endMs: end, minPrice: padRange(rawRange).min, maxPrice: padRange(rawRange).max }
-      : { startMs: start, endMs: end, minPrice: 0, maxPrice: 1 };
-    renderChart(ctx, {
-      candles: visible,
-      viewport,
-      width,
-      height,
-      theme: DEFAULT_CHART_THEME,
-      lastPrice: last?.close ?? null,
-    });
-  };
-
-  const onFrame = (frames: readonly DecodedFrame[]) => {
-    let changed = false;
-    for (const frame of frames) {
-      if (frame.channel !== "ohlcv" && frame.channel !== "depth") continue;
-      const result = applyMarketFrame(stores, frame);
-      changed = changed || result.changed;
+  const explicitSubject = createMemo<ChartSubject | null>(() => {
+    if (props.entityKey !== undefined && props.entityKey.length > 0) {
+      return subjectFromEntityKey(props.entityKey);
     }
-    if (changed) {
-      // Only auto-scroll while the user is following the right edge; a manual
-      // pan/zoom must not be overridden by the next frame.
-      if (follow()) setEndMs(null);
-      setVersion((value) => value + 1);
-    }
-  };
+    return null;
+  });
+
+  const subject = createMemo<ChartSubject>(
+    () => explicitSubject() ?? subjectFromInstrument(ws.selectedInstrument()) ?? DEFAULT_CHART_SUBJECT,
+  );
+
+  const hasTarget = createMemo(
+    () => explicitSubject() !== null || ws.selectedInstrument() !== null,
+  );
+
+  const datafeed = createProDatafeed({
+    history: createPepHistoryProvider(
+      createServerHistoryProvider({
+        command: ws.command,
+        ready: () => ws.commandReady(),
+        chartAllowed: () => ws.capabilityDenial("chart") === null,
+      }),
+      createLocalHistoryProvider(router),
+    ),
+    realtime: { subscribe: (target, timeframe, sink) => router.subscribe(target, timeframe, sink) },
+    resolveSubject: (ticker) => (chartTicker(subject()) === ticker ? subject() : null),
+    historyLimit: props.bars,
+  });
 
   onMount(() => {
-    const unsubscribe = feed?.subscribe(onFrame);
-    onCleanup(() => unsubscribe?.());
-
-    if (container && typeof ResizeObserver !== "undefined") {
-      const observer = new ResizeObserver((entries) => {
-        const rect = entries[0]?.contentRect;
-        if (rect) setSize({ width: rect.width, height: rect.height });
-      });
-      observer.observe(container);
-      onCleanup(() => observer.disconnect());
-      const rect = container.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) setSize({ width: rect.width, height: rect.height });
-    }
-    onCleanup(() => {
-      if (raf) cancelAnimationFrame(raf);
+    const unsubscribe = feed?.subscribe((frames) => {
+      if (router.apply(frames)) setVersion((value) => value + 1);
     });
-    scheduleRender();
+    onCleanup(() => unsubscribe?.());
   });
+
+  let host: HTMLDivElement | undefined;
+  let handle: ProChartHandle | null = null;
+  let createdTicker: string | null = null;
+  const [chartError, setChartError] = createSignal(false);
+  // Only offer periods the local contract can serve; an unknown initial id
+  // falls back explicitly instead of silently rendering a different window.
+  const normalizedInitialTimeframe = PRO_PERIODS.some(
+    (period) => period.text === props.initialTimeframe,
+  )
+    ? props.initialTimeframe!
+    : DEFAULT_PRO_TIMEFRAME;
+  let timeframeId = normalizedInitialTimeframe;
+  const [activeTimeframe, setActiveTimeframe] = createSignal(normalizedInitialTimeframe);
 
   createEffect(() => {
-    // Track the entity key so a shared-target change clears/redraws the canvas
-    // immediately instead of waiting for an unrelated frame or resize.
-    entityKey();
-    version();
-    size();
-    timeframeId();
-    spanMs();
-    endMs();
-    scheduleRender();
+    const current = subject();
+    const ticker = chartTicker(current);
+    if (!host) return;
+    if (handle !== null && createdTicker === ticker) return;
+    // Pro 0.1.1 can drop the last symbol/period change when two land while a
+    // history load is in flight (its loading guard is not reactive), so a
+    // subject switch rebuilds the renderer instead of calling `setSymbol`.
+    // The datafeed owns every subscription and is torn down with the instance.
+    handle?.dispose();
+    handle = null;
+    datafeed.dispose();
+    try {
+      handle = createProChart(host, {
+        subject: current,
+        datafeed,
+        timeframeId,
+        testId: "pro-chart",
+      });
+      createdTicker = ticker;
+      setChartError(false);
+    } catch {
+      // No usable canvas (unsupported/headless runtime): degrade to a clear
+      // message instead of breaking the whole workspace.
+      createdTicker = null;
+      handle = null;
+      setChartError(true);
+    }
   });
 
-  const onWheel = (event: WheelEvent) => {
-    event.preventDefault();
-    const rect = canvas?.getBoundingClientRect();
-    if (!rect) return;
-    const all = series()?.toArray() ?? [];
-    const tfMs = currentTimeframe().ms;
-    const span = spanMs() ?? tfMs * (props.bars ?? 120);
-    const last = all[all.length - 1];
-    const end = endMs() ?? (last ? last.timeMs + tfMs : Date.now());
-    const start = end - span;
-    const anchorX = event.clientX - rect.left;
-    const anchor = xToTime(anchorX, start, end, rect.width);
-    const factor = event.deltaY > 0 ? 1.15 : 0.87;
-    const dataStart = all[0]?.timeMs ?? start - span;
-    const dataEnd = last ? last.timeMs + tfMs : end;
-    const next = zoomViewport(
-      { startMs: start, endMs: end, minPrice: 0, maxPrice: 1 },
-      factor,
-      anchor,
-      tfMs * 5,
-      Math.min(dataStart, start - span),
-      Math.max(dataEnd, end),
-    );
-    setSpanMs(next.endMs - next.startMs);
-    setEndMs(next.endMs);
-    setFollow(false);
-  };
-
-  const onPointerDown = (event: PointerEvent) => {
-    if (!canvas) return;
-    const all = series()?.toArray() ?? [];
-    if (all.length === 0) return;
-    setDragging(true);
-    setFollow(false);
-    dragStartX = event.clientX;
-    const tfMs = currentTimeframe().ms;
-    const span = spanMs() ?? tfMs * (props.bars ?? 120);
-    dragStartEnd = endMs() ?? (all[all.length - 1]!.timeMs + tfMs);
-    canvas.setPointerCapture?.(event.pointerId);
-  };
-
-  const onPointerMove = (event: PointerEvent) => {
-    if (!dragging() || !canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const tfMs = currentTimeframe().ms;
-    const span = spanMs() ?? tfMs * (props.bars ?? 120);
-    const deltaPx = event.clientX - dragStartX;
-    const deltaMs = -(deltaPx / Math.max(1, rect.width)) * span;
-    setSpanMs(span);
-    setEndMs(dragStartEnd + deltaMs);
-  };
-
-  const onPointerUp = (event: PointerEvent) => {
-    setDragging(false);
-    canvas?.releasePointerCapture?.(event.pointerId);
-  };
-
-  const reset = () => {
-    setEndMs(null);
-    setSpanMs(null);
-    setFollow(true);
-    scheduleRender();
-  };
+  onCleanup(() => {
+    handle?.dispose();
+    handle = null;
+    datafeed.dispose();
+  });
 
   const depth = () => {
     // Track the frame version so depth tables re-render with new snapshots.
     version();
-    const bids = stores.depth.bidLevels().slice(0, 8);
-    const asks = stores.depth.askLevels().slice(0, 8);
-    return { bids, asks };
+    return {
+      bids: router.stores.depth.bidLevels().slice(0, 8),
+      asks: router.stores.depth.askLevels().slice(0, 8),
+    };
   };
 
   return (
     <div class="chart-panel">
       <div class="chart-target" data-testid="chart-target">
-        <Show
-          when={ws.selectedInstrument()}
-          fallback={<Badge tone="muted">No target selected</Badge>}
-        >
-          {(instrument) => (
-            <Badge tone="info">
-              {instrument().symbol} · {truncateAddress(instrument().address, 6, 6)} ·{" "}
-              {instrument().chain}
-            </Badge>
-          )}
+        <Show when={hasTarget()} fallback={<Badge tone="muted">No target selected</Badge>}>
+          <Badge tone="info">
+            {subject().symbol} · {truncateAddress(subject().address, 6, 6)} · {subject().chain}
+          </Badge>
         </Show>
-        <span class="muted">entity {entityKey()}</span>
-      </div>
-      <div class="timeframe-row" role="group" aria-label="Chart timeframe">
-        {TIMEFRAMES.map((tf) => (
-          <button
-           
-            type="button"
-            class="chip-button"
-            aria-pressed={timeframeId() === tf.id}
-            onClick={() => {
-              setTimeframeId(tf.id);
-              reset();
-            }}
-          >
-            {tf.label}
-          </button>
-        ))}
-        <button type="button" class="chip-button" onClick={reset}>
-          Reset
-        </button>
         <Badge tone={version() > 0 ? "positive" : "muted"}>
           {version() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
         </Badge>
       </div>
-      <div
-        class="chart-frame chart-frame--interactive"
-        ref={(element) => {
-          container = element;
-        }}
-      >
-        <canvas
-          ref={(element) => {
-            canvas = element;
+      {/* First-party timeframe control: KLineChart Pro 0.1.1's own period items
+          are non-focusable spans, so the keyboard/AT path is owned here. The
+          vendor period bar is hidden. */}
+      <div class="chart-toolbar">
+        <label class="chart-toolbar__label" for="chart-timeframe">
+          Timeframe
+        </label>
+        <select
+          id="chart-timeframe"
+          class="input chart-timeframe"
+          aria-label="Chart timeframe"
+          value={activeTimeframe()}
+          onChange={(event) => {
+            const value = event.currentTarget.value;
+            timeframeId = value;
+            setActiveTimeframe(value);
+            handle?.setTimeframe(value);
           }}
-          class="chart-canvas"
-          role="img"
-          aria-label={`Price chart, ${timeframeId()} timeframe`}
-          onWheel={onWheel}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerUp}
-          onDblClick={reset}
+        >
+          <For each={PRO_PERIODS}>
+            {(period) => <option value={period.text}>{period.text}</option>}
+          </For>
+        </select>
+      </div>
+      <Show when={chartError()}>
+        <EmptyBlock
+          title="Chart unavailable"
+          detail="This browser could not start the chart renderer. Market data stays read-only."
+        />
+      </Show>
+      <div class="chart-frame chart-frame--interactive">
+        <div
+          class="pep-pro-chart-host"
+          role="group"
+          aria-label={
+            hasTarget()
+              ? `Price chart for ${subject().symbol}, ${activeTimeframe()} timeframe`
+              : `Price chart, ${activeTimeframe()} timeframe`
+          }
+          ref={(element) => {
+            host = element;
+          }}
         />
       </div>
       <div class="depth-columns">
@@ -320,8 +257,10 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
         </div>
       </div>
       <p class="muted">
-        Spread {formatBps(version() >= 0 ? stores.depth.spreadBps() : null)} · imbalance{" "}
-        {stores.depth.imbalancePct() === null ? "—" : `${stores.depth.imbalancePct()!.toFixed(1)}%`}
+        Spread {formatBps(version() >= 0 ? router.stores.depth.spreadBps() : null)} · imbalance{" "}
+        {router.stores.depth.imbalancePct() === null
+          ? "—"
+          : `${router.stores.depth.imbalancePct()!.toFixed(1)}%`}
       </p>
     </div>
   );
