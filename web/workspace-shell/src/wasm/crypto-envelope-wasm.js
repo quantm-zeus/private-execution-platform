@@ -232,6 +232,81 @@ export class WasmWorkspaceKey {
 if (Symbol.dispose) WasmWorkspaceKey.prototype[Symbol.dispose] = WasmWorkspaceKey.prototype.free;
 
 /**
+ * Stable Root-Key V2 workspace recipient key, derived from a 32-byte Workspace
+ * Root Secret under a fixed domain.
+ *
+ * The recipient identity is intentionally independent of any artifact/release
+ * KID: there is no KID parameter and none is stored. `decrypt_artifact` opens
+ * any well-formed artifact sealed to this stable public key, binding the
+ * artifact KID through the authenticated HPKE/AEAD envelope rather than by
+ * comparing it to stored key metadata.
+ *
+ * Private key material lives ONLY in WASM memory, is zeroized on drop, and has
+ * no accessor. ONLY the public key is exportable.
+ */
+export class WasmWorkspaceRootKey {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        WasmWorkspaceRootKeyFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wasmworkspacerootkey_free(ptr, 0);
+    }
+    /**
+     * Authenticated decrypt of a sealed workspace artifact envelope:
+     * `version(1) || kid(16) || encapsulated_key(32) || ciphertext`.
+     *
+     * The envelope KID is release metadata authenticated into the HPKE info/AAD.
+     * It is never compared to a stored recipient KID. Fails closed on wrong
+     * root, tampered/foreign KID, wrong version, tampering, or truncation.
+     * @param {Uint8Array} artifact_wire
+     * @returns {Uint8Array}
+     */
+    decrypt_artifact(artifact_wire) {
+        const ptr0 = passArray8ToWasm0(artifact_wire, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmworkspacerootkey_decrypt_artifact(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v2;
+    }
+    /**
+     * Derive the stable Root-Key V2 keypair.
+     *
+     * Requirements: `root_secret` exactly 32 bytes and not all-zero.
+     * @param {Uint8Array} root_secret
+     */
+    constructor(root_secret) {
+        const ptr0 = passArray8ToWasm0(root_secret, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmworkspacerootkey_new(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        WasmWorkspaceRootKeyFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * The derived 32-byte X25519 public key (safe to export to server/build pipeline).
+     * @returns {Uint8Array}
+     */
+    public_key() {
+        const ret = wasm.wasmworkspacerootkey_public_key(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+}
+if (Symbol.dispose) WasmWorkspaceRootKey.prototype[Symbol.dispose] = WasmWorkspaceRootKey.prototype.free;
+
+/**
  * Standalone convenience function to decrypt a workspace artifact using unlock secret.
  * Derives key in RAM, decrypts, and zeroizes key material.
  * @param {Uint8Array} unlock_secret
@@ -257,6 +332,26 @@ export function decrypt_workspace_artifact(unlock_secret, version, kid, artifact
 }
 
 /**
+ * Standalone convenience: decrypt a Root-Key V2 artifact from a root secret.
+ * @param {Uint8Array} root_secret
+ * @param {Uint8Array} artifact_wire
+ * @returns {Uint8Array}
+ */
+export function decrypt_workspace_artifact_with_root(root_secret, artifact_wire) {
+    const ptr0 = passArray8ToWasm0(root_secret, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(artifact_wire, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.decrypt_workspace_artifact_with_root(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * Standalone convenience function to derive workspace public key from unlock secret.
  * Returns ONLY the 32-byte public key. Private key is zeroized and discarded.
  * @param {Uint8Array} unlock_secret
@@ -276,6 +371,24 @@ export function derive_workspace_public_key(unlock_secret, version, kid) {
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
+}
+
+/**
+ * Standalone convenience: derive the stable Root-Key V2 public key from a root
+ * secret. Returns ONLY the 32-byte public key.
+ * @param {Uint8Array} root_secret
+ * @returns {Uint8Array}
+ */
+export function derive_workspace_root_public_key(root_secret) {
+    const ptr0 = passArray8ToWasm0(root_secret, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.derive_workspace_root_public_key(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 function __wbg_get_imports() {
     const import0 = {
@@ -400,6 +513,9 @@ const WasmOfferFinalization = (typeof FinalizationRegistry === 'undefined')
 const WasmWorkspaceKeyFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmworkspacekey_free(ptr, 1));
+const WasmWorkspaceRootKeyFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wasmworkspacerootkey_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();

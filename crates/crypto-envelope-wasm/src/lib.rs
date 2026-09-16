@@ -234,6 +234,76 @@ impl WasmWorkspaceKey {
     }
 }
 
+/// Stable Root-Key V2 workspace recipient key, derived from a 32-byte Workspace
+/// Root Secret under a fixed domain.
+///
+/// The recipient identity is intentionally independent of any artifact/release
+/// KID: there is no KID parameter and none is stored. `decrypt_artifact` opens
+/// any well-formed artifact sealed to this stable public key, binding the
+/// artifact KID through the authenticated HPKE/AEAD envelope rather than by
+/// comparing it to stored key metadata.
+///
+/// Private key material lives ONLY in WASM memory, is zeroized on drop, and has
+/// no accessor. ONLY the public key is exportable.
+#[wasm_bindgen]
+pub struct WasmWorkspaceRootKey {
+    keypair: crypto_envelope::WorkspaceRootKeyPair,
+}
+
+#[wasm_bindgen]
+impl WasmWorkspaceRootKey {
+    /// Derive the stable Root-Key V2 keypair.
+    ///
+    /// Requirements: `root_secret` exactly 32 bytes and not all-zero.
+    #[wasm_bindgen(constructor)]
+    pub fn new(root_secret: &[u8]) -> Result<WasmWorkspaceRootKey, JsValue> {
+        if root_secret.len() != UNLOCK_SECRET_LEN || root_secret.iter().all(|&b| b == 0) {
+            return Err(invalid_input());
+        }
+        let secret_arr: &[u8; UNLOCK_SECRET_LEN] =
+            root_secret.try_into().map_err(|_| invalid_input())?;
+        let keypair = crypto_envelope::derive_workspace_root_keypair(secret_arr)
+            .map_err(|_| crypto_error())?;
+        Ok(WasmWorkspaceRootKey { keypair })
+    }
+
+    /// The derived 32-byte X25519 public key (safe to export to server/build pipeline).
+    #[wasm_bindgen]
+    pub fn public_key(&self) -> Vec<u8> {
+        self.keypair.public_key_bytes().to_vec()
+    }
+
+    /// Authenticated decrypt of a sealed workspace artifact envelope:
+    /// `version(1) || kid(16) || encapsulated_key(32) || ciphertext`.
+    ///
+    /// The envelope KID is release metadata authenticated into the HPKE info/AAD.
+    /// It is never compared to a stored recipient KID. Fails closed on wrong
+    /// root, tampered/foreign KID, wrong version, tampering, or truncation.
+    #[wasm_bindgen]
+    pub fn decrypt_artifact(&self, artifact_wire: &[u8]) -> Result<Vec<u8>, JsValue> {
+        crypto_envelope::decrypt_artifact_with_root(&self.keypair, artifact_wire)
+            .map_err(|_| crypto_error())
+    }
+}
+
+/// Standalone convenience: derive the stable Root-Key V2 public key from a root
+/// secret. Returns ONLY the 32-byte public key.
+#[wasm_bindgen]
+pub fn derive_workspace_root_public_key(root_secret: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let key = WasmWorkspaceRootKey::new(root_secret)?;
+    Ok(key.public_key())
+}
+
+/// Standalone convenience: decrypt a Root-Key V2 artifact from a root secret.
+#[wasm_bindgen]
+pub fn decrypt_workspace_artifact_with_root(
+    root_secret: &[u8],
+    artifact_wire: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    let key = WasmWorkspaceRootKey::new(root_secret)?;
+    key.decrypt_artifact(artifact_wire)
+}
+
 /// Standalone convenience function to derive workspace public key from unlock secret.
 /// Returns ONLY the 32-byte public key. Private key is zeroized and discarded.
 #[wasm_bindgen]
@@ -470,5 +540,83 @@ mod tests {
         assert!(
             decrypt_workspace_artifact(&TEST_SECRET, TEST_VERSION, &zero_kid, &[0u8; 65]).is_err()
         );
+    }
+
+    const ROOT_SECRET: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+        0xf0, 0x01,
+    ];
+    const ROOT_KID_A: [u8; 16] = [
+        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19,
+    ];
+    const ROOT_KID_B: [u8; 16] = [
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09,
+    ];
+
+    #[wasm_bindgen_test]
+    fn root_key_identity_is_stable_and_kid_free() {
+        let key1 = WasmWorkspaceRootKey::new(&ROOT_SECRET).expect("root key 1");
+        let key2 = WasmWorkspaceRootKey::new(&ROOT_SECRET).expect("root key 2");
+        assert_eq!(key1.public_key(), key2.public_key());
+        assert_eq!(
+            derive_workspace_root_public_key(&ROOT_SECRET).expect("direct root pk"),
+            key1.public_key()
+        );
+
+        let mut other_root = ROOT_SECRET;
+        other_root[0] ^= 1;
+        let other = WasmWorkspaceRootKey::new(&other_root).unwrap();
+        assert_ne!(key1.public_key(), other.public_key());
+
+        assert!(WasmWorkspaceRootKey::new(&[0u8; 32]).is_err());
+        assert!(WasmWorkspaceRootKey::new(&[0u8; 31]).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn one_stable_root_key_decrypts_artifacts_with_distinct_kids() {
+        let key = WasmWorkspaceRootKey::new(&ROOT_SECRET).unwrap();
+        let pk = key.public_key();
+
+        // Two consecutive releases, one recipient identity, different KIDs.
+        let release_n =
+            seal_workspace_artifact(&pk, TEST_VERSION, &ROOT_KID_A, b"release N").unwrap();
+        let release_n1 =
+            seal_workspace_artifact(&pk, TEST_VERSION, &ROOT_KID_B, b"release N+1").unwrap();
+
+        assert_eq!(key.decrypt_artifact(&release_n).unwrap(), b"release N");
+        assert_eq!(key.decrypt_artifact(&release_n1).unwrap(), b"release N+1");
+        assert_eq!(
+            decrypt_workspace_artifact_with_root(&ROOT_SECRET, &release_n1).unwrap(),
+            b"release N+1"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn root_key_rejects_tampered_kid_and_wrong_root() {
+        let key = WasmWorkspaceRootKey::new(&ROOT_SECRET).unwrap();
+        let sealed =
+            seal_workspace_artifact(&key.public_key(), TEST_VERSION, &ROOT_KID_A, b"payload")
+                .unwrap();
+
+        for index in 0..KID_LEN {
+            let mut tampered = sealed.clone();
+            tampered[1 + index] ^= 0x01;
+            assert!(
+                key.decrypt_artifact(&tampered).is_err(),
+                "tampered KID byte {index} must fail closed"
+            );
+        }
+
+        let mut wrong_root = ROOT_SECRET;
+        wrong_root[31] ^= 0x01;
+        let wrong = WasmWorkspaceRootKey::new(&wrong_root).unwrap();
+        assert!(wrong.decrypt_artifact(&sealed).is_err());
+
+        // Truncated and empty inputs fail closed.
+        assert!(key.decrypt_artifact(&sealed[..48]).is_err());
+        assert!(key.decrypt_artifact(&[]).is_err());
     }
 }

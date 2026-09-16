@@ -99,16 +99,64 @@ export class WasmWorkspaceKey {
 }
 
 /**
+ * Stable Root-Key V2 workspace recipient key, derived from a 32-byte Workspace
+ * Root Secret under a fixed domain.
+ *
+ * The recipient identity is intentionally independent of any artifact/release
+ * KID: there is no KID parameter and none is stored. `decrypt_artifact` opens
+ * any well-formed artifact sealed to this stable public key, binding the
+ * artifact KID through the authenticated HPKE/AEAD envelope rather than by
+ * comparing it to stored key metadata.
+ *
+ * Private key material lives ONLY in WASM memory, is zeroized on drop, and has
+ * no accessor. ONLY the public key is exportable.
+ */
+export class WasmWorkspaceRootKey {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Authenticated decrypt of a sealed workspace artifact envelope:
+     * `version(1) || kid(16) || encapsulated_key(32) || ciphertext`.
+     *
+     * The envelope KID is release metadata authenticated into the HPKE info/AAD.
+     * It is never compared to a stored recipient KID. Fails closed on wrong
+     * root, tampered/foreign KID, wrong version, tampering, or truncation.
+     */
+    decrypt_artifact(artifact_wire: Uint8Array): Uint8Array;
+    /**
+     * Derive the stable Root-Key V2 keypair.
+     *
+     * Requirements: `root_secret` exactly 32 bytes and not all-zero.
+     */
+    constructor(root_secret: Uint8Array);
+    /**
+     * The derived 32-byte X25519 public key (safe to export to server/build pipeline).
+     */
+    public_key(): Uint8Array;
+}
+
+/**
  * Standalone convenience function to decrypt a workspace artifact using unlock secret.
  * Derives key in RAM, decrypts, and zeroizes key material.
  */
 export function decrypt_workspace_artifact(unlock_secret: Uint8Array, version: number, kid: Uint8Array, artifact_wire: Uint8Array): Uint8Array;
 
 /**
+ * Standalone convenience: decrypt a Root-Key V2 artifact from a root secret.
+ */
+export function decrypt_workspace_artifact_with_root(root_secret: Uint8Array, artifact_wire: Uint8Array): Uint8Array;
+
+/**
  * Standalone convenience function to derive workspace public key from unlock secret.
  * Returns ONLY the 32-byte public key. Private key is zeroized and discarded.
  */
 export function derive_workspace_public_key(unlock_secret: Uint8Array, version: number, kid: Uint8Array): Uint8Array;
+
+/**
+ * Standalone convenience: derive the stable Root-Key V2 public key from a root
+ * secret. Returns ONLY the 32-byte public key.
+ */
+export function derive_workspace_root_public_key(root_secret: Uint8Array): Uint8Array;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
@@ -117,8 +165,11 @@ export interface InitOutput {
     readonly __wbg_wasminitiatorsession_free: (a: number, b: number) => void;
     readonly __wbg_wasmoffer_free: (a: number, b: number) => void;
     readonly __wbg_wasmworkspacekey_free: (a: number, b: number) => void;
+    readonly __wbg_wasmworkspacerootkey_free: (a: number, b: number) => void;
     readonly decrypt_workspace_artifact: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly decrypt_workspace_artifact_with_root: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly derive_workspace_public_key: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly derive_workspace_root_public_key: (a: number, b: number) => [number, number, number, number];
     readonly wasminitiatorsession_app_session_keys: (a: number) => [number, number];
     readonly wasminitiatorsession_decrypt: (a: number, b: number, c: number) => [number, number, number, number];
     readonly wasminitiatorsession_encapsulated_key: (a: number) => [number, number];
@@ -131,6 +182,9 @@ export interface InitOutput {
     readonly wasmworkspacekey_new: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly wasmworkspacekey_public_key: (a: number) => [number, number];
     readonly wasmworkspacekey_version: (a: number) => number;
+    readonly wasmworkspacerootkey_decrypt_artifact: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly wasmworkspacerootkey_new: (a: number, b: number) => [number, number, number];
+    readonly wasmworkspacerootkey_public_key: (a: number) => [number, number];
     readonly __wbindgen_exn_store: (a: number) => void;
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;

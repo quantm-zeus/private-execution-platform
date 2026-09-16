@@ -5,8 +5,8 @@
 
 use base64::Engine;
 use crypto_envelope::{
-    decrypt_artifact_with_secret, ARTIFACT_VERSION, KID_LEN, MAX_ARTIFACT_LEN, MIN_ARTIFACT_LEN,
-    UNLOCK_SECRET_LEN,
+    decrypt_artifact_with_root_secret, decrypt_artifact_with_secret, ARTIFACT_VERSION, KID_LEN,
+    MAX_ARTIFACT_LEN, MIN_ARTIFACT_LEN, UNLOCK_SECRET_LEN,
 };
 use std::env;
 use std::fs;
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: decrypt-artifact --unlock-secret-b64 <B64> --kid-b64 <B64> [--version <U8>] --input <PATH> --output <PATH>"
+        "Usage: decrypt-artifact --unlock-secret-b64 <B64> (--root-key-v2 | --kid-b64 <B64> [--version <U8>]) --input <PATH> --output <PATH>"
     );
     std::process::exit(1);
 }
@@ -25,6 +25,7 @@ fn main() {
     let mut unlock_secret_b64: Option<String> = None;
     let mut kid_b64: Option<String> = None;
     let mut version: u8 = ARTIFACT_VERSION;
+    let mut root_key_v2 = false;
     let mut input_path: Option<PathBuf> = None;
     let mut output_path: Option<PathBuf> = None;
 
@@ -37,6 +38,9 @@ fn main() {
                     print_usage_and_exit();
                 }
                 unlock_secret_b64 = Some(args[i].clone());
+            }
+            "--root-key-v2" => {
+                root_key_v2 = true;
             }
             "--kid-b64" => {
                 i += 1;
@@ -82,7 +86,7 @@ fn main() {
             unlock_secret_b64 = Some(val);
         }
     }
-    if kid_b64.is_none() {
+    if !root_key_v2 && kid_b64.is_none() {
         if let Ok(val) = env::var("WORKSPACE_ARTIFACT_KID_B64") {
             kid_b64 = Some(val);
         }
@@ -117,28 +121,33 @@ fn main() {
     let mut secret_arr = [0u8; UNLOCK_SECRET_LEN];
     secret_arr.copy_from_slice(&secret_bytes);
 
-    let kid_str = kid_b64.unwrap_or_else(|| {
-        eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
-        std::process::exit(1);
-    });
-    let kid_bytes = b64_engine.decode(kid_str.trim()).unwrap_or_else(|_| {
-        eprintln!("error: invalid base64 kid");
-        std::process::exit(1);
-    });
-    if kid_bytes.len() != KID_LEN {
-        eprintln!(
-            "error: kid must be exactly {} bytes, got {}",
-            KID_LEN,
-            kid_bytes.len()
-        );
-        std::process::exit(1);
-    }
-    let mut kid = [0u8; KID_LEN];
-    kid.copy_from_slice(&kid_bytes);
-    if kid.iter().all(|&b| b == 0) {
-        eprintln!("error: all-zero kid rejected");
-        std::process::exit(1);
-    }
+    let kid: Option<[u8; KID_LEN]> = if root_key_v2 {
+        None
+    } else {
+        let kid_str = kid_b64.unwrap_or_else(|| {
+            eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
+            std::process::exit(1);
+        });
+        let kid_bytes = b64_engine.decode(kid_str.trim()).unwrap_or_else(|_| {
+            eprintln!("error: invalid base64 kid");
+            std::process::exit(1);
+        });
+        if kid_bytes.len() != KID_LEN {
+            eprintln!(
+                "error: kid must be exactly {} bytes, got {}",
+                KID_LEN,
+                kid_bytes.len()
+            );
+            std::process::exit(1);
+        }
+        let mut kid = [0u8; KID_LEN];
+        kid.copy_from_slice(&kid_bytes);
+        if kid.iter().all(|&b| b == 0) {
+            eprintln!("error: all-zero kid rejected");
+            std::process::exit(1);
+        }
+        Some(kid)
+    };
 
     let input_meta = fs::metadata(&input).unwrap_or_else(|e| {
         eprintln!(
@@ -200,11 +209,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    let plaintext = decrypt_artifact_with_secret(&secret_arr, version, &kid, &artifact_wire)
-        .unwrap_or_else(|e| {
-            eprintln!("error: artifact decryption failed: {}", e);
-            std::process::exit(1);
-        });
+    let plaintext = if root_key_v2 {
+        decrypt_artifact_with_root_secret(&secret_arr, &artifact_wire)
+    } else {
+        decrypt_artifact_with_secret(
+            &secret_arr,
+            version,
+            &kid.expect("kid present"),
+            &artifact_wire,
+        )
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("error: artifact decryption failed: {}", e);
+        std::process::exit(1);
+    });
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|e| {

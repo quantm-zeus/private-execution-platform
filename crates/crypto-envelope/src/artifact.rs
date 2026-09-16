@@ -21,6 +21,15 @@ use zeroize::Zeroizing;
 pub const WORKSPACE_UNLOCK_DOMAIN: &[u8] = b"private-execution/workspace-unlock/v1";
 pub const ARTIFACT_SEAL_DOMAIN: &[u8] = b"private-execution/workspace-artifact/v1";
 
+/// Root-Key V2 derivation domain. The stable workspace recipient keypair is a
+/// function ONLY of the 32-byte Workspace Root Secret plus this fixed
+/// domain/version. The artifact KID never participates in recipient-key
+/// derivation, so rotating a release/artifact KID cannot change the workspace
+/// recipient identity.
+pub const WORKSPACE_ROOT_V2_DOMAIN: &[u8] = b"private-execution/workspace-root-key/v2";
+/// Fixed protocol version folded into the Root-Key V2 derivation domain.
+pub const WORKSPACE_ROOT_V2_VERSION: u8 = 1;
+
 pub const ARTIFACT_VERSION: u8 = 1;
 pub const UNLOCK_SECRET_LEN: usize = 32;
 pub const PUBLIC_KEY_LEN: usize = 32;
@@ -46,6 +55,17 @@ pub fn canonical_artifact_info(version: u8, kid: &[u8; KID_LEN]) -> Vec<u8> {
     info.extend_from_slice(ARTIFACT_SEAL_DOMAIN);
     info.push(version);
     info.extend_from_slice(kid);
+    info
+}
+
+/// Canonical, KID-independent info for Root-Key V2 recipient derivation.
+///
+/// Takes no KID by construction: the stable workspace recipient identity must
+/// not be a function of any release/artifact KID.
+pub fn canonical_workspace_root_info() -> Vec<u8> {
+    let mut info = Vec::with_capacity(WORKSPACE_ROOT_V2_DOMAIN.len() + 1);
+    info.extend_from_slice(WORKSPACE_ROOT_V2_DOMAIN);
+    info.push(WORKSPACE_ROOT_V2_VERSION);
     info
 }
 
@@ -117,6 +137,64 @@ pub fn derive_workspace_keypair(
         public: HpkePublicKey(pk_bytes),
         version,
         kid: *kid,
+    })
+}
+
+/// Stable Root-Key V2 workspace recipient keypair.
+///
+/// Derived from the 32-byte Workspace Root Secret under
+/// [`canonical_workspace_root_info`] alone. It stores no KID and no artifact
+/// version, so its public identity is byte-identical for every release/artifact
+/// KID. The private key is RAM-only, never exported or serialized, and Debug is
+/// strictly redacted.
+pub struct WorkspaceRootKeyPair {
+    private: <X25519HkdfSha256 as KemTrait>::PrivateKey,
+    public: HpkePublicKey,
+}
+
+impl WorkspaceRootKeyPair {
+    /// Return the public key (safe to export).
+    pub fn public_key(&self) -> HpkePublicKey {
+        self.public.clone()
+    }
+
+    /// Return the 32-byte public key as raw bytes.
+    pub fn public_key_bytes(&self) -> [u8; PUBLIC_KEY_LEN] {
+        self.public.0
+    }
+}
+
+impl std::fmt::Debug for WorkspaceRootKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkspaceRootKeyPair([REDACTED])")
+    }
+}
+
+/// Deterministically derives the stable Root-Key V2 workspace keypair from an
+/// exact 32-byte Workspace Root Secret.
+///
+/// The derivation is a function ONLY of the root secret and the fixed
+/// Root-Key-V2 domain/version. Any artifact/release KID is intentionally absent,
+/// so the same root yields the same public identity for every release.
+pub fn derive_workspace_root_keypair(
+    root_secret: &[u8; UNLOCK_SECRET_LEN],
+) -> Result<WorkspaceRootKeyPair, CryptoError> {
+    if root_secret.iter().all(|&b| b == 0) {
+        return Err(CryptoError::InvalidInput);
+    }
+
+    let info = canonical_workspace_root_info();
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, root_secret);
+    let mut derived_seed = Zeroizing::new([0u8; 32]);
+    hk.expand(&info, &mut derived_seed[..])
+        .map_err(|_| CryptoError::DerivationFailed)?;
+
+    let (sk, pk) = <X25519HkdfSha256 as KemTrait>::derive_keypair(&derived_seed[..]);
+    let pk_bytes: [u8; 32] = pk.to_bytes().into();
+
+    Ok(WorkspaceRootKeyPair {
+        private: sk,
+        public: HpkePublicKey(pk_bytes),
     })
 }
 
@@ -277,6 +355,59 @@ pub fn decrypt_artifact_with_secret(
 ) -> Result<Vec<u8>, CryptoError> {
     let keypair = derive_workspace_keypair(unlock_secret, version, kid)?;
     decrypt_artifact(&keypair, artifact_wire)
+}
+
+/// Authenticated Root-Key V2 artifact decryption using the stable workspace
+/// recipient keypair.
+///
+/// The artifact KID is release/protocol **metadata**: it is bound into both the
+/// HPKE `info` ([`canonical_artifact_info`]) and the AEAD associated data (the
+/// artifact header), but it is NOT compared against any stored recipient KID
+/// and does not participate in the recipient identity. The same stable key
+/// therefore opens artifacts carrying different valid KIDs, while a wrong or
+/// tampered KID fails closed through the authenticated HPKE/AEAD binding.
+pub fn decrypt_artifact_with_root(
+    root_keypair: &WorkspaceRootKeyPair,
+    artifact_wire: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let envelope = ArtifactEnvelope::from_bytes(artifact_wire)?;
+    if envelope.version != ARTIFACT_VERSION {
+        return Err(CryptoError::UnsupportedVersion);
+    }
+
+    let encapped =
+        <X25519HkdfSha256 as KemTrait>::EncappedKey::from_bytes(&envelope.encapsulated_key)
+            .map_err(|_| CryptoError::DecryptFailed)?;
+
+    let info = canonical_artifact_info(envelope.version, &envelope.kid);
+    let mut aead_ctx = ::hpke::setup_receiver::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+        &OpModeR::Base,
+        &root_keypair.private,
+        &encapped,
+        &info,
+    )
+    .map_err(|_| CryptoError::DecryptFailed)?;
+
+    let aad = &artifact_wire[..ARTIFACT_HEADER_LEN];
+    let plaintext = aead_ctx
+        .open(&envelope.ciphertext, aad)
+        .map_err(|_| CryptoError::DecryptFailed)?;
+
+    if plaintext.is_empty() {
+        return Err(CryptoError::FormatError);
+    }
+    Ok(plaintext)
+}
+
+/// Convenience helper to decrypt a Root-Key V2 artifact from the root secret
+/// directly (derives the stable key in RAM, opens the payload, and zeroizes the
+/// derived key on drop).
+pub fn decrypt_artifact_with_root_secret(
+    root_secret: &[u8; UNLOCK_SECRET_LEN],
+    artifact_wire: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let keypair = derive_workspace_root_keypair(root_secret)?;
+    decrypt_artifact_with_root(&keypair, artifact_wire)
 }
 
 /// Re-seals an existing workspace artifact from the old unlock keypair to a new
@@ -538,5 +669,139 @@ mod tests {
         let dbg = format!("{:?}", keypair);
         assert_eq!(dbg, "WorkspaceUnlockKeyPair([REDACTED])");
         assert!(!dbg.contains("42"));
+    }
+
+    const ROOT_SECRET: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+        0xf0, 0x01,
+    ];
+    const ROOT_KID_A: [u8; 16] = [
+        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19,
+    ];
+    const ROOT_KID_B: [u8; 16] = [
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09,
+    ];
+
+    #[test]
+    fn root_keypair_public_identity_is_kid_independent() {
+        let kp1 = derive_workspace_root_keypair(&ROOT_SECRET).expect("root key 1");
+        let kp2 = derive_workspace_root_keypair(&ROOT_SECRET).expect("root key 2");
+        assert_eq!(
+            kp1.public_key_bytes(),
+            kp2.public_key_bytes(),
+            "root identity must be deterministic for one root"
+        );
+        // There is no KID parameter: the public identity is a function of the
+        // root secret and the fixed domain only.
+        let info = canonical_workspace_root_info();
+        assert!(info.starts_with(WORKSPACE_ROOT_V2_DOMAIN));
+        assert_eq!(
+            info[WORKSPACE_ROOT_V2_DOMAIN.len()],
+            WORKSPACE_ROOT_V2_VERSION
+        );
+        assert!(
+            !info
+                .windows(KID_LEN)
+                .any(|w| w == ROOT_KID_A.as_slice() || w == ROOT_KID_B.as_slice()),
+            "Root-Key V2 derivation info must not embed any artifact KID"
+        );
+    }
+
+    #[test]
+    fn one_root_decrypts_two_releases_with_distinct_kids() {
+        let root = derive_workspace_root_keypair(&ROOT_SECRET).unwrap();
+        let public_key = root.public_key();
+
+        // Two consecutive releases, identical recipient, different artifact KIDs.
+        let release_n = seal_artifact(&public_key, ARTIFACT_VERSION, &ROOT_KID_A, b"release N")
+            .expect("seal N");
+        let release_n1 = seal_artifact(&public_key, ARTIFACT_VERSION, &ROOT_KID_B, b"release N+1")
+            .expect("seal N+1");
+
+        assert_eq!(&release_n[1..1 + KID_LEN], &ROOT_KID_A);
+        assert_eq!(&release_n1[1..1 + KID_LEN], &ROOT_KID_B);
+
+        assert_eq!(
+            decrypt_artifact_with_root(&root, &release_n).expect("decrypt N"),
+            b"release N"
+        );
+        assert_eq!(
+            decrypt_artifact_with_root(&root, &release_n1).expect("decrypt N+1"),
+            b"release N+1"
+        );
+        // The convenience helper returns the same result without any KID arg.
+        assert_eq!(
+            decrypt_artifact_with_root_secret(&ROOT_SECRET, &release_n1).expect("secret N+1"),
+            b"release N+1"
+        );
+    }
+
+    #[test]
+    fn root_decrypt_rejects_tampered_kid_and_accepts_a_valid_foreign_kid() {
+        let root = derive_workspace_root_keypair(&ROOT_SECRET).unwrap();
+        let sealed = seal_artifact(
+            &root.public_key(),
+            ARTIFACT_VERSION,
+            &ROOT_KID_A,
+            b"payload",
+        )
+        .expect("seal");
+
+        // Every single-byte KID mutation must fail the authenticated binding.
+        for index in 0..KID_LEN {
+            let mut tampered = sealed.clone();
+            tampered[1 + index] ^= 0x01;
+            assert!(
+                decrypt_artifact_with_root(&root, &tampered).is_err(),
+                "tampered KID byte {index} must fail closed"
+            );
+        }
+
+        // A foreign-but-valid KID (as if sealed under a different context) is not
+        // silently accepted either: re-sealing under the same public key with a
+        // different KID produces a different authenticated ciphertext.
+        let foreign = seal_artifact(
+            &root.public_key(),
+            ARTIFACT_VERSION,
+            &ROOT_KID_B,
+            b"payload",
+        )
+        .expect("seal foreign");
+        let cross =
+            decrypt_artifact_with_root(&root, &foreign).expect("foreign KID still decrypts");
+        assert_eq!(cross, b"payload");
+
+        // Truncated header and zero-KID envelope fail the parser.
+        assert!(decrypt_artifact_with_root(&root, &sealed[..ARTIFACT_HEADER_LEN]).is_err());
+        let mut zero_kid = sealed.clone();
+        zero_kid[1..1 + KID_LEN].fill(0);
+        assert!(decrypt_artifact_with_root(&root, &zero_kid).is_err());
+    }
+
+    #[test]
+    fn root_and_legacy_identities_are_domain_separated() {
+        // Same 32 bytes used as both legacy unlock secret and Root-Key V2 root
+        // must not collide: the derivation domains differ.
+        let legacy = derive_workspace_keypair(&ROOT_SECRET, ARTIFACT_VERSION, &ROOT_KID_A).unwrap();
+        let root = derive_workspace_root_keypair(&ROOT_SECRET).unwrap();
+        assert_ne!(legacy.public_key_bytes(), root.public_key_bytes());
+
+        // Legacy derivation still varies with KID (bounded migration behavior),
+        // while the Root-Key V2 identity does not.
+        let legacy_other =
+            derive_workspace_keypair(&ROOT_SECRET, ARTIFACT_VERSION, &ROOT_KID_B).unwrap();
+        assert_ne!(legacy.public_key_bytes(), legacy_other.public_key_bytes());
+    }
+
+    #[test]
+    fn root_keypair_rejects_zero_secret_and_redacts_debug() {
+        assert!(derive_workspace_root_keypair(&[0u8; 32]).is_err());
+        let root = derive_workspace_root_keypair(&ROOT_SECRET).unwrap();
+        let dbg = format!("{:?}", root);
+        assert_eq!(dbg, "WorkspaceRootKeyPair([REDACTED])");
+        assert!(!dbg.contains("11"));
     }
 }

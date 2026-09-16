@@ -24,11 +24,14 @@ pub use at_rest::{
 };
 
 pub use artifact::{
-    canonical_artifact_info, canonical_unlock_info, decrypt_artifact, decrypt_artifact_with_secret,
-    derive_workspace_keypair, rotate_artifact, seal_artifact, ArtifactEnvelope,
-    WorkspaceUnlockKeyPair, AEAD_TAG_LEN, ARTIFACT_HEADER_LEN, ARTIFACT_SEAL_DOMAIN,
-    ARTIFACT_VERSION, ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MAX_ARTIFACT_PAYLOAD_LEN,
-    MIN_ARTIFACT_LEN, PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN, WORKSPACE_UNLOCK_DOMAIN,
+    canonical_artifact_info, canonical_unlock_info, canonical_workspace_root_info,
+    decrypt_artifact, decrypt_artifact_with_root, decrypt_artifact_with_root_secret,
+    decrypt_artifact_with_secret, derive_workspace_keypair, derive_workspace_root_keypair,
+    rotate_artifact, seal_artifact, ArtifactEnvelope, WorkspaceRootKeyPair, WorkspaceUnlockKeyPair,
+    AEAD_TAG_LEN, ARTIFACT_HEADER_LEN, ARTIFACT_SEAL_DOMAIN, ARTIFACT_VERSION,
+    ENCAPSULATED_KEY_LEN, MAX_ARTIFACT_LEN, MAX_ARTIFACT_PAYLOAD_LEN, MIN_ARTIFACT_LEN,
+    PUBLIC_KEY_LEN, UNLOCK_SECRET_LEN, WORKSPACE_ROOT_V2_DOMAIN, WORKSPACE_ROOT_V2_VERSION,
+    WORKSPACE_UNLOCK_DOMAIN,
 };
 pub use frame::{
     Frame, FrameError, FrameKind, StreamFrame, StreamFrameCodec, StreamFrameError, StreamFrameKind,

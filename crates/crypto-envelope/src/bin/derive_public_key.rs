@@ -1,15 +1,25 @@
-//! CLI binary to derive a workspace public key from an unlock secret.
+//! CLI binary to derive a workspace public key from an unlock/root secret.
+//!
+//! Two derivation modes:
+//! * default (legacy `unlock_secret_v1`): requires `--kid-b64`/`--version`.
+//! * `--root-key-v2`: the stable Root-Key-V2 recipient identity, a function of
+//!   the 32-byte root secret and the fixed domain only (no KID). This exists for
+//!   browser-bootstrap simulation and tests; production release tooling never
+//!   holds the root secret.
 //!
 //! Output is ONLY the 32-byte public key in base64.
 //! Private key material is derived in RAM and zeroized on drop.
 
 use base64::Engine;
-use crypto_envelope::{derive_workspace_keypair, ARTIFACT_VERSION, KID_LEN, UNLOCK_SECRET_LEN};
+use crypto_envelope::{
+    derive_workspace_keypair, derive_workspace_root_keypair, ARTIFACT_VERSION, KID_LEN,
+    UNLOCK_SECRET_LEN,
+};
 use std::env;
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: derive-public-key --unlock-secret-b64 <B64> --kid-b64 <B64> [--version <U8>]"
+        "Usage: derive-public-key --unlock-secret-b64 <B64> (--root-key-v2 | --kid-b64 <B64> [--version <U8>])"
     );
     std::process::exit(1);
 }
@@ -19,6 +29,7 @@ fn main() {
     let mut unlock_secret_b64: Option<String> = None;
     let mut kid_b64: Option<String> = None;
     let mut version: u8 = ARTIFACT_VERSION;
+    let mut root_key_v2 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -29,6 +40,9 @@ fn main() {
                     print_usage_and_exit();
                 }
                 unlock_secret_b64 = Some(args[i].clone());
+            }
+            "--root-key-v2" => {
+                root_key_v2 = true;
             }
             "--kid-b64" => {
                 i += 1;
@@ -60,7 +74,7 @@ fn main() {
             unlock_secret_b64 = Some(val);
         }
     }
-    if kid_b64.is_none() {
+    if !root_key_v2 && kid_b64.is_none() {
         if let Ok(val) = env::var("WORKSPACE_ARTIFACT_KID_B64") {
             kid_b64 = Some(val);
         }
@@ -86,6 +100,15 @@ fn main() {
     }
     let mut secret_arr = [0u8; UNLOCK_SECRET_LEN];
     secret_arr.copy_from_slice(&secret_bytes);
+
+    if root_key_v2 {
+        let keypair = derive_workspace_root_keypair(&secret_arr).unwrap_or_else(|e| {
+            eprintln!("error: root key derivation failed: {}", e);
+            std::process::exit(1);
+        });
+        println!("{}", b64_engine.encode(keypair.public_key_bytes()));
+        return;
+    }
 
     let kid_str = kid_b64.unwrap_or_else(|| {
         eprintln!("error: --kid-b64 or WORKSPACE_ARTIFACT_KID_B64 required");
