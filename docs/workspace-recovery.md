@@ -63,6 +63,12 @@ reports `configured: false`:
    `POST /internal/workspace/identity` (create-once).
 5. Show the recovery code exactly once with an explicit saved-confirmation step.
 
+Setup does **not** require a published release: the stable identity must be
+creatable on a clean deployment, after which release tooling seals to it. The
+recovery code is shown and gated on confirmation before any unlock attempt, so a
+release that is not yet sealed to the new identity cannot cause the code to be
+lost.
+
 The recoverable public identity is client-generated and uploaded; the operator
 never receives or handles a public key, and no helper page derives one.
 
@@ -98,12 +104,16 @@ The durable store (`apps/private-api/src/recovery.rs`, env
 | `created_at_ms`, `last_used_at_ms` | coarse lifecycle only |
 | `revoked_at_ms` | soft revoke |
 
-The identity is create-once and immutable; a second bootstrap is refused. The
-bootstrap request uses `deny_unknown_fields`, so a client can never smuggle a
-plaintext root secret, recovery code, PRF output or unwrap key into a write. The
-store is file-backed with owner-only atomic writes, refused symlinks, checked
-inode/permissions, and a bounded document size. A corrupt identity (public
-key/fingerprint mismatch) refuses startup.
+The identity is create-once and immutable; a second bootstrap is refused. Once a
+release has been sealed to the stable context, the bootstrap additionally
+requires the submitted public key to match that release manifest's recipient
+fingerprint, so an authenticated session cannot squat the identity with a key it
+controls (a legacy per-release manifest does not constrain the one-time
+migration bootstrap). The bootstrap request uses `deny_unknown_fields`, so a
+client can never smuggle a plaintext root secret, recovery code, PRF output or
+unwrap key into a write. The store is file-backed with owner-only atomic writes,
+refused symlinks, checked inode/permissions, and a bounded document size. A
+corrupt identity (public key/fingerprint mismatch) refuses startup.
 
 Without `PRIVATE_RECOVERY_WRAPPER_STORE_PATH` the whole surface answers `503`
 and the workspace cannot be set up or unlocked in the stable-root model.
