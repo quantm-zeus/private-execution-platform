@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   chmod,
@@ -24,6 +24,16 @@ import { fileURLToPath } from "node:url";
 
 import { writeArtifactAtomically } from "./build-workspace-encrypted.mjs";
 import { sanitizeConsoleSource } from "./build-crypto-wasm-bindings.mjs";
+import {
+  ARTIFACT_VERSION,
+  KID_BYTES,
+  WORKSPACE_ROOT_CONTEXT_B64,
+  WORKSPACE_ROOT_CONTEXT_BYTES,
+  artifactKidFromEnv,
+  decryptArtifact,
+  derivePublicKey,
+  sealPackage,
+} from "./workspace-artifact.mjs";
 import {
   ARTIFACT_FILE,
   CURRENT_LINK,
@@ -52,7 +62,9 @@ import {
 } from "./workspace-release.mjs";
 
 const PUBLIC_KEY_B64 = Buffer.alloc(32, 7).toString("base64");
-const KID = Buffer.alloc(16, 3);
+// Releases are sealed under the fixed stable workspace context, never a
+// per-release KID.
+const KID = Buffer.from(WORKSPACE_ROOT_CONTEXT_B64, "base64");
 const KID_B64 = KID.toString("base64");
 
 const IS_ROOT = typeof process.getuid === "function" && process.getuid() === 0;
@@ -1394,5 +1406,175 @@ test("writeArtifactAtomically never removes the destination on failure", async (
     assert.equal(await readFile(destination, "utf8"), "old-bytes");
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Stable Workspace Root Key operational proof.
+//
+// This is the mandatory release-operations test: two consecutive releases are
+// built using ONLY the stable PUBLIC key (no root secret in the build path),
+// the descriptor is switched between them, and the same browser root decrypts
+// both with no reseal and no manual operator action.
+// ---------------------------------------------------------------------------
+
+test("stable release tooling seals to the fixed context and rejects a foreign KID", () => {
+  assert.equal(artifactKidFromEnv({}).toString("base64"), WORKSPACE_ROOT_CONTEXT_B64);
+  assert.equal(
+    artifactKidFromEnv({
+      WORKSPACE_ARTIFACT_KID_B64: WORKSPACE_ROOT_CONTEXT_B64,
+    }).toString("base64"),
+    WORKSPACE_ROOT_CONTEXT_B64,
+  );
+  assert.throws(
+    () =>
+      artifactKidFromEnv({
+        WORKSPACE_ARTIFACT_KID_B64: Buffer.alloc(16, 3).toString("base64"),
+      }),
+    /deprecated|stable workspace context/,
+  );
+});
+
+test("operational: N and N+1 built from the stable public key decrypt with one root", async () => {
+  const rootSecret = randomBytes(32);
+  const publicKey = derivePublicKey(
+    rootSecret,
+    WORKSPACE_ROOT_CONTEXT_BYTES,
+    ARTIFACT_VERSION,
+  );
+  assert.equal(publicKey.length, 32);
+  // The recipient identity is a pure function of the root + fixed context, so
+  // it is identical for every release.
+  assert.deepEqual(
+    derivePublicKey(rootSecret, WORKSPACE_ROOT_CONTEXT_BYTES, ARTIFACT_VERSION),
+    publicKey,
+  );
+
+  const root = await mkdtemp(join(tmpdir(), "root-release-ops-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "root-release-ops-shell-"));
+  const payloadA = await mkdtemp(join(tmpdir(), "root-release-ops-payload-a-"));
+  const payloadB = await mkdtemp(join(tmpdir(), "root-release-ops-payload-b-"));
+  const previousKey = process.env.WORKSPACE_PUBLIC_KEY_B64;
+  const previousKid = process.env.WORKSPACE_ARTIFACT_KID_B64;
+  try {
+    await writeFile(join(shellDir, "_headers"), PRODUCTION_HEADERS);
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    await mkdir(join(shellDir, "assets"));
+    await writeFile(join(shellDir, "assets", "index-abc.js"), "console.log(1)");
+    await writeFile(join(payloadA, "index.html"), "release-n");
+    await writeFile(join(payloadB, "index.html"), "release-n-plus-1");
+
+    // The build path sees only the public key and no KID override.
+    delete process.env.WORKSPACE_ARTIFACT_KID_B64;
+    process.env.WORKSPACE_PUBLIC_KEY_B64 = publicKey.toString("base64");
+
+    const first = await buildAndPublishRelease({
+      releasesRoot: root,
+      shellDir,
+      payloadDir: payloadA,
+      sourceSha: "aaaa111",
+    });
+    const second = await buildAndPublishRelease({
+      releasesRoot: root,
+      shellDir,
+      payloadDir: payloadB,
+      sourceSha: "bbbb222",
+    });
+    assert.notEqual(first.releaseId, second.releaseId);
+
+    const { manifest: manifestFirst } = await readRelease(root, first.releaseId);
+    const { manifest: manifestSecond } = await readRelease(root, second.releaseId);
+
+    // One stable identity: same envelope KID and same recipient fingerprint.
+    assert.equal(manifestFirst.artifact.kid_b64, WORKSPACE_ROOT_CONTEXT_B64);
+    assert.equal(manifestSecond.artifact.kid_b64, WORKSPACE_ROOT_CONTEXT_B64);
+    assert.equal(
+      manifestFirst.recipient.public_key_fingerprint_b64,
+      manifestSecond.recipient.public_key_fingerprint_b64,
+    );
+    // Per-artifact freshness comes from the envelope, so the digests differ.
+    assert.notEqual(
+      manifestFirst.artifact.sha256_hex,
+      manifestSecond.artifact.sha256_hex,
+    );
+
+    const artifactFirst = await readFile(
+      join(root, first.releaseId, ARTIFACT_FILE),
+    );
+    const artifactSecond = await readFile(
+      join(root, second.releaseId, ARTIFACT_FILE),
+    );
+    assert.equal(
+      artifactFirst.subarray(1, 1 + KID_BYTES).toString("base64"),
+      WORKSPACE_ROOT_CONTEXT_B64,
+    );
+    assert.equal(
+      artifactSecond.subarray(1, 1 + KID_BYTES).toString("base64"),
+      WORKSPACE_ROOT_CONTEXT_B64,
+    );
+
+    // The same browser root unlocks both releases, with no reseal.
+    const plainFirst = await decryptArtifact(
+      artifactFirst,
+      rootSecret,
+      WORKSPACE_ROOT_CONTEXT_BYTES,
+      ARTIFACT_VERSION,
+    );
+    const plainSecond = await decryptArtifact(
+      artifactSecond,
+      rootSecret,
+      WORKSPACE_ROOT_CONTEXT_BYTES,
+      ARTIFACT_VERSION,
+    );
+    assert.ok(plainFirst.length > 0);
+    assert.ok(plainSecond.length > 0);
+    assert.notDeepEqual(plainFirst, plainSecond);
+
+    // Switching the current descriptor back and forth never invalidates either
+    // release for the stable root.
+    await switchCurrent(root, first.releaseId);
+    assert.equal(await readlink(join(root, CURRENT_LINK)), first.releaseId);
+    assert.ok(
+      (
+        await decryptArtifact(
+          artifactFirst,
+          rootSecret,
+          WORKSPACE_ROOT_CONTEXT_BYTES,
+          ARTIFACT_VERSION,
+        )
+      ).length > 0,
+    );
+    await switchCurrent(root, second.releaseId);
+    assert.equal(await readlink(join(root, CURRENT_LINK)), second.releaseId);
+    assert.ok(
+      (
+        await decryptArtifact(
+          artifactSecond,
+          rootSecret,
+          WORKSPACE_ROOT_CONTEXT_BYTES,
+          ARTIFACT_VERSION,
+        )
+      ).length > 0,
+    );
+
+    // A different root cannot open either release.
+    const otherRoot = randomBytes(32);
+    await assert.rejects(
+      decryptArtifact(
+        artifactFirst,
+        otherRoot,
+        WORKSPACE_ROOT_CONTEXT_BYTES,
+        ARTIFACT_VERSION,
+      ),
+    );
+  } finally {
+    if (previousKey === undefined) delete process.env.WORKSPACE_PUBLIC_KEY_B64;
+    else process.env.WORKSPACE_PUBLIC_KEY_B64 = previousKey;
+    if (previousKid === undefined) delete process.env.WORKSPACE_ARTIFACT_KID_B64;
+    else process.env.WORKSPACE_ARTIFACT_KID_B64 = previousKid;
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+    await rm(payloadA, { recursive: true, force: true });
+    await rm(payloadB, { recursive: true, force: true });
   }
 });

@@ -16,6 +16,34 @@ export const MAX_PATH_BYTES = 4096;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_PACKAGE_BYTES = 256 * 1024 * 1024;
 
+/**
+ * Fixed 16-byte stable workspace derivation context (standard base64):
+ * `sha256("evergreen/workspace-root-key/v2")[0..16]`. It is a protocol constant,
+ * never a release id or KID. Every release is sealed under this context so the
+ * workspace recipient identity is identical across releases and no reseal is
+ * needed.
+ */
+export const WORKSPACE_ROOT_CONTEXT_B64 = "St8tQ/Ednd6gbvtkRXZJsQ==";
+export const WORKSPACE_ROOT_CONTEXT_BYTES = Buffer.from(
+  WORKSPACE_ROOT_CONTEXT_B64,
+  "base64",
+);
+if (WORKSPACE_ROOT_CONTEXT_BYTES.length !== KID_BYTES) {
+  throw new Error("workspace root context must be exactly 16 bytes");
+}
+
+/** Canonical base64 validation for the stable workspace context. */
+export function assertWorkspaceRootContext(kid) {
+  if (
+    !Buffer.isBuffer(kid) ||
+    kid.length !== KID_BYTES ||
+    kid.every((byte) => byte === 0)
+  ) {
+    throw new Error("invalid workspace root context");
+  }
+  return kid;
+}
+
 export function artifactPublicKeyFromEnv(env = process.env) {
   if (env.WORKSPACE_ARTIFACT_KEY_B64) {
     throw new Error(
@@ -36,6 +64,13 @@ export function artifactPublicKeyFromEnv(env = process.env) {
   return key;
 }
 
+/**
+ * The envelope KID is the fixed stable workspace context, never a per-release
+ * value. `WORKSPACE_ARTIFACT_KID_B64` is deprecated migration input: if set it
+ * must equal the stable context, so an operator cannot accidentally seal a
+ * release to a different workspace identity (which the stable root could never
+ * open). Release tooling never needs the root secret.
+ */
 export function artifactKidFromEnv(env = process.env) {
   if (env.WORKSPACE_ARTIFACT_KEY_B64) {
     throw new Error(
@@ -43,8 +78,8 @@ export function artifactKidFromEnv(env = process.env) {
     );
   }
   const raw = env.WORKSPACE_ARTIFACT_KID_B64;
-  if (!raw) {
-    throw new Error("workspace kid unavailable or missing: WORKSPACE_ARTIFACT_KID_B64 required");
+  if (raw === undefined || raw === null || raw === "") {
+    return WORKSPACE_ROOT_CONTEXT_BYTES;
   }
   if (typeof raw !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(raw)) {
     throw new Error("workspace kid invalid base64");
@@ -56,7 +91,12 @@ export function artifactKidFromEnv(env = process.env) {
   if (kid.every((b) => b === 0)) {
     throw new Error("all-zero workspace kid rejected");
   }
-  return kid;
+  if (raw !== WORKSPACE_ROOT_CONTEXT_B64) {
+    throw new Error(
+      "WORKSPACE_ARTIFACT_KID_B64 is deprecated; releases are sealed to the stable workspace context",
+    );
+  }
+  return WORKSPACE_ROOT_CONTEXT_BYTES;
 }
 
 export function unlockSecretFromEnv(env = process.env) {

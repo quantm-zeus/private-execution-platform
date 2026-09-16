@@ -9,6 +9,7 @@ import { decryptArtifactFile } from "./decrypt-workspace-artifact.mjs";
 import {
   ARTIFACT_HEADER_BYTES,
   ARTIFACT_VERSION,
+  WORKSPACE_ROOT_CONTEXT_B64,
   derivePublicKey,
   packDirectory,
   sealPackage,
@@ -1085,6 +1086,7 @@ try {
     "/internal/auth/session",
     "/internal/auth/verify",
     "/internal/workspace/descriptor",
+    "/internal/workspace/identity",
     "/internal/workspace/recovery",
     "/internal/workspace/recovery/challenge",
     "/internal/workspace/recovery/revoke",
@@ -1206,21 +1208,31 @@ try {
   // 6. Strict validation on required WORKSPACE_PUBLIC_KEY_B64 and KID
   // =========================================================================
   unlockSecret = randomBytes(32);
-  const kid = randomBytes(16);
+  // Releases are sealed to the fixed stable workspace context, never a
+  // per-release KID; the public identity is derived from the root + context.
+  const kid = Buffer.from(WORKSPACE_ROOT_CONTEXT_B64, "base64");
   const publicKey = derivePublicKey(unlockSecret, kid, ARTIFACT_VERSION);
 
-  // Missing kid
-  const missingKidAttempt = spawnSync("pnpm", ["build:workspace:encrypted"], {
-    stdio: "pipe",
-    env: {
-      ...process.env,
-      WORKSPACE_PUBLIC_KEY_B64: publicKey.toString("base64"),
-    },
-  });
-  assertCliRejected(
-    missingKidAttempt,
-    "missing WORKSPACE_ARTIFACT_KID_B64 was accepted by encrypted build",
-  );
+  // Missing kid now defaults to the stable workspace context (and never
+  // changes the workspace identity).
+  if (!artifactKidFromEnv({}).equals(kid)) {
+    throw new Error(
+      "missing WORKSPACE_ARTIFACT_KID_B64 did not default to the stable workspace context",
+    );
+  }
+
+  // A foreign KID is deprecated migration input and must fail closed.
+  let foreignKidRejected = false;
+  try {
+    artifactKidFromEnv({
+      WORKSPACE_ARTIFACT_KID_B64: randomBytes(16).toString("base64"),
+    });
+  } catch {
+    foreignKidRejected = true;
+  }
+  if (!foreignKidRejected) {
+    throw new Error("a foreign WORKSPACE_ARTIFACT_KID_B64 was accepted");
+  }
 
   // All-zero kid
   const zeroKidAttempt = spawnSync("pnpm", ["build:workspace:encrypted"], {
