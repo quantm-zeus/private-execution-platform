@@ -2,9 +2,12 @@ name: CI
 on:
   push:
   pull_request:
+permissions:
+  contents: read
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -15,6 +18,7 @@ jobs:
       - run: cargo test --workspace
   web-boundary:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # verify:web-boundary shells out to the crypto-envelope CLI/wasm proofs,
@@ -40,6 +44,7 @@ jobs:
       - run: pnpm verify:web-boundary
   web-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

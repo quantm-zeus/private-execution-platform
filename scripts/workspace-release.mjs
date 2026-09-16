@@ -759,6 +759,10 @@ async function switchCurrentLocked(releasesRoot, releaseId) {
   const previousPath = join(releasesRoot, PREVIOUS_LINK);
   const current = await linkTarget(currentPath);
   if (current && current !== id) {
+    // `current` is attacker-influencable link content and is persisted as
+    // `previous` (then served by rollback). Validate it as a real release id
+    // before writing it, matching every other link consumer.
+    assertReleaseId(current);
     await atomicSymlink(previousPath, current);
   }
   await atomicSymlink(currentPath, id);

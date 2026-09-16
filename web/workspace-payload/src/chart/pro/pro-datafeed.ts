@@ -108,6 +108,11 @@ export interface ProDatafeed extends Datafeed {
 
 export function createProDatafeed(deps: ProDatafeedDeps): ProDatafeed {
   const subscriptions = new Map<string, () => void>();
+  // Pro 0.1.1 calls `subscribe()` only after its history `await` resolves, so a
+  // chart disposed mid-load can still re-subscribe after teardown. Once disposed
+  // the adapter is terminal: a late subscribe must not register a live sink on a
+  // detached renderer. Callers that switch subjects create a fresh datafeed.
+  let disposed = false;
   const limit = clampHistoryLimit(deps.historyLimit);
   const keyFor = (ticker: string, period: Period): string => `${ticker}#${period.text}`;
 
@@ -143,6 +148,7 @@ export function createProDatafeed(deps: ProDatafeedDeps): ProDatafeed {
     },
 
     subscribe(symbol, period, callback: DatafeedSubscribeCallback): void {
+      if (disposed) return;
       // Pro may re-subscribe without an intervening unsubscribe; always drop the
       // previous handler so a period/symbol switch cannot leak a live feed.
       teardown(symbol.ticker, period);
@@ -165,6 +171,7 @@ export function createProDatafeed(deps: ProDatafeedDeps): ProDatafeed {
     },
 
     dispose(): void {
+      disposed = true;
       for (const unsubscribe of subscriptions.values()) unsubscribe();
       subscriptions.clear();
     },

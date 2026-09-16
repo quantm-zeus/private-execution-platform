@@ -69,7 +69,19 @@ export function parseChartCandle(raw: unknown): Candle | null {
   const close = finiteNumber(record.close);
   const volume = finiteNumber(record.volume) ?? 0;
   if (timeMs === null || open === null || high === null || low === null || close === null) return null;
-  if (timeMs <= 0 || high < low || volume < 0) return null;
+  // Same envelope as the realtime parser (`frames.ts`): a bar whose open/close
+  // lies outside [low, high] is malformed, not a renderable candle.
+  if (
+    timeMs <= 0 ||
+    volume < 0 ||
+    high < low ||
+    high < open ||
+    high < close ||
+    low > open ||
+    low > close
+  ) {
+    return null;
+  }
   return { timeMs, open, high, low, close, volume };
 }
 

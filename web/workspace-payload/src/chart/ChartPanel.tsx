@@ -17,7 +17,7 @@ import {
 } from "./chart-datafeed";
 import { createPepHistoryProvider, createServerHistoryProvider } from "./history";
 import { createProChart, type ProChartHandle } from "./pro/pro-chart";
-import { DEFAULT_PRO_TIMEFRAME, PRO_PERIODS, createProDatafeed } from "./pro/pro-datafeed";
+import { DEFAULT_PRO_TIMEFRAME, PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
 import { formatAmount, formatBps, truncateAddress } from "../core/format";
 import type { InstrumentRef } from "../core/types";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
@@ -86,19 +86,20 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     () => explicitSubject() !== null || ws.selectedInstrument() !== null,
   );
 
-  const datafeed = createProDatafeed({
-    history: createPepHistoryProvider(
-      createServerHistoryProvider({
-        command: ws.command,
-        ready: () => ws.commandReady(),
-        chartAllowed: () => ws.capabilityDenial("chart") === null,
-      }),
-      createLocalHistoryProvider(router),
-    ),
-    realtime: { subscribe: (target, timeframe, sink) => router.subscribe(target, timeframe, sink) },
-    resolveSubject: (ticker) => (chartTicker(subject()) === ticker ? subject() : null),
-    historyLimit: props.bars,
-  });
+  const buildDatafeed = (): ProDatafeed =>
+    createProDatafeed({
+      history: createPepHistoryProvider(
+        createServerHistoryProvider({
+          command: ws.command,
+          ready: () => ws.commandReady(),
+          chartAllowed: () => ws.capabilityDenial("chart") === null,
+        }),
+        createLocalHistoryProvider(router),
+      ),
+      realtime: { subscribe: (target, timeframe, sink) => router.subscribe(target, timeframe, sink) },
+      resolveSubject: (ticker) => (chartTicker(subject()) === ticker ? subject() : null),
+      historyLimit: props.bars,
+    });
 
   onMount(() => {
     const unsubscribe = feed?.subscribe((frames) => {
@@ -109,6 +110,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
 
   let host: HTMLDivElement | undefined;
   let handle: ProChartHandle | null = null;
+  let activeDatafeed: ProDatafeed | null = null;
   let createdTicker: string | null = null;
   const [chartError, setChartError] = createSignal(false);
   // Only offer periods the local contract can serve; an unknown initial id
@@ -132,7 +134,13 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     // The datafeed owns every subscription and is torn down with the instance.
     handle?.dispose();
     handle = null;
-    datafeed.dispose();
+    activeDatafeed?.dispose();
+    activeDatafeed = null;
+    // A fresh datafeed per renderer instance: Pro 0.1.1 can call `subscribe()`
+    // only after its history `await` resolves, so a disposed instance must never
+    // be reused (its terminal guard would otherwise either leak a sink or drop a
+    // legitimate late subscribe).
+    const datafeed = buildDatafeed();
     try {
       handle = createProChart(host, {
         subject: current,
@@ -140,11 +148,13 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
         timeframeId,
         testId: "pro-chart",
       });
+      activeDatafeed = datafeed;
       createdTicker = ticker;
       setChartError(false);
     } catch {
       // No usable canvas (unsupported/headless runtime): degrade to a clear
       // message instead of breaking the whole workspace.
+      datafeed.dispose();
       createdTicker = null;
       handle = null;
       setChartError(true);
@@ -154,7 +164,8 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   onCleanup(() => {
     handle?.dispose();
     handle = null;
-    datafeed.dispose();
+    activeDatafeed?.dispose();
+    activeDatafeed = null;
   });
 
   const depth = () => {

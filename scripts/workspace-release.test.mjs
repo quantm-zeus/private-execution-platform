@@ -735,6 +735,31 @@ test("switching to an unpublished release refuses", async () => {
   }
 });
 
+test("a tampered current link is never persisted as previous", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-current-tamper-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-current-tamper-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const { releaseId } = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    // `current` is attacker-influencable link content and a switch writes it to
+    // `previous`. A tampered target must be rejected by the id check, never
+    // persisted as a rollback destination.
+    await rm(join(root, CURRENT_LINK), { force: true });
+    await symlink("../../etc", join(root, CURRENT_LINK));
+    await assert.rejects(switchCurrent(root, releaseId), /invalid release id/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
+  }
+});
+
 test("a corrupt existing release never leaks the staging directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "release-staging-leak-"));
   const shellDir = await mkdtemp(join(tmpdir(), "release-staging-src-"));

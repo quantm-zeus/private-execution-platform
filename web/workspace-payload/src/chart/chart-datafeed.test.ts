@@ -69,6 +69,9 @@ describe("candle normalization", () => {
       { timeMs: 1_000, open: 1, high: 0.5, low: 1, close: 1, volume: 1 },
       { timeMs: 4_000, open: 1, high: 2, low: 0.5, close: 1, volume: -1 },
       { timeMs: 0, open: 1, high: 2, low: 0.5, close: 1, volume: 1 },
+      // OHLC envelope: open above high / close below low are not renderable.
+      { timeMs: 5_000, open: 5, high: 4, low: 1, close: 2, volume: 1 },
+      { timeMs: 6_000, open: 2, high: 4, low: 3, close: 2, volume: 1 },
     ]);
     expect(normalized.map((c) => c.timeMs)).toEqual([2_000, 3_000]);
     expect(normalized[0]!.close).toBe(25);

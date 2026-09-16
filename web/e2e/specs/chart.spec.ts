@@ -52,6 +52,15 @@ test.describe("private chart (KLineChart Pro)", () => {
     expect(box?.width ?? 0).toBeGreaterThan(100);
     expect(box?.height ?? 0).toBeGreaterThan(100);
 
+    // Positive control: a valid decrypted frame must actually reach the chart
+    // router. The badge reads `LOCAL DATA` only after `ChartFrameRouter.apply`
+    // reports a store change, so a datafeed that silently dropped every frame
+    // can no longer pass this smoke on canvas visibility alone.
+    const target = page.getByTestId("chart-target");
+    await expect(target.getByText("AWAITING FEED")).toBeVisible();
+    await sendFrames(request, { frames: [ohlcvSnapshot(120)] });
+    await expect(target.getByText("LOCAL DATA")).toBeVisible({ timeout: 7_000 });
+
     // The first-party timeframe control is the keyboard/AT path; Pro 0.1.1's
     // own period items are non-focusable spans and its bar is hidden.
     const timeframe = page.locator("#chart-timeframe");
@@ -80,6 +89,13 @@ test.describe("private chart (KLineChart Pro)", () => {
     await page.locator('button[data-view="terminal"]').click();
     await expect(page.locator(".pep-pro-chart-host canvas").first()).toBeVisible();
 
+    // Positive control: the feed is live and mutating the chart before the
+    // malformed frame is sent. Without this, a renderer that dropped every frame
+    // (valid or not) would still pass the tolerance assertion below.
+    const target = page.getByTestId("chart-target");
+    await sendFrames(request, { frames: [ohlcvSnapshot(130)] });
+    await expect(target.getByText("LOCAL DATA")).toBeVisible({ timeout: 7_000 });
+
     await sendFrames(request, {
       frames: [
         {
@@ -98,6 +114,8 @@ test.describe("private chart (KLineChart Pro)", () => {
     });
     await page.waitForTimeout(250);
     await expect(page.locator(".pep-pro-chart-host canvas").first()).toBeVisible();
+    // The malformed frame was dropped, not applied: the prior valid series stays.
+    await expect(target.getByText("LOCAL DATA")).toBeVisible();
     expect(chartErrors(errors)).toEqual([]);
   });
 });

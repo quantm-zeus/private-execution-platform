@@ -78,7 +78,13 @@ function isValidCandle(candle: Candle): boolean {
     Number.isFinite(candle.low) &&
     Number.isFinite(candle.close) &&
     Number.isFinite(candle.volume) &&
+    // Same OHLC envelope as `frames.ts`/`history.ts`: open/close must lie within
+    // [low, high], so no renderer accepts a bar the parsers would reject.
     candle.high >= candle.low &&
+    candle.high >= candle.open &&
+    candle.high >= candle.close &&
+    candle.low <= candle.open &&
+    candle.low <= candle.close &&
     candle.volume >= 0
   );
 }

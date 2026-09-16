@@ -41,6 +41,10 @@ describe("parseChartCandle", () => {
     expect(parseChartCandle({ time_ms: 0, open: 1, high: 2, low: 0.5, close: 1, volume: 1 })).toBeNull();
     expect(parseChartCandle({ time_ms: 1, open: 1, high: 0.5, low: 1, close: 1, volume: 1 })).toBeNull();
     expect(parseChartCandle({ time_ms: 1, open: 1, high: 2, low: 0.5, close: 1, volume: -1 })).toBeNull();
+    // The OHLC envelope must match the realtime parser: a bar whose open/close
+    // lies outside [low, high] is malformed, not renderable history.
+    expect(parseChartCandle({ time_ms: 1, open: 3, high: 2, low: 0.5, close: 1, volume: 1 })).toBeNull();
+    expect(parseChartCandle({ time_ms: 1, open: 1, high: 2, low: 0.5, close: 3, volume: 1 })).toBeNull();
   });
 });
 

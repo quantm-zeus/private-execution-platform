@@ -29,7 +29,11 @@ const ALL_TRUE_BOOTSTRAP = {
 
 test.describe("fail-closed private workspace", () => {
   test("renders an explicit unavailable state and enables no capability on 404", async ({ page }) => {
-    await page.route("**/v1/bootstrap", (route) => route.fulfill({ status: 404, body: "not found" }));
+    let bootstrapHits = 0;
+    await page.route("**/v1/bootstrap", (route) => {
+      bootstrapHits += 1;
+      return route.fulfill({ status: 404, body: "not found" });
+    });
     await page.goto("/");
     // Bootstrap is opaque now: it needs a BR-5 key before the routed 404 can be
     // observed (with no key it fails closed locally instead of probing).
@@ -37,6 +41,10 @@ test.describe("fail-closed private workspace", () => {
 
     await expect(page.locator(".workspace")).toBeVisible();
     await expect(page.getByText(/not available on this deployment/i).first()).toBeVisible();
+    // Positive control: the fail-closed state came from the routed 404, not from
+    // a local no-op. A regression that stopped probing (or a hidden fallback that
+    // rendered the same text without a request) now fails this assertion.
+    expect(bootstrapHits).toBeGreaterThan(0);
     await expect(page.locator(".chip--on")).toHaveCount(0);
     await expect(page.getByText("TRADING ENABLED")).toHaveCount(0);
   });

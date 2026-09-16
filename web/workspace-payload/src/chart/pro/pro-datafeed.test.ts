@@ -169,4 +169,17 @@ describe("createProDatafeed", () => {
     datafeed.dispose();
     expect(realtime.active()).toBe(0);
   });
+
+  it("ignores a subscribe that arrives after dispose (terminal adapter)", () => {
+    const { datafeed, realtime } = make({ load: async () => ({ candles: [], source: "local" }) });
+    datafeed.subscribe(symbol, minute, () => {});
+    expect(realtime.active()).toBe(1);
+    datafeed.dispose();
+    expect(realtime.active()).toBe(0);
+    // Pro 0.1.1 re-subscribes only after its history `await` resolves, so a
+    // chart disposed mid-load can call this late; the adapter must stay terminal
+    // and never register a sink on a detached renderer.
+    datafeed.subscribe(symbol, minute, () => {});
+    expect(realtime.active()).toBe(0);
+  });
 });

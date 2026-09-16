@@ -7,6 +7,7 @@ import {
   randomKeyB64,
   resetServer,
   sendFrames,
+  serverState,
   waitForSocket,
   waitForWorkspace,
 } from "./helpers";
@@ -199,6 +200,15 @@ test.describe("performance budgets (local harness)", () => {
         { timeout: 7_000 },
       )
       .toBeGreaterThan(0);
+
+    // Bind the measurement to the search action: the test server only records a
+    // command `op` after it decrypts the envelope, so an unrelated `/v1/command`
+    // call can no longer satisfy the round-trip assertion.
+    await expect
+      .poll(async () => (await serverState(request)).commands.map((command) => command.op), {
+        timeout: 7_000,
+      })
+      .toContain("search_token");
 
     const samples = await page.evaluate(
       () => (window as unknown as { __commandMs: number[] }).__commandMs,
