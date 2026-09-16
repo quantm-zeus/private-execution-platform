@@ -44,11 +44,24 @@ async function unlock(page: import("@playwright/test").Page, info: { secretB64?:
   // automatically and only the offline recovery code is required. The KID is
   // never typed: it comes from the authenticated descriptor.
   await page.locator("#recovery-code").fill(info.secretB64!);
+  // Snapshot the field at the instant the first unlock network exchange starts.
+  // `toHaveValue("")` below retries for up to 7s, so on its own it would also
+  // pass if the secret were cleared only after the exchange; this route pins the
+  // "cleared before the first await" claim. The grant request always fires on an
+  // unlock (enrollment may be skipped once the host has bound the key).
+  let valueAtFirstGrant: string | null = null;
+  await page.route("**/internal/artifact/grant", async (route) => {
+    if (valueAtFirstGrant === null) {
+      valueAtFirstGrant = await page.locator("#recovery-code").inputValue();
+    }
+    await route.continue();
+  });
   await page.getByRole("button", { name: "Unlock Workspace" }).click();
   // The recovery code is cleared from the DOM synchronously before the first
   // network await, and the form stays mounted until the payload boots, so this
   // pins the secret-lifetime claim.
   await expect(page.locator("#recovery-code")).toHaveValue("");
+  expect(valueAtFirstGrant).toBe("");
   // The payload may announce readiness and overwrite the status text, so wait for
   // the instantiated frame itself rather than a transient status string.
   await expect(page.locator("#workspace-frame")).toBeVisible({ timeout: 20_000 });
@@ -202,6 +215,40 @@ test.describe("shell artifact unlock", () => {
         }));
     });
     expect(violations, JSON.stringify(violations, null, 2)).toEqual([]);
+  });
+
+  test("the authenticated unlock surface and failure alert have no moderate-or-worse axe violations", async ({
+    page,
+    request,
+  }) => {
+    const info = await unlockInfo(request);
+    test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
+
+    const axeViolations = () =>
+      page.evaluate(async () => {
+        const axe = (window as unknown as { axe: { run: (ctx: Document, opts: unknown) => Promise<{ violations: { id: string; impact: string; nodes: { target: string[] }[] }[] }> } }).axe;
+        const result = await axe.run(document, { resultTypes: ["violations"] });
+        return result.violations
+          .filter((violation) => ["moderate", "serious", "critical"].includes(violation.impact))
+          .map((violation) => ({
+            id: violation.id,
+            impact: violation.impact,
+            nodes: violation.nodes.map((node) => node.target),
+          }));
+      });
+
+    await page.goto(`${SHELL_ORIGIN}/`);
+    // Authenticated + descriptor loaded: the unlock form, release fingerprint and
+    // recovery guidance are mounted, none of which the signed-out scan covers.
+    await expect(page.locator("#recovery-code")).toBeVisible({ timeout: 20_000 });
+    await page.addScriptTag({ url: "/__test__/axe.min.js" });
+    expect(await axeViolations(), "authenticated unlock surface").toEqual([]);
+
+    // Trigger the credential-failure alert and scan that security-relevant state.
+    await page.locator("#recovery-code").fill(Buffer.alloc(32, 9).toString("base64"));
+    await page.getByRole("button", { name: "Unlock Workspace" }).click();
+    await expect(page.locator(".notice__title")).toBeVisible({ timeout: 20_000 });
+    expect(await axeViolations(), "credential-failure alert").toEqual([]);
   });
 
   test("the security gateway honours reduced motion and 44px touch targets", async ({

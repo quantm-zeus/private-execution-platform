@@ -3,7 +3,7 @@ import { spawnSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { decryptArtifactFile } from "./decrypt-workspace-artifact.mjs";
 import {
@@ -146,11 +146,24 @@ const trackerTerms = [
 ];
 
 /**
+ * Decode the common JavaScript string escapes that can hide an endpoint from a
+ * literal scan: `https:\/\/evil.example`, `\x68ttps://evil.example` and
+ * `\u0068ttps://evil.example`. This only broadens a deny-list scan, so a false
+ * positive is a fail-closed build failure, never a missed match.
+ */
+function decodeJsStringEscapes(text) {
+  return String(text)
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\\//g, "/");
+}
+
+/**
  * Own-origin URL scanner shared by the shell and payload boundaries. (The public
  * site is intentionally scanned only for trackers and source maps: it is a
  * separate non-private build and may legitimately link out.)
  */
-function assertNoExternalUrls(text, label) {
+function scanExternalUrls(text, label) {
   for (const match of text.matchAll(/(?:https?|wss?):\/\/[^"'`\s)<]+/gi)) {
     const raw = match[0];
     let parsed;
@@ -178,8 +191,14 @@ function assertNoExternalUrls(text, label) {
   }
 }
 
+function assertNoExternalUrls(text, label) {
+  scanExternalUrls(text, label);
+  const decoded = decodeJsStringEscapes(text);
+  if (decoded !== text) scanExternalUrls(decoded, label);
+}
+
 function assertNoTrackers(text, label) {
-  const lower = collapseStringConcatenation(text).toLowerCase();
+  const lower = decodeJsStringEscapes(collapseStringConcatenation(text)).toLowerCase();
   for (const tracker of trackerTerms) {
     if (lower.includes(tracker)) throw new Error(`${label} references external tracker: ${tracker}`);
   }
@@ -260,10 +279,66 @@ const CONSOLE_CALL_PATTERN = new RegExp(
 );
 
 function assertNoConsoleUsage(text, label) {
-  const match = CONSOLE_CALL_PATTERN.exec(collapseStringConcatenation(text));
+  const normalized = collapseStringConcatenation(text);
+  const match = CONSOLE_CALL_PATTERN.exec(normalized);
   if (match) {
     throw new Error(`${label} writes to the developer console: ${match[0].trim()}`);
   }
+  // A bare `console` identifier is refused too. The call pattern above can be
+  // dodged by qualifying or wrapping the global (`globalThis["console"].log`,
+  // `window["console"]["warn"]`, `console?.log`, `console["log"]?.(...)`), and
+  // the shipped shell/payload has no legitimate use for the global at all — the
+  // same bare-token rule the wasm-glue sanitizer uses. This is stricter than the
+  // call pattern on purpose: a console write can carry exception text and asset
+  // URLs out of the private origin's control.
+  const bare = /\bconsole\b/.exec(normalized);
+  if (bare) {
+    throw new Error(`${label} references the developer console`);
+  }
+}
+
+/**
+ * Text-only scanners run on UTF-8-decodable assets. A non-UTF-8 asset is only
+ * acceptable when its extension is an unambiguous binary container; otherwise a
+ * UTF-16/encoded text asset (`charset="utf-16"`) could carry an external
+ * endpoint or a tracker token past every text scanner. We refuse to guess.
+ */
+const KNOWN_BINARY_ASSET_EXTENSIONS = new Set([
+  ".wasm",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".avif",
+  ".ico",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".otf",
+  ".eot",
+  ".mp4",
+  ".webm",
+  ".pdf",
+  ".zip",
+]);
+
+/**
+ * Decide whether a built asset must still run the text scanners. A UTF-8
+ * decodable asset always does. A non-UTF-8 asset may skip them only when its
+ * extension is an unambiguous binary container; otherwise a UTF-16/encoded text
+ * asset (`charset="utf-16"`) could carry an external endpoint or a tracker token
+ * past every text scanner. We refuse to guess.
+ */
+function requiresTextScan(path, buffer, label) {
+  if (isUtf8Text(buffer)) return true;
+  const extension = extname(path).toLowerCase();
+  if (!KNOWN_BINARY_ASSET_EXTENSIONS.has(extension)) {
+    throw new Error(
+      `${label} is not valid UTF-8 and is not a known binary asset (extension "${extension || "none"}") — an encoded text asset could evade the URL/tracker/console scans`,
+    );
+  }
+  return false;
 }
 
 /**
@@ -347,7 +422,7 @@ function collapseStringConcatenation(text) {
 }
 
 function assertNoProviderEndpoints(text, label) {
-  const lower = collapseStringConcatenation(text).toLowerCase();
+  const lower = decodeJsStringEscapes(collapseStringConcatenation(text)).toLowerCase();
   for (const term of providerEndpointTerms) {
     if (lower.includes(term)) {
       throw new Error(`${label} references a provider endpoint/credential: ${term}`);
@@ -388,10 +463,36 @@ function assertScannerControls() {
     ["provider split-literal host", () => assertNoProviderEndpoints('fetch("okx"+".com")', "control")],
     ["provider ok-access header", () => assertNoProviderEndpoints('"OK-ACCESS-KEY"', "control")],
     ["provider camelCase credential", () => assertNoProviderEndpoints("const okxApiKey = 1;", "control")],
+    [
+      "escaped-slash external URL",
+      () => assertNoExternalUrls('const u = "https:\\/\\/evil.example/x";', "control"),
+    ],
+    [
+      "hex-escaped external URL",
+      () => assertNoExternalUrls('const u = "\\x68ttps://evil.example/x";', "control"),
+    ],
+    [
+      "escaped tracker token",
+      () => assertNoTrackers('"google-analytics\\u002Ecom"', "control"),
+    ],
     ["console dotted call", () => assertNoConsoleUsage('console.warn("wasm failed", e)', "control")],
     [
       "console bracket call",
       () => assertNoConsoleUsage('console["warn"]("wasm failed", e)', "control"),
+    ],
+    [
+      "console qualified bracket call",
+      () => assertNoConsoleUsage('globalThis["console"]["warn"](1)', "control"),
+    ],
+    ["console window bracket call", () => assertNoConsoleUsage('window["console"].log(1)', "control")],
+    ["console optional-chain call", () => assertNoConsoleUsage("console?.log(1)", "control")],
+    [
+      "console optional bracket call",
+      () => assertNoConsoleUsage('console["log"]?.(1)', "control"),
+    ],
+    [
+      "non-utf8 text-like asset",
+      () => requiresTextScan("assets/app.js", Buffer.from([0xff, 0xfe, 0x00]), "control"),
     ],
     [
       "tracker in a decodable non-JS asset",
@@ -412,6 +513,13 @@ function assertScannerControls() {
   assertNoForbiddenStorage('const label = "local" + " router"; console.log(label)', "control");
   assertNoProviderEndpoints('const capability = "okx";', "control");
   assertNoRuntimeMetadataWrites('const href = location.origin + "/v1/blob";', "control");
+  // A known binary container skips the text scan; a UTF-8 text asset does not.
+  if (requiresTextScan("assets/module.wasm", Buffer.from([0x00, 0xff]), "control")) {
+    throw new Error("boundary scanner self-test failed: a binary asset must skip the text scan");
+  }
+  if (!requiresTextScan("assets/app.js", Buffer.from("const x = 1;", "utf8"), "control")) {
+    throw new Error("boundary scanner self-test failed: a UTF-8 asset must be text-scanned");
+  }
 }
 assertScannerControls();
 
@@ -572,9 +680,16 @@ try {
   // Parse standard static-host _headers format (Cloudflare Pages / Netlify convention)
   const headerRules = [];
   let currentHeaderRule = null;
-  for (const rawLine of shellHeadersRaw.split("\n")) {
+  for (const rawLine of shellHeadersRaw.split(/\r\n|\r|\n/)) {
     const trimmed = rawLine.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
+    // Cloudflare Pages `! Header-Name` detaches an inherited header. The clear
+    // shell `_headers` must never detach a header: silently ignoring the line
+    // would let a path-specific rule remove a hardened security header from the
+    // page that hosts the recovery-code input.
+    if (/^\s*!/.test(rawLine)) {
+      throw new Error(`workspace-shell _headers must not detach a header (! ...): ${trimmed}`);
+    }
     if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t")) {
       currentHeaderRule = { path: trimmed, headers: {} };
       headerRules.push(currentHeaderRule);
@@ -588,39 +703,110 @@ try {
     }
   }
 
-  const wildcardRule = headerRules.find((r) => r.path === "/*");
-  if (!wildcardRule) {
+  // Cloudflare Pages semantics (the named static target): every matching rule is
+  // inherited and a header set twice is comma-joined. Resolve the effective
+  // headers per representative path so a wildcard `no-store` can never be
+  // silently joined with (and defeat) the `/assets/*` immutable value.
+  const headerPatternMatches = (pattern, requestPath) => {
+    if (!pattern.includes("*")) return pattern === requestPath;
+    const star = pattern.indexOf("*");
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    return (
+      requestPath.startsWith(prefix) &&
+      requestPath.endsWith(suffix) &&
+      requestPath.length >= prefix.length + suffix.length
+    );
+  };
+  const resolveHeaders = (requestPath) => {
+    const joined = {};
+    for (const rule of headerRules) {
+      if (!headerPatternMatches(rule.path, requestPath)) continue;
+      for (const [name, value] of Object.entries(rule.headers)) {
+        joined[name] = joined[name] === undefined ? value : `${joined[name]}, ${value}`;
+      }
+    }
+    return joined;
+  };
+
+  const wildcardRules = headerRules.filter((r) => r.path === "/*");
+  if (wildcardRules.length === 0) {
     throw new Error("workspace-shell _headers missing universal wildcard rule (/*)");
   }
-  if (wildcardRule.headers["cache-control"] !== "no-store") {
-    throw new Error(`workspace-shell _headers Cache-Control mismatch: ${wildcardRule.headers["cache-control"]}`);
+  for (const wildcardRule of wildcardRules) {
+    if (wildcardRule.headers["cache-control"] !== undefined) {
+      throw new Error(
+        `workspace-shell _headers /* must not set Cache-Control (joined with /assets/* immutable on Cloudflare Pages): ${wildcardRule.headers["cache-control"]}`,
+      );
+    }
+    for (const [name, expected] of [
+      ["x-content-type-options", "nosniff"],
+      ["referrer-policy", "no-referrer"],
+      ["x-frame-options", "DENY"],
+    ]) {
+      if (wildcardRule.headers[name] !== expected) {
+        throw new Error(`workspace-shell _headers ${name} mismatch: ${wildcardRule.headers[name]}`);
+      }
+    }
+    if (wildcardRule.headers["content-security-policy"] !== expectedCspHeader) {
+      throw new Error(`workspace-shell _headers Content-Security-Policy mismatch: ${wildcardRule.headers["content-security-policy"]}`);
+    }
   }
-  if (wildcardRule.headers["x-content-type-options"] !== "nosniff") {
-    throw new Error(`workspace-shell _headers X-Content-Type-Options mismatch: ${wildcardRule.headers["x-content-type-options"]}`);
-  }
-  if (wildcardRule.headers["referrer-policy"] !== "no-referrer") {
-    throw new Error(`workspace-shell _headers Referrer-Policy mismatch: ${wildcardRule.headers["referrer-policy"]}`);
-  }
-  if (wildcardRule.headers["x-frame-options"] !== "DENY") {
-    throw new Error(`workspace-shell _headers X-Frame-Options mismatch: ${wildcardRule.headers["x-frame-options"]}`);
-  }
-  if (wildcardRule.headers["content-security-policy"] !== expectedCspHeader) {
-    throw new Error(`workspace-shell _headers Content-Security-Policy mismatch: ${wildcardRule.headers["content-security-policy"]}`);
-  }
-  const headerCsp = wildcardRule.headers["content-security-policy"];
+  const headerCsp = wildcardRules[0].headers["content-security-policy"];
   if (/https?:\/\//i.test(headerCsp) || headerCsp.includes("*")) {
     throw new Error(`shell _headers CSP contains non-own-origin or wildcard directive: ${headerCsp}`);
+  }
+  // A path-specific rule must not weaken a security header: a host where the
+  // specific rule wins would otherwise serve a weakened page, and the release
+  // writer rejects the same shape.
+  for (const rule of headerRules) {
+    for (const [name, expected] of [
+      ["x-content-type-options", "nosniff"],
+      ["referrer-policy", "no-referrer"],
+      ["x-frame-options", "DENY"],
+      ["content-security-policy", expectedCspHeader],
+    ]) {
+      const value = rule.headers[name];
+      if (value !== undefined && value !== expected) {
+        throw new Error(`workspace-shell _headers ${rule.path} rule weakens hardened ${name}`);
+      }
+    }
+  }
+  // HTML entrypoints must carry no-store and must not inherit `immutable`; a
+  // hashed asset must be immutable and must not inherit `no-store` (the exact
+  // production failure a wildcard Cache-Control would reintroduce).
+  for (const requestPath of ["/", "/index.html"]) {
+    const cacheControl = (resolveHeaders(requestPath)["cache-control"] ?? "").toLowerCase();
+    if (!cacheControl.includes("no-store")) {
+      throw new Error(
+        `workspace-shell _headers ${requestPath} must be Cache-Control: no-store (got "${cacheControl}")`,
+      );
+    }
+    if (cacheControl.includes("immutable")) {
+      throw new Error(`workspace-shell _headers ${requestPath} must not be immutable`);
+    }
+  }
+  const assetProbePath = "/assets/app-0123456789abcdef.js";
+  const assetCacheControl = (resolveHeaders(assetProbePath)["cache-control"] ?? "").toLowerCase();
+  if (!assetCacheControl.includes("immutable")) {
+    throw new Error(
+      `workspace-shell _headers ${assetProbePath} must be immutable (got "${assetCacheControl}")`,
+    );
+  }
+  if (assetCacheControl.includes("no-store")) {
+    throw new Error(
+      `workspace-shell _headers ${assetProbePath} inherits no-store (Cloudflare joins matching rules) and would never be cached`,
+    );
   }
 
   // 2d. Assert actual HTTP response headers via local static server consuming _headers
   const staticServer = createServer(async (req, res) => {
     const urlPath = (req.url || "/").split("?")[0];
-    for (const rule of headerRules) {
-      if (rule.path === "/*" || rule.path === urlPath) {
-        for (const [k, v] of Object.entries(rule.headers)) {
-          res.setHeader(k, v);
-        }
-      }
+    // Mirror Cloudflare Pages: every matching rule is inherited and a header set
+    // twice is comma-joined, so the server under test resolves rather than
+    // letting a later rule overwrite an earlier one.
+    for (const [k, v] of Object.entries(resolveHeaders(urlPath))) {
+      res.setHeader(k, v);
     }
     const relativeFile = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
     const targetFile = join(shellDist, relativeFile);
@@ -652,9 +838,28 @@ try {
       if (resp.status !== 200) {
         throw new Error(`static shell server returned status ${resp.status} for ${reqPath}`);
       }
-      if (resp.headers.get("cache-control") !== "no-store") {
-        throw new Error(`actual response for ${reqPath} missing Cache-Control: no-store`);
+      const responseCacheControl = (
+        resp.headers.get("cache-control") ?? ""
+      ).toLowerCase();
+      const isAsset = reqPath.startsWith("/assets/");
+      const isHtmlEntry =
+        reqPath === "/" || reqPath === "/index.html" || reqPath.endsWith(".html");
+      if (isAsset) {
+        if (
+          !responseCacheControl.includes("immutable") ||
+          responseCacheControl.includes("no-store")
+        ) {
+          throw new Error(
+            `actual response for ${reqPath} must be immutable without no-store (got "${responseCacheControl}")`,
+          );
+        }
+      } else if (isHtmlEntry && !responseCacheControl.includes("no-store")) {
+        throw new Error(
+          `actual response for ${reqPath} missing Cache-Control: no-store (got "${responseCacheControl}")`,
+        );
       }
+      // Non-HTML statics (favicon/robots/manifest) fall back to the host cache
+      // policy; every path still must carry the hardened security headers below.
       if (resp.headers.get("x-content-type-options") !== "nosniff") {
         throw new Error(`actual response for ${reqPath} missing X-Content-Type-Options: nosniff`);
       }
@@ -757,7 +962,7 @@ try {
     const latin1 = buffer.toString("latin1");
     assertNoForbiddenStorage(latin1, `shell built file ${path}`);
     assertNoProviderEndpoints(latin1, `shell built file ${path}`);
-    if (!isUtf8Text(buffer)) continue;
+    if (!requiresTextScan(path, buffer, `shell built file ${path}`)) continue;
     const text = buffer.toString("utf8");
     assertNoRuntimeMetadataWrites(text, `shell built file ${path}`);
     assertNoExternalUrls(text, `shell built file ${path}`);
@@ -1075,8 +1280,10 @@ try {
     assertNoProviderEndpoints(latin1, `payload file ${p}`);
     // Decodability, not an extension allowlist, decides whether the text-only
     // scanners run: a `.cjs`, `.webmanifest`, extensionless or otherwise-unknown
-    // text asset is still scanned. Binary assets keep the byte scans above.
-    if (!isUtf8Text(buffer)) continue;
+    // text asset is still scanned. A non-UTF-8 asset is only tolerated when it is
+    // an unambiguous binary container; otherwise it could carry an encoded
+    // endpoint past the text scanners.
+    if (!requiresTextScan(p, buffer, `payload file ${p}`)) continue;
     const text = buffer.toString("utf8");
     // Any absolute network scheme (http/https/ws/wss) that is not loopback or a
     // pure XML namespace is an external dependency and must not be shipped.

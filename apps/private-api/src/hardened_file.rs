@@ -71,9 +71,16 @@ pub fn open_hardened(path: &Path) -> std::io::Result<Option<HardenedFile>> {
 fn open_no_follow(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    // `O_NONBLOCK` closes a rename-swap availability hole: the earlier
+    // `symlink_metadata(...).is_file()` check and this `open` are separate
+    // syscalls, so a writer to a group-writable parent could replace the
+    // inspected regular file with a FIFO and make a blocking `open` hang a
+    // Tokio blocking thread forever. Regular files ignore the flag; a FIFO
+    // open now fails fast and the post-open `metadata.is_file()` check rejects
+    // it. The final-component symlink is still refused by `O_NOFOLLOW`.
     fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
 }
 
@@ -218,6 +225,40 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(open_hardened(&path).is_err());
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_no_follow_does_not_block_on_a_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = temp_dir();
+        let path = dir.join("pipe");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // A read-only open of a FIFO with no writer blocks indefinitely unless
+        // `O_NONBLOCK` is set. This is the rename-swap availability hole the
+        // flag closes: a group writer can replace a checked regular file with a
+        // FIFO between the `is_file()` check and the open. The open must fail
+        // fast instead of hanging a Tokio blocking thread forever.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+        let started = std::time::Instant::now();
+        // A read-only `O_NONBLOCK` open of a writerless FIFO returns immediately
+        // (it may succeed or fail depending on the OS); either way it must not
+        // block, and a successful open must not look like a regular file.
+        let opened = open_no_follow(&path);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "opening a FIFO must not block"
+        );
+        if let Ok(file) = opened {
+            assert!(
+                !file.metadata().unwrap().is_file(),
+                "a FIFO must not be accepted as a regular trust file"
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

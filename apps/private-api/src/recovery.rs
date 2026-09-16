@@ -448,7 +448,9 @@ fn open_private_file(path: &Path) -> Result<Option<(fs::Metadata, fs::File)>, Au
     }
     let file = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // `O_NONBLOCK` prevents a rename-swapped FIFO from blocking the open
+        // forever (see `hardened_file::open_no_follow`); regular files ignore it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| AuthError::VerifierUnavailable)?;
     let metadata = file

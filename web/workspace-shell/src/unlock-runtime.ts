@@ -454,9 +454,14 @@ export class WorkspaceUnlockRuntime {
     let unlocked = false;
 
     try {
+      // Announce the stage *before* each pre-network validation, so a failure in
+      // descriptor/enrollment compatibility is reflected in the progress ledger
+      // as its real stage instead of the caller's optimistic U1 preset.
+      onStage("U2_ENROLL");
       if (secretBytes.length !== 32 || secretBytes.every((b) => b === 0)) {
         throw new UnlockError("U2_ENROLL", "invalid_secret");
       }
+      onStage("U5_ARTIFACT");
       if (
         descriptor.artifact_version !== 1 ||
         descriptor.package_format_version !== 1

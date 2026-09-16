@@ -951,3 +951,49 @@ were fixed with regression tests:
   production-faithful unlock host and every payload surface run in a second
   engine as well as Chromium.
 
+## Fourth adversarial review pass (independent delta audit)
+
+Three fresh-context reviewers re-audited the browser shell/unlock/recovery, the
+Rust private-api/edge trust anchors, and the release tooling/boundary gate. No
+CRITICAL/HIGH runtime defect was found; the confirmed findings were fixed with
+regression tests and a fresh-context delta review of the fixes
+(`.dsh/release-remediation/REVIEW_V7.md`):
+
+- **Boundary gate: console evasion (MEDIUM).** `assertNoConsoleUsage` now also
+  rejects a bare `console` identifier, closing qualified/bracketed/optional-chain
+  evasions (`globalThis["console"]["warn"]`, `console?.log`,
+  `console["log"]?.(...)`) that the call regex alone missed.
+- **Boundary gate: encoded assets (LOW).** A non-UTF-8 asset is refused unless
+  its extension is a known binary container, so a UTF-16/encoded text asset can
+  no longer carry an endpoint past the text scanners. `assertNoExternalUrls`
+  additionally decodes `\/`, `\xNN` and `\uNNNN` escapes before scanning.
+- **Release cache policy (MEDIUM).** The hardened `/*` block no longer sets
+  `Cache-Control`. Cloudflare Pages inherits every matching rule and comma-joins
+  a header set twice, so the old wildcard `no-store` was joined with the
+  `/assets/*` immutable value and `no-store` won — hashed assets were never
+  cached. HTML stays `no-store, must-revalidate`; `/assets/*` stays immutable.
+  `writeShellCacheHeaders` and the boundary verifier now resolve headers with
+  Cloudflare join semantics and reject a wildcard `Cache-Control` or any
+  path-specific rule that weakens a hardened security header.
+- **Trust-anchor open: FIFO swap (MEDIUM, availability).** `open_no_follow`
+  (manifest/artifact), the recovery store and the passkey store add
+  `O_NONBLOCK`, so a rename-swapped FIFO cannot block a non-following open and
+  exhaust Tokio blocking threads. Regular-file reads are unaffected.
+- **Unlock UX/a11y (MEDIUM/LOW).** The enrollment and add-recovery inputs now
+  carry `aria-invalid`/`aria-describedby` to their message regions; the PRF
+  output is zeroized immediately after wrapping instead of across two network
+  awaits; and `unlock()` announces `U2_ENROLL`/`U5_ARTIFACT` before the
+  pre-network validations so the progress ledger reflects the real failing stage.
+- **E2E.** The shell spec now snapshots `#recovery-code` at the first
+  `/internal/artifact/grant` request (pinning "cleared before the first await"
+  rather than retrying), and axe-scans the authenticated unlock surface and the
+  credential-failure alert at moderate-or-worse.
+
+Accepted residuals (unchanged): the recovery proof-of-possession challenge is
+single-use, session-bound and TTL-bounded but not bound to a specific operation;
+`list_recovery_wrappers` requires only an authenticated session (the wrapped
+ciphertext is AES-256-GCM under the PRF/offline secret, and the pre-unlock client
+must list it); `/ready` validates the manifest shape/KID/size but not the full
+artifact digest on every unauthenticated probe; and edge perimeter trust stays
+presence-only with the loopback bind as the compensating control.
+

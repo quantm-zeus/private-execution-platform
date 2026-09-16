@@ -104,6 +104,9 @@ function App() {
   const [payloadUrl, setPayloadUrl] = createSignal("");
   const [enrollSecret, setEnrollSecret] = createSignal("");
   const [isEnrolling, setIsEnrolling] = createSignal(false);
+  // Field-level validity for the two credential inputs, so a screen reader is
+  // told which control failed instead of only hearing a live-region message.
+  const [enrollInvalid, setEnrollInvalid] = createSignal(false);
   const [recoveryWrappers, setRecoveryWrappers] = createSignal<
     RecoveryWrapperRecord[]
   >([]);
@@ -112,6 +115,7 @@ function App() {
   const [recoveryMessage, setRecoveryMessage] = createSignal("");
   const [deviceLabel, setDeviceLabel] = createSignal("This device");
   const [addRecoveryCode, setAddRecoveryCode] = createSignal("");
+  const [addRecoveryInvalid, setAddRecoveryInvalid] = createSignal(false);
   let frame: HTMLIFrameElement | undefined;
   let recoveryInput: HTMLInputElement | undefined;
   let alertRef: HTMLDivElement | undefined;
@@ -274,9 +278,11 @@ function App() {
   const handleEnroll = async (e: Event) => {
     e.preventDefault();
     if (isEnrolling()) return;
+    setEnrollInvalid(false);
     const secretValue = enrollSecret().trim();
     setEnrollSecret("");
     if (!secretValue) {
+      setEnrollInvalid(true);
       setAuthMessage("Enrollment secret required.");
       return;
     }
@@ -284,8 +290,10 @@ function App() {
     setAuthMessage("Enrolling passkey...");
     try {
       await enrollPasskey(secretValue);
+      setEnrollInvalid(false);
       await runAuthentication();
     } catch (error) {
+      setEnrollInvalid(true);
       setAuthMessage(
         error instanceof PasskeyAuthError && error.code === "enrollment_unavailable"
           ? "Passkey enrollment is not open."
@@ -544,6 +552,7 @@ function App() {
   const addRecoveryPasskey = async (e: Event) => {
     e.preventDefault();
     if (recoveryBusy()) return;
+    setAddRecoveryInvalid(false);
     let raw = addRecoveryCode();
     setAddRecoveryCode("");
     let secret: Uint8Array;
@@ -556,6 +565,7 @@ function App() {
     }
     if (secret.length !== 32 || secret.every((byte) => byte === 0)) {
       secret.fill(0);
+      setAddRecoveryInvalid(true);
       setRecoveryMessage(
         "Enter the 32-byte offline recovery code to authorize adding this passkey.",
       );
@@ -585,6 +595,7 @@ function App() {
         activeDescriptor.artifact_kid_b64,
       );
       if (fingerprint === null || fingerprint !== expectedFingerprint) {
+        setAddRecoveryInvalid(true);
         setRecoveryMessage(
           "That recovery code does not match this workspace's active release.",
         );
@@ -601,6 +612,12 @@ function App() {
         return;
       }
       const wrapped = await wrapRootKey(prfOutput, secret, salt, undefined, assertion.credentialIdB64);
+      // The wrapping key was derived from the PRF output inside `wrapRootKey`,
+      // so the raw PRF bytes are no longer needed once the record exists. Drop
+      // them before the proof-of-possession network round trip instead of
+      // holding them across two awaits until the outer `finally`.
+      prfOutput.fill(0);
+      prfOutput = null;
       // Drop the offline-code bytes before the proof-of-possession network
       // round trip so they are not retained across it.
       secret.fill(0);
@@ -785,7 +802,7 @@ function App() {
           <h2 id="open-heading" class="panel__heading" tabindex={-1}>
             Open the private workspace
           </h2>
-          <p class="panel__copy" role="status" aria-live="polite">
+          <p id="auth-message" class="panel__copy" role="status" aria-live="polite">
             {authMessage()}
           </p>
           <div class="actions">
@@ -829,6 +846,8 @@ function App() {
                     value={enrollSecret()}
                     onInput={(e) => setEnrollSecret(e.currentTarget.value)}
                     disabled={isEnrolling()}
+                    aria-invalid={enrollInvalid() ? "true" : "false"}
+                    aria-describedby={enrollInvalid() ? "auth-message" : undefined}
                   />
                 </label>
                 <button class="button" type="submit" disabled={isEnrolling()}>
@@ -1093,6 +1112,10 @@ function App() {
                   value={addRecoveryCode()}
                   onInput={(event) => setAddRecoveryCode(event.currentTarget.value)}
                   disabled={recoveryBusy()}
+                  aria-invalid={addRecoveryInvalid() ? "true" : "false"}
+                  aria-describedby={
+                    addRecoveryInvalid() ? "recovery-device-message" : undefined
+                  }
                 />
               </label>
               <button class="button" type="submit" disabled={recoveryBusy()}>
@@ -1100,7 +1123,7 @@ function App() {
               </button>
             </form>
             <Show when={recoveryMessage()}>
-              <p class="panel__note" role="status">
+              <p id="recovery-device-message" class="panel__note" role="status" aria-live="polite">
                 {recoveryMessage()}
               </p>
             </Show>

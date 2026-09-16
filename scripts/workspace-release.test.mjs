@@ -70,6 +70,49 @@ const PRODUCTION_CSP = (() => {
 })();
 const PARTIAL_HEADERS = ["/index.html", "  Cache-Control: no-store", ""].join("\n");
 
+/**
+ * Resolve `_headers`-style rules the way Cloudflare Pages does: every matching
+ * rule is inherited and a header present in more than one matching rule is
+ * comma-joined. Mirrors the boundary verifier, so a regression that
+ * reintroduces a wildcard Cache-Control fails here too.
+ */
+function resolveHeaderRules(text, requestPath) {
+  const rules = [];
+  let current = null;
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+$/, "");
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (/^\s/.test(line)) {
+      const match = /^\s+([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+      if (current && match) {
+        const name = match[1].toLowerCase();
+        const value = match[2].trim();
+        current.headers[name] =
+          current.headers[name] === undefined ? value : `${current.headers[name]}, ${value}`;
+      }
+      continue;
+    }
+    current = { path: trimmed, headers: {} };
+    rules.push(current);
+  }
+  const matches = (pattern, path) => {
+    if (!pattern.includes("*")) return pattern === path;
+    const star = pattern.indexOf("*");
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    return path.startsWith(prefix) && path.endsWith(suffix) && path.length >= prefix.length + suffix.length;
+  };
+  const resolved = {};
+  for (const rule of rules) {
+    if (!matches(rule.path, requestPath)) continue;
+    for (const [name, value] of Object.entries(rule.headers)) {
+      resolved[name] = resolved[name] === undefined ? value : `${resolved[name]}, ${value}`;
+    }
+  }
+  return resolved;
+}
+
 /** Fail fast instead of hanging when a lock regression deadlocks a test. */
 function withTimeout(promise, ms, label) {
   let timer;
@@ -264,10 +307,89 @@ test("shell cache headers accept the shipped production _headers verbatim", asyn
     );
     // The `/*` rule must precede the more specific overrides.
     assert.ok(headers.indexOf("/*") < headers.indexOf("/index.html"));
+    // The wildcard must not carry Cache-Control: Cloudflare Pages joins every
+    // matching rule, so `no-store` on `/*` would defeat the `/assets/*`
+    // immutable value.
+    const wildcardBlock = headers
+      .split("\n\n")
+      .find((block) => block.split("\n")[0].trim() === "/*");
+    assert.ok(wildcardBlock, "wildcard block present");
+    assert.equal(/^\s*Cache-Control\s*:/im.test(wildcardBlock), false);
     // Re-running is idempotent: no duplicated cache rules.
     await writeShellCacheHeaders(root);
     const rerun = await readFile(join(root, "_headers"), "utf8");
     assert.equal(rerun, headers);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("published cache policy never joins no-store onto hashed assets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-join-"));
+  try {
+    await writeFile(join(root, "_headers"), PRODUCTION_HEADERS);
+    await writeShellCacheHeaders(root);
+    const headers = await readFile(join(root, "_headers"), "utf8");
+    // Cloudflare Pages inherits every matching rule and comma-joins duplicates.
+    // The HTML entrypoint must be no-store and must not inherit `immutable`; a
+    // hashed asset must be immutable and must not inherit `no-store`.
+    const html = String(resolveHeaderRules(headers, "/index.html")["cache-control"] ?? "").toLowerCase();
+    assert.match(html, /no-store/);
+    assert.doesNotMatch(html, /immutable/);
+    const asset = String(
+      resolveHeaderRules(headers, "/assets/app-abc123.js")["cache-control"] ?? "",
+    ).toLowerCase();
+    assert.match(asset, /immutable/);
+    assert.doesNotMatch(asset, /no-store/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a wildcard Cache-Control is refused (it would defeat immutable assets)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-wildcard-cache-"));
+  try {
+    const withWildcardCache = PRODUCTION_HEADERS.replace(
+      "/*\n",
+      "/*\n  Cache-Control: no-store\n",
+    );
+    assert.notEqual(withWildcardCache, PRODUCTION_HEADERS, "fixture must add a wildcard Cache-Control");
+    await writeFile(join(root, "_headers"), withWildcardCache);
+    await assert.rejects(writeShellCacheHeaders(root), /must not set Cache-Control/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a path-specific rule cannot weaken a hardened security header", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-specific-"));
+  try {
+    const weakened = `${PRODUCTION_HEADERS.trimEnd()}\n\n/index.html\n  Content-Security-Policy: default-src *\n`;
+    await writeFile(join(root, "_headers"), weakened);
+    await assert.rejects(
+      writeShellCacheHeaders(root),
+      /weakens hardened content-security-policy/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a Cloudflare header detach directive is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-headers-detach-"));
+  try {
+    // `! Header-Name` detaches an inherited header on Cloudflare Pages. A
+    // parser that only understands `Name: value` would ignore these lines and
+    // let `/index.html` drop X-Frame-Options and CSP from the recovery page.
+    const detached = `${PRODUCTION_HEADERS.trimEnd()}\n\n/index.html\n  ! X-Frame-Options\n  ! Content-Security-Policy\n`;
+    await writeFile(join(root, "_headers"), detached);
+    await assert.rejects(writeShellCacheHeaders(root), /must not detach a header/);
+    // A lone CR is a line boundary on hosts whose config parser uses
+    // `splitlines()`; splitting only on `\n` would let
+    // `/index.html\r  ! X-Frame-Options` through.
+    const carriageReturn = `${PRODUCTION_HEADERS.trimEnd()}\n\n/index.html\r  ! X-Frame-Options\n`;
+    await writeFile(join(root, "_headers"), carriageReturn);
+    await assert.rejects(writeShellCacheHeaders(root), /must not detach a header/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

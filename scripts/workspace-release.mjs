@@ -533,18 +533,29 @@ export const HARDENED_CSP =
   "worker-src 'self' blob: data:; object-src 'none'; base-uri 'none'; form-action 'self'; " +
   "frame-ancestors 'none'";
 
-// Same hardened header set as web/workspace-shell/public/_headers.
+// Same hardened security-header set as web/workspace-shell/public/_headers.
+//
+// Deliberately NO `Cache-Control` here. Cloudflare Pages (the named static
+// target) inherits every matching rule and comma-joins a header set twice, so a
+// wildcard `Cache-Control: no-store` would be joined with the `/assets/*`
+// immutable value into `no-store, public, max-age=…, immutable` and `no-store`
+// would win: hashed assets would never be cached. Cache policy is owned by the
+// explicit `/`, `/index.html` and `/assets/*` rules below instead.
 const HARDENED_WILDCARD_BLOCK = [
   "/*",
-  "  Cache-Control: no-store",
   "  X-Content-Type-Options: nosniff",
   "  X-Frame-Options: DENY",
   "  Referrer-Policy: no-referrer",
   `  Content-Security-Policy: ${HARDENED_CSP}`,
 ].join("\n");
 
-/** Paths whose cache policy the release writer owns end-to-end. */
-const MANAGED_CACHE_PATHS = ["/", "/index.html", "/assets/*"];
+/**
+ * Paths whose cache policy the release writer owns end-to-end. `/*` is included
+ * as a defensive backstop: the hardened-wildcard guard already refuses a
+ * wildcard `Cache-Control`, but if that guard is ever relaxed this strips it
+ * rather than letting it join the `/assets/*` immutable value.
+ */
+const MANAGED_CACHE_PATHS = ["/*", "/", "/index.html", "/assets/*"];
 
 const SHELL_CACHE_RULES = [
   "/",
@@ -557,11 +568,7 @@ const SHELL_CACHE_RULES = [
   "  Cache-Control: public, max-age=31536000, immutable",
 ].join("\n");
 
-const REQUIRED_WILDCARD_HEADERS = [
-  [
-    "cache-control",
-    (value) => value.split(",").some((part) => part.trim().toLowerCase() === "no-store"),
-  ],
+const REQUIRED_SECURITY_HEADERS = [
   ["x-content-type-options", (value) => value.trim().toLowerCase() === "nosniff"],
   ["x-frame-options", (value) => value.trim().toUpperCase() === "DENY"],
   ["referrer-policy", (value) => value.trim().toLowerCase() === "no-referrer"],
@@ -574,7 +581,7 @@ const REQUIRED_WILDCARD_HEADERS = [
 function parseHeaderRules(text) {
   const rules = [];
   let current = null;
-  for (const rawLine of String(text).split(/\r?\n/)) {
+  for (const rawLine of String(text).split(/\r\n|\r|\n/)) {
     const line = rawLine.replace(/\s+$/, "");
     const trimmed = line.trim();
     // Blank lines and `#` comments never create a rule and never detach the
@@ -596,7 +603,7 @@ function parseHeaderRules(text) {
 function splitHeaderBlocks(text) {
   const blocks = [];
   let current = [];
-  for (const line of String(text).split(/\r?\n/)) {
+  for (const line of String(text).split(/\r\n|\r|\n/)) {
     if (line.trim() === "") {
       if (current.length > 0) blocks.push(current);
       current = [];
@@ -609,20 +616,53 @@ function splitHeaderBlocks(text) {
 }
 
 /**
- * Throw unless the `_headers` text has at least one `/*` rule and *every* `/*`
- * rule carries the complete hardened header set. Checking only the first would
- * let a later weaker wildcard survive publication.
+ * Throw unless the `_headers` text has at least one `/*` rule, *every* `/*` rule
+ * carries the complete hardened security-header set, the wildcard does not set
+ * `Cache-Control`, and no path-specific rule weakens a hardened security header.
+ * Checking only the first wildcard would let a later weaker wildcard survive
+ * publication; checking only `/*` would let a specific rule (`/index.html`) that
+ * weakens the policy be preserved for a host where the specific rule wins.
  */
 function assertHardenedWildcard(text) {
-  const wildcards = parseHeaderRules(text).filter((rule) => rule.path === "/*");
+  // Cloudflare Pages `! Header-Name` detaches an inherited header. The clear
+  // shell `_headers` must never detach one: a parser that only understands
+  // `Name: value` would silently ignore the line, letting a path-specific rule
+  // remove a hardened security header from the page that hosts the recovery-code
+  // input.
+  for (const rawLine of String(text).split(/\r\n|\r|\n/)) {
+    const detach = /^\s*!\s*([A-Za-z0-9-]+)\s*$/.exec(rawLine);
+    if (detach) {
+      throw new Error(
+        `shell _headers must not detach a header (! ${detach[1]}); the hardened security headers must apply to every matching path`,
+      );
+    }
+  }
+  const rules = parseHeaderRules(text);
+  const wildcards = rules.filter((rule) => rule.path === "/*");
   if (wildcards.length === 0) {
     throw new Error("shell _headers is missing the hardened /* rule");
   }
   for (const wildcard of wildcards) {
-    for (const [name, acceptable] of REQUIRED_WILDCARD_HEADERS) {
+    for (const [name, acceptable] of REQUIRED_SECURITY_HEADERS) {
       const value = wildcard.headers.get(name);
       if (!value || !acceptable(value)) {
         throw new Error(`shell _headers /* rule is missing hardened ${name}`);
+      }
+    }
+    // A wildcard `Cache-Control` is comma-joined with the `/assets/*` immutable
+    // value by Cloudflare Pages and `no-store` wins, so hashed assets would never
+    // be cached. Cache policy is owned by the explicit path rules.
+    if (wildcard.headers.has("cache-control")) {
+      throw new Error(
+        "shell _headers /* rule must not set Cache-Control; cache policy is path-specific",
+      );
+    }
+  }
+  for (const rule of rules) {
+    for (const [name, acceptable] of REQUIRED_SECURITY_HEADERS) {
+      const value = rule.headers.get(name);
+      if (value !== undefined && !acceptable(value)) {
+        throw new Error(`shell _headers ${rule.path} rule weakens hardened ${name}`);
       }
     }
   }
@@ -647,12 +687,15 @@ function withoutCacheRules(text) {
 
 /**
  * Add cache rules to the shell `_headers` **without dropping the hardened
- * security headers** the shell build ships. HTML revalidates, hashed assets are
- * immutable; the hardened `/*` rule (CSP, nosniff, frame-deny, referrer policy,
- * no-store) is preserved because a release must never weaken the clear shell
- * that hosts the recovery-code input. An existing `_headers` that lacks the
- * hardened `/*` rule is refused rather than silently patched, and an absent
- * `_headers` gets the complete hardened block, never a bare Cache-Control.
+ * security headers** the shell build ships. HTML revalidates (`no-store,
+ * must-revalidate`), hashed assets are immutable; the hardened `/*` rule (CSP,
+ * nosniff, frame-deny, referrer policy) is preserved because a release must
+ * never weaken the clear shell that hosts the recovery-code input. The wildcard
+ * deliberately does not carry `Cache-Control`: on Cloudflare Pages it would be
+ * comma-joined with the `/assets/*` immutable value and `no-store` would win.
+ * An existing `_headers` that lacks the hardened `/*` rule is refused rather
+ * than silently patched, and an absent `_headers` gets the complete hardened
+ * block, never a bare Cache-Control.
  */
 export async function writeShellCacheHeaders(shellDir) {
   const headersPath = join(shellDir, "_headers");
