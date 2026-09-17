@@ -6,8 +6,13 @@ export const Badge: Component<{
   tone?: Tone;
   children: JSX.Element;
   title?: string;
+  "data-testid"?: string;
 }> = (props) => (
-  <span class={`badge badge--${props.tone ?? "neutral"}`} title={props.title}>
+  <span
+    class={`badge badge--${props.tone ?? "neutral"}`}
+    title={props.title}
+    data-testid={props["data-testid"]}
+  >
     {props.children}
   </span>
 );
@@ -57,10 +62,10 @@ export const Metric: Component<{
 );
 
 export const MetricGrid: Component<{ children: JSX.Element; columns?: number }> = (props) => (
-  <div
-    class="metric-grid"
-    style={props.columns ? { "grid-template-columns": `repeat(${props.columns}, minmax(0, 1fr))` } : undefined}
-  >
+  // Column count is expressed as a data attribute so the layout stays in the
+  // stylesheet. An inline `style=` attribute would be blocked by the payload
+  // `style-src 'self'` policy (no `unsafe-inline`) and silently drop the grid.
+  <div class="metric-grid" data-columns={props.columns ? String(props.columns) : undefined}>
     {props.children}
   </div>
 );

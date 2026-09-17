@@ -5,10 +5,54 @@ import {
   ohlcvSnapshot,
   randomKeyB64,
   resetServer,
+  searchAndSelectToken,
+  searchTokens,
   sendFrames,
+  setCommandResponse,
   waitForSocket,
   waitForWorkspace,
 } from "./helpers";
+
+/** A search + detail body so the shared ticket target can be resolved. */
+const TARGET_RESPONSE = {
+  result: {
+    results: [
+      {
+        chain: "base",
+        address: "0x00000000000000000000000000000000000000a1",
+        symbol: "SOL",
+        name: "Wrapped SOL",
+      },
+    ],
+    token: {
+      chain: "base",
+      address: "0x00000000000000000000000000000000000000a1",
+      symbol: "SOL",
+      name: "Wrapped SOL",
+      decimals: 9,
+    },
+    stats: {
+      priceUsd: 150,
+      priceChange24h: 1.5,
+      marketCapUsd: 1_000_000,
+      liquidityUsd: 250_000,
+      volume24hUsd: 50_000,
+      holders: 1_200,
+    },
+    risk: {
+      score: 12,
+      factors: [],
+      buyTaxBps: 0,
+      sellTaxBps: 0,
+      transferFeeBps: 0,
+      sellRestricted: false,
+      simulated: true,
+    },
+    evidence: [],
+    slot: 1,
+    sourceAgeMs: 0,
+  },
+};
 
 async function bootLive(
   page: import("@playwright/test").Page,
@@ -29,7 +73,7 @@ test.describe("private-state hygiene", () => {
   test("persists no private plaintext before or after a live session", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100)] });
-    await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
 
     const audit = await page.evaluate(async () => {
       const databases =
@@ -50,15 +94,11 @@ test.describe("private-state hygiene", () => {
     const c2s = randomKeyB64();
     await configureSession(request, s2c, c2s);
     const payload = '<img src=x onerror="window.__xss=1">';
-    await request.post("/__test__/command-response", {
-      data: {
-        response: {
-          result: {
-            results: [
-              { chain: "base", address: "0xBONKtokenAddress000000000000000000000000", symbol: payload },
-            ],
-          },
-        },
+    await setCommandResponse(request, {
+      result: {
+        results: [
+          { chain: "base", address: "0xBONKtokenAddress000000000000000000000000", symbol: payload },
+        ],
       },
     });
 
@@ -66,11 +106,13 @@ test.describe("private-state hygiene", () => {
     await waitForWorkspace(page);
     await handoffKey(page, s2c, c2s);
     await waitForSocket(request);
-    await page.locator('button[data-view="discover"]').click();
-    await page.getByLabel("Search token").fill("bonk");
-    await page.getByRole("button", { name: "Search" }).click();
 
-    await expect(page.getByText(payload)).toBeVisible();
+    // Search results now render in the top-bar popover, not a Discover view.
+    // The same token also appears in the rail's search-results section, so the
+    // hostile-metadata assertion is scoped to the popover to stay unambiguous.
+    await searchTokens(page, "bonk");
+
+    await expect(page.locator(".search-popover").getByText(payload)).toBeVisible();
     expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss ?? null)).toBeNull();
     // The string must be escaped, not parsed into an element.
     expect(await page.locator('img[src="x"]').count()).toBe(0);
@@ -78,8 +120,11 @@ test.describe("private-state hygiene", () => {
 
   test("does not leak trading semantics into the URL, title or history", async ({ page, request }) => {
     await bootLive(page, request);
+    await setCommandResponse(request, TARGET_RESPONSE);
     await sendFrames(request, { frames: [ohlcvSnapshot(100)] });
-    await page.locator('button[data-view="trade"]').click();
+
+    // The ticket defaults to Market and only renders once a target is resolved.
+    await searchAndSelectToken(page, "SOL", "SOL");
     await expect(page.getByLabel("Amount", { exact: true })).toBeVisible();
 
     const before = page.url();

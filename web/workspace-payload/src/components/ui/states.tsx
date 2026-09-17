@@ -42,8 +42,15 @@ export const ErrorBlock: Component<{ error: WorkspaceErrorShape; onRetry?: () =>
   );
 };
 
-export const UnavailableBlock: Component<{ denial: CapabilityDenial | null; detail?: string }> = (props) => (
-  <div class="state-block state-block--unavailable">
+/**
+ * Compact, truthful unavailable notice. The primary terminal must not spend a
+ * giant card on a missing backend contract: the title, one-sentence reason and
+ * the capability key are enough for an operator to act.
+ */
+export const UnavailableBlock: Component<{ denial: CapabilityDenial | null; detail?: string }> = (
+  props,
+) => (
+  <div class="state-block state-block--unavailable" role="status">
     <p class="state-block__title">Backend capability missing</p>
     <p class="state-block__detail">
       {props.denial?.reason ?? "This surface needs a backend contract that is not deployed yet."}
@@ -56,9 +63,6 @@ export const UnavailableBlock: Component<{ denial: CapabilityDenial | null; deta
     <Show when={props.detail}>
       <p class="state-block__meta">{props.detail}</p>
     </Show>
-    <p class="state-block__detail state-block__detail--muted">
-      The workspace fails closed: no synthetic value is shown as if it were live.
-    </p>
   </div>
 );
 
@@ -166,4 +170,24 @@ export const DenialNote: Component<{ denial: CapabilityDenial | null }> = (props
   <Show when={props.denial}>
     <ReasonNote tone="warning">Disabled: {props.denial!.reason}</ReasonNote>
   </Show>
+);
+
+/**
+ * One-line, truthful unavailable row for a secondary function whose backend is
+ * not composed. The primary terminal must never render a giant capability card;
+ * a compact row that names the missing contract is the correct affordance.
+ */
+export const CompactNote: Component<{
+  label: string;
+  reason: string;
+  capability?: string;
+}> = (props) => (
+  <p class="compact-note" role="status">
+    <Badge tone="muted">UNAVAILABLE</Badge>
+    <span>{props.label}</span>
+    <span class="muted">{props.reason}</span>
+    <Show when={props.capability}>
+      <code class="compact-note__key">{props.capability}</code>
+    </Show>
+  </p>
 );

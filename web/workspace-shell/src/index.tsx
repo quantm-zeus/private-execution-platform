@@ -1360,6 +1360,7 @@ function App() {
             onLoad={(event) => defaultRuntime.releaseDocumentUrl(event.currentTarget.src)}
             title="Private trading workspace"
             sandbox="allow-scripts allow-same-origin"
+            referrerpolicy="no-referrer"
             class="workspace-frame"
           />
         </section>

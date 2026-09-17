@@ -132,7 +132,15 @@ function validatePayload(payload: PlaceLimitPayload): string | null {
  * authoritative lifecycle. Unknown states are never retried blindly: the
  * operator must reconcile first.
  */
-export default function LimitsPanel(): JSX.Element {
+export interface LimitsPanelProps {
+  /** Which half of the surface to render; the workstation splits form/dock. */
+  readonly section?: "form" | "orders" | "all";
+  /** Skip the outer `Panel` chrome when composed inside the trade ticket. */
+  readonly embedded?: boolean;
+}
+
+export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
+  const view = props.section ?? "all";
   const ws = useWorkspace();
   const command = ws.command;
 
@@ -213,6 +221,9 @@ export default function LimitsPanel(): JSX.Element {
   // `capability_missing` to a permanent `unavailable` state.
   let requested = false;
   createEffect(() => {
+    // The form-only ticket must not issue a duplicate get_orders read; the
+    // dock's orders surface owns that query.
+    if (view === "form") return;
     if (readDenial() === null && ws.commandReady() && !requested) {
       requested = true;
       void orders.run();
@@ -507,20 +518,12 @@ export default function LimitsPanel(): JSX.Element {
     );
   };
 
-  return (
-    <Panel
-      title="Net-price limit orders"
-      subtitle="A chart crossing is only a trigger candidate; a net executable limit still requires exact simulation"
-      badge={
-        <Badge tone={readDenial() ? "warning" : "positive"}>
-          {readDenial() ? "NOT AVAILABLE" : "AVAILABLE"}
-        </Badge>
-      }
-    >
+  const inner = (
       <Show
         when={readDenial()}
         fallback={
           <div class="panel-stack">
+            <Show when={view !== "orders"}>
             <form
               class="ticket"
               onSubmit={(event) => {
@@ -735,7 +738,9 @@ export default function LimitsPanel(): JSX.Element {
                 )}
               </Show>
             </form>
+            </Show>
 
+            <Show when={view !== "form"}>
             <section class="orders" aria-label="Limit orders">
               <header class="orders__head">
                 <h3>Orders</h3>
@@ -764,6 +769,7 @@ export default function LimitsPanel(): JSX.Element {
                 )}
               </AsyncSurface>
             </section>
+            </Show>
           </div>
         }
       >
@@ -772,6 +778,19 @@ export default function LimitsPanel(): JSX.Element {
           detail="Requires the durable limit engine: place_limit_order, get_orders, get_order and cancel_order."
         />
       </Show>
+  );
+  if (props.embedded) return <div class="panel-stack">{inner}</div>;
+  return (
+    <Panel
+      title="Net-price limit orders"
+      subtitle="A chart crossing is only a trigger candidate; a net executable limit still requires exact simulation"
+      badge={
+        <Badge tone={readDenial() ? "warning" : "positive"}>
+          {readDenial() ? "NOT AVAILABLE" : "AVAILABLE"}
+        </Badge>
+      }
+    >
+      {inner}
     </Panel>
   );
 }

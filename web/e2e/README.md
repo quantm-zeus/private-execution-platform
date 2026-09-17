@@ -20,10 +20,16 @@ encrypted frames, inspect recorded commands/resyncs). It is never part of a prod
   reason while the trading gate is off.
 - Privacy: no `localStorage`/`sessionStorage`/cookies/IndexedDB; no DOM XSS from hostile provider text;
   no trading semantics in URL/title/history.
-- Accessibility: axe-core reports no `serious`/`critical` violations on any of the nine views.
-- Routing source (W13): the market ticket defaults to OKX, sends `router_preference` only to the neutral
-  first-party command contract, invalidates a source-bound preview when the source changes, and refuses a
-  silent OKX→Local substitution (`router.spec.ts`).
+- Accessibility: axe-core reports no `serious`/`critical` violations across the workstation states
+  (no token, search results, Market/Limit ticket, each bottom-dock tab, security drawer).
+- Workstation layout (`visual.spec.ts`): the post-unlock shell is one 100vw x 100dvh multi-pane
+  workstation (top bar + market rail + chart/bottom dock + right ticket). At 1366x768, 1440x900,
+  1920x1080 and 1024x720 it asserts no outer scrollbar, every primary pane in-grid and inside the
+  viewport, and the collapsed market rail at <=1180px (the ticket stays in-grid). It attaches
+  screenshots for the primary states rather than doing pixel-baseline comparison.
+- Routing source (W13): the right ticket defaults to Market/OKX, sends `router_preference` only to the
+  neutral first-party command contract, invalidates a source-bound preview when the source changes,
+  and refuses a silent OKX→Local substitution (`router.spec.ts`).
 - Performance budgets: post-auth load `<2s`, realtime visual update `<300ms`, command round trip
   `<100ms` on the local harness (values are logged per run).
 - **Shell unlock** (`shell.spec.ts`): the shell derives the workspace key in audited WASM,
