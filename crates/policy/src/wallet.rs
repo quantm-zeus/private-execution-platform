@@ -68,7 +68,11 @@ impl WalletLimits {
         if self.allowed_chains.is_empty() {
             return Err(WalletPolicyError::InvalidLimits);
         }
-        if self.allowed_venues.iter().any(|venue| venue.trim().is_empty()) {
+        if self
+            .allowed_venues
+            .iter()
+            .any(|venue| venue.trim().is_empty())
+        {
             return Err(WalletPolicyError::InvalidLimits);
         }
         Ok(())
@@ -208,10 +212,7 @@ pub enum WalletPolicyError {
 /// no stored baseline there is nothing to tighten against, so the first write
 /// (including one that enables trading for the wallet) requires strong
 /// confirmation rather than being applied implicitly.
-pub fn classify_limits_change(
-    current: Option<&WalletLimits>,
-    next: &WalletLimits,
-) -> LimitsChange {
+pub fn classify_limits_change(current: Option<&WalletLimits>, next: &WalletLimits) -> LimitsChange {
     let Some(current) = current else {
         return LimitsChange::Relaxation;
     };
@@ -262,7 +263,10 @@ pub fn classify_limits_change(
 /// Durable wallet-policy store contract.
 pub trait WalletPolicyStore: Send + Sync {
     /// Reads the wallet's current record, or `None` when unset.
-    fn record(&self, wallet_ref: &WalletRef) -> Result<Option<WalletPolicyRecord>, WalletPolicyError>;
+    fn record(
+        &self,
+        wallet_ref: &WalletRef,
+    ) -> Result<Option<WalletPolicyRecord>, WalletPolicyError>;
 
     /// Applies a version-guarded change, enforcing the strong-confirmation rule.
     ///
@@ -323,7 +327,10 @@ impl InMemoryWalletPolicyStore {
 }
 
 impl WalletPolicyStore for InMemoryWalletPolicyStore {
-    fn record(&self, wallet_ref: &WalletRef) -> Result<Option<WalletPolicyRecord>, WalletPolicyError> {
+    fn record(
+        &self,
+        wallet_ref: &WalletRef,
+    ) -> Result<Option<WalletPolicyRecord>, WalletPolicyError> {
         let records = Self::lock(&self.records);
         Ok(records
             .get(wallet_ref.as_str())
@@ -484,15 +491,15 @@ mod tests {
         let store = InMemoryWalletPolicyStore::new();
         // The first write needs strong confirmation.
         assert_eq!(
-            store.apply(&change(limits(1_000_000), 0, "k1"), Confirmation::None, true),
+            store.apply(
+                &change(limits(1_000_000), 0, "k1"),
+                Confirmation::None,
+                true
+            ),
             Err(WalletPolicyError::StrongConfirmationRequired)
         );
         let first = store
-            .apply(
-                &change(limits(1_000_000), 0, "k1"),
-                confirmed(),
-                true,
-            )
+            .apply(&change(limits(1_000_000), 0, "k1"), confirmed(), true)
             .expect("initial write");
         assert_eq!(first.version, 1);
 
@@ -513,7 +520,11 @@ mod tests {
         );
         // The rejected write did not advance the version.
         assert_eq!(
-            store.record(&wallet()).expect("record").expect("some").version,
+            store
+                .record(&wallet())
+                .expect("record")
+                .expect("some")
+                .version,
             2
         );
 
@@ -548,7 +559,11 @@ mod tests {
         // Same key and target retried after success is idempotent, even with a
         // refreshed expected_version.
         let retried = store
-            .apply(&change(limits(1_000_000), 1, "k1"), Confirmation::None, true)
+            .apply(
+                &change(limits(1_000_000), 1, "k1"),
+                Confirmation::None,
+                true,
+            )
             .expect("idempotent retry");
         assert_eq!(retried.version, 1);
 
@@ -558,7 +573,11 @@ mod tests {
             .apply(&change(limits(500_000), 1, "k2"), Confirmation::None, true)
             .expect("tightening");
         let replay = store
-            .apply(&change(limits(1_000_000), 0, "k1"), Confirmation::None, true)
+            .apply(
+                &change(limits(1_000_000), 0, "k1"),
+                Confirmation::None,
+                true,
+            )
             .expect("replay");
         assert_eq!(replay.version, 1);
         assert_eq!(replay.limits.max_trade_usd, UsdMicros::new(1_000_000));

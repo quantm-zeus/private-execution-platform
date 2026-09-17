@@ -18,6 +18,7 @@ import {
 import { createPepHistoryProvider, createServerHistoryProvider } from "./history";
 import { createProChart, type ProChartHandle } from "./pro/pro-chart";
 import { DEFAULT_PRO_TIMEFRAME, PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
+import { timeframeById, type Timeframe } from "../market/ohlcv";
 import { formatAmount, formatBps, truncateAddress } from "../core/format";
 import type { InstrumentRef } from "../core/types";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
@@ -122,6 +123,17 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     : DEFAULT_PRO_TIMEFRAME;
   let timeframeId = normalizedInitialTimeframe;
   const [activeTimeframe, setActiveTimeframe] = createSignal(normalizedInitialTimeframe);
+  const activeTimeframeDef = createMemo<Timeframe>(
+    () => timeframeById(activeTimeframe()) ?? timeframeById(DEFAULT_PRO_TIMEFRAME)!,
+  );
+
+  // The badge reflects the CURRENT exact subject/timeframe only, so an
+  // `ohlcv:default` or depth frame can never make a selected token look live
+  // (exact entity-key isolation is preserved; nothing is matched loosely).
+  const selectedCandleCount = createMemo(() => {
+    version();
+    return router.localCandles(subject(), activeTimeframeDef()).length;
+  });
 
   createEffect(() => {
     const current = subject();
@@ -185,8 +197,8 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
             {subject().symbol} · {truncateAddress(subject().address, 6, 6)} · {subject().chain}
           </Badge>
         </Show>
-        <Badge tone={version() > 0 ? "positive" : "muted"}>
-          {version() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
+        <Badge tone={selectedCandleCount() > 0 ? "positive" : "muted"}>
+          {selectedCandleCount() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
         </Badge>
       </div>
       {/* First-party timeframe control: KLineChart Pro 0.1.1's own period items
@@ -233,9 +245,9 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
           }}
         />
       </div>
-      <div class="depth-columns">
+      <div class="depth-columns" tabindex="0" aria-label="Depth of book">
         <div class="depth-col">
-          <h3>Bids</h3>
+          <h2 class="depth-col__title">Bids</h2>
           {depth().bids.length === 0 ? (
             <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
           ) : (
@@ -251,7 +263,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
           )}
         </div>
         <div class="depth-col">
-          <h3>Asks</h3>
+          <h2 class="depth-col__title">Asks</h2>
           {depth().asks.length === 0 ? (
             <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
           ) : (

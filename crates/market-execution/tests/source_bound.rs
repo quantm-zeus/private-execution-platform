@@ -119,7 +119,11 @@ async fn okx_request_reaches_only_the_okx_port() {
         })
     );
     assert_eq!(okx.executes(), 1);
-    assert_eq!(local.executes(), 0, "local port must not see an OKX request");
+    assert_eq!(
+        local.executes(),
+        0,
+        "local port must not see an OKX request"
+    );
 }
 
 #[tokio::test]
@@ -131,7 +135,11 @@ async fn okx_without_a_configured_source_is_a_final_denial() {
         port.execute(request(RouterSource::Okx)).await,
         Err(MarketExecutionError::Denied)
     );
-    assert_eq!(local.executes(), 0, "no silent fallback to the local router");
+    assert_eq!(
+        local.executes(),
+        0,
+        "no silent fallback to the local router"
+    );
 }
 
 #[tokio::test]
@@ -226,10 +234,8 @@ async fn reconcile_for_an_okx_binding_without_a_provider_stays_unknown() {
 #[test]
 fn debug_reports_only_the_source_configuration() {
     let local = ScriptedPort::executing(MarketExecutionOutcome::Unknown);
-    let with_okx =
-        SourceBoundMarketExecutionPort::new(local.clone()).with_okx(ScriptedPort::executing(
-            MarketExecutionOutcome::Unknown,
-        ));
+    let with_okx = SourceBoundMarketExecutionPort::new(local.clone())
+        .with_okx(ScriptedPort::executing(MarketExecutionOutcome::Unknown));
     assert_eq!(
         format!("{with_okx:?}"),
         "SourceBoundMarketExecutionPort { okx_configured: true, .. }"

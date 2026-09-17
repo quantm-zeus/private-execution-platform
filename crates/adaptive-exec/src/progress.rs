@@ -154,10 +154,8 @@ impl TwapProgress {
         if idempotency_key.trim().is_empty() {
             return Err(ProgressError::MissingIdempotencyKey);
         }
-        if let Some((_, applied_chunk)) = self
-            .applied
-            .iter()
-            .find(|(key, _)| key == idempotency_key)
+        if let Some((_, applied_chunk)) =
+            self.applied.iter().find(|(key, _)| key == idempotency_key)
         {
             return if *applied_chunk == chunk {
                 Ok(self.clone())
@@ -322,11 +320,7 @@ impl RfqProgress {
     }
 
     /// Records that usable quotes were collected.
-    pub fn record_quoted(
-        &self,
-        at_ms: i64,
-        idempotency_key: &str,
-    ) -> Result<Self, ProgressError> {
+    pub fn record_quoted(&self, at_ms: i64, idempotency_key: &str) -> Result<Self, ProgressError> {
         self.transition(RfqStatus::Quoted, at_ms, idempotency_key, |_| {})
     }
 
@@ -345,15 +339,10 @@ impl RfqProgress {
             } => {
                 let winner_id = winner.solver_id.clone();
                 let improvement = *improvement_bps;
-                self.transition(
-                    RfqStatus::Won,
-                    at_ms,
-                    idempotency_key,
-                    move |updated| {
-                        updated.winner = Some(winner_id);
-                        updated.improvement_bps = Some(improvement);
-                    },
-                )
+                self.transition(RfqStatus::Won, at_ms, idempotency_key, move |updated| {
+                    updated.winner = Some(winner_id);
+                    updated.improvement_bps = Some(improvement);
+                })
             }
             CompetitionOutcome::NoWinner {
                 improvement_bps, ..
@@ -551,9 +540,7 @@ mod tests {
             runner_up: None,
             improvement_bps: 40,
         };
-        let won = quoted
-            .record_decision(&decision, 2, "d1")
-            .expect("won");
+        let won = quoted.record_decision(&decision, 2, "d1").expect("won");
         assert_eq!(won.status, RfqStatus::Won);
         assert_eq!(won.winner.as_deref(), Some("solver-a"));
         assert_eq!(won.improvement_bps, Some(40));

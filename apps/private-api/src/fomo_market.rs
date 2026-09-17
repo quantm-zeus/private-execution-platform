@@ -259,24 +259,26 @@ pub fn fomo_chain_slug(network_id: i64) -> Option<&'static str> {
 /// document.
 ///
 /// Every entry is a chain whose FOMO network id is verified above. `enabled`
-/// reflects that the read path covers the chain; mutation still requires the
-/// per-chain execution capability, which this lane never advertises. The native
-/// quote asset is intentionally `None`: PEP has no authoritative native-asset
-/// address for these chains and must not guess one (the web fails closed on a
-/// `null` native token).
+/// is consumed by the terminal's mutation surfaces as execution readiness, so
+/// read-path coverage alone must never set it. Solana/Base/Ethereum/BNB Chain
+/// are execution-verified by `chain-adapters`; Robinhood-associated is read-only
+/// and remains explicitly disabled for execution advertisement. The native quote
+/// asset is intentionally `None`: PEP has no authoritative native-asset address
+/// for these chains and must not guess one (the web fails closed on a `null`
+/// native token).
 pub fn read_path_chains() -> Vec<crate::opaque::ChainEntry> {
     [
-        ("solana", "Solana"),
-        ("base", "Base"),
-        ("ethereum", "Ethereum"),
-        ("bnb_chain", "BNB Chain"),
-        ("robinhood", "Robinhood"),
+        ("solana", "Solana", true),
+        ("base", "Base", true),
+        ("ethereum", "Ethereum", true),
+        ("bnb_chain", "BNB Chain", true),
+        ("robinhood", "Robinhood", false),
     ]
     .into_iter()
-    .map(|(id, display)| crate::opaque::ChainEntry {
+    .map(|(id, display, enabled)| crate::opaque::ChainEntry {
         id: id.to_string(),
         display: display.to_string(),
-        enabled: true,
+        enabled,
         native_token: None,
     })
     .collect()
@@ -1744,10 +1746,16 @@ impl FomoSessionStreamSource {
     }
 
     fn remember(&self, kid: &[u8], target: &RealtimeTarget) {
-        self.sessions
+        let mut sessions = self
+            .sessions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(kid.to_vec(), target.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sessions.len() >= RealtimeTargetRegistry::MAX_ENTRIES && !sessions.contains_key(kid) {
+            if let Some(evict) = sessions.keys().next().cloned() {
+                sessions.remove(&evict);
+            }
+        }
+        sessions.insert(kid.to_vec(), target.clone());
     }
 
     async fn fetch_target(&self, target: &RealtimeTarget) -> Result<Vec<Bar>, FomoMarketError> {
@@ -3040,9 +3048,17 @@ mod tests {
         assert_eq!(fomo_chain_slug(999_999), None);
         let chains = read_path_chains();
         assert_eq!(chains.len(), 5);
-        for id in ["solana", "base", "ethereum", "bnb_chain", "robinhood"] {
+        for id in ["solana", "base", "ethereum", "bnb_chain"] {
             assert!(chains.iter().any(|c| c.id == id && c.enabled), "{id}");
         }
+        let robinhood = chains
+            .iter()
+            .find(|c| c.id == "robinhood")
+            .expect("robinhood read identity");
+        assert!(
+            !robinhood.enabled,
+            "Robinhood read coverage must not advertise execution readiness"
+        );
         // No native quote asset is guessed.
         assert!(chains.iter().all(|c| c.native_token.is_none()));
     }
@@ -3336,6 +3352,51 @@ mod tests {
         assert_eq!(
             switched.payload.as_ref().unwrap()["candles"][0]["close"],
             99.0
+        );
+    }
+
+    #[tokio::test]
+    async fn session_stream_target_memory_is_bounded_and_eviction_resnapshots() {
+        let provider = Arc::new(FakeMarketProvider::with_bars(
+            "0xAAA",
+            vec![bar(1_000, 10.0)],
+        ));
+        let targets = Arc::new(RealtimeTargetRegistry::new());
+        let source = FomoSessionStreamSource::new_for_test(
+            provider,
+            targets.clone(),
+            None,
+            10,
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let target = RealtimeTarget::validated("base", "0xAAA", "1m").unwrap();
+
+        for n in 0..=RealtimeTargetRegistry::MAX_ENTRIES {
+            source.remember(&(n as u64).to_le_bytes(), &target);
+        }
+        assert!(
+            source
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                <= RealtimeTargetRegistry::MAX_ENTRIES
+        );
+
+        let kid = [9u8; session_transport::KID_BYTES];
+        targets.set(&kid, target.clone()).unwrap();
+        source.remember(&kid, &target);
+        source
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(kid.as_slice());
+        let frame = source.next_delta_for(&kid).await.expect("resnapshot");
+        assert_eq!(
+            frame.op,
+            session_transport::StreamOp::Snapshot,
+            "a missing/evicted session target must force a fresh snapshot"
         );
     }
 

@@ -22,7 +22,7 @@
   /* Text */
   --text-1: #f2f7f5;
   --text-2: #a9b8b3;
-  --text-3: #71837d;
+  --text-3: #93a7a0;
 
   /* Semantic */
   --accent: #29d3a2;
@@ -781,6 +781,10 @@ input[type="checkbox"] {
 .workspace__body {
   display: grid;
   grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--ticket-w);
+  /* Named areas keep each pane in its column even when the collapsed rail is
+     `display: none` (auto-placement would otherwise shift the work area into
+     the zero-width rail column and collapse the chart). */
+  grid-template-areas: "rail work ticket";
   grid-row: 3;
   min-height: 0;
   min-width: 0;
@@ -794,6 +798,7 @@ input[type="checkbox"] {
 }
 
 .rail {
+  grid-area: rail;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -804,6 +809,7 @@ input[type="checkbox"] {
 }
 
 .workarea {
+  grid-area: work;
   display: grid;
   grid-template-rows: minmax(0, 1fr) var(--dock-h);
   min-height: 0;
@@ -895,6 +901,7 @@ input[type="checkbox"] {
 }
 
 .ticket-pane {
+  grid-area: ticket;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1353,8 +1360,9 @@ input[type="checkbox"] {
   overflow: auto;
   flex: none;
 }
-.depth-col h3 {
+.depth-col h2, .depth-col__title {
   font-size: 11px;
+  font-weight: 400;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-3);
@@ -1828,7 +1836,19 @@ input[type="checkbox"] {
   .terminal[data-rail="collapsed"] {
     --rail-w: 0px;
   }
-  .topbar__title,
+  .topbar__title {
+    /* Keep the product heading in the accessibility tree when the brand folds
+       visually; the shell-unlock spec asserts the accessible name. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
   .topbar__stats {
     display: none;
   }
@@ -1855,6 +1875,7 @@ input[type="checkbox"] {
   .terminal__body,
   .workspace__body {
     grid-template-columns: var(--rail-w) minmax(0, 1fr);
+    grid-template-areas: "rail work";
   }
   .topbar__search {
     flex: 1 1 auto;

@@ -147,7 +147,16 @@ test.describe("fail-closed private workspace", () => {
     await expect(page.getByTestId("selected-instrument")).toContainText("SOL");
 
     await expect(page.getByRole("button", { name: /execute buy/i })).toBeDisabled();
-    await expect(page.getByText(/trading is disabled|foundation phase/i).first()).toBeVisible();
+    // The disabled reason must be visible in the active ticket. The bottom dock
+    // and the inactive Limit pane also mount hidden reason notes, so scope to
+    // the visible one rather than the first DOM match.
+    await expect(
+      page
+        .getByTestId("trade-ticket")
+        .getByText(/trading is disabled|foundation phase/i)
+        .filter({ visible: true })
+        .first(),
+    ).toBeVisible();
 
     await page.getByTestId("ticket-tab-limit").click();
     await expect(page.getByRole("button", { name: /place limit order/i })).toBeDisabled();

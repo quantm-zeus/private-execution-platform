@@ -41,12 +41,12 @@ const DrawerContent: Component<{ onClose: () => void }> = (props) => {
           panelRef = element;
         }}
       >
-        <header class="drawer__head">
+        <div class="drawer__head">
           <h2 class="drawer__title">Security &amp; settings</h2>
           <ActionButton onClick={props.onClose} title="Close security and settings">
             Close
           </ActionButton>
-        </header>
+        </div>
         <div class="drawer__body">
           <SecurityPanel />
         </div>

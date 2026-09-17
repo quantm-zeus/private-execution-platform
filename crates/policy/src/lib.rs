@@ -12,8 +12,8 @@ pub mod wallet;
 pub mod withdrawal;
 
 pub use wallet::{
-    classify_limits_change, Confirmation, InMemoryWalletPolicyStore, LimitsChange,
-    WalletLimits, WalletLimitsChange, WalletPolicyError, WalletPolicyRecord, WalletPolicyStore,
+    classify_limits_change, Confirmation, InMemoryWalletPolicyStore, LimitsChange, WalletLimits,
+    WalletLimitsChange, WalletPolicyError, WalletPolicyRecord, WalletPolicyStore,
     WebStrongConfirmation, MAX_APPLIED_POLICY_KEYS,
 };
 pub use withdrawal::{

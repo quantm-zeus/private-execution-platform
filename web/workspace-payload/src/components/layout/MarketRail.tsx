@@ -58,7 +58,7 @@ export const MarketRail: Component = () => {
           ‹
         </button>
       </div>
-      <div class="market-rail__scroll">
+      <div class="market-rail__scroll" tabindex="0" aria-label="Tracked tokens">
         <Show when={station.searchDenial()}>
           {(denial) => (
             <div class="market-rail__note">

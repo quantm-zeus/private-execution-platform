@@ -1507,7 +1507,8 @@ pub fn build_trading_core<S: OpaqueStore + 'static>(
     TradingCoreHandoff { core, readiness }
 }
 
-impl<S: OpaqueStore> std::fmt::Debug for TradingCore<S> {    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: OpaqueStore> std::fmt::Debug for TradingCore<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TradingCore")
             .field(

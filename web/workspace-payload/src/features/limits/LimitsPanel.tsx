@@ -420,7 +420,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
     const denial = mutationDenial();
     return (
       <li class="order-card" data-state={order.state} data-order-id={order.orderId}>
-        <header class="order-card__head">
+        <div class="order-card__head">
           <code class="order-card__id">{truncateAddress(order.orderId, 8, 6)}</code>
           <Badge tone={STATE_TONES[order.state]}>{order.state}</Badge>
           <span class="muted">updated {formatAge(Math.max(0, ws.nowMs() - order.updatedAtMs))} ago</span>
@@ -432,7 +432,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
           >
             Cancel
           </ActionButton>
-        </header>
+        </div>
 
         <Show when={order.state === "UNKNOWN"}>
           <ReasonNote tone="warning">
