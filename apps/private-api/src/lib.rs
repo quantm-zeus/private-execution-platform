@@ -52,11 +52,13 @@ pub use release::{
 };
 
 pub use fomo_market::{
-    build_wiring as build_fomo_market_wiring,
+    build_wiring as build_fomo_market_wiring, build_wiring_full as build_fomo_market_wiring_full,
     build_wiring_with_health as build_fomo_market_wiring_with_health,
     build_wiring_with_health_flags as build_fomo_market_wiring_with_health_flags, probe_history,
-    probe_realtime, Bar, BarsProvider, FomoBarsClient, FomoChartDispatcher, FomoMarketConfig,
-    FomoMarketError, FomoMarketWiring, FomoOhlcvStreamSource,
+    probe_market, probe_realtime, read_path_chains, Bar, BarsProvider, BridgeRisk, BridgeSearch,
+    BridgeToken, BridgeTokenDetail, BridgeTrending, FomoBarsClient, FomoChartDispatcher,
+    FomoMarketConfig, FomoMarketError, FomoMarketWiring, FomoOhlcvStreamSource,
+    FomoSessionStreamSource, RealtimeTarget, RealtimeTargetRegistry,
 };
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -392,6 +394,12 @@ pub struct PrivateApiState {
     /// truthfully rather than masked by a live process.
     fomo_required: bool,
     fomo_ready: Arc<AtomicBool>,
+    /// Whether the FOMO token read path (search/detail/trending) is a required
+    /// dependency and whether its bounded authenticated proof is currently
+    /// healthy. A configured-but-auth-rejected read path fails `/ready` so the
+    /// process cannot report ready while `market` is unservable.
+    market_read_required: bool,
+    market_read_ready: Arc<AtomicBool>,
     /// Whether a live execution path was configured (`TRADING_CORE_LIVE=1`) and
     /// whether every concrete dependency (durable store, Base RPC, Privy HTTP
     /// signer, payload builder) was proven healthy at composition time. A
@@ -431,6 +439,8 @@ impl PrivateApiState {
             stream_ready: Arc::new(AtomicBool::new(true)),
             fomo_required: false,
             fomo_ready: Arc::new(AtomicBool::new(true)),
+            market_read_required: false,
+            market_read_ready: Arc::new(AtomicBool::new(true)),
             live_required: false,
             live_ready: false,
         })
@@ -531,6 +541,17 @@ impl PrivateApiState {
         self
     }
 
+    /// Attach the FOMO token read path's readiness contract. `required` records
+    /// that the token read path was configured; `ready` is set true only after a
+    /// bounded authenticated `/market/trending` read proves the provider session
+    /// works. A configured-but-auth-rejected read path therefore fails `/ready`
+    /// even while the chart route may still be healthy.
+    pub fn with_fomo_market_readiness(mut self, required: bool, ready: Arc<AtomicBool>) -> Self {
+        self.market_read_required = required;
+        self.market_read_ready = ready;
+        self
+    }
+
     /// Attach the live execution path's readiness contract. `required` records
     /// that the operator explicitly opted into live composition
     /// (`TRADING_CORE_LIVE=1`); `ready` is true only when the durable store and
@@ -578,6 +599,8 @@ impl PrivateApiState {
             stream_ready: Arc::new(AtomicBool::new(true)),
             fomo_required: false,
             fomo_ready: Arc::new(AtomicBool::new(true)),
+            market_read_required: false,
+            market_read_ready: Arc::new(AtomicBool::new(true)),
             live_required: false,
             live_ready: false,
         })
@@ -825,6 +848,14 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
+    // The FOMO token read path (search/detail/trending) is a separate dependency
+    // from chart history: a configured read path whose authenticated proof failed
+    // fails `/ready` while `chart` may still be advertised independently.
+    let market_read_ok = if state.market_read_required {
+        state.market_read_ready.load(Ordering::SeqCst)
+    } else {
+        true
+    };
     // A configured live execution path is a dependency even when a concrete
     // transport or credential could not be proven: `/ready` fails rather than
     // reporting a half-wired execution dependency as healthy. Without the
@@ -840,6 +871,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
         && dispatcher_ok
         && stream_ok
         && fomo_ok
+        && market_read_ok
         && live_ok
         && passkey_store_ok
         && recovery_ok;
@@ -853,6 +885,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
             "dispatcher": dispatcher_ok,
             "stream": stream_ok,
             "fomo_market": fomo_ok,
+            "fomo_market_read": market_read_ok,
             "live_execution": live_ok,
             "passkey_store": passkey_store_ok,
             "recovery_store": recovery_ok,
