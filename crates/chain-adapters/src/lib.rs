@@ -1,42 +1,42 @@
-//! One-chain live adapter foundation (remediation D6) — Base.
+//! Multi-chain live adapter foundation — shared EVM transport + typed Solana.
 //!
-//! # Why Base is the first chain
+//! # Scope
 //!
-//! `docs/PRD.md` lists the initial chains as Solana, Base, BNB Chain,
-//! Robinhood-associated, and Ethereum, and the build order mandates "one chain
-//! end-to-end first" without naming a priority. Base is the narrowest
-//! highest-priority supported chain that composes correctly with the code that
-//! already exists:
+//! Base, Ethereum and BNB Chain share one EVM-family transport seam
+//! ([`EvmChainTransport`]) and one submission adapter
+//! ([`EvmChainSubmissionAdapter`]) that binds and verifies the expected
+//! `eth_chainId`. Solana has a distinct typed seam
+//! ([`SolanaChainTransport`]) because its transaction, signature, and
+//! confirmation semantics are unrelated to EVM; its payload parser rejects any
+//! non-Solana (including EVM) payload.
 //!
-//! - `ChainId::Base` already has a canonical signing tag (`1`) in `privy`, and
-//!   the locked execution fixtures, route venues (`uniswap_v3`), policy
-//!   allowlists, and limit-engine tests are all EVM/Base shaped.
-//! - The private execution pipeline (`policy` → `execution-preview` →
-//!   `execution-relay` → `execution-store`) is chain-neutral and already exercised
-//!   against Base, so no pipeline rewrite is needed.
-//! - Solana's Token-2022 extension safety (transfer fees/hooks, permanent
-//!   delegate, freeze/mint authority) is first-class PRD work but requires
-//!   net-new inspection and simulation code; starting there would add risk before
-//!   the one-chain vertical is proven. Solana remains the next chain, and the
-//!   adapters here are trait-based so it slots in without changing the pipeline.
-//!
-//! This does not contradict the PRD: it selects the narrowest chain that can be
-//! composed *correctly* with current code, which is what Phase 3 requires.
+//! `RobinhoodAssociated` is deliberately **not** an execution chain here: its
+//! transport, signing-payload, submit, and receipt layers are unverified, so
+//! [`support::execution_support`] records an explicit hard blocker with evidence
+//! and the adapter factory refuses to build an execution adapter for it.
 //!
 //! # Boundaries
 //!
-//! Every network capability is an injected seam ([`BaseChainTransport`],
-//! [`MarketCodec`], [`QuoteCodec`]); this crate owns no HTTP client, no
-//! credentials, and no signing key. [`BaseChainSubmissionAdapter::new`] takes an
-//! operator-injected transport, and the deterministic tests use fixtures only —
-//! no real broadcast, no real credentials.
+//! Every network capability is an injected seam ([`EvmChainTransport`],
+//! [`SolanaChainTransport`], [`MarketCodec`], [`QuoteCodec`]); this crate owns
+//! no HTTP client, no credentials, and no signing key.
+//! [`EvmChainSubmissionAdapter::for_chain`] and
+//! [`SolanaChainSubmissionAdapter::new`] take operator-injected transports, and
+//! the deterministic tests use fixtures only — no real broadcast, no real
+//! credentials, no real endpoint calls.
 //!
-//! This crate is a foundation: it composes concrete ports but is **not** wired
-//! into a running service here, and it does not advertise live capability.
+//! This crate is a foundation: it composes concrete ports and exposes a factory
+//! handoff ([`ChainAdapterRegistry`]) but is **not** wired into a running
+//! service here, and it does not advertise live capability.
 
 #![forbid(unsafe_code)]
 
+pub mod solana;
+pub mod support;
+
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chain_types::{AssetId, ChainId};
@@ -46,21 +46,97 @@ use execution_relay::{
 };
 use thiserror::Error;
 
+pub use solana::{
+    validate_solana_transaction, SolanaChainSubmissionAdapter, SolanaChainTransport, SolanaCluster,
+    SolanaCommitment, SolanaConfirmationStatus, SolanaSignatureStatus, SolanaTransactionInfo,
+    SolanaTransactionVersion, MAX_SOLANA_TRANSACTION_BYTES,
+};
+pub use support::{
+    execution_support, submission_adapter_for_chain, ChainAdapterRegistry, ChainExecutionSupport,
+    ExecutionBlocker, ExecutionVerdict,
+};
+
 /// Fail-closed adapter error. Redacted: no endpoints, addresses, or payloads.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ChainAdapterError {
     /// The injected transport is unavailable or failed ambiguously.
     #[error("chain transport unavailable")]
     TransportUnavailable,
+    /// The injected transport timed out; the request state is unknown.
+    #[error("chain transport timed out")]
+    Timeout,
     /// The transport definitively rejected the request.
     #[error("chain transport rejected request")]
     Rejected,
-    /// The requested chain is not Base.
+    /// The requested chain is not the chain this adapter is bound to.
     #[error("unsupported chain")]
     UnsupportedChain,
+    /// The transport reported a chain identity that does not match the binding.
+    #[error("chain identity mismatch")]
+    WrongChain,
+    /// A payload is not a well-formed transaction for the bound chain family.
+    #[error("chain payload invalid")]
+    InvalidPayload,
     /// A response could not be decoded.
     #[error("chain response invalid")]
     InvalidResponse,
+}
+
+/// A supported EVM-family execution chain with its canonical chain id.
+///
+/// `RobinhoodAssociated` is deliberately **not** a variant: its execution
+/// semantics are not verified (see [`support`]), so it must not be silently
+/// treated as a generic EVM chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvmChain {
+    /// Base mainnet (`8453`).
+    Base,
+    /// Ethereum mainnet (`1`).
+    Ethereum,
+    /// BNB Smart Chain (`56`).
+    BnbChain,
+}
+
+impl EvmChain {
+    /// The canonical `eth_chainId` value this chain must report.
+    pub const fn expected_chain_id(self) -> u64 {
+        match self {
+            Self::Base => 8453,
+            Self::Ethereum => 1,
+            Self::BnbChain => 56,
+        }
+    }
+
+    /// The canonical domain chain identifier.
+    pub const fn chain(self) -> ChainId {
+        match self {
+            Self::Base => ChainId::Base,
+            Self::Ethereum => ChainId::Ethereum,
+            Self::BnbChain => ChainId::BnbChain,
+        }
+    }
+
+    /// Maps a domain chain identifier to its EVM execution chain, if it has one.
+    ///
+    /// Only the three verified EVM chains map; `RobinhoodAssociated` and custom
+    /// chains return `None` rather than being guessed into the EVM family.
+    pub fn from_chain_id(chain: &ChainId) -> Option<Self> {
+        match chain {
+            ChainId::Base => Some(Self::Base),
+            ChainId::Ethereum => Some(Self::Ethereum),
+            ChainId::BnbChain => Some(Self::BnbChain),
+            _ => None,
+        }
+    }
+
+    /// Stable label used in redacted diagnostics.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Ethereum => "ethereum",
+            Self::BnbChain => "bnb_chain",
+        }
+    }
 }
 
 /// Token metadata read from authoritative chain state.
@@ -123,14 +199,24 @@ pub struct ReceiptObservation {
     pub net_output: Option<u128>,
 }
 
-/// Injected chain transport. No implementation in this crate performs I/O.
+/// Injected EVM-family chain transport shared by Base, Ethereum, and BNB Chain.
+///
+/// The transport is deliberately chain-agnostic: it reports whatever
+/// `eth_chainId` the endpoint answers with, and the chain binding (and its
+/// verification) lives in [`EvmChainSubmissionAdapter`]. One concrete JSON-RPC
+/// transport therefore serves every EVM chain instead of a copy per chain. No
+/// implementation in this crate performs I/O.
 ///
 /// A production implementation owns the RPC endpoint, credentials, and
 /// retry-free policy; the adapters below never retry and never broadcast on a
 /// read path.
+///
+/// [`BaseChainTransport`] remains as a compatibility alias for the original
+/// Base-only name.
 #[async_trait]
-pub trait BaseChainTransport: Send + Sync {
-    /// Chain id; must be Base's (`8453`) for the adapters to be healthy.
+pub trait EvmChainTransport: Send + Sync {
+    /// The endpoint's reported `eth_chainId`; the adapter binds it to the
+    /// expected [`EvmChain::expected_chain_id`] and fails closed on a mismatch.
     async fn chain_id(&self) -> Result<u64, ChainAdapterError>;
     /// Latest block number.
     async fn block_number(&self) -> Result<u64, ChainAdapterError>;
@@ -150,7 +236,7 @@ pub trait BaseChainTransport: Send + Sync {
 }
 
 #[async_trait]
-impl<T: BaseChainTransport + ?Sized> BaseChainTransport for std::sync::Arc<T> {
+impl<T: EvmChainTransport + ?Sized> EvmChainTransport for std::sync::Arc<T> {
     async fn chain_id(&self) -> Result<u64, ChainAdapterError> {
         (**self).chain_id().await
     }
@@ -182,6 +268,10 @@ impl<T: BaseChainTransport + ?Sized> BaseChainTransport for std::sync::Arc<T> {
         (**self).transaction_receipt(reference).await
     }
 }
+
+/// Compatibility alias: the original Base-only transport name now denotes the
+/// shared EVM-family transport.
+pub use EvmChainTransport as BaseChainTransport;
 
 /// Injected encoder/decoder for market-state reads.
 pub trait MarketCodec: Send + Sync {
@@ -218,13 +308,13 @@ fn code_health(code: u8) -> ChainHealth {
     }
 }
 
-/// Authoritative Base market-state adapter.
-pub struct BaseMarketStateAdapter<T: BaseChainTransport, C: MarketCodec> {
+/// Authoritative EVM market-state adapter (chain-agnostic `eth_call` reads).
+pub struct EvmMarketStateAdapter<T: EvmChainTransport, C: MarketCodec> {
     transport: T,
     codec: C,
 }
 
-impl<T: BaseChainTransport, C: MarketCodec> BaseMarketStateAdapter<T, C> {
+impl<T: EvmChainTransport, C: MarketCodec> EvmMarketStateAdapter<T, C> {
     /// Wires the adapter from its injected transport and codec.
     pub fn new(transport: T, codec: C) -> Self {
         Self { transport, codec }
@@ -246,15 +336,33 @@ impl<T: BaseChainTransport, C: MarketCodec> BaseMarketStateAdapter<T, C> {
     }
 }
 
-/// Authoritative Base balances and token-metadata adapter.
-pub struct BaseWalletAdapter<T: BaseChainTransport> {
+/// Compatibility alias for the original Base-only market-state adapter name.
+pub type BaseMarketStateAdapter<T, C> = EvmMarketStateAdapter<T, C>;
+
+/// Authoritative EVM balances and token-metadata adapter.
+///
+/// The adapter is bound to one [`EvmChain`] and rejects an asset from any other
+/// chain, so a Base read can never be served by an Ethereum or BNB binding and
+/// vice versa.
+pub struct EvmWalletAdapter<T: EvmChainTransport> {
     transport: T,
+    chain: EvmChain,
 }
 
-impl<T: BaseChainTransport> BaseWalletAdapter<T> {
-    /// Wires the adapter from its injected transport.
+impl<T: EvmChainTransport> EvmWalletAdapter<T> {
+    /// Wires the adapter to Base (the historical default).
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self::for_chain(transport, EvmChain::Base)
+    }
+
+    /// Wires the adapter to an explicit EVM chain.
+    pub fn for_chain(transport: T, chain: EvmChain) -> Self {
+        Self { transport, chain }
+    }
+
+    /// The EVM chain this adapter is bound to.
+    pub fn chain(&self) -> EvmChain {
+        self.chain
     }
 
     /// Reads an authoritative token balance for `owner`.
@@ -263,7 +371,7 @@ impl<T: BaseChainTransport> BaseWalletAdapter<T> {
         token: &AssetId,
         owner: &str,
     ) -> Result<BalanceObservation, ChainAdapterError> {
-        if token.chain != ChainId::Base {
+        if token.chain != self.chain.chain() {
             return Err(ChainAdapterError::UnsupportedChain);
         }
         let block_number = self.transport.block_number().await?;
@@ -280,20 +388,23 @@ impl<T: BaseChainTransport> BaseWalletAdapter<T> {
         &self,
         token: &AssetId,
     ) -> Result<TokenMetadata, ChainAdapterError> {
-        if token.chain != ChainId::Base {
+        if token.chain != self.chain.chain() {
             return Err(ChainAdapterError::UnsupportedChain);
         }
         self.transport.erc20_metadata(&token.address).await
     }
 }
 
+/// Compatibility alias for the original Base-only wallet adapter name.
+pub type BaseWalletAdapter<T> = EvmWalletAdapter<T>;
+
 /// Exact quote/simulation adapter over an injected codec.
-pub struct BaseQuoteAdapter<T: BaseChainTransport, Q: QuoteCodec> {
+pub struct EvmQuoteAdapter<T: EvmChainTransport, Q: QuoteCodec> {
     transport: T,
     codec: Q,
 }
 
-impl<T: BaseChainTransport, Q: QuoteCodec> BaseQuoteAdapter<T, Q> {
+impl<T: EvmChainTransport, Q: QuoteCodec> EvmQuoteAdapter<T, Q> {
     /// Wires the adapter from its injected transport and quote codec.
     pub fn new(transport: T, codec: Q) -> Self {
         Self { transport, codec }
@@ -318,60 +429,162 @@ impl<T: BaseChainTransport, Q: QuoteCodec> BaseQuoteAdapter<T, Q> {
     }
 }
 
-/// Concrete Base chain submission/reconciliation adapter over an injected RPC
-/// transport.
-///
-/// It implements the relay's [`ChainSubmissionAdapter`], so it can be injected
-/// into `ExecutionRelay::production_with_chain`. `submit` broadcasts exactly the
-/// bound payload once (no retry); `query`/`reconcile` are read-only. Health is
-/// cached and refreshed by [`Self::refresh_health`] because the trait's `health`
-/// method is synchronous.
-pub struct BaseChainSubmissionAdapter<T: BaseChainTransport> {
-    transport: T,
-    health: AtomicU8,
+/// Compatibility alias for the original Base-only quote adapter name.
+pub type BaseQuoteAdapter<T, Q> = EvmQuoteAdapter<T, Q>;
+
+/// One in-process submission admission, keyed by the request idempotency key.
+enum SubmitAdmission {
+    /// A submission with this payload digest is being broadcast right now.
+    InFlight([u8; 32]),
+    /// A submission with this payload digest completed with this reference.
+    Done([u8; 32], String),
 }
 
-impl<T: BaseChainTransport> BaseChainSubmissionAdapter<T> {
-    /// Wires the adapter from an operator-injected transport.
+/// Concrete EVM chain submission/reconciliation adapter over a shared injected
+/// RPC transport.
+///
+/// It implements the relay's [`ChainSubmissionAdapter`], so it can be injected
+/// into `ExecutionRelay::production_with_chain`. One adapter instance is bound
+/// to exactly one [`EvmChain`] and verifies the endpoint's `eth_chainId` against
+/// that binding, so the same shared transport serves Base, Ethereum and BNB
+/// Chain without a per-chain copy.
+///
+/// `submit` broadcasts exactly the bound payload once (no retry) and is
+/// idempotent on `(idempotency_key, payload_digest)`: a replay returns the
+/// already-observed reference without a second broadcast, while a reused key
+/// with a different payload fails closed with
+/// [`RelayError::IdempotencyConflict`]. `query`/`reconcile` are read-only and
+/// reject a request bound to a different chain. Health is cached and refreshed
+/// by [`Self::refresh_health`] because the trait's `health` method is
+/// synchronous.
+pub struct EvmChainSubmissionAdapter<T: EvmChainTransport> {
+    transport: T,
+    chain: EvmChain,
+    health: AtomicU8,
+    submissions: Mutex<HashMap<String, SubmitAdmission>>,
+}
+
+impl<T: EvmChainTransport> EvmChainSubmissionAdapter<T> {
+    /// Wires the adapter to Base (the historical default).
     ///
     /// The cached health starts `Unavailable`; a composition root must call
     /// [`Self::refresh_health`] before any execution is attempted.
     pub fn new(transport: T) -> Self {
+        Self::for_chain(transport, EvmChain::Base)
+    }
+
+    /// Wires the adapter to an explicit EVM chain.
+    pub fn for_chain(transport: T, chain: EvmChain) -> Self {
         Self {
             transport,
+            chain,
             health: AtomicU8::new(health_code(ChainHealth::Unavailable)),
+            submissions: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Refreshes the cached health from the transport's chain id.
+    /// The EVM chain this adapter is bound to.
+    pub fn chain(&self) -> EvmChain {
+        self.chain
+    }
+
+    /// Verifies the endpoint's reported chain id against the binding, failing
+    /// closed with [`ChainAdapterError::WrongChain`] on a mismatch.
+    pub async fn verify_chain_identity(&self) -> Result<(), ChainAdapterError> {
+        let observed = self.transport.chain_id().await?;
+        if observed == self.chain.expected_chain_id() {
+            Ok(())
+        } else {
+            Err(ChainAdapterError::WrongChain)
+        }
+    }
+
+    /// Refreshes the cached health from the transport's verified chain id.
     pub async fn refresh_health(&self) {
-        let healthy = match self.transport.chain_id().await {
-            Ok(8453) => ChainHealth::Healthy,
-            Ok(_) => ChainHealth::Unavailable,
+        let healthy = match self.verify_chain_identity().await {
+            Ok(()) => ChainHealth::Healthy,
             Err(_) => ChainHealth::Unavailable,
         };
         self.health.store(health_code(healthy), Ordering::SeqCst);
     }
 }
 
+/// Compatibility alias for the original Base-only submission adapter name.
+///
+/// `BaseChainSubmissionAdapter::new(transport)` binds Base, exactly as before;
+/// use [`EvmChainSubmissionAdapter::for_chain`] for Ethereum or BNB Chain.
+pub type BaseChainSubmissionAdapter<T> = EvmChainSubmissionAdapter<T>;
+
+/// Maps a transport error on the submit (write) path to a redacted relay error.
+fn map_submit_error(error: ChainAdapterError) -> RelayError {
+    match error {
+        ChainAdapterError::Rejected => RelayError::AdapterRejected,
+        ChainAdapterError::Timeout => RelayError::AdapterTimeout,
+        _ => RelayError::AdapterUnavailable,
+    }
+}
+
+/// Maps a transport error on the read (query/reconcile) path.
+fn map_query_error(error: ChainAdapterError) -> RelayError {
+    match error {
+        ChainAdapterError::Timeout => RelayError::AdapterTimeout,
+        _ => RelayError::AdapterUnavailable,
+    }
+}
+
+/// Acquires a mutex, recovering from poisoning (plain map; never panics).
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[async_trait]
-impl<T: BaseChainTransport> ChainSubmissionAdapter for BaseChainSubmissionAdapter<T> {
+impl<T: EvmChainTransport> ChainSubmissionAdapter for EvmChainSubmissionAdapter<T> {
     async fn submit(&self, request: &SubmitRequest) -> Result<SubmissionReceipt, RelayError> {
-        if request.chain() != &ChainId::Base {
+        if request.chain() != &self.chain.chain() {
             return Err(RelayError::ChainMismatch);
         }
         if request.payload().is_empty() {
             return Err(RelayError::SignedPayloadEmpty);
         }
-        let reference = self
-            .transport
-            .send_raw_transaction(request.payload())
-            .await
-            .map_err(|error| match error {
-                ChainAdapterError::Rejected => RelayError::AdapterRejected,
-                _ => RelayError::AdapterUnavailable,
-            })?;
-        SubmissionReceipt::new(reference)
+        let key = request.idempotency_key().as_str().to_string();
+        let digest = *request.payload_digest().as_bytes();
+        {
+            let mut ledger = lock(&self.submissions);
+            match ledger.get(&key) {
+                Some(SubmitAdmission::Done(existing, reference)) if *existing == digest => {
+                    return SubmissionReceipt::new(reference.clone());
+                }
+                Some(SubmitAdmission::Done(..)) => {
+                    return Err(RelayError::IdempotencyConflict);
+                }
+                Some(SubmitAdmission::InFlight(existing)) if *existing == digest => {
+                    // A concurrent duplicate is not allowed to broadcast again.
+                    return Err(RelayError::AdapterUnavailable);
+                }
+                Some(SubmitAdmission::InFlight(..)) => {
+                    return Err(RelayError::IdempotencyConflict);
+                }
+                None => {
+                    ledger.insert(key.clone(), SubmitAdmission::InFlight(digest));
+                }
+            }
+        }
+        match self.transport.send_raw_transaction(request.payload()).await {
+            Ok(reference) => {
+                let mut ledger = lock(&self.submissions);
+                ledger.insert(key, SubmitAdmission::Done(digest, reference.clone()));
+                SubmissionReceipt::new(reference)
+            }
+            Err(error) => {
+                // The admission is released so a later explicit retry is not
+                // permanently wedged; the relay itself never auto-retries.
+                lock(&self.submissions).remove(&key);
+                Err(map_submit_error(error))
+            }
+        }
     }
 
     async fn query(
@@ -379,6 +592,9 @@ impl<T: BaseChainTransport> ChainSubmissionAdapter for BaseChainSubmissionAdapte
         request: &SubmitRequest,
         _now_ms: i64,
     ) -> Result<ChainObservation, RelayError> {
+        if request.chain() != &self.chain.chain() {
+            return Err(RelayError::ChainMismatch);
+        }
         // Prefer the chain acknowledgement reference when one was recorded;
         // the signer reference is not necessarily the transaction hash.
         let reference = request.reconciliation_reference();
@@ -386,7 +602,7 @@ impl<T: BaseChainTransport> ChainSubmissionAdapter for BaseChainSubmissionAdapte
             .transport
             .transaction_receipt(reference)
             .await
-            .map_err(|_| RelayError::AdapterUnavailable)?;
+            .map_err(map_query_error)?;
         Ok(observation_from_receipt(receipt, reference))
     }
 
@@ -459,6 +675,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         receipt_refs: Mutex<Vec<String>>,
         receipt: Option<ReceiptObservation>,
+        send_error: Option<ChainAdapterError>,
+        receipt_error: Option<ChainAdapterError>,
     }
 
     #[async_trait]
@@ -494,6 +712,9 @@ mod tests {
 
         async fn send_raw_transaction(&self, _raw: &[u8]) -> Result<String, ChainAdapterError> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.send_error {
+                return Err(error);
+            }
             Ok("0xreceipt".to_string())
         }
 
@@ -505,6 +726,9 @@ mod tests {
                 .lock()
                 .expect("receipt refs")
                 .push(reference.to_string());
+            if let Some(error) = self.receipt_error {
+                return Err(error);
+            }
             Ok(self.receipt.clone())
         }
     }
@@ -638,6 +862,255 @@ mod tests {
                 .as_slice(),
             ["0xbroadcast-hash".to_string()]
         );
+    }
+
+    /// Builds a fully bound Base submit request with the shared fixture identity.
+    fn fixture_bound_request(payload: Vec<u8>) -> SubmitRequest {
+        let payload = execution_relay::SignedPayload::new(payload).expect("payload");
+        let signing = privy::SigningRequest::bind(
+            &fixture_engine(),
+            &fixture_approved(),
+            &fixture_prepared(),
+            &fixture_intent(),
+            &fixture_route(),
+            &fixture_preview(),
+            *payload.digest(),
+            1_000,
+        )
+        .expect("bind");
+        let signed = execution_relay::SignedExecutionRef::new(
+            "0xtx",
+            *signing.request_digest(),
+            signing.intent_id().clone(),
+            signing.idempotency_key().clone(),
+        )
+        .expect("signed");
+        SubmitRequest::bind(&signing, &signed, &payload, &ChainId::Base).expect("submit request")
+    }
+
+    #[tokio::test]
+    async fn submission_adapter_verifies_the_bound_chain_id() {
+        // A Base binding against a chain-1 endpoint fails closed.
+        let wrong = BaseChainSubmissionAdapter::for_chain(
+            MockTransport {
+                chain_id: 1,
+                ..MockTransport::default()
+            },
+            EvmChain::Base,
+        );
+        assert_eq!(
+            wrong.verify_chain_identity().await,
+            Err(ChainAdapterError::WrongChain)
+        );
+        wrong.refresh_health().await;
+        assert_eq!(wrong.health(0), ChainHealth::Unavailable);
+
+        // The matching binding verifies and becomes healthy.
+        let right = BaseChainSubmissionAdapter::for_chain(
+            MockTransport {
+                chain_id: 8453,
+                ..MockTransport::default()
+            },
+            EvmChain::Base,
+        );
+        assert_eq!(right.verify_chain_identity().await, Ok(()));
+        right.refresh_health().await;
+        assert_eq!(right.health(0), ChainHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn submission_adapter_prevents_duplicate_submits() {
+        let adapter = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            ..MockTransport::default()
+        });
+        let request = fixture_bound_request(vec![1, 2, 3]);
+        let first = adapter.submit(&request).await.expect("first");
+        let replay = adapter.submit(&request).await.expect("replay");
+        assert_eq!(first.reference, replay.reference);
+        assert_eq!(adapter.transport.sends.load(Ordering::SeqCst), 1);
+
+        // The same idempotency key with a different payload is a conflict, and
+        // never reaches the transport.
+        let conflicting = fixture_bound_request(vec![9, 9, 9]);
+        assert_eq!(
+            adapter.submit(&conflicting).await,
+            Err(RelayError::IdempotencyConflict)
+        );
+        assert_eq!(adapter.transport.sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn submission_adapter_separates_evm_chains() {
+        let bnb = BaseChainSubmissionAdapter::for_chain(
+            MockTransport {
+                chain_id: 56,
+                ..MockTransport::default()
+            },
+            EvmChain::BnbChain,
+        );
+        assert_eq!(bnb.verify_chain_identity().await, Ok(()));
+        // A Base-bound request is refused by the BNB-bound adapter on both the
+        // write and read paths.
+        let request = fixture_bound_request(vec![1, 2, 3]);
+        assert_eq!(bnb.submit(&request).await, Err(RelayError::ChainMismatch));
+        assert_eq!(bnb.query(&request, 0).await, Err(RelayError::ChainMismatch));
+        assert_eq!(bnb.transport.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn evm_chain_family_mapping_is_explicit() {
+        assert_eq!(EvmChain::Base.expected_chain_id(), 8453);
+        assert_eq!(EvmChain::Ethereum.expected_chain_id(), 1);
+        assert_eq!(EvmChain::BnbChain.expected_chain_id(), 56);
+        assert_eq!(
+            EvmChain::from_chain_id(&ChainId::Base),
+            Some(EvmChain::Base)
+        );
+        assert_eq!(
+            EvmChain::from_chain_id(&ChainId::Ethereum),
+            Some(EvmChain::Ethereum)
+        );
+        assert_eq!(
+            EvmChain::from_chain_id(&ChainId::BnbChain),
+            Some(EvmChain::BnbChain)
+        );
+        // Solana is a different family, and Robinhood-associated is not guessed
+        // into the EVM family.
+        assert_eq!(EvmChain::from_chain_id(&ChainId::Solana), None);
+        assert_eq!(EvmChain::from_chain_id(&ChainId::RobinhoodAssociated), None);
+        assert_eq!(
+            EvmChain::from_chain_id(&ChainId::Other("hypercore".to_string())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_adapter_maps_transport_failures() {
+        // Malformed response on the write path.
+        let malformed = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            send_error: Some(ChainAdapterError::InvalidResponse),
+            ..MockTransport::default()
+        });
+        let request = fixture_bound_request(vec![1, 2, 3]);
+        assert_eq!(
+            malformed.submit(&request).await,
+            Err(RelayError::AdapterUnavailable)
+        );
+        // A timeout on the write path is a typed timeout.
+        let timeout = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            send_error: Some(ChainAdapterError::Timeout),
+            ..MockTransport::default()
+        });
+        assert_eq!(
+            timeout.submit(&request).await,
+            Err(RelayError::AdapterTimeout)
+        );
+        // Malformed and timed-out reads are read-only failures.
+        let bad_read = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt_error: Some(ChainAdapterError::InvalidResponse),
+            ..MockTransport::default()
+        });
+        assert_eq!(
+            bad_read.query(&request, 0).await,
+            Err(RelayError::AdapterUnavailable)
+        );
+        let slow_read = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt_error: Some(ChainAdapterError::Timeout),
+            ..MockTransport::default()
+        });
+        assert_eq!(
+            slow_read.query(&request, 0).await,
+            Err(RelayError::AdapterTimeout)
+        );
+        assert_eq!(slow_read.transport.sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn submission_adapter_maps_unknown_and_unresolved_receipts() {
+        let request = fixture_bound_request(vec![1, 2, 3]).with_chain_reference("0xhash");
+
+        // An unmined/unknown receipt is pending, never a confirmation.
+        let unknown = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            ..MockTransport::default()
+        });
+        assert_eq!(
+            unknown.reconcile(&request, 0).await.expect("unknown"),
+            ChainObservation::Pending
+        );
+
+        // A success receipt without exact amounts confirms but leaves the fill
+        // unresolved instead of fabricating one.
+        let unresolved = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt: Some(ReceiptObservation {
+                status: ReceiptStatus::Success,
+                net_input: None,
+                net_output: None,
+            }),
+            ..MockTransport::default()
+        });
+        assert!(matches!(
+            unresolved.reconcile(&request, 0).await.expect("unresolved"),
+            ChainObservation::Confirmed { fill: None, .. }
+        ));
+
+        // A reverted receipt is a definitive rejection.
+        let reverted = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt: Some(ReceiptObservation {
+                status: ReceiptStatus::Reverted,
+                net_input: None,
+                net_output: None,
+            }),
+            ..MockTransport::default()
+        });
+        assert!(matches!(
+            reverted.reconcile(&request, 0).await.expect("reverted"),
+            ChainObservation::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_reconciliation_never_resubmits() {
+        let first = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt: Some(ReceiptObservation {
+                status: ReceiptStatus::Success,
+                net_input: Some(1),
+                net_output: Some(2),
+            }),
+            ..MockTransport::default()
+        });
+        let request = fixture_bound_request(vec![1, 2, 3]);
+        first.submit(&request).await.expect("submit");
+        assert_eq!(first.transport.sends.load(Ordering::SeqCst), 1);
+
+        // A fresh adapter over the same endpoint (empty in-process ledger) must
+        // reconcile a broadcast attempt without resubmitting it.
+        let restarted = BaseChainSubmissionAdapter::new(MockTransport {
+            chain_id: 8453,
+            receipt: Some(ReceiptObservation {
+                status: ReceiptStatus::Success,
+                net_input: Some(1),
+                net_output: Some(2),
+            }),
+            ..MockTransport::default()
+        });
+        let observation = restarted
+            .reconcile(&request.with_chain_reference("0xbroadcast-hash"), 0)
+            .await
+            .expect("reconcile");
+        assert!(matches!(
+            observation,
+            ChainObservation::Confirmed { fill: Some(_), .. }
+        ));
+        assert_eq!(restarted.transport.sends.load(Ordering::SeqCst), 0);
     }
 
     fn fixture_intent() -> domain::TradeIntent {
