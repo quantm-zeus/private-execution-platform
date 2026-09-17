@@ -67,8 +67,10 @@ pub enum LiveTransportError {
 /// Redacted transport-level failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportError {
-    /// The endpoint could not be reached or did not answer in time.
+    /// The endpoint could not be reached.
     Unavailable,
+    /// The endpoint did not answer within the bounded timeout.
+    Timeout,
     /// The peer answered with a definitive 4xx rejection.
     Rejected,
     /// The answer could not be decoded.
@@ -199,7 +201,7 @@ impl JsonHttpTransport {
 
         let response = tokio::time::timeout(self.timeout, self.client.request(request))
             .await
-            .map_err(|_| TransportError::Unavailable)?
+            .map_err(|_| TransportError::Timeout)?
             .map_err(|_| TransportError::Unavailable)?;
         let status = response.status();
         let body = tokio::time::timeout(self.timeout, async {
@@ -217,7 +219,7 @@ impl JsonHttpTransport {
             Ok::<Vec<u8>, TransportError>(collected)
         })
         .await
-        .map_err(|_| TransportError::Unavailable)??;
+        .map_err(|_| TransportError::Timeout)??;
 
         if !status.is_success() {
             return Err(if status.is_client_error() {
@@ -239,25 +241,33 @@ impl JsonHttpTransport {
 }
 
 // ---------------------------------------------------------------------------
-// Base JSON-RPC transport
+// Shared EVM JSON-RPC transport (Base, Ethereum, BNB Chain)
 // ---------------------------------------------------------------------------
 
-/// Concrete, retry-free Base JSON-RPC transport.
+/// Concrete, retry-free EVM JSON-RPC transport.
 ///
-/// It implements [`BaseChainTransport`] over a single JSON-RPC endpoint and is
-/// the transport [`BaseChainSubmissionAdapter`] broadcasts through. It never
-/// retries: every method performs exactly one HTTP request.
-pub struct BaseRpcChainTransport {
+/// It implements the shared `EvmChainTransport` seam over a single JSON-RPC
+/// endpoint and is chain-agnostic: the same type serves Base, Ethereum and BNB
+/// Chain, and the [`BaseChainSubmissionAdapter`] (or
+/// `chain_adapters::EvmChainSubmissionAdapter::for_chain`) binds and verifies
+/// the expected `eth_chainId`. It never retries: every method performs exactly
+/// one HTTP request.
+///
+/// `BaseRpcChainTransport` remains as a compatibility alias.
+pub struct EvmRpcChainTransport {
     rpc: JsonHttpTransport,
 }
 
-impl std::fmt::Debug for BaseRpcChainTransport {
+/// Compatibility alias for the original Base-only transport name.
+pub type BaseRpcChainTransport = EvmRpcChainTransport;
+
+impl std::fmt::Debug for EvmRpcChainTransport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BaseRpcChainTransport { .. }")
+        formatter.write_str("EvmRpcChainTransport { .. }")
     }
 }
 
-impl BaseRpcChainTransport {
+impl EvmRpcChainTransport {
     /// Wires the transport to an operator endpoint and optional bearer token.
     pub fn new(
         endpoint: &str,
@@ -277,6 +287,8 @@ impl BaseRpcChainTransport {
             .await
             .map_err(|error| match error {
                 TransportError::Rejected => ChainAdapterError::Rejected,
+                TransportError::Timeout => ChainAdapterError::Timeout,
+                TransportError::InvalidResponse => ChainAdapterError::InvalidResponse,
                 _ => ChainAdapterError::TransportUnavailable,
             })?;
         if response.get("error").is_some_and(|error| !error.is_null()) {
@@ -290,7 +302,7 @@ impl BaseRpcChainTransport {
 }
 
 #[async_trait]
-impl BaseChainTransport for BaseRpcChainTransport {
+impl BaseChainTransport for EvmRpcChainTransport {
     async fn chain_id(&self) -> Result<u64, ChainAdapterError> {
         let result = self.rpc("eth_chainId", json!([])).await?;
         parse_u64_hex(&result)
@@ -645,8 +657,9 @@ pub struct LiveTransportConfig {
 
 /// The concrete live transports plus the composed chain submission adapter.
 pub struct LiveTransports {
-    /// The Base JSON-RPC transport used by the probes.
-    pub chain: Arc<BaseRpcChainTransport>,
+    /// The shared EVM JSON-RPC transport used by the probes. It is deliberately
+    /// chain-agnostic; `chain_submission` binds and verifies the Base chain id.
+    pub chain: Arc<EvmRpcChainTransport>,
     /// The relay-facing chain submission adapter (wraps `chain`).
     pub chain_submission: Arc<dyn execution_relay::ChainSubmissionAdapter>,
     /// The Privy signing client.
@@ -667,7 +680,7 @@ pub async fn build_live_transports(
     config: LiveTransportConfig,
 ) -> Result<LiveTransports, LiveTransportError> {
     let chain = Arc::new(
-        BaseRpcChainTransport::new(
+        EvmRpcChainTransport::new(
             &config.base_rpc_endpoint,
             config.base_rpc_bearer,
             config.request_timeout,
@@ -893,6 +906,40 @@ mod tests {
         let transport =
             BaseRpcChainTransport::new(&wrong, None, Duration::from_secs(2)).expect("transport");
         assert_eq!(transport.chain_id().await, Ok(1));
+    }
+
+    #[tokio::test]
+    async fn evm_rpc_timeout_maps_to_a_typed_timeout() {
+        // A listener that accepts and never answers forces the bounded read to
+        // time out; the transport reports the typed timeout rather than a
+        // generic outage.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let transport = EvmRpcChainTransport::new(
+            &format!("http://{address}"),
+            None,
+            Duration::from_millis(100),
+        )
+        .expect("transport");
+        assert_eq!(transport.chain_id().await, Err(ChainAdapterError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn evm_rpc_malformed_body_is_rejected() {
+        // A 200 with a non-JSON body must fail closed, not be treated as a
+        // chain answer.
+        let base = spawn_mock(|_path, _body| (200, "not-json".to_string())).await;
+        let transport =
+            EvmRpcChainTransport::new(&base, None, Duration::from_secs(2)).expect("transport");
+        assert_eq!(
+            transport.chain_id().await,
+            Err(ChainAdapterError::InvalidResponse)
+        );
     }
 
     #[tokio::test]
