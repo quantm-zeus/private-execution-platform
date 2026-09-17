@@ -9,6 +9,7 @@ import type { TokenDetail } from "../contracts/market";
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 const BONK = { chain: "base", address: "0xBONK", symbol: "BONK" } as const;
+const PEPE = { chain: "base", address: "0xPEPE", symbol: "PEPE" } as const;
 
 function bonkDetail(): TokenDetail {
   return {
@@ -34,6 +35,34 @@ function bonkDetail(): TokenDetail {
     slot: 42,
     sourceAgeMs: 0,
   };
+}
+
+function pepeDetail(): TokenDetail {
+  return {
+    ...bonkDetail(),
+    token: PEPE,
+    stats: {
+      ...bonkDetail().stats!,
+      priceUsd: 2.5,
+      priceChange24h: -3.25,
+    },
+    risk: {
+      ...bonkDetail().risk!,
+      score: 88,
+      sellRestricted: true,
+    },
+    slot: 43,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 const WALLET_LIMITS = {
@@ -98,7 +127,7 @@ function fakeCommandClient(): CommandClient {
   };
 }
 
-function createStore() {
+function createStore(command: CommandClient = fakeCommandClient()) {
   const store = createWorkspaceStore({
     manualClock: true,
     clock: () => 1_000,
@@ -125,7 +154,7 @@ function createStore() {
       server_time_ms: 1_699_999_000_000,
     }),
   });
-  store.setCommand(fakeCommandClient());
+  store.setCommand(command);
   store.reload();
   return store;
 }
@@ -139,15 +168,43 @@ function renderShell(store: ReturnType<typeof createWorkspaceStore>) {
 }
 
 /** Drive the debounced header search and click the matching result. */
-async function selectBonkViaSearch() {
+async function selectViaSearch(query: string, expectedSymbol: string) {
   const input = screen.getByLabelText("Search token") as HTMLInputElement;
-  fireEvent.input(input, { target: { value: "BONK" } });
+  fireEvent.input(input, { target: { value: query } });
+  let result: HTMLButtonElement | undefined;
   await waitFor(
-    () => expect(document.querySelector(".search-popover button")).not.toBeNull(),
+    () => {
+      result = Array.from(document.querySelectorAll<HTMLButtonElement>(".search-popover button")).find(
+        (button) => button.textContent?.includes(expectedSymbol),
+      );
+      expect(result).not.toBeUndefined();
+    },
     { timeout: 2_000 },
   );
-  fireEvent.click(document.querySelector<HTMLButtonElement>(".search-popover button")!);
+  fireEvent.click(result!);
   await flush();
+}
+
+async function selectBonkViaSearch() {
+  await selectViaSearch("BONK", "BONK");
+}
+
+function switchingCommandClient(secondDetail: Promise<TokenDetail>): CommandClient {
+  const fallback = fakeCommandClient();
+  return {
+    async send<T>(op: string, payload?: unknown, options?: Parameters<CommandClient["send"]>[2]): Promise<T> {
+      if (op === "search_token") {
+        const query = String((payload as { query?: unknown } | undefined)?.query ?? "").toUpperCase();
+        return { results: query.includes("PEPE") ? [PEPE] : [BONK] } as unknown as T;
+      }
+      if (op === "get_token") {
+        const address = (payload as { address?: unknown } | undefined)?.address;
+        if (address === PEPE.address) return (await secondDetail) as T;
+        if (address === BONK.address) return bonkDetail() as T;
+      }
+      return fallback.send<T>(op, payload, options);
+    },
+  };
 }
 
 describe("AppShell", () => {
@@ -225,6 +282,49 @@ describe("AppShell", () => {
       expect(node.textContent).not.toBe("—");
     }
     expect(screen.getByTestId("token-risk")).toBeTruthy();
+  });
+
+  it("never renders token A stats or risk beside token B while B detail is loading", async () => {
+    const pending = deferred<TokenDetail>();
+    const store = createStore(switchingCommandClient(pending.promise));
+    await flush();
+    renderShell(store);
+    await flush();
+
+    await selectBonkViaSearch();
+    await waitFor(() => expect(screen.getByTestId("token-stat-price")).toBeTruthy());
+    expect(screen.getByTestId("token-risk").textContent).toMatch(/risk 12/);
+
+    await selectViaSearch("PEPE", "PEPE");
+    expect(screen.getByTestId("selected-instrument").textContent).toMatch(/PEPE/);
+    expect(screen.queryByTestId("token-stat-price")).toBeNull();
+    expect(screen.queryByTestId("token-risk")).toBeNull();
+
+    pending.resolve(pepeDetail());
+    await waitFor(() => expect(screen.getByTestId("token-stat-price").textContent).toContain("2.5"));
+    expect(screen.getByTestId("token-risk").textContent).toMatch(/risk 88/);
+  });
+
+  it("keeps token A stats and risk hidden if token B detail fails", async () => {
+    const pending = deferred<TokenDetail>();
+    const store = createStore(switchingCommandClient(pending.promise));
+    await flush();
+    renderShell(store);
+    await flush();
+
+    await selectBonkViaSearch();
+    await waitFor(() => expect(screen.getByTestId("token-stat-price")).toBeTruthy());
+    expect(screen.getByTestId("token-risk").textContent).toMatch(/risk 12/);
+
+    await selectViaSearch("PEPE", "PEPE");
+    expect(screen.getByTestId("selected-instrument").textContent).toMatch(/PEPE/);
+    expect(screen.queryByTestId("token-stat-price")).toBeNull();
+    expect(screen.queryByTestId("token-risk")).toBeNull();
+
+    pending.reject(new Error("provider unavailable"));
+    await flush();
+    await waitFor(() => expect(screen.queryByTestId("token-stat-price")).toBeNull());
+    expect(screen.queryByTestId("token-risk")).toBeNull();
   });
 
   it("opens and closes the security drawer", async () => {

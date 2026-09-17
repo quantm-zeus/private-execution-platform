@@ -1,5 +1,6 @@
 import {
   createContext,
+  createMemo,
   createSignal,
   getOwner,
   onCleanup,
@@ -54,8 +55,8 @@ export interface WorkstationStore {
   readonly searchDenial: Accessor<CapabilityDenial | null>;
 
   /* Selected token detail for the header stats and centre identity strip. */
-  readonly detail: CommandResource<TokenDetail>;
-  readonly detailState: Accessor<DataState<TokenDetail>>;
+  /** Detail value is visible only when it belongs to the currently selected token. */
+  readonly visibleDetail: Accessor<TokenDetail | null>;
 
   readonly recent: Accessor<readonly TokenRef[]>;
   readonly watchlist: Accessor<readonly TokenRef[]>;
@@ -119,6 +120,18 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     capability: "market",
     ttlMs: DETAIL_TTL_MS,
     clock: () => ws.nowMs(),
+  });
+  const visibleDetail = createMemo<TokenDetail | null>(() => {
+    const selected = ws.selectedInstrument();
+    if (!selected) return null;
+    const state = detail.state();
+    const candidate =
+      state.kind === "ready" || state.kind === "stale"
+        ? state.value
+        : state.kind === "loading" || state.kind === "error"
+          ? state.prior
+          : undefined;
+    return candidate && sameInstrument(candidate.token, selected) ? candidate : null;
   });
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -216,8 +229,7 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     search,
     searchState: search.state,
     searchDenial,
-    detail,
-    detailState: detail.state,
+    visibleDetail,
     recent,
     watchlist,
     isWatched,

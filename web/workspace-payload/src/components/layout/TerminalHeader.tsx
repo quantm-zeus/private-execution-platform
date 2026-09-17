@@ -37,12 +37,7 @@ export const TerminalHeader: Component = () => {
   const station = useWorkstation();
 
   const instrument = (): InstrumentRef | null => ws.selectedInstrument();
-  const stats = createMemo(() => {
-    const state = station.detailState();
-    if (state.kind === "ready" || state.kind === "stale") return state.value.stats;
-    if (state.kind === "loading" || state.kind === "error") return state.prior?.stats ?? null;
-    return null;
-  });
+  const stats = createMemo(() => station.visibleDetail()?.stats ?? null);
   const results = createMemo<readonly TokenRef[]>(() => {
     const state = station.searchState();
     return state.kind === "ready" || state.kind === "stale" ? state.value.results : [];

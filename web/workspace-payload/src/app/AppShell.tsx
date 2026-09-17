@@ -19,12 +19,7 @@ import { formatBps } from "../core/format";
  */
 const TokenRiskStrip: Component = () => {
   const station = useWorkstation();
-  const risk = createMemo(() => {
-    const state = station.detailState();
-    if (state.kind === "ready" || state.kind === "stale") return state.value.risk;
-    if (state.kind === "loading" || state.kind === "error") return state.prior?.risk ?? null;
-    return null;
-  });
+  const risk = createMemo(() => station.visibleDetail()?.risk ?? null);
   return (
     <Show when={risk()}>
       {(value) => (
