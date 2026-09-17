@@ -8,6 +8,7 @@ import {
   ohlcvSnapshot,
   randomKeyB64,
   resetServer,
+  searchTokens,
   sendFrames,
   serverState,
   waitForResyncIncrease,
@@ -33,17 +34,20 @@ async function bootLive(page: import("@playwright/test").Page, request: import("
   return { s2c, c2s };
 }
 
+/** The chart pane is always mounted, so live data renders without a view tab. */
+async function expectLocalData(page: import("@playwright/test").Page): Promise<void> {
+  await expect(page.getByTestId("chart-target").getByText("LOCAL DATA")).toBeVisible();
+}
+
 test.describe("encrypted realtime workspace", () => {
   test("renders the local chart and depth from authenticated encrypted frames", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
 
-    await page.locator('button[data-view="terminal"]').click();
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
     await expect(page.locator(".depth-list__row").first()).toBeVisible();
-    await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
-    // The worker owns the socket/key; the main thread only renders.
-    await expect(page.getByText("worker").first()).toBeVisible();
+    // `connection-phase` is the workstation's single connection indicator.
+    await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
     // No cleartext control frame may ever be sent on the binary-only relay: the
     // mock edge records (and would close on) any text frame. The worker's one
     // binary AEAD `subscribe` frame is expected and is not a text frame.
@@ -56,8 +60,7 @@ test.describe("encrypted realtime workspace", () => {
   test("rejects a replayed envelope without advancing or re-rendering", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
-    await page.locator('button[data-view="terminal"]').click();
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
 
     const before = await serverState(request);
     await sendFrames(request, { replay: true });
@@ -65,14 +68,13 @@ test.describe("encrypted realtime workspace", () => {
     const after = await serverState(request);
     // A duplicate is ignored: no resync and no new frame is applied.
     expect(after.resyncCount).toBe(before.resyncCount);
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
   });
 
   test("recovers to live by accepting an authenticated snapshot after a sequence gap", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
-    await page.locator('button[data-view="terminal"]').click();
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
 
     const before = (await serverState(request)).resyncCount;
     await sendFrames(request, { skip: 3, frames: [ohlcvDelta(500)] });
@@ -81,14 +83,13 @@ test.describe("encrypted realtime workspace", () => {
     // The recovery snapshot must be accepted (this was a deadlock before the fix).
     await sendFrames(request, { frames: [ohlcvSnapshot(200), depthSnapshot(777, 778)] });
     await expect(page.locator(".depth-list__row").first()).toContainText("777");
-    await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
   });
 
   test("fails a tampered frame closed and recovers on a fresh authenticated snapshot", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
-    await page.locator('button[data-view="terminal"]').click();
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
 
     const before = (await serverState(request)).resyncCount;
     await sendFrames(request, { frames: [ohlcvDelta(500)], tamper: true });
@@ -96,14 +97,13 @@ test.describe("encrypted realtime workspace", () => {
 
     await sendFrames(request, { frames: [depthSnapshot(313, 314)] });
     await expect(page.locator(".depth-list__row").first()).toContainText("313");
-    await expect(page.getByText("LIVE", { exact: true })).toBeVisible();
+    await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
   });
 
   test("reconnects after a dropped socket and resyncs from a fresh snapshot", async ({ page, request }) => {
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
-    await page.locator('button[data-view="terminal"]').click();
-    await expect(page.getByText("LOCAL DATA")).toBeVisible();
+    await expectLocalData(page);
 
     const before = await serverState(request);
     const resyncs = (await serverState(request)).resyncCount;
@@ -150,9 +150,9 @@ test.describe("encrypted command channel", () => {
     await handoffKey(page, s2c, c2s);
     await waitForSocket(request);
 
-    await page.locator('button[data-view="discover"]').click();
-    await page.getByLabel("Search token").fill("bonk");
-    await page.getByRole("button", { name: "Search" }).click();
+    // Search lives in the top bar and dispatches on a 300ms debounce; there is
+    // no Discover view and no submit button.
+    await searchTokens(page, "bonk");
 
     await expect(page.locator(".search-results__symbol")).toHaveText("BONK");
     const state = await serverState(request);
@@ -183,9 +183,7 @@ test.describe("encrypted command channel", () => {
     await handoffKey(page, s2c, c2s);
     await waitForSocket(request);
 
-    await page.locator('button[data-view="discover"]').click();
-    await page.getByLabel("Search token").fill("secretquery");
-    await page.getByRole("button", { name: "Search" }).click();
+    await searchTokens(page, "secretquery");
     await expect.poll(() => cleartextBodies.length, { timeout: 7_000 }).toBeGreaterThan(0);
 
     for (const body of cleartextBodies) {

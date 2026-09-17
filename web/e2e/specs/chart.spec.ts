@@ -42,8 +42,9 @@ test.describe("private chart (KLineChart Pro)", () => {
 
     await bootLive(page, request);
     await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
-    await page.locator('button[data-view="terminal"]').click();
 
+    // The chart is mounted in the workstation centre pane from unlock: there is
+    // no terminal tab to open first.
     const host = page.locator(".pep-pro-chart-host");
     await expect(host).toBeVisible();
     const canvas = host.locator("canvas").first();
@@ -56,8 +57,9 @@ test.describe("private chart (KLineChart Pro)", () => {
     // router. The badge reads `LOCAL DATA` only after `ChartFrameRouter.apply`
     // reports a store change, so a datafeed that silently dropped every frame
     // can no longer pass this smoke on canvas visibility alone. (Frames were
-    // already sent before the view mounted, so the badge may already be set;
-    // the fresh send below guarantees a post-subscription delivery either way.)
+    // already sent right after the workstation mounted, so the badge may already
+    // be set; the fresh send below guarantees a post-subscription delivery
+    // either way.)
     const target = page.getByTestId("chart-target");
     await sendFrames(request, { frames: [ohlcvSnapshot(120)] });
     await expect(target.getByText("LOCAL DATA")).toBeVisible({ timeout: 7_000 });
@@ -87,7 +89,6 @@ test.describe("private chart (KLineChart Pro)", () => {
     page.on("pageerror", (error) => errors.push(String(error)));
 
     await bootLive(page, request);
-    await page.locator('button[data-view="terminal"]').click();
     await expect(page.locator(".pep-pro-chart-host canvas").first()).toBeVisible();
 
     // Positive control: the feed is live and mutating the chart before the

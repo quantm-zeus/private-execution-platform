@@ -10,11 +10,11 @@ import {
 } from "./helpers";
 
 /**
- * W14 in a real browser: the Security view exposes the trading-wallet limit
- * configuration. The mock applies a write and changes the authoritative read,
- * so the test proves the full load → tighten → verify → relax (phrase-gated)
- * flow. The write travels only to the neutral first-party `set_wallet_limits`
- * command.
+ * W14 in a real browser: the on-demand security drawer exposes the
+ * trading-wallet limit configuration. The mock applies a write and changes the
+ * authoritative read, so the test proves the full load → tighten → verify →
+ * relax (phrase-gated) flow. The write travels only to the neutral first-party
+ * `set_wallet_limits` command.
  */
 
 test.describe("trading wallet limits (W14)", () => {
@@ -32,7 +32,9 @@ test.describe("trading wallet limits (W14)", () => {
     await handoffKey(page, s2c, c2s);
     await waitForSocket(request);
 
-    await page.locator('button[data-view="security"]').click();
+    // Security & settings moved to the on-demand drawer opened from the top bar.
+    await page.getByRole("button", { name: "Security and settings" }).click();
+    await expect(page.getByRole("dialog", { name: "Security and settings" })).toBeVisible();
     const maxTrade = page.getByTestId("limit-maxTradeUsd");
     await expect(maxTrade).toHaveValue("5000");
 

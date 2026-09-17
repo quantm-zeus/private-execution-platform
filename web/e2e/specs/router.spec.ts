@@ -4,6 +4,7 @@ import {
   handoffKey,
   randomKeyB64,
   resetServer,
+  searchAndSelectToken,
   serverState,
   setCommandResponse,
   waitForSocket,
@@ -17,9 +18,9 @@ import {
  * invalidates a source-bound preview when the source changes.
  *
  * The ticket needs a resolved pair, and the only UI path that sets the shared
- * memory-only target is a Discover selection, so the spec selects a candidate
- * first (a regression guard: without a target the Preview control is disabled
- * and W13 is never exercised).
+ * memory-only target is a top-bar search selection, so the spec selects a
+ * candidate first (a regression guard: without a target the Preview control is
+ * disabled and W13 is never exercised). The right ticket defaults to Market.
  */
 
 const OKX_PREVIEW_RESPONSE = {
@@ -127,17 +128,16 @@ test.describe("routing source selector (W13)", () => {
     await handoffKey(page, s2c, c2s);
     await waitForSocket(request);
 
-    // Resolve the ticket target through the real UI before opening the ticket.
-    await page.locator('button[data-view="discover"]').click();
-    await page.getByLabel("Search token").fill("SOL");
-    await page.getByRole("button", { name: "Search", exact: true }).click();
-    await page.getByRole("button", { name: /^SOL/ }).first().click();
-    await expect(page.getByText("Token detail loaded.")).toBeVisible();
+    // Resolve the ticket target through the real top-bar search before opening
+    // the ticket. Results render as `role=option` rows in the popover.
+    await searchAndSelectToken(page, "SOL", "SOL");
+    await expect(page.getByTestId("selected-instrument")).toContainText("SOL");
 
     // Install the W13 preview response only once the target is resolved.
     await setCommandResponse(request, OKX_PREVIEW_RESPONSE);
 
-    await page.locator('button[data-view="trade"]').click();
+    // The right ticket defaults to the Market tab; no navigation is required.
+    await expect(page.getByTestId("ticket-tab-market")).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("button", { name: "OKX" })).toHaveAttribute(
       "aria-pressed",
       "true",

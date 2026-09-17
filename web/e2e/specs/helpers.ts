@@ -150,3 +150,32 @@ export function ohlcvDelta(close: number) {
 export async function waitForWorkspace(page: Page): Promise<void> {
   await expect(page.locator(".workspace")).toBeVisible();
 }
+
+/**
+ * Type a query into the top-bar global token search. The input is debounced
+ * (300ms) before the encrypted `search_token` command is dispatched, so callers
+ * should await the rendered `.search-popover` result rather than a submit.
+ */
+export async function searchTokens(page: Page, query: string): Promise<void> {
+  await page.getByLabel("Search token").fill(query);
+}
+
+/**
+ * Search and click a result in the top-bar popover. Results are `<button
+ * role="option">` rows, so the symbol cell is clicked directly (the opt-in
+ * result is the only selection path that resolves the shared ticket target).
+ */
+export async function selectSearchResult(page: Page, symbol: string): Promise<void> {
+  const cell = page
+    .locator(".search-popover .search-results__symbol")
+    .filter({ hasText: symbol })
+    .first();
+  await expect(cell).toBeVisible();
+  await cell.click();
+}
+
+/** Search the top bar and select the first rendered result. */
+export async function searchAndSelectToken(page: Page, query: string, symbol: string): Promise<void> {
+  await searchTokens(page, query);
+  await selectSearchResult(page, symbol);
+}

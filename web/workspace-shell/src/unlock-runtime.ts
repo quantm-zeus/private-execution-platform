@@ -362,8 +362,9 @@ export class WorkspaceUnlockRuntime {
 
   constructor() {
     if (typeof window !== "undefined") {
-      window.addEventListener("beforeunload", () => this.lock());
-      window.addEventListener("unload", () => this.lock());
+      // `pagehide` covers tab close, navigation and bfcache eviction without the
+      // deprecated `unload` handler (which is unreliable and blocks bfcache).
+      window.addEventListener("pagehide", () => this.lock());
     }
   }
 
