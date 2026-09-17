@@ -630,7 +630,10 @@ impl<O: OrderReadModel, P: PortfolioReadModel, S> TradingAgentBackend<O, P, S> {
             Err(BackendError::Unavailable) => return Err(MarketExecutionError::Unavailable),
         };
         let binding = execution_relay::AttemptBinding::from_intent(&intent);
-        self.execution.reconcile(&binding, now_ms).await
+        // Source-aware: the binding is only queried at the source that owns it,
+        // so an outage in one source cannot be misreported as a terminal failure
+        // of an attempt owned by the other.
+        self.execution.reconcile_for(router, &binding, now_ms).await
     }
 
     /// Reconciles an already-submitted market order identified by the same

@@ -123,12 +123,30 @@ pub trait MarketExecutionPort: Send + Sync {
     /// tenant's attempt that happens to share the idempotency key. The default
     /// has no observation capability and fails closed to `Unknown`; a `Filled`
     /// may only be produced from exact observed amounts.
+    ///
+    /// `reconcile_for` is the source-aware form. A port that composes multiple
+    /// sources (see `market_execution::SourceBoundMarketExecutionPort`) must
+    /// override it so a binding is only ever queried at the source that owns it;
+    /// the default ignores the source and delegates to `reconcile`.
     async fn reconcile(
         &self,
         _binding: &execution_relay::AttemptBinding,
         _now_ms: i64,
     ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
         Ok(MarketExecutionOutcome::Unknown)
+    }
+
+    /// Reconciles a binding at the source that owns it.
+    ///
+    /// The default ignores `router_source` and delegates to [`Self::reconcile`];
+    /// single-source ports therefore need only implement `reconcile`.
+    async fn reconcile_for(
+        &self,
+        _router_source: agent_commands::RouterSource,
+        binding: &execution_relay::AttemptBinding,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        self.reconcile(binding, now_ms).await
     }
 }
 
