@@ -156,6 +156,17 @@ pub trait StreamSource: Send + Sync {
     async fn snapshot(&self, from_seq: Option<u64>) -> Option<SourceFrame>;
     /// Next ordered delta; `None` ends the stream.
     async fn next_delta(&self) -> Option<SourceFrame>;
+    /// Session-scoped snapshot. The default delegates to [`Self::snapshot`] so a
+    /// source that has no per-session target keeps its existing behavior; a
+    /// session-aware source overrides it to select the authenticated session's
+    /// own encrypted target.
+    async fn snapshot_for(&self, _kid: &[u8], from_seq: Option<u64>) -> Option<SourceFrame> {
+        self.snapshot(from_seq).await
+    }
+    /// Session-scoped next delta. The default delegates to [`Self::next_delta`].
+    async fn next_delta_for(&self, _kid: &[u8]) -> Option<SourceFrame> {
+        self.next_delta().await
+    }
     /// Frames emitted when no snapshot is available. Defaults to one
     /// authenticated error frame (fail-closed: no fabricated state).
     async fn unavailable(&self) -> Vec<SourceFrame> {
@@ -388,7 +399,7 @@ impl StreamDriver {
             }
             tokio::select! {
                 _ = notify.notified() => continue,
-                delta = self.source.next_delta() => match delta {
+                delta = self.source.next_delta_for(&kid) => match delta {
                     Some(frame) => {
                         if !self.emit(kid, frame, generation, sink).await {
                             return;
@@ -407,7 +418,7 @@ impl StreamDriver {
         generation: u64,
         sink: &mut dyn FrameSink,
     ) -> bool {
-        match self.source.snapshot(from_seq).await {
+        match self.source.snapshot_for(&kid, from_seq).await {
             Some(frame) => self.emit(kid, frame, generation, sink).await,
             None => {
                 // Fail closed: surface the unavailability to the client as an

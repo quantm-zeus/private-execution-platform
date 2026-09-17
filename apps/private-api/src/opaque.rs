@@ -107,8 +107,9 @@ impl CapabilitySet {
             "request_withdrawal" => "withdraw",
             "get_wallet_limits" | "set_wallet_limits" => "wallet_limits",
             "get_intelligence" | "get_provider_health" | "get_alerts" => "intelligence",
-            "search_token" | "get_token" => "market",
+            "search_token" | "get_token" | "get_trending" => "market",
             "get_chart" => "chart",
+            "set_realtime_target" => "realtime",
             _ => return None,
         };
         Some(capabilities)

@@ -538,28 +538,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Optional read-only FOMO market bridge. With no configuration the chart
     // stays on its bounded local buffer and no capability is advertised; the
-    // chart dispatcher wraps the fail-closed default for every non-chart op.
+    // read dispatcher wraps the fail-closed default for every other op.
     let fomo = optional_fomo_market_config()?;
     // Observational health flags shared with `/ready`. The history flag is the
-    // chart capability proof; the stream flag is the realtime proof. Both start
-    // false and are only set true by an observed successful bridge read, so a
-    // configured-but-unreachable provider is never reported healthy.
+    // chart capability proof; the market flag is the token search/detail/trending
+    // proof; the stream flag is the realtime proof. All start false and are only
+    // set true by an observed successful bridge read, so a configured-but-
+    // unreachable provider is never reported healthy.
     let fomo_history_health = Arc::new(AtomicBool::new(false));
+    let market_read_health = Arc::new(AtomicBool::new(false));
     let stream_health = Arc::new(AtomicBool::new(false));
     let fomo_configured = fomo.is_some();
-    let (fomo_dispatcher, fomo_stream, fomo_wired) = match fomo {
+    let (fomo_dispatcher, fomo_stream, fomo_wired, fomo_market_read) = match fomo {
         Some((config, api_key)) => {
             let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
                 private_api::FomoBarsClient::new(&config.base_url, api_key, config.request_timeout)
                     .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
             );
             let probe_provider = provider.clone();
-            let wiring = private_api::build_fomo_market_wiring_with_health_flags(
+            let wiring = private_api::build_fomo_market_wiring_full(
                 &config,
                 provider,
                 Arc::new(private_api::FailClosedDispatcher),
                 Some(stream_health.clone()),
                 Some(fomo_history_health.clone()),
+                Some(market_read_health.clone()),
+                Arc::new(private_api::fomo_market::RealtimeTargetRegistry::new()),
             )
             .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
             // Chart history proof: a bounded authenticated `/market/bars` read
@@ -569,6 +573,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let history_healthy =
                 private_api::fomo_market::probe_history(probe_provider.as_ref(), &config).await;
             fomo_history_health.store(history_healthy, Ordering::SeqCst);
+            // Market read proof: a bounded authenticated `/market/trending` read
+            // proves the token search/detail/trending path. An expired bridge
+            // session or provider outage leaves `market` unadvertised; the
+            // capability is never inferred from configuration alone.
+            let market_healthy =
+                private_api::fomo_market::probe_market(probe_provider.as_ref()).await;
+            market_read_health.store(market_healthy, Ordering::SeqCst);
             // Observe the configured realtime source once at startup. A
             // reachable bridge proves the realtime capability; an unavailable
             // one leaves it unadvertised (fail closed). The shared flag keeps
@@ -583,20 +594,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            if market_healthy {
+                trading_seams = trading_seams.with_market_probe(private_api::trading::healthy(
+                    private_api::trading::COMPONENT_MARKET,
+                ));
+            }
             let wired = private_api::production::WiredCapabilities {
-                // Chart history only: `search_token`/`get_token` stay denied
-                // because FOMO does not back them (capability truth, audit F6),
-                // and chart itself requires the healthy history proof above.
+                // Each read capability is advertised only after its own bounded
+                // authenticated proof: `market` for token reads, `chart` for
+                // history, `realtime` for the seeded stream source.
+                market: market_healthy,
                 chart: history_healthy,
                 realtime: wiring.stream_source.is_some(),
                 ..private_api::production::WiredCapabilities::default()
             };
-            (Some(wiring.dispatcher), wiring.stream_source, wired)
+            (
+                Some(wiring.dispatcher),
+                wiring.stream_source,
+                wired,
+                market_read_health.clone(),
+            )
         }
         None => (
             None,
             None,
             private_api::production::WiredCapabilities::default(),
+            market_read_health.clone(),
         ),
     };
     let fomo_stream_present = fomo_stream.is_some();
@@ -614,7 +637,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dispatcher: fomo_dispatcher,
             wired: fomo_wired,
             stream_source: fomo_stream,
-            chains: Vec::new(),
+            // The read-path chain registry: verified Solana, Base, Ethereum,
+            // BNB Chain and Robinhood-associated (4663) identities. No native
+            // quote asset is guessed; mutation stays capability-gated.
+            chains: private_api::fomo_market::read_path_chains(),
             readiness,
         })
         .map_err(|_| std::io::Error::other("opaque service configuration invalid"))?;
@@ -666,6 +692,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_dispatcher_readiness(dispatcher_ready)
         .with_stream_readiness(stream_required, stream_health)
         .with_fomo_readiness(fomo_configured, fomo_history_health)
+        .with_fomo_market_readiness(fomo_configured, fomo_market_read)
         // The explicit live opt-in makes the concrete execution dependencies a
         // readiness requirement. `live_execution` exists only when the durable
         // store and all of chain/signer/payload were proven, so a missing
