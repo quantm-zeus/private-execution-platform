@@ -1,11 +1,11 @@
-import { For, Show, createMemo, type Component } from "solid-js";
+import { Show, createMemo, type Component } from "solid-js";
 import { formatPercent, formatUsd, truncateAddress } from "../../core/format";
 import type { ConnectionStatus, InstrumentRef } from "../../core/types";
-import type { TokenRef } from "../../contracts/market";
 import { useWorkspace } from "../../state/session";
 import { tokenLabel, useWorkstation } from "../../state/workstation";
 import { requestHostLock } from "../../state/host";
 import { ActionButton, Badge, StatusDot, type Tone } from "../ui/primitives";
+import { TokenSearch } from "./TokenSearch";
 
 function connectionTone(phase: ConnectionStatus["phase"]): Tone {
   switch (phase) {
@@ -28,9 +28,10 @@ function changeTone(change: number | null | undefined): Tone {
 }
 
 /**
- * Compact top bar: global token search, selected-instrument identity and live
- * stats, connection/market health, the on-demand security drawer and the single
- * Lock action. It carries no navigation tabs and no session/auth chrome.
+ * Compact top bar. The selected token and its live market stats are the primary
+ * content; security, kill-switch and trading-gate truth is collapsed into
+ * compact status controls so fail-closed state stays visible without dominating
+ * the product. It carries no navigation tabs and no session/auth chrome.
  */
 export const TerminalHeader: Component = () => {
   const ws = useWorkspace();
@@ -38,27 +39,15 @@ export const TerminalHeader: Component = () => {
 
   const instrument = (): InstrumentRef | null => ws.selectedInstrument();
   const stats = createMemo(() => station.visibleDetail()?.stats ?? null);
-  const results = createMemo<readonly TokenRef[]>(() => {
-    const state = station.searchState();
-    return state.kind === "ready" || state.kind === "stale" ? state.value.results : [];
-  });
 
   const offline = createMemo(() =>
     ["offline", "degraded", "reconnecting"].includes(ws.connection().phase),
   );
-
-  const submit = (event: Event): void => {
-    event.preventDefault();
-    station.runSearch(station.query());
-  };
+  const tradingDisabled = createMemo(() => !ws.tradingEnabled());
 
   return (
     <header class="topbar" data-testid="terminal-topbar">
-      <div class="topbar__brand">
-        <span class="topbar__mark" aria-hidden="true">
-          ◈
-        </span>
-        <h1 class="topbar__title">Evergreen Private Workspace</h1>
+      <div class="topbar__lead">
         <button
           type="button"
           class="icon-button"
@@ -69,62 +58,37 @@ export const TerminalHeader: Component = () => {
         >
           ▤
         </button>
+        <span class="topbar__mark" aria-hidden="true">
+          ◈
+        </span>
+        <h1 class="topbar__title">Evergreen Private Workspace</h1>
       </div>
 
-      <form class="topbar__search" role="search" onSubmit={submit}>
-        <label class="sr-only" for="global-token-search">
-          Search token
-        </label>
-        <input
-          id="global-token-search"
-          class="input"
-          type="search"
-          placeholder="Search token, symbol or address"
-          aria-label="Search token"
-          autocomplete="off"
-          value={station.query()}
-          onInput={(event) => station.setQuery(event.currentTarget.value)}
-        />
-        <Show when={results().length > 0}>
-          <div class="search-popover" aria-label="Token search results">
-            <For each={results()}>
-              {(token) => (
-                <button
-                  type="button"
-                  class="link-button"
-                  onClick={() => station.selectInstrument(token)}
-                >
-                  <span class="search-results__symbol">{tokenLabel(token)}</span>
-                  <code class="search-results__address">{truncateAddress(token.address, 6, 6)}</code>
-                  <Badge tone="muted">{token.chain}</Badge>
-                </button>
-              )}
-            </For>
-          </div>
-        </Show>
-      </form>
+      <TokenSearch />
 
-      <div class="topbar__identity">
+      <div class="topbar__market">
         <Show
           when={instrument()}
           fallback={
-            <span class="muted" data-testid="selected-instrument">
+            <span class="muted topbar__no-target" data-testid="selected-instrument">
               No token selected
             </span>
           }
         >
           {(ref) => (
             <span class="topbar__identity" data-testid="selected-instrument">
-              <Badge tone="info">{ref().symbol}</Badge>
-              <code title={ref().address}>{truncateAddress(ref().address, 6, 6)}</code>
-              <span class="muted">{ref().chain}</span>
+              <span class="topbar__symbol">{tokenLabel(ref())}</span>
+              <span class="topbar__ref">
+                <span class="muted">{ref().chain}</span>
+                <code title={ref().address}>{truncateAddress(ref().address, 6, 6)}</code>
+              </span>
             </span>
           )}
         </Show>
         <Show when={stats()}>
           {(value) => (
             <span class="topbar__stats">
-              <span class="stat">
+              <span class="stat stat--price">
                 <span class="stat__label">Price</span>
                 <span class="stat__value" data-testid="token-stat-price">
                   {formatUsd(value().priceUsd, 6)}
@@ -142,13 +106,13 @@ export const TerminalHeader: Component = () => {
                   {formatUsd(value().marketCapUsd)}
                 </span>
               </span>
-              <span class="stat">
+              <span class="stat stat--optional">
                 <span class="stat__label">Liquidity</span>
                 <span class="stat__value" data-testid="token-stat-liquidity">
                   {formatUsd(value().liquidityUsd)}
                 </span>
               </span>
-              <span class="stat">
+              <span class="stat stat--optional">
                 <span class="stat__label">Volume</span>
                 <span class="stat__value" data-testid="token-stat-volume">
                   {formatUsd(value().volume24hUsd)}
@@ -164,19 +128,27 @@ export const TerminalHeader: Component = () => {
           <StatusDot tone={connectionTone(ws.connection().phase)} label="Connection state" />
           <span data-testid="connection-phase">{ws.connection().phase.toUpperCase()}</span>
         </Badge>
+        <Badge
+          tone={tradingDisabled() ? "danger" : "positive"}
+          title={
+            tradingDisabled()
+              ? "Capital-committing actions fail closed until the operator enables trading."
+              : "Trading is enabled for this deployment."
+          }
+          data-testid="trading-gate"
+        >
+          {tradingDisabled() ? "TRADING DISABLED" : "TRADING ENABLED"}
+        </Badge>
         <Show when={ws.killSwitch().enabled}>
           <Badge tone="danger" title={ws.killSwitch().reason ?? undefined} data-testid="kill-switch">
-            KILL SWITCH
+            HALTED
           </Badge>
         </Show>
         <Show when={offline()}>
-          <Badge tone="warning" data-testid="degraded">
+          <Badge tone="warning" data-testid="degraded" title={ws.connection().reason ?? undefined}>
             DEGRADED
           </Badge>
         </Show>
-        <Badge tone={ws.tradingEnabled() ? "info" : "danger"} data-testid="trading-gate">
-          {ws.tradingEnabled() ? "TRADING ENABLED" : "TRADING DISABLED"}
-        </Badge>
         <Show when={station.narrow()}>
           <button
             type="button"

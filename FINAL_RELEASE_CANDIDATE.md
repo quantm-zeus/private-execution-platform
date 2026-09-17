@@ -156,7 +156,11 @@ green. Reproduced deterministically only in the local, `--no-sudo` sandbox envir
    fingerprint, then publish the immutable release (writes `manifest.json` + `workspace.artifact`):
    `node scripts/workspace-release.mjs build --root /var/lib/evergreen/releases --source-sha <sha>`
 5. `node scripts/workspace-release.mjs validate --root /var/lib/evergreen/releases`
-   (and `current` to confirm the active release id)
+   (and `current` to confirm the active release id), then
+   `node scripts/workspace-release.mjs check-deploy --root /var/lib/evergreen/releases --shell <served-shell-dir> --artifact <served-artifact> --manifest <served-manifest>`
+   to prove the served shell, manifest and artifact all resolve into that one
+   release. Serve the shell from `/releases/current/shell` — never a pinned
+   release id or a separately built `web/workspace-shell/dist`.
 6. Configure the environment from §4, keeping `TRADING_ENABLED=false` and
    `WORKSPACE_RELEASE_MANIFEST` set. Do not set `TRADING_CORE_LIVE=1` unless a complete live
    composition exists.

@@ -11,8 +11,13 @@ import {
   type Accessor,
   type JSX,
 } from "solid-js";
-import type { TokenDetail, TokenRef } from "../contracts/market";
+import type { MarketListRow, TokenDetail, TokenRef } from "../contracts/market";
 import type { CapabilityDenial, DataState } from "../core/types";
+import { isServedTimeframe } from "../market/ohlcv";
+import {
+  createRealtimeTargetCoordinator,
+  type RealtimeTargetState,
+} from "../realtime/target-coordinator";
 import { createCommandResource, type CommandResource } from "./command-state";
 import { useWorkspace, type WorkspaceStore } from "./session";
 
@@ -20,12 +25,12 @@ export type TicketTab = "market" | "limit";
 export type DockTab = "positions" | "orders" | "activity" | "trades" | "holders";
 
 interface SearchPayload {
-  readonly results: readonly TokenRef[];
+  readonly results: readonly MarketListRow[];
 }
 
 export interface TrendingPayload {
   readonly category: string;
-  readonly tokens: readonly TokenRef[];
+  readonly tokens: readonly MarketListRow[];
 }
 
 const SEARCH_TTL_MS = 30_000;
@@ -34,6 +39,13 @@ const TRENDING_TTL_MS = 30_000;
 const TRENDING_REFRESH_MS = 30_000;
 const RECENT_LIMIT = 8;
 const WATCHLIST_LIMIT = 50;
+
+/**
+ * Default chart window. It is owned by the workstation store so the chart and
+ * the encrypted realtime-target coordinator always agree on one authoritative
+ * timeframe for the selected token.
+ */
+export const DEFAULT_TIMEFRAME = "1m";
 
 export interface WorkstationStore {
   /* Pane / drawer state — memory-only for the session, never persisted. */
@@ -71,11 +83,21 @@ export interface WorkstationStore {
   /** Detail value is visible only when it belongs to the currently selected token. */
   readonly visibleDetail: Accessor<TokenDetail | null>;
 
-  readonly recent: Accessor<readonly TokenRef[]>;
-  readonly watchlist: Accessor<readonly TokenRef[]>;
+  readonly recent: Accessor<readonly MarketListRow[]>;
+  readonly watchlist: Accessor<readonly MarketListRow[]>;
   isWatched(ref: TokenRef): boolean;
-  toggleWatch(ref: TokenRef): void;
-  selectInstrument(ref: TokenRef): void;
+  toggleWatch(row: MarketListRow): void;
+  selectInstrument(row: MarketListRow): void;
+
+  /**
+   * One authoritative chart timeframe for the selected token. The chart reads
+   * and writes this; the realtime-target coordinator reads it too, so a token or
+   * timeframe change produces exactly one encrypted `set_realtime_target`.
+   */
+  readonly timeframe: Accessor<string>;
+  setTimeframe(value: string): void;
+  /** Observable state of the encrypted per-session realtime target binding. */
+  readonly realtimeTarget: Accessor<RealtimeTargetState>;
 }
 
 const WorkspaceContext = createContext<WorkstationStore>();
@@ -93,23 +115,85 @@ function sameInstrument(a: { chain: string; address: string }, b: { chain: strin
   return a.chain === b.chain && a.address === b.address;
 }
 
-function parseTokenRefs(value: unknown): readonly TokenRef[] {
+/**
+ * A finite, non-negative provider number, or `null`. Anything else (absent,
+ * `NaN`, `Infinity`, a string, a negative) stays unknown so the renderer shows
+ * an explicit `—` and never invents a zero.
+ */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/** A finite signed number (a 24h change may legitimately be negative), or `null`. */
+function signedFiniteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** A positive integer rank, or `null`. */
+function rankOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function parseTokenRef(entry: unknown): TokenRef | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const token = entry as Record<string, unknown>;
+  // Normalize the identity once, so the chart entity key, the coordinator's
+  // exact target and the backend's trimmed identity all agree.
+  const chain = typeof token.chain === "string" ? token.chain.trim() : "";
+  const address = typeof token.address === "string" ? token.address.trim() : "";
+  if (chain.length === 0 || address.length === 0) return null;
+  const ref: {
+    chain: string;
+    address: string;
+    symbol?: string;
+    name?: string;
+    decimals?: number;
+  } = { chain, address };
+  if (typeof token.symbol === "string" && token.symbol.length > 0) ref.symbol = token.symbol;
+  if (typeof token.name === "string" && token.name.length > 0) ref.name = token.name;
+  if (typeof token.decimals === "number" && Number.isInteger(token.decimals)) {
+    ref.decimals = token.decimals;
+  }
+  return ref;
+}
+
+/**
+ * Parse one market-list row, preserving the validated optional financial fields
+ * the provider supplied. This is the typed row the market rail and search
+ * combobox render; it never fabricates a price, market cap or rank.
+ */
+export function parseMarketRow(entry: unknown): MarketListRow | null {
+  const token = parseTokenRef(entry);
+  if (!token) return null;
+  const record = entry as Record<string, unknown>;
+  return {
+    ...token,
+    priceUsd: finiteOrNull(record.priceUsd),
+    // A 24h change is signed: a down token must keep its negative value.
+    priceChange24h: signedFiniteOrNull(record.priceChange24h),
+    marketCapUsd: finiteOrNull(record.marketCapUsd),
+    rank: rankOrNull(record.rank),
+  };
+}
+
+/** Upper bound on rows parsed from one provider page. */
+export const MAX_MARKET_ROWS = 200;
+
+/** Parse a bounded list of market rows, dropping entries without an identity. */
+export function parseMarketRows(value: unknown): readonly MarketListRow[] {
   if (!Array.isArray(value)) return [];
-  return value.filter((entry): entry is TokenRef => {
-    if (typeof entry !== "object" || entry === null) return false;
-    const token = entry as Record<string, unknown>;
-    return (
-      typeof token.chain === "string" &&
-      token.chain.length > 0 &&
-      typeof token.address === "string" &&
-      token.address.length > 0
-    );
-  });
+  const rows: MarketListRow[] = [];
+  for (const entry of value) {
+    if (rows.length >= MAX_MARKET_ROWS) break;
+    const row = parseMarketRow(entry);
+    if (row) rows.push(row);
+  }
+  return rows;
 }
 
 function asTokenResults(value: unknown): SearchPayload {
   if (typeof value !== "object" || value === null) return { results: [] };
-  return { results: parseTokenRefs((value as { results?: unknown }).results) };
+  return { results: parseMarketRows((value as { results?: unknown }).results) };
 }
 
 function asTrendingPayload(value: unknown): TrendingPayload {
@@ -119,7 +203,7 @@ function asTrendingPayload(value: unknown): TrendingPayload {
   const raw = value as { category?: unknown; tokens?: unknown };
   return {
     category: typeof raw.category === "string" && raw.category.length > 0 ? raw.category : "trending",
-    tokens: parseTokenRefs(raw.tokens),
+    tokens: parseMarketRows(raw.tokens),
   };
 }
 
@@ -130,8 +214,9 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
   const [ticketTab, setTicketTab] = createSignal<TicketTab>("market");
   const [dockTab, setDockTab] = createSignal<DockTab>("positions");
   const [query, setQueryValue] = createSignal("");
-  const [recent, setRecent] = createSignal<readonly TokenRef[]>([]);
-  const [watchlist, setWatchlist] = createSignal<readonly TokenRef[]>([]);
+  const [recent, setRecent] = createSignal<readonly MarketListRow[]>([]);
+  const [watchlist, setWatchlist] = createSignal<readonly MarketListRow[]>([]);
+  const [timeframe, setTimeframeValue] = createSignal<string>(DEFAULT_TIMEFRAME);
 
   const [narrow, setNarrow] = createSignal(false);
 
@@ -171,6 +256,29 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     return candidate && sameInstrument(candidate.token, selected) ? candidate : null;
   });
 
+  // Encrypted per-session realtime target binding. It is driven by one effect so
+  // a token/timeframe change produces exactly one deduplicated command once both
+  // the command channel and the realtime capability are ready.
+  const targetCoordinator = createRealtimeTargetCoordinator({
+    command: ws.command,
+    canSend: () => ws.commandReady() && ws.capabilities().realtime,
+  });
+  createEffect(() => {
+    const selected = ws.selectedInstrument();
+    const window = timeframe();
+    const ready = ws.commandReady() && ws.capabilities().realtime;
+    if (!ready || selected === null) {
+      targetCoordinator.setDesired(null);
+      return;
+    }
+    targetCoordinator.setDesired({
+      chain: selected.chain,
+      address: selected.address,
+      timeframe: window,
+    });
+  });
+  onCleanup(() => targetCoordinator.reset());
+
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
   const clearDebounce = (): void => {
     if (debounceTimer !== undefined) {
@@ -198,29 +306,37 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     }, 300);
   };
 
-  const selectInstrument = (token: TokenRef): void => {
+  const selectInstrument = (row: MarketListRow): void => {
     ws.setSelectedInstrument({
-      chain: token.chain,
-      address: token.address,
-      symbol: tokenLabel(token),
+      chain: row.chain,
+      address: row.address,
+      symbol: tokenLabel(row),
     });
-    setRecent((prev) => [token, ...prev.filter((entry) => !sameInstrument(entry, token))].slice(0, RECENT_LIMIT));
+    setRecent((prev) => [row, ...prev.filter((entry) => !sameInstrument(entry, row))].slice(0, RECENT_LIMIT));
     // Reflecting the label is not a new query: do not dispatch a search here.
     clearDebounce();
-    setQueryValue(tokenLabel(token));
-    void detail.run({ chain: token.chain, address: token.address });
+    setQueryValue(tokenLabel(row));
+    void detail.run({ chain: row.chain, address: row.address });
   };
 
-  const toggleWatch = (token: TokenRef): void => {
+  const toggleWatch = (row: MarketListRow): void => {
     setWatchlist((prev) =>
-      prev.some((entry) => sameInstrument(entry, token))
-        ? prev.filter((entry) => !sameInstrument(entry, token))
-        : [token, ...prev].slice(0, WATCHLIST_LIMIT),
+      prev.some((entry) => sameInstrument(entry, row))
+        ? prev.filter((entry) => !sameInstrument(entry, row))
+        : [row, ...prev].slice(0, WATCHLIST_LIMIT),
     );
   };
 
   const isWatched = (token: TokenRef): boolean =>
     watchlist().some((entry) => sameInstrument(entry, token));
+
+  const setTimeframe = (value: string): void => {
+    // An unserved id (unknown or a local-only seconds window) is refused rather
+    // than silently rendering a different window: the chart, the backend
+    // realtime target and the Pro period set must all agree exactly.
+    if (!isServedTimeframe(value)) return;
+    setTimeframeValue(value);
+  };
 
   let trendingTimer: ReturnType<typeof setInterval> | undefined;
   createEffect(() => {
@@ -295,6 +411,9 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     isWatched,
     toggleWatch,
     selectInstrument,
+    timeframe,
+    setTimeframe,
+    realtimeTarget: targetCoordinator.state,
   };
 }
 

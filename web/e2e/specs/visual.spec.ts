@@ -8,6 +8,7 @@ import {
   randomKeyB64,
   resetServer,
   searchAndSelectToken,
+  selectedEntityKey,
   sendFrames,
   setCommandResponse,
   waitForSocket,
@@ -250,8 +251,21 @@ test.describe("workstation layout across operator viewports", () => {
       await setCommandResponse(request, TARGET_RESPONSE);
       await searchAndSelectToken(page, "SOL", "SOL");
       await expect(page.getByTestId("selected-instrument")).toContainText("SOL");
-      await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
+      // The exact selected entity key, on a production-faithful recent window:
+      // Pro asks for the *current* window, so 2023 timestamps would render as a
+      // single right-edge bar.
+      await sendFrames(request, {
+        frames: [
+          ohlcvSnapshot(100, 40, { entityKey: selectedEntityKey("base", TOKEN_ADDRESS) }),
+          depthSnapshot(100, 101),
+        ],
+      });
       await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
+      await expect(page.getByTestId("chart-target")).toContainText("LOCAL DATA");
+      const candles = Number(
+        await page.getByTestId("chart-target").getAttribute("data-candles"),
+      );
+      expect(candles, "selected-token candles rendered").toBeGreaterThan(1);
       await assertWorkstationFits(page, viewport);
       await attach(page, testInfo, `selected-live-market-${viewport.width}x${viewport.height}`);
     });
@@ -270,8 +284,14 @@ test.describe("workstation state gallery (attachments only)", () => {
     await setCommandResponse(request, TARGET_RESPONSE);
     await searchAndSelectToken(page, "SOL", "SOL");
     await expect(page.getByTestId("selected-instrument")).toContainText("SOL");
-    await sendFrames(request, { frames: [ohlcvSnapshot(100), depthSnapshot(100, 101)] });
+    await sendFrames(request, {
+      frames: [
+        ohlcvSnapshot(100, 40, { entityKey: selectedEntityKey("base", TOKEN_ADDRESS) }),
+        depthSnapshot(100, 101),
+      ],
+    });
     await expect(page.getByTestId("connection-phase")).toHaveText("LIVE");
+    await expect(page.getByTestId("chart-target")).toContainText("LOCAL DATA");
     await attach(page, testInfo, "selected-token-live-market");
 
     // Market quote.

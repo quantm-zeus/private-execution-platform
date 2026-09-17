@@ -800,7 +800,33 @@ node scripts/workspace-release.mjs build    --root /var/lib/evergreen/releases
 node scripts/workspace-release.mjs validate --root /var/lib/evergreen/releases
 node scripts/workspace-release.mjs current  --root /var/lib/evergreen/releases
 node scripts/workspace-release.mjs rollback --root /var/lib/evergreen/releases
+node scripts/workspace-release.mjs check-deploy --root /var/lib/evergreen/releases \
+  --shell /srv/evergreen/shell \
+  --artifact /srv/evergreen/workspace.artifact \
+  --manifest /srv/evergreen/manifest.json
 ```
+
+### Static-host serving contract (one release, one path)
+
+A live deployment **must** serve all three artifacts from the same `current`
+release directory:
+
+- clear shell: `<releasesRoot>/current/shell`
+- release manifest: `<releasesRoot>/current/manifest.json`
+- encrypted artifact: `<releasesRoot>/current/workspace.artifact`
+
+Never pin the shell to a concrete release id (for example
+`/releases/ff8740f0ee0c-…/shell`) or serve a separately built
+`web/workspace-shell/dist`. Doing so lets the clear bootstrap drift away from the
+encrypted payload: a browser then unlocks an old shell against a new artifact.
+`check-deploy` requires the **actual served paths** as explicit arguments and
+refuses any that is not exactly inside the validated `current` release (it also
+recomputes the artifact digest and the shell tree digest from the manifest). A
+path defaulted to the release's own `current/…` would make the check tautological,
+so omitting one is an error. Run it after any deploy or Caddy/reverse-proxy
+change; the release tooling's `publishRelease` already keeps shell + manifest +
+artifact in one atomically switched directory, so a mismatch can only come from
+the static-host configuration.
 
 ### Privacy-safe unlock stages
 

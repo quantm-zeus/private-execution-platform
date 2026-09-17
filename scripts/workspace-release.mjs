@@ -887,6 +887,75 @@ export async function readRelease(releasesRoot, releaseId) {
 }
 
 /**
+ * The static-host serving contract for a published release.
+ *
+ * The clear shell, the manifest and the encrypted artifact are one release and
+ * must be served from the **same** `current` release directory. Pinning any one
+ * of them to a fixed release id (or to a separately built shell directory)
+ * allows the shell and the artifact to drift: a browser then boots an old
+ * bootstrap against a new encrypted payload.
+ */
+export const DEPLOY_SHELL_PATH = `${CURRENT_LINK}/${SHELL_DIR}`;
+export const DEPLOY_MANIFEST_PATH = `${CURRENT_LINK}/${MANIFEST_FILE}`;
+export const DEPLOY_ARTIFACT_PATH = `${CURRENT_LINK}/${ARTIFACT_FILE}`;
+
+/**
+ * Resolve a deployed path and assert it is exactly the expected file/directory
+ * inside the `current` release. A symlink that escapes the release (or a stale
+ * copy outside it) fails closed. An omitted path is an error, never a skipped
+ * check: a partially-specified deploy must not report success.
+ */
+async function assertDeployedPathInsideRelease(releaseDir, expectedPath, basename, label) {
+  if (expectedPath === undefined || expectedPath === null) {
+    throw new Error(`check-deploy requires an explicit ${label} path`);
+  }
+  let real;
+  try {
+    real = await realpath(resolve(expectedPath));
+  } catch (error) {
+    throw new Error(`${label} is not readable: ${error?.code ?? "unknown"}`);
+  }
+  // Compare against the resolved release directory so a symlinked releases root
+  // (or a symlinked `current`) cannot produce a false mismatch.
+  const realReleaseDir = await realpath(releaseDir);
+  if (real !== join(realReleaseDir, basename)) {
+    throw new Error(`${label} is not served from the current release`);
+  }
+  return real;
+}
+
+/**
+ * Self-check a live deployment: the **served** shell, manifest and artifact must
+ * all resolve into the one `current` release, and that release must fully
+ * validate (artifact digest, manifest identity and shell tree digest). Returns
+ * the validated release id. This is the regression guard for the production
+ * defect where Caddy served an old clear shell against a new encrypted artifact.
+ *
+ * Every path must be supplied explicitly: defaulting a path to the release's own
+ * `current/<name>` would make the check tautological (it would only re-validate
+ * what `readRelease` already validated) and could not detect the static-host
+ * drift it exists to catch.
+ */
+export async function checkDeployment({ releasesRoot, shellDir, artifactPath, manifestPath }) {
+  const root = resolve(releasesRoot);
+  const current = await linkTarget(join(root, CURRENT_LINK));
+  if (!current) throw new Error("no current release to check");
+  assertReleaseId(current);
+  const { releaseDir, manifest } = await readRelease(root, current);
+  await assertDeployedPathInsideRelease(releaseDir, shellDir, SHELL_DIR, "shell");
+  await assertDeployedPathInsideRelease(releaseDir, artifactPath, ARTIFACT_FILE, "artifact");
+  await assertDeployedPathInsideRelease(releaseDir, manifestPath, MANIFEST_FILE, "manifest");
+  return {
+    releaseId: current,
+    releaseDir,
+    manifestPath: join(releaseDir, MANIFEST_FILE),
+    artifactPath: join(releaseDir, ARTIFACT_FILE),
+    shellDir: join(releaseDir, SHELL_DIR),
+    manifest,
+  };
+}
+
+/**
  * Remove stale staging directories left by a killed publish. Only directories
  * older than one hour are swept, so a concurrent in-flight publish is never
  * disturbed.
@@ -1134,6 +1203,25 @@ async function main() {
     console.log(`rolled back ${result.from} -> ${result.to}`);
   } else if (command === "current") {
     console.log((await linkTarget(join(releasesRoot, CURRENT_LINK))) ?? "none");
+  } else if (command === "check-deploy") {
+    // Verify the live static-host layout: shell + manifest + artifact must all
+    // resolve into the same `current` release. Run this after any deploy or
+    // Caddy change; a mismatch is the old-shell/new-artifact drift defect.
+    const shell = args.get("shell");
+    const artifact = args.get("artifact");
+    const manifest = args.get("manifest");
+    if (!shell || !artifact || !manifest) {
+      throw new Error(
+        "check-deploy requires --shell <dir> --artifact <path> --manifest <path> (the paths the static host actually serves)",
+      );
+    }
+    const result = await checkDeployment({
+      releasesRoot,
+      shellDir: resolve(shell),
+      artifactPath: resolve(artifact),
+      manifestPath: resolve(manifest),
+    });
+    console.log(`deploy ${result.releaseId} consistent`);
   } else if (command === "build") {
     const sourceSha = args.get("source-sha") ?? process.env.GITHUB_SHA ?? "unknown";
     const shellDir = resolve(args.get("shell") ?? "web/workspace-shell/dist");
@@ -1151,7 +1239,9 @@ async function main() {
     console.log(`published ${releaseId} (${manifest.artifact.sha256_hex.slice(0, 12)})`);
     console.log(`manifest: ${join(releasesRoot, releaseId, MANIFEST_FILE)}`);
   } else {
-    throw new Error("usage: build|validate|rollback|current --root <dir>");
+    throw new Error(
+      "usage: build|validate|rollback|current --root <dir> | check-deploy --root <dir> --shell <dir> --artifact <path> --manifest <path>",
+    );
   }
 }
 

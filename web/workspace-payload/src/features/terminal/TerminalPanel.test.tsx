@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@solidjs/testing-library";
 import { TerminalPanel } from "./TerminalPanel";
 import { WorkspaceProvider, createWorkspaceStore } from "../../state/session";
+import { WorkstationProvider } from "../../state/workstation";
 import { parseWorkspaceSession } from "../../transport/bootstrap";
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -28,7 +29,9 @@ describe("TerminalPanel", () => {
     await flush();
     render(() => (
       <WorkspaceProvider store={store}>
-        <TerminalPanel />
+        <WorkstationProvider ws={store}>
+          <TerminalPanel />
+        </WorkstationProvider>
       </WorkspaceProvider>
     ));
     expect(screen.getByText(/AWAITING FEED/)).toBeTruthy();

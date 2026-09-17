@@ -45,6 +45,7 @@ import {
   SHELL_DIR,
   acquireReleaseLock,
   buildAndPublishRelease,
+  checkDeployment,
   computeReleaseManifest,
   digestDirectory,
   isDefaultPayloadDir,
@@ -608,6 +609,111 @@ test("managed-path blocks keep unrelated headers while cache rules are replaced"
     assert.equal(rerun, headers);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("check-deploy keeps shell, manifest and artifact on one release", async () => {
+  const root = await mkdtemp(join(tmpdir(), "release-deploy-check-"));
+  const shellDir = await mkdtemp(join(tmpdir(), "release-deploy-check-src-"));
+  try {
+    await writeFile(join(shellDir, "index.html"), "<!doctype html>");
+    const first = await publishRelease({
+      releasesRoot: root,
+      artifact: fakeArtifact(),
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "9a5a712",
+      shellDir,
+    });
+    const consistent = await checkDeployment({
+      releasesRoot: root,
+      shellDir: join(root, first.releaseId, SHELL_DIR),
+      artifactPath: join(root, first.releaseId, ARTIFACT_FILE),
+      manifestPath: join(root, first.releaseId, MANIFEST_FILE),
+    });
+    assert.equal(consistent.releaseId, first.releaseId);
+
+    // Publishing a second release moves `current`; the previous release's shell
+    // is now stale. Serving it against the new artifact must fail closed.
+    const secondArtifact = Buffer.concat([
+      Buffer.from([1]),
+      KID,
+      Buffer.alloc(32, 5),
+      Buffer.alloc(16, 6),
+    ]);
+    const second = await publishRelease({
+      releasesRoot: root,
+      artifact: secondArtifact,
+      publicKeyB64: PUBLIC_KEY_B64,
+      kidB64: KID_B64,
+      sourceSha: "beef123",
+      shellDir,
+    });
+    assert.notEqual(second.releaseId, first.releaseId);
+    await assert.rejects(
+      checkDeployment({
+        releasesRoot: root,
+        shellDir: join(root, first.releaseId, SHELL_DIR),
+        artifactPath: join(root, second.releaseId, ARTIFACT_FILE),
+        manifestPath: join(root, second.releaseId, MANIFEST_FILE),
+      }),
+      /shell is not served from the current release/,
+    );
+
+    // A shell directory outside the releases root (a separately built static
+    // host) is refused too, even when it is the byte-identical build.
+    await assert.rejects(
+      checkDeployment({
+        releasesRoot: root,
+        shellDir,
+        artifactPath: join(root, second.releaseId, ARTIFACT_FILE),
+        manifestPath: join(root, second.releaseId, MANIFEST_FILE),
+      }),
+      /shell is not served from the current release/,
+    );
+
+    // A stale artifact/manifest from the previous release is refused as well.
+    await assert.rejects(
+      checkDeployment({
+        releasesRoot: root,
+        shellDir: join(root, second.releaseId, SHELL_DIR),
+        artifactPath: join(root, first.releaseId, ARTIFACT_FILE),
+        manifestPath: join(root, second.releaseId, MANIFEST_FILE),
+      }),
+      /artifact is not served from the current release/,
+    );
+    await assert.rejects(
+      checkDeployment({
+        releasesRoot: root,
+        shellDir: join(root, second.releaseId, SHELL_DIR),
+        artifactPath: join(root, second.releaseId, ARTIFACT_FILE),
+        manifestPath: join(root, first.releaseId, MANIFEST_FILE),
+      }),
+      /manifest is not served from the current release/,
+    );
+
+    // An omitted served path is an error, never a silently skipped check: a
+    // partially-specified deploy must not print "consistent".
+    await assert.rejects(
+      checkDeployment({
+        releasesRoot: root,
+        shellDir: join(root, second.releaseId, SHELL_DIR),
+        artifactPath: join(root, second.releaseId, ARTIFACT_FILE),
+      }),
+      /requires an explicit manifest path/,
+    );
+
+    // The fully-explicit current release still validates after the refusals.
+    const ok = await checkDeployment({
+      releasesRoot: root,
+      shellDir: join(root, second.releaseId, SHELL_DIR),
+      artifactPath: join(root, second.releaseId, ARTIFACT_FILE),
+      manifestPath: join(root, second.releaseId, MANIFEST_FILE),
+    });
+    assert.equal(ok.releaseId, second.releaseId);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(shellDir, { recursive: true, force: true });
   }
 });
 

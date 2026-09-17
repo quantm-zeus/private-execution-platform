@@ -94,22 +94,53 @@ export function candle(timeMs: number, close: number, volume = 10) {
   };
 }
 
-export function ohlcvSnapshot(close = 100, bars = 40) {
-  const start = 1_700_000_000_000;
+const TIMEFRAME_MS: Record<string, number> = {
+  "1m": 60_000,
+  "5m": 300_000,
+  "15m": 900_000,
+  "1h": 3_600_000,
+  "4h": 14_400_000,
+  "1d": 86_400_000,
+};
+
+export interface OhlcvSnapshotOptions {
+  /** Exact sealed entity key, e.g. `ohlcv:base:0x…`. Defaults to `ohlcv:default`. */
+  readonly entityKey?: string;
+  readonly timeframe?: string;
+  /** Explicit start time; defaults to a recent window ending at the test clock. */
+  readonly startMs?: number;
+}
+
+/**
+ * A production-faithful OHLCV snapshot. The bars end at/just before `Date.now()`
+ * on the requested timeframe, so KLineChart Pro's *current* history window
+ * actually contains them (a fixed 2023 epoch renders as a single right-edge bar
+ * because Pro asks for the live window).
+ */
+export function ohlcvSnapshot(close = 100, bars = 40, options: OhlcvSnapshotOptions = {}) {
+  const timeframe = options.timeframe ?? "1m";
+  const stepMs = TIMEFRAME_MS[timeframe] ?? 60_000;
+  const end = Math.floor(Date.now() / stepMs) * stepMs;
+  const start = options.startMs ?? end - (bars - 1) * stepMs;
   return {
     op: "snapshot",
     channel: "ohlcv",
     priority: 1,
-    entity_key: "ohlcv:default",
+    entity_key: options.entityKey ?? "ohlcv:default",
     slot: 1,
     source_age_ms: 0,
     payload: {
-      timeframe: "1m",
+      timeframe,
       candles: Array.from({ length: bars }, (_, index) =>
-        candle(start + index * 60_000, close + index),
+        candle(start + index * stepMs, close + index),
       ),
     },
   };
+}
+
+/** The exact entity key the chart uses for a selected instrument. */
+export function selectedEntityKey(chain: string, address: string): string {
+  return `ohlcv:${chain}:${address}`;
 }
 
 export function depthSnapshot(bestBid = 100, bestAsk = 101) {
@@ -134,15 +165,21 @@ export function depthSnapshot(bestBid = 100, bestAsk = 101) {
   };
 }
 
-export function ohlcvDelta(close: number) {
+export function ohlcvDelta(
+  close: number,
+  options: { entityKey?: string; timeframe?: string } = {},
+) {
+  const timeframe = options.timeframe ?? "1m";
+  const stepMs = TIMEFRAME_MS[timeframe] ?? 60_000;
+  const timestamp = Math.floor(Date.now() / stepMs) * stepMs;
   return {
     op: "delta",
     channel: "ohlcv",
     priority: 1,
-    entity_key: "ohlcv:default",
+    entity_key: options.entityKey ?? "ohlcv:default",
     slot: 2,
     source_age_ms: 0,
-    payload: { timeframe: "1m", candle: candle(1_700_000_000_000 + 40 * 60_000, close) },
+    payload: { timeframe, candle: candle(timestamp, close) },
   };
 }
 
@@ -161,9 +198,9 @@ export async function searchTokens(page: Page, query: string): Promise<void> {
 }
 
 /**
- * Search and click a result in the top-bar popover. Results are `<button
- * role="option">` rows, so the symbol cell is clicked directly (the opt-in
- * result is the only selection path that resolves the shared ticket target).
+ * Search and click a result in the top-bar combobox. Results are `<li
+ * role="option">` rows; the symbol cell is clicked (its click bubbles to the
+ * option), which is the only selection path that resolves the shared target.
  */
 export async function selectSearchResult(page: Page, symbol: string): Promise<void> {
   const cell = page

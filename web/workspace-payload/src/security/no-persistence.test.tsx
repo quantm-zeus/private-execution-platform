@@ -91,6 +91,8 @@ function fakeCommandClient(): CommandClient {
           } as unknown as T;
         case "get_wallet_limits":
           return WALLET_LIMITS as unknown as T;
+        case "set_realtime_target":
+          return { accepted: true } as unknown as T;
         default:
           throw new Error(`unexpected op ${op}`);
       }
@@ -144,7 +146,7 @@ async function runTokenSearch(query: string) {
   const input = screen.getByLabelText("Search token") as HTMLInputElement;
   fireEvent.input(input, { target: { value: query } });
   await waitFor(
-    () => expect(document.querySelector(".search-popover button")).not.toBeNull(),
+    () => expect(document.querySelector('.search-popover [role="option"]')).not.toBeNull(),
     { timeout: 2_000 },
   );
 }

@@ -122,6 +122,8 @@ function fakeCommandClient(): CommandClient {
           } as unknown as T;
         case "get_wallet_limits":
           return WALLET_LIMITS as unknown as T;
+        case "set_realtime_target":
+          return { accepted: true } as unknown as T;
         default:
           throw new Error(`unexpected op ${op}`);
       }
@@ -173,12 +175,12 @@ function renderShell(store: ReturnType<typeof createWorkspaceStore>) {
 async function selectViaSearch(query: string, expectedSymbol: string) {
   const input = screen.getByLabelText("Search token") as HTMLInputElement;
   fireEvent.input(input, { target: { value: query } });
-  let result: HTMLButtonElement | undefined;
+  let result: HTMLElement | undefined;
   await waitFor(
     () => {
-      result = Array.from(document.querySelectorAll<HTMLButtonElement>(".search-popover button")).find(
-        (button) => button.textContent?.includes(expectedSymbol),
-      );
+      result = Array.from(
+        document.querySelectorAll<HTMLElement>('.search-popover [role="option"]'),
+      ).find((option) => option.textContent?.includes(expectedSymbol));
       expect(result).not.toBeUndefined();
     },
     { timeout: 2_000 },
@@ -222,7 +224,7 @@ describe("AppShell", () => {
       screen.getByRole("heading", { name: "Evergreen Private Workspace" }),
     ).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "Lock" })).toHaveLength(1);
-    expect(screen.getByRole("searchbox", { name: "Search token" })).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Search token" })).toBeTruthy();
     expect(document.querySelector(".terminal.workspace")).not.toBeNull();
     expect(document.getElementById("terminal-main")).not.toBeNull();
 
@@ -254,6 +256,49 @@ describe("AppShell", () => {
     fireEvent.click(pepe!);
     await flush();
     expect(screen.getByTestId("selected-instrument").textContent).toMatch(/PEPE/);
+  });
+
+  it("renders trending price as the primary row value and — when the provider omits it", async () => {
+    const fallback = fakeCommandClient();
+    const priced = {
+      ...BONK,
+      name: "Bonk",
+      priceUsd: 0.0000123,
+      marketCapUsd: 1_000_000,
+      rank: 3,
+    };
+    const unpriced = { ...PEPE, name: "Pepe" };
+    const command: CommandClient = {
+      async send<T>(op: string, payload?: unknown, options?: Parameters<CommandClient["send"]>[2]): Promise<T> {
+        if (op === "get_trending") {
+          return { category: "trending", count: 2, tokens: [priced, unpriced] } as unknown as T;
+        }
+        return fallback.send<T>(op, payload, options);
+      },
+    };
+    const store = createStore(command);
+    await flush();
+    renderShell(store);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("trending-tokens").textContent).toMatch(/BONK/);
+      expect(screen.getByTestId("trending-tokens").textContent).toMatch(/PEPE/);
+    });
+
+    const rows = Array.from(
+      screen.getByTestId("trending-tokens").querySelectorAll<HTMLButtonElement>(".market-item"),
+    );
+    const bonkRow = rows.find((row) => row.textContent?.includes("BONK"))!;
+    const pepeRow = rows.find((row) => row.textContent?.includes("PEPE"))!;
+
+    expect(bonkRow.querySelector('[data-testid="market-row-price"]')?.textContent).toContain(
+      "$0.000012",
+    );
+    const pepePrice = pepeRow.querySelector('[data-testid="market-row-price"]')?.textContent;
+    expect(pepePrice).toBe("—");
+    // Never the address, never a confident zero.
+    expect(pepeRow.textContent).not.toContain(PEPE.address);
+    expect(pepePrice).not.toContain("$0.00");
   });
 
   it("switches between Market and Limit while preserving the selected instrument", async () => {

@@ -22,6 +22,19 @@ export function timeframeById(id: string): Timeframe | undefined {
   return TIMEFRAMES.find((timeframe) => timeframe.id === id);
 }
 
+/**
+ * Timeframes the authoritative paths can actually serve: the canonical
+ * `get_chart` windows and the Pro period bar. Seconds exist only as local
+ * aggregation primitives and are rejected by the backend realtime target, so
+ * the shared workstation timeframe must never accept them (a determinate
+ * rejection would otherwise wedge the target binding).
+ */
+export const SERVED_TIMEFRAME_IDS: readonly string[] = ["1m", "5m", "15m", "1h", "4h", "1d"];
+
+export function isServedTimeframe(id: string): boolean {
+  return SERVED_TIMEFRAME_IDS.includes(id);
+}
+
 function isValidCandle(candle: CandleLike): boolean {
   return (
     Number.isFinite(candle.timeMs) &&

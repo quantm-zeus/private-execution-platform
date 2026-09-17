@@ -75,3 +75,15 @@ describe("CandleSeries", () => {
     expect(series.range(1_000, 3_000).map((c) => c.timeMs)).toEqual([1_000, 2_000, 3_000]);
   });
 });
+
+describe("served timeframes", () => {
+  it("accepts only windows the backend and Pro period bar can serve", async () => {
+    const { isServedTimeframe, SERVED_TIMEFRAME_IDS } = await import("./ohlcv");
+    for (const id of SERVED_TIMEFRAME_IDS) expect(isServedTimeframe(id)).toBe(true);
+    // Seconds are local aggregation primitives only; the backend realtime target
+    // rejects them, so the shared workstation timeframe must never accept one.
+    expect(isServedTimeframe("1s")).toBe(false);
+    expect(isServedTimeframe("5s")).toBe(false);
+    expect(isServedTimeframe("nope")).toBe(false);
+  });
+});

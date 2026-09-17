@@ -71,7 +71,12 @@ const Terminal: Component = () => {
           <section class="chart-pane" aria-label="Price chart">
             <div class="chart-pane__bar">
               <div class="chart-pane__identity">
-                <Badge tone="muted">Chart</Badge>
+                <span class="chart-pane__symbol">
+                  {ws.selectedInstrument()?.symbol ?? "Price"}
+                </span>
+                <span class="muted">
+                  {ws.selectedInstrument()?.chain ?? "Select a token to load its chart"}
+                </span>
               </div>
               <TokenRiskStrip />
             </div>

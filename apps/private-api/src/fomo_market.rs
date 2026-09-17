@@ -3007,6 +3007,8 @@ mod tests {
         search: StdMutex<Option<Result<BridgeSearch, FomoMarketError>>>,
         token: StdMutex<Option<Result<BridgeTokenDetail, FomoMarketError>>>,
         trending: StdMutex<Option<Result<BridgeTrending, FomoMarketError>>>,
+        /// Every `search` query the dispatcher forwarded, in order.
+        search_queries: StdMutex<Vec<String>>,
     }
 
     impl FakeMarketProvider {
@@ -3028,6 +3030,9 @@ mod tests {
         fn set_trending(&self, result: Result<BridgeTrending, FomoMarketError>) {
             *self.trending.lock().unwrap() = Some(result);
         }
+        fn search_queries(&self) -> Vec<String> {
+            self.search_queries.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -3041,7 +3046,8 @@ mod tests {
                 .ok_or(FomoMarketError::Unavailable)
         }
 
-        async fn search(&self, _query: &str) -> Result<BridgeSearch, FomoMarketError> {
+        async fn search(&self, query: &str) -> Result<BridgeSearch, FomoMarketError> {
+            self.search_queries.lock().unwrap().push(query.to_string());
             self.search
                 .lock()
                 .unwrap()
@@ -3129,6 +3135,34 @@ mod tests {
         assert_eq!(results[2]["chain"], "robinhood");
         // Decimals are never guessed.
         assert!(results.iter().all(|row| row.get("decimals").is_none()));
+    }
+
+    #[tokio::test]
+    async fn search_forwards_name_and_address_queries_verbatim() {
+        let provider = Arc::new(FakeMarketProvider::default());
+        provider.set_search(Ok(BridgeSearch {
+            query: "echo".to_string(),
+            count: 1,
+            results: vec![bridge_token("0xbase", 8_453, "BASE")],
+        }));
+        let dispatcher = FomoChartDispatcher::new(
+            Arc::new(crate::opaque::FailClosedDispatcher),
+            provider.clone(),
+        );
+        let address = "0x00000000000000000000000000000000000000a1";
+        // Live FOMO matches symbol, name and full address; PEP must forward the
+        // operator's query byte-for-byte and never rewrite/normalize it.
+        for query in ["Bonk Inu", address] {
+            let result = dispatcher
+                .dispatch(&market_request("search_token", json!({ "query": query })))
+                .await
+                .unwrap();
+            assert_eq!(result["results"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            provider.search_queries(),
+            vec!["Bonk Inu".to_string(), address.to_string()]
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,23 @@ export interface TokenRef {
   readonly decimals?: number;
 }
 
+/**
+ * A typed market-list row: a `TokenRef` plus the optional financial fields a
+ * market provider may return for list surfaces (search / trending / watchlist).
+ *
+ * The backend already returns `priceUsd` / `marketCapUsd` / `rank` on trending
+ * rows. They are optional by contract: an absent or non-finite value stays
+ * `null` so the renderer shows an explicit `—` and never invents a zero. The
+ * row is a superset of `TokenRef`, so existing selection/detail consumers keep
+ * accepting it unchanged.
+ */
+export interface MarketListRow extends TokenRef {
+  readonly priceUsd: number | null;
+  readonly priceChange24h: number | null;
+  readonly marketCapUsd: number | null;
+  readonly rank: number | null;
+}
+
 export interface TokenStats {
   readonly priceUsd: number | null;
   readonly priceChange24h: number | null;

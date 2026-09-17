@@ -1,32 +1,65 @@
 import { For, Show, createMemo, type Component } from "solid-js";
-import { truncateAddress } from "../../core/format";
-import type { TokenRef } from "../../contracts/market";
+import { formatPercent, formatUsd } from "../../core/format";
+import type { MarketListRow } from "../../contracts/market";
 import { tokenLabel, useWorkstation } from "../../state/workstation";
 import { useWorkspace } from "../../state/session";
 import { CompactNote } from "../ui/states";
 
-const MarketItem: Component<{ token: TokenRef }> = (props) => {
+/** Optional rank/change context on the right, never a fabricated zero. */
+function secondaryValue(row: MarketListRow): string | null {
+  if (row.priceChange24h !== null) return formatPercent(row.priceChange24h);
+  if (row.rank !== null) return `#${row.rank}`;
+  return null;
+}
+
+function secondaryTone(row: MarketListRow): string {
+  if (row.priceChange24h === null) return "market-item__sub--muted";
+  return row.priceChange24h >= 0 ? "market-item__sub--up" : "market-item__sub--down";
+}
+
+/**
+ * One trading-product market row: identity on the left, the price as the
+ * primary right-side value, and optional change/rank context beneath it. A
+ * missing price renders an explicit `—`; the contract address is context only
+ * (tooltip), never the numeric column.
+ */
+const MarketItem: Component<{ row: MarketListRow }> = (props) => {
   const ws = useWorkspace();
   const station = useWorkstation();
   const active = createMemo(() => {
     const selected = ws.selectedInstrument();
     return (
       selected !== null &&
-      selected.chain === props.token.chain &&
-      selected.address === props.token.address
+      selected.chain === props.row.chain &&
+      selected.address === props.row.address
     );
   });
+  const sub = createMemo(() => secondaryValue(props.row));
   return (
     <li>
       <button
         type="button"
         class="market-item"
         aria-pressed={active()}
-        title={`${tokenLabel(props.token)} · ${props.token.address}`}
-        onClick={() => station.selectInstrument(props.token)}
+        title={`${tokenLabel(props.row)} · ${props.row.name ?? ""} · ${props.row.chain} · ${props.row.address}`}
+        onClick={() => station.selectInstrument(props.row)}
       >
-        <span class="market-item__symbol">{tokenLabel(props.token)}</span>
-        <span class="market-item__meta">{truncateAddress(props.token.address, 4, 4)}</span>
+        <span class="market-item__id">
+          <span class="market-item__symbol">{tokenLabel(props.row)}</span>
+          <span class="market-item__name">
+            {props.row.name && props.row.name !== tokenLabel(props.row)
+              ? props.row.name
+              : props.row.chain}
+          </span>
+        </span>
+        <span class="market-item__value">
+          <span class="market-item__price" data-testid="market-row-price">
+            {formatUsd(props.row.priceUsd, 6)}
+          </span>
+          <span class={`market-item__sub ${secondaryTone(props.row)}`}>
+            {sub() ?? props.row.chain}
+          </span>
+        </span>
       </button>
     </li>
   );
@@ -39,11 +72,11 @@ const MarketItem: Component<{ token: TokenRef }> = (props) => {
  */
 export const MarketRail: Component = () => {
   const station = useWorkstation();
-  const results = createMemo<readonly TokenRef[]>(() => {
+  const results = createMemo<readonly MarketListRow[]>(() => {
     const state = station.searchState();
     return state.kind === "ready" || state.kind === "stale" ? state.value.results : [];
   });
-  const trendingTokens = createMemo<readonly TokenRef[]>(() => {
+  const trendingTokens = createMemo<readonly MarketListRow[]>(() => {
     const state = station.trendingState();
     if (state.kind === "ready" || state.kind === "stale") return state.value.tokens;
     if ((state.kind === "loading" || state.kind === "error") && state.prior) return state.prior.tokens;
@@ -88,7 +121,7 @@ export const MarketRail: Component = () => {
           <section class="market-rail__section" aria-label="Search results">
             <p class="market-rail__section-head">Search results</p>
             <ul class="market-rail__list">
-              <For each={results()}>{(token) => <MarketItem token={token} />}</For>
+              <For each={results()}>{(row) => <MarketItem row={row} />}</For>
             </ul>
           </section>
         </Show>
@@ -100,7 +133,7 @@ export const MarketRail: Component = () => {
             fallback={<p class="market-rail__section-head muted">No watched tokens yet.</p>}
           >
             <ul class="market-rail__list">
-              <For each={station.watchlist()}>{(token) => <MarketItem token={token} />}</For>
+              <For each={station.watchlist()}>{(row) => <MarketItem row={row} />}</For>
             </ul>
           </Show>
         </section>
@@ -112,7 +145,7 @@ export const MarketRail: Component = () => {
             fallback={<p class="market-rail__section-head muted">No recent selections.</p>}
           >
             <ul class="market-rail__list">
-              <For each={station.recent()}>{(token) => <MarketItem token={token} />}</For>
+              <For each={station.recent()}>{(row) => <MarketItem row={row} />}</For>
             </ul>
           </Show>
         </section>
@@ -146,7 +179,7 @@ export const MarketRail: Component = () => {
           >
             <Show when={trendingTokens().length > 0}>
               <ul class="market-rail__list" data-testid="trending-tokens">
-                <For each={trendingTokens()}>{(token) => <MarketItem token={token} />}</For>
+                <For each={trendingTokens()}>{(row) => <MarketItem row={row} />}</For>
               </ul>
             </Show>
             <Show when={trendingTokens().length === 0 && trendingLoading()}>

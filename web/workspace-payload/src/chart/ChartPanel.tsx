@@ -6,6 +6,7 @@ import {
   createSignal,
   onCleanup,
   onMount,
+  untrack,
   type Component,
 } from "solid-js";
 import {
@@ -17,12 +18,13 @@ import {
 } from "./chart-datafeed";
 import { createPepHistoryProvider, createServerHistoryProvider } from "./history";
 import { createProChart, type ProChartHandle } from "./pro/pro-chart";
-import { DEFAULT_PRO_TIMEFRAME, PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
+import { PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
 import { timeframeById, type Timeframe } from "../market/ohlcv";
 import { formatAmount, formatBps, truncateAddress } from "../core/format";
 import type { InstrumentRef } from "../core/types";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
 import { useWorkspace } from "../state/session";
+import { useWorkstation } from "../state/workstation";
 import { Badge } from "../components/ui/primitives";
 import { EmptyBlock } from "../components/ui/states";
 
@@ -68,9 +70,25 @@ function subjectFromEntityKey(key: string): ChartSubject | null {
  */
 export const ChartPanel: Component<ChartPanelProps> = (props) => {
   const ws = useWorkspace();
+  const station = useWorkstation();
   const feed = useRealtimeFeedContext();
   const router = new ChartFrameRouter();
   const [version, setVersion] = createSignal(0);
+
+  // The workstation store owns the authoritative timeframe: the chart and the
+  // encrypted realtime-target coordinator read the same signal, so switching a
+  // window issues exactly one `set_realtime_target` for the selected token.
+  const activeTimeframe = createMemo<string>(() => {
+    const shared = station.timeframe();
+    if (timeframeById(shared)) return shared;
+    if (props.initialTimeframe && timeframeById(props.initialTimeframe)) {
+      return props.initialTimeframe;
+    }
+    return "1m";
+  });
+  const activeTimeframeDef = createMemo<Timeframe>(
+    () => timeframeById(activeTimeframe()) ?? timeframeById("1m")!,
+  );
 
   const explicitSubject = createMemo<ChartSubject | null>(() => {
     if (props.entityKey !== undefined && props.entityKey.length > 0) {
@@ -113,19 +131,15 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   let handle: ProChartHandle | null = null;
   let activeDatafeed: ProDatafeed | null = null;
   let createdTicker: string | null = null;
+  let createdNonce = -1;
   const [chartError, setChartError] = createSignal(false);
-  // Only offer periods the local contract can serve; an unknown initial id
-  // falls back explicitly instead of silently rendering a different window.
-  const normalizedInitialTimeframe = PRO_PERIODS.some(
-    (period) => period.text === props.initialTimeframe,
-  )
-    ? props.initialTimeframe!
-    : DEFAULT_PRO_TIMEFRAME;
-  let timeframeId = normalizedInitialTimeframe;
-  const [activeTimeframe, setActiveTimeframe] = createSignal(normalizedInitialTimeframe);
-  const activeTimeframeDef = createMemo<Timeframe>(
-    () => timeframeById(activeTimeframe()) ?? timeframeById(DEFAULT_PRO_TIMEFRAME)!,
-  );
+  // Bumped when the exact selected entity+timeframe gains its first local
+  // candles after the renderer was created. Pro loads history once at init, so a
+  // snapshot that arrives afterwards would otherwise leave only its single
+  // replayed bar on screen; the bump rebuilds the renderer so `getHistoryKLineData`
+  // runs again against the now-populated local buffer and the full series renders.
+  const [reloadNonce, setReloadNonce] = createSignal(0);
+  let hydratedKey: string | null = null;
 
   // The badge reflects the CURRENT exact subject/timeframe only, so an
   // `ohlcv:default` or depth frame can never make a selected token look live
@@ -138,8 +152,9 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   createEffect(() => {
     const current = subject();
     const ticker = chartTicker(current);
+    const nonce = reloadNonce();
     if (!host) return;
-    if (handle !== null && createdTicker === ticker) return;
+    if (handle !== null && createdTicker === ticker && createdNonce === nonce) return;
     // Pro 0.1.1 can drop the last symbol/period change when two land while a
     // history load is in flight (its loading guard is not reactive), so a
     // subject switch rebuilds the renderer instead of calling `setSymbol`.
@@ -157,11 +172,20 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
       handle = createProChart(host, {
         subject: current,
         datafeed,
-        timeframeId,
+        // Read the initial window without tracking it: a timeframe change is
+        // applied in place by the effect below, not by rebuilding the chart.
+        timeframeId: untrack(activeTimeframe),
         testId: "pro-chart",
       });
       activeDatafeed = datafeed;
       createdTicker = ticker;
+      createdNonce = nonce;
+      // If the local buffer already has this entity+window, the init history load
+      // renders it; mark it hydrated so the effect below does not rebuild again.
+      const timeframe = untrack(activeTimeframeDef);
+      if (router.localCandles(current, timeframe).length > 0) {
+        hydratedKey = `${ticker}#${timeframe.id}`;
+      }
       setChartError(false);
     } catch {
       // No usable canvas (unsupported/headless runtime): degrade to a clear
@@ -171,6 +195,24 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
       handle = null;
       setChartError(true);
     }
+  });
+
+  // Rebuild once per exact entity+window when its first local candles arrive.
+  createEffect(() => {
+    const current = subject();
+    const timeframe = activeTimeframeDef();
+    version();
+    const key = `${chartTicker(current)}#${timeframe.id}`;
+    if (router.localCandles(current, timeframe).length > 0 && hydratedKey !== key) {
+      hydratedKey = key;
+      setReloadNonce((value) => value + 1);
+    }
+  });
+
+  // A timeframe change is applied to the live renderer in place.
+  createEffect(() => {
+    const value = activeTimeframe();
+    handle?.setTimeframe(value);
   });
 
   onCleanup(() => {
@@ -191,39 +233,40 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
 
   return (
     <div class="chart-panel">
-      <div class="chart-target" data-testid="chart-target">
-        <Show when={hasTarget()} fallback={<Badge tone="muted">No target selected</Badge>}>
-          <Badge tone="info">
-            {subject().symbol} · {truncateAddress(subject().address, 6, 6)} · {subject().chain}
+      <div class="chart-panel__head">
+        <div class="chart-target" data-testid="chart-target" data-candles={String(selectedCandleCount())}>
+          <Show when={hasTarget()} fallback={<Badge tone="muted">No target selected</Badge>}>
+            <Badge tone="info">
+              {subject().symbol} · {truncateAddress(subject().address, 6, 6)} · {subject().chain}
+            </Badge>
+          </Show>
+          <Badge tone={selectedCandleCount() > 0 ? "positive" : "muted"}>
+            {selectedCandleCount() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
           </Badge>
-        </Show>
-        <Badge tone={selectedCandleCount() > 0 ? "positive" : "muted"}>
-          {selectedCandleCount() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
-        </Badge>
-      </div>
-      {/* First-party timeframe control: KLineChart Pro 0.1.1's own period items
-          are non-focusable spans, so the keyboard/AT path is owned here. The
-          vendor period bar is hidden. */}
-      <div class="chart-toolbar">
-        <label class="chart-toolbar__label" for="chart-timeframe">
-          Timeframe
-        </label>
-        <select
-          id="chart-timeframe"
-          class="input chart-timeframe"
-          aria-label="Chart timeframe"
-          value={activeTimeframe()}
-          onChange={(event) => {
-            const value = event.currentTarget.value;
-            timeframeId = value;
-            setActiveTimeframe(value);
-            handle?.setTimeframe(value);
-          }}
-        >
-          <For each={PRO_PERIODS}>
-            {(period) => <option value={period.text}>{period.text}</option>}
-          </For>
-        </select>
+        </div>
+        {/* First-party timeframe control: KLineChart Pro 0.1.1's own period items
+            are non-focusable spans, so the keyboard/AT path is owned here. The
+            vendor period bar is hidden. */}
+        <div class="chart-toolbar">
+          <label class="chart-toolbar__label" for="chart-timeframe">
+            Timeframe
+          </label>
+          <select
+            id="chart-timeframe"
+            class="input chart-timeframe"
+            aria-label="Chart timeframe"
+            value={activeTimeframe()}
+            onChange={(event) => {
+              // The workstation store owns the window; the effect above applies it
+              // to the live renderer and the coordinator re-targets the stream.
+              station.setTimeframe(event.currentTarget.value);
+            }}
+          >
+            <For each={PRO_PERIODS}>
+              {(period) => <option value={period.text}>{period.text}</option>}
+            </For>
+          </select>
+        </div>
       </div>
       <Show when={chartError()}>
         <EmptyBlock

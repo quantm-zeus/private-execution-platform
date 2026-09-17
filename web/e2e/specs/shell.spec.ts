@@ -115,7 +115,10 @@ test.describe("shell artifact unlock", () => {
     ).toBeVisible({ timeout: 15_000 });
   });
 
-  test("lock revokes the blob payload frame and private state", async ({ page, request }) => {
+  test("post-unlock hides gateway chrome and the workspace frame owns the viewport", async ({
+    page,
+    request,
+  }) => {
     const info = await unlockInfo(request);
     test.skip(!info.available, `crypto tooling unavailable: ${info.reason ?? "unknown"}`);
 
@@ -124,7 +127,30 @@ test.describe("shell artifact unlock", () => {
       timeout: 20_000,
     });
 
-    await page.getByRole("button", { name: "Lock Workspace" }).click();
+    // The old gateway ledger, auth status, footer, Workspace security card and
+    // outside Lock action must all be gone from the rendered viewport.
+    await expect(page.locator("header.gateway__masthead")).toBeHidden();
+    await expect(page.locator(".ledger")).toBeHidden();
+    await expect(page.locator("#status")).toBeHidden();
+    await expect(page.locator(".gateway__footer")).toBeHidden();
+    await expect(page.getByRole("heading", { name: "Workspace security" })).toBeHidden();
+    await expect(page.getByRole("button", { name: "Lock Workspace" })).toBeHidden();
+    await expect(page.locator(".workspace__bar")).toBeHidden();
+
+    // The decrypted frame owns the entire viewport (the terminal is the product).
+    const frame = page.locator("#workspace-frame");
+    const box = await frame.boundingBox();
+    const viewport = page.viewportSize();
+    expect(box).not.toBeNull();
+    expect(viewport).not.toBeNull();
+    expect(box!.width).toBeGreaterThanOrEqual(viewport!.width - 1);
+    expect(box!.height).toBeGreaterThanOrEqual(viewport!.height - 1);
+
+    // The payload's own Lock tears the session down (the W9 logout path).
+    await page
+      .frameLocator("#workspace-frame")
+      .getByRole("button", { name: "Lock", exact: true })
+      .click();
     await expect(page.locator("#workspace-frame")).toHaveCount(0);
     await expect(page.getByText("Workspace locked.")).toBeVisible();
   });
