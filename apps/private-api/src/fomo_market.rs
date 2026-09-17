@@ -260,18 +260,19 @@ pub fn fomo_chain_slug(network_id: i64) -> Option<&'static str> {
 ///
 /// Every entry is a chain whose FOMO network id is verified above. `enabled`
 /// is consumed by the terminal's mutation surfaces as execution readiness, so
-/// read-path coverage alone must never set it. Solana/Base/Ethereum/BNB Chain
-/// are execution-verified by `chain-adapters`; Robinhood-associated is read-only
-/// and remains explicitly disabled for execution advertisement. The native quote
-/// asset is intentionally `None`: PEP has no authoritative native-asset address
-/// for these chains and must not guess one (the web fails closed on a `null`
-/// native token).
+/// a read-path registry must NEVER set it merely because an adapter type exists.
+/// Production execution readiness belongs to the live composition after a
+/// concrete transport is configured and probed; this read-only FOMO registry
+/// therefore advertises every identity with `enabled=false`, including chains
+/// that have verified adapter implementations. The native quote asset is
+/// intentionally `None`: PEP has no authoritative native-asset address for
+/// these read identities and must not guess one.
 pub fn read_path_chains() -> Vec<crate::opaque::ChainEntry> {
     [
-        ("solana", "Solana", true),
-        ("base", "Base", true),
-        ("ethereum", "Ethereum", true),
-        ("bnb_chain", "BNB Chain", true),
+        ("solana", "Solana", false),
+        ("base", "Base", false),
+        ("ethereum", "Ethereum", false),
+        ("bnb_chain", "BNB Chain", false),
         ("robinhood", "Robinhood", false),
     ]
     .into_iter()
@@ -3084,17 +3085,16 @@ mod tests {
         assert_eq!(fomo_chain_slug(999_999), None);
         let chains = read_path_chains();
         assert_eq!(chains.len(), 5);
-        for id in ["solana", "base", "ethereum", "bnb_chain"] {
-            assert!(chains.iter().any(|c| c.id == id && c.enabled), "{id}");
+        for id in ["solana", "base", "ethereum", "bnb_chain", "robinhood"] {
+            let chain = chains
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("missing read identity {id}"));
+            assert!(
+                !chain.enabled,
+                "read-path coverage must not advertise execution readiness for {id}"
+            );
         }
-        let robinhood = chains
-            .iter()
-            .find(|c| c.id == "robinhood")
-            .expect("robinhood read identity");
-        assert!(
-            !robinhood.enabled,
-            "Robinhood read coverage must not advertise execution readiness"
-        );
         // No native quote asset is guessed.
         assert!(chains.iter().all(|c| c.native_token.is_none()));
     }
