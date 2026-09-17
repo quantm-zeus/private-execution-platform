@@ -558,6 +558,47 @@ summary:focus-visible,
   max-width: 70ch;
 }
 
+/* After Root-Key V2 unlock, auth chrome disappears and the decrypted
+   workstation owns the full viewport. Lock/security remain inside the
+   workstation and this gateway returns after the host lock request. */
+.gateway.gateway--unlocked {
+  width: 100%;
+  max-width: none;
+  height: 100vh;
+  height: 100dvh;
+  margin: 0;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  background: #061014;
+}
+
+.gateway--unlocked > :not(.workspace) {
+  display: none;
+}
+
+.gateway--unlocked .workspace {
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.gateway--unlocked .workspace__bar {
+  display: none;
+}
+
+.gateway--unlocked .workspace-frame {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  display: block;
+}
+
 @media (max-width: 640px) {
   .gateway {
     width: min(100% - 1.5rem, 760px);

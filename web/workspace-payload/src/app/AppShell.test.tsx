@@ -92,6 +92,8 @@ function fakeCommandClient(): CommandClient {
       switch (op) {
         case "search_token":
           return { results: [BONK] } as unknown as T;
+        case "get_trending":
+          return { category: "trending", count: 2, tokens: [BONK, PEPE] } as unknown as T;
         case "get_token":
           return bonkDetail() as unknown as T;
         case "get_orders":
@@ -233,6 +235,25 @@ describe("AppShell", () => {
     for (const id of ["positions", "orders", "activity", "trades", "holders"]) {
       expect(screen.getByTestId(`dock-tab-${id}`)).toBeTruthy();
     }
+  });
+
+  it("loads real trending tokens through the encrypted market command and selects one", async () => {
+    const store = createStore();
+    await flush();
+    renderShell(store);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("trending-tokens").textContent).toMatch(/BONK/);
+      expect(screen.getByTestId("trending-tokens").textContent).toMatch(/PEPE/);
+    });
+
+    const pepe = Array.from(
+      screen.getByTestId("trending-tokens").querySelectorAll<HTMLButtonElement>("button"),
+    ).find((button) => button.textContent?.includes("PEPE"));
+    expect(pepe).not.toBeUndefined();
+    fireEvent.click(pepe!);
+    await flush();
+    expect(screen.getByTestId("selected-instrument").textContent).toMatch(/PEPE/);
   });
 
   it("switches between Market and Limit while preserving the selected instrument", async () => {

@@ -1,10 +1,12 @@
 import {
   createContext,
+  createEffect,
   createMemo,
   createSignal,
   getOwner,
   onCleanup,
   onMount,
+  untrack,
   useContext,
   type Accessor,
   type JSX,
@@ -21,8 +23,15 @@ interface SearchPayload {
   readonly results: readonly TokenRef[];
 }
 
+export interface TrendingPayload {
+  readonly category: string;
+  readonly tokens: readonly TokenRef[];
+}
+
 const SEARCH_TTL_MS = 30_000;
 const DETAIL_TTL_MS = 30_000;
+const TRENDING_TTL_MS = 30_000;
+const TRENDING_REFRESH_MS = 30_000;
 const RECENT_LIMIT = 8;
 const WATCHLIST_LIMIT = 50;
 
@@ -53,6 +62,10 @@ export interface WorkstationStore {
   readonly search: CommandResource<SearchPayload>;
   readonly searchState: Accessor<DataState<SearchPayload>>;
   readonly searchDenial: Accessor<CapabilityDenial | null>;
+  readonly trending: CommandResource<TrendingPayload>;
+  readonly trendingState: Accessor<DataState<TrendingPayload>>;
+  readonly trendingDenial: Accessor<CapabilityDenial | null>;
+  refreshTrending(): void;
 
   /* Selected token detail for the header stats and centre identity strip. */
   /** Detail value is visible only when it belongs to the currently selected token. */
@@ -80,11 +93,9 @@ function sameInstrument(a: { chain: string; address: string }, b: { chain: strin
   return a.chain === b.chain && a.address === b.address;
 }
 
-function asTokenResults(value: unknown): SearchPayload {
-  if (typeof value !== "object" || value === null) return { results: [] };
-  const results = (value as { results?: unknown }).results;
-  if (!Array.isArray(results)) return { results: [] };
-  const parsed = results.filter((entry): entry is TokenRef => {
+function parseTokenRefs(value: unknown): readonly TokenRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is TokenRef => {
     if (typeof entry !== "object" || entry === null) return false;
     const token = entry as Record<string, unknown>;
     return (
@@ -94,7 +105,22 @@ function asTokenResults(value: unknown): SearchPayload {
       token.address.length > 0
     );
   });
-  return { results: parsed };
+}
+
+function asTokenResults(value: unknown): SearchPayload {
+  if (typeof value !== "object" || value === null) return { results: [] };
+  return { results: parseTokenRefs((value as { results?: unknown }).results) };
+}
+
+function asTrendingPayload(value: unknown): TrendingPayload {
+  if (typeof value !== "object" || value === null) {
+    return { category: "trending", tokens: [] };
+  }
+  const raw = value as { category?: unknown; tokens?: unknown };
+  return {
+    category: typeof raw.category === "string" && raw.category.length > 0 ? raw.category : "trending",
+    tokens: parseTokenRefs(raw.tokens),
+  };
 }
 
 export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
@@ -121,6 +147,17 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     ttlMs: DETAIL_TTL_MS,
     clock: () => ws.nowMs(),
   });
+  const trendingDenial = () => ws.capabilityDenial("market");
+  const trending = createCommandResource<TrendingPayload>(ws.command, "get_trending", {
+    capability: "market",
+    ttlMs: TRENDING_TTL_MS,
+    clock: () => ws.nowMs(),
+    validate: asTrendingPayload,
+  });
+  const refreshTrending = (): void => {
+    if (!ws.commandReady() || trendingDenial()) return;
+    void trending.run({ category: "trending", limit: 30 });
+  };
   const visibleDetail = createMemo<TokenDetail | null>(() => {
     const selected = ws.selectedInstrument();
     if (!selected) return null;
@@ -185,6 +222,24 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
   const isWatched = (token: TokenRef): boolean =>
     watchlist().some((entry) => sameInstrument(entry, token));
 
+  let trendingTimer: ReturnType<typeof setInterval> | undefined;
+  createEffect(() => {
+    const canReadTrending = ws.commandReady() && !trendingDenial();
+    if (trendingTimer !== undefined) {
+      clearInterval(trendingTimer);
+      trendingTimer = undefined;
+    }
+    if (!canReadTrending) {
+      trending.reset();
+      return;
+    }
+    untrack(refreshTrending);
+    trendingTimer = setInterval(refreshTrending, TRENDING_REFRESH_MS);
+  });
+  onCleanup(() => {
+    if (trendingTimer !== undefined) clearInterval(trendingTimer);
+  });
+
   // Responsive collapse: the rail is the first thing to fold at <=1180px. A
   // user can still reopen it; crossing the breakpoint collapses but never
   // force-expands, so an explicit choice is not fought by the media query.
@@ -208,6 +263,7 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
 
   if (getOwner()) onCleanup(() => search.reset());
   if (getOwner()) onCleanup(() => detail.reset());
+  if (getOwner()) onCleanup(() => trending.reset());
 
   return {
     railCollapsed,
@@ -229,6 +285,10 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     search,
     searchState: search.state,
     searchDenial,
+    trending,
+    trendingState: trending.state,
+    trendingDenial,
+    refreshTrending,
     visibleDetail,
     recent,
     watchlist,

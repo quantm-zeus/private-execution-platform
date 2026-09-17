@@ -43,6 +43,20 @@ export const MarketRail: Component = () => {
     const state = station.searchState();
     return state.kind === "ready" || state.kind === "stale" ? state.value.results : [];
   });
+  const trendingTokens = createMemo<readonly TokenRef[]>(() => {
+    const state = station.trendingState();
+    if (state.kind === "ready" || state.kind === "stale") return state.value.tokens;
+    if ((state.kind === "loading" || state.kind === "error") && state.prior) return state.prior.tokens;
+    return [];
+  });
+  const trendingLoading = createMemo(() => {
+    const kind = station.trendingState().kind;
+    return kind === "idle" || kind === "loading";
+  });
+  const trendingError = createMemo(() => {
+    const state = station.trendingState();
+    return state.kind === "error" ? state.error.message : null;
+  });
 
   return (
     <div class="market-rail" aria-label="Markets">
@@ -104,14 +118,55 @@ export const MarketRail: Component = () => {
         </section>
 
         <section class="market-rail__section" aria-label="Trending">
-          <p class="market-rail__section-head">Trending</p>
-          <div class="market-rail__note">
-            <CompactNote
-              label="Trending"
-              reason="No composed trending feed is advertised by this deployment."
-              capability="market.trending"
-            />
-          </div>
+          <p class="market-rail__section-head">
+            <span>Trending</span>
+            <Show when={!station.trendingDenial()}>
+              <button
+                type="button"
+                class="market-rail__refresh"
+                onClick={() => station.refreshTrending()}
+                aria-label="Refresh trending tokens"
+                title="Refresh trending"
+              >
+                ↻
+              </button>
+            </Show>
+          </p>
+          <Show
+            when={!station.trendingDenial()}
+            fallback={
+              <div class="market-rail__note">
+                <CompactNote
+                  label="Trending"
+                  reason={station.trendingDenial()?.reason ?? "Market data is unavailable."}
+                  capability="market"
+                />
+              </div>
+            }
+          >
+            <Show when={trendingTokens().length > 0}>
+              <ul class="market-rail__list" data-testid="trending-tokens">
+                <For each={trendingTokens()}>{(token) => <MarketItem token={token} />}</For>
+              </ul>
+            </Show>
+            <Show when={trendingTokens().length === 0 && trendingLoading()}>
+              <p class="market-rail__empty" role="status">Loading trending…</p>
+            </Show>
+            <Show when={trendingTokens().length === 0 && trendingError()}>
+              <div class="market-rail__note" role="status">
+                <span class="muted">Trending temporarily unavailable.</span>
+              </div>
+            </Show>
+            <Show
+              when={
+                trendingTokens().length === 0 &&
+                !trendingLoading() &&
+                !trendingError()
+              }
+            >
+              <p class="market-rail__empty">No trending tokens right now.</p>
+            </Show>
+          </Show>
         </section>
       </div>
     </div>

@@ -946,7 +946,7 @@ function App() {
     !prfUnavailable() && selectPasskeyUnlockWrappers(wrappers()).length > 0;
 
   return (
-    <main class="gateway">
+    <main class="gateway" classList={{ "gateway--unlocked": isUnlocked() && !showSetupRecovery() }}>
       <header class="gateway__masthead">
         <p class="gateway__wordmark">Evergreen</p>
         <h1 class="gateway__title">Private Workspace Gateway</h1>

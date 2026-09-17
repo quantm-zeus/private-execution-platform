@@ -1083,6 +1083,28 @@ input[type="checkbox"] {
 .market-rail__note {
   padding: 0 var(--space-3) var(--space-3);
 }
+.market-rail__empty {
+  margin: 0;
+  padding: 6px var(--space-3) var(--space-3);
+  color: var(--text-3);
+  font-size: 12px;
+}
+.market-rail__refresh {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-dense);
+  cursor: pointer;
+  line-height: 1;
+}
+.market-rail__refresh:hover,
+.market-rail__refresh:focus-visible {
+  color: var(--text-1);
+  background: var(--surface-2);
+}
 .market-item {
   display: flex;
   align-items: center;
