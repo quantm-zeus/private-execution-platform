@@ -302,6 +302,40 @@ pub fn fomo_symbol(chain_slug: &str, address: &str) -> Option<String> {
     Some(format!("{address}:{network_id}"))
 }
 
+/// Whether a chain's token identity is verified EVM-address-shaped and may
+/// therefore be compared ASCII-case-insensitively.
+///
+/// Only Base/Ethereum/BNB Chain are verified EVM chains. Solana base58 is
+/// case-sensitive, and the Robinhood-associated network is not verified as EVM,
+/// so both must compare byte-for-byte rather than guess.
+fn identity_is_case_insensitive(chain_slug: &str) -> bool {
+    matches!(
+        chain_slug.trim().to_ascii_lowercase().as_str(),
+        "base" | "ethereum" | "bnb_chain" | "bsc" | "bnb"
+    )
+}
+
+/// Compare the bridge-echoed token identity against the exact identity PEP
+/// requested, using the chain-specific case rule.
+///
+/// A response that fails this rule is an invalid provider response: it must
+/// never be rendered under the requested identity. EVM chains accept a
+/// checksum/case variant; Solana and the unverified Robinhood-associated
+/// network require byte-for-byte equality.
+fn returned_identity_matches(
+    chain_slug: &str,
+    expected_network: i64,
+    expected_address: &str,
+    detail: &BridgeTokenDetail,
+) -> bool {
+    detail.network_id == expected_network
+        && if identity_is_case_insensitive(chain_slug) {
+            detail.address.eq_ignore_ascii_case(expected_address)
+        } else {
+            detail.address == expected_address
+        }
+}
+
 /// A per-session realtime chart target.
 ///
 /// The target is only ever set through the authenticated encrypted command
@@ -1330,11 +1364,13 @@ impl FomoChartDispatcher {
             return Err(FomoMarketError::InvalidRequest.market_denial());
         }
         let detail = self.market_result(self.provider.token(&chain, &address).await)?;
-        if detail.network_id != expected_network || !detail.address.eq_ignore_ascii_case(&address) {
-            return Err(CommandDenial::indeterminate(
-                DenialCode::Server,
-                "Market data is temporarily unavailable.",
-            ));
+        // The bridge must echo the exact identity PEP asked for under the
+        // chain-specific case rule. A mismatch (including a same-network Solana
+        // base58 case variant) is an invalid provider response: route it through
+        // `market_result` so the shared market-read health flag is demoted before
+        // the fail-closed denial, and `/ready` can never stay green on it.
+        if !returned_identity_matches(&chain, expected_network, &address, &detail) {
+            return self.market_result(Err(FomoMarketError::InvalidResponse));
         }
         Ok(token_detail_json(&chain, &address, &detail))
     }
@@ -3163,6 +3199,168 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "server");
+    }
+
+    #[test]
+    fn returned_identity_case_rule_is_chain_aware() {
+        // Only verified EVM chains may ignore ASCII case.
+        for chain in ["base", "ethereum", "bnb_chain", "bsc", "bnb"] {
+            assert!(identity_is_case_insensitive(chain), "{chain} is EVM");
+        }
+        // Solana base58 and the unverified Robinhood-associated network must be
+        // compared byte-for-byte, so their case variants are distinct tokens.
+        for chain in ["solana", "robinhood", "robinhood_chain"] {
+            assert!(!identity_is_case_insensitive(chain), "{chain} is strict");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_token_refuses_a_solana_case_variant_identity() {
+        // Base58 is case-sensitive: the same network id with an address that
+        // differs only by case is a different token and must be refused rather
+        // than rendered under the requested identity.
+        let requested = "So11111111111111111111111111111111111111112";
+        let case_variant = "so11111111111111111111111111111111111111112";
+        assert_ne!(requested, case_variant);
+        assert!(requested.eq_ignore_ascii_case(case_variant));
+
+        let provider = Arc::new(FakeMarketProvider::default());
+        provider.set_token(Ok(BridgeTokenDetail {
+            address: case_variant.to_string(),
+            network_id: 1_399_811_149,
+            chain: Some("solana".to_string()),
+            token: bridge_token(case_variant, 1_399_811_149, "SOL"),
+            detail: None,
+            risk: None,
+            warnings: Vec::new(),
+        }));
+        let health = Arc::new(AtomicBool::new(true));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider)
+                .with_market_health_flag(Some(health.clone()));
+        let error = dispatcher
+            .dispatch(&market_request(
+                "get_token",
+                json!({"chain": "solana", "address": requested}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "server");
+        assert!(error.retryable);
+        assert!(
+            !health.load(Ordering::SeqCst),
+            "a returned-identity mismatch must demote market readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_token_accepts_an_evm_checksum_case_variant() {
+        // Base/Ethereum/BNB addresses are EVM-cased; a checksum variant of the
+        // requested address is the same token and is projected under the exact
+        // requested identity.
+        let requested = "0xabcdef0000000000000000000000000000000001";
+        let checksummed = "0xAbCdEf0000000000000000000000000000000001";
+        let provider = Arc::new(FakeMarketProvider::default());
+        provider.set_token(Ok(BridgeTokenDetail {
+            address: checksummed.to_string(),
+            network_id: 8_453,
+            chain: Some("base".to_string()),
+            token: bridge_token(checksummed, 8_453, "BASE"),
+            detail: None,
+            risk: None,
+            warnings: Vec::new(),
+        }));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        let result = dispatcher
+            .dispatch(&market_request(
+                "get_token",
+                json!({"chain": "base", "address": requested}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result["token"]["address"], requested);
+        assert_eq!(result["token"]["chain"], "base");
+    }
+
+    #[tokio::test]
+    async fn get_token_refuses_a_robinhood_case_variant_identity() {
+        // Robinhood-associated semantics are not verified as EVM, so its
+        // identity is compared strictly rather than guessed.
+        let requested = "0xAbCdEf0000000000000000000000000000000001";
+        let case_variant = "0xabcdef0000000000000000000000000000000001";
+        let provider = Arc::new(FakeMarketProvider::default());
+        provider.set_token(Ok(BridgeTokenDetail {
+            address: case_variant.to_string(),
+            network_id: 4_663,
+            chain: Some("robinhood".to_string()),
+            token: bridge_token(case_variant, 4_663, "RH"),
+            detail: None,
+            risk: None,
+            warnings: Vec::new(),
+        }));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        let error = dispatcher
+            .dispatch(&market_request(
+                "get_token",
+                json!({"chain": "robinhood", "address": requested}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "server");
+    }
+
+    #[tokio::test]
+    async fn get_token_identity_mismatch_demotes_and_recovers_market_readiness() {
+        let health = Arc::new(AtomicBool::new(true));
+        let provider = Arc::new(FakeMarketProvider::default());
+        provider.set_token(Ok(BridgeTokenDetail {
+            address: "0xOTHER".to_string(),
+            network_id: 1,
+            chain: Some("ethereum".to_string()),
+            token: bridge_token("0xOTHER", 1, "OTHER"),
+            detail: None,
+            risk: None,
+            warnings: Vec::new(),
+        }));
+        let dispatcher = FomoChartDispatcher::new(
+            Arc::new(crate::opaque::FailClosedDispatcher),
+            provider.clone(),
+        )
+        .with_market_health_flag(Some(health.clone()));
+
+        let error = dispatcher
+            .dispatch(&market_request(
+                "get_token",
+                json!({"chain": "base", "address": "0xbase"}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "server");
+        assert!(
+            !health.load(Ordering::SeqCst),
+            "an identity mismatch must demote readiness before denying"
+        );
+
+        // A later valid identity read restores readiness.
+        provider.set_token(Ok(BridgeTokenDetail {
+            address: "0xbase".to_string(),
+            network_id: 8_453,
+            chain: Some("base".to_string()),
+            token: bridge_token("0xbase", 8_453, "BASE"),
+            detail: None,
+            risk: None,
+            warnings: Vec::new(),
+        }));
+        assert!(dispatcher
+            .dispatch(&market_request(
+                "get_token",
+                json!({"chain": "base", "address": "0xbase"}),
+            ))
+            .await
+            .is_ok());
+        assert!(health.load(Ordering::SeqCst), "recovery restores readiness");
     }
 
     #[tokio::test]
