@@ -72,7 +72,7 @@ pub use okx_benchmark::OkxBenchmarkQuoteSource;
 pub use order::{DurableOrderReadModel, OrderReadModel, OrderSummary, DEFAULT_ORDER_PAGE};
 pub use portfolio::{
     BalanceEntry, BalanceProvider, ComposedPortfolioReadModel, PortfolioReadModel,
-    PortfolioSummary, UnavailablePortfolioReadModel,
+    PortfolioSummary, SharedPortfolioReadModel, UnavailablePortfolioReadModel,
 };
 pub use trade::{
     FixedClock, OrderValuation, SystemClock, TradingAgentBackend, TradingBackendConfig,

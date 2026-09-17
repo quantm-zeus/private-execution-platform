@@ -8,6 +8,19 @@ use domain::{AmountType, IdempotencyKey, IntentId, TradeIntent, WalletRef};
 use market_types::Bps;
 use thiserror::Error;
 
+pub mod wallet;
+pub mod withdrawal;
+
+pub use wallet::{
+    classify_limits_change, Confirmation, InMemoryWalletPolicyStore, LimitsChange,
+    WalletLimits, WalletLimitsChange, WalletPolicyError, WalletPolicyRecord, WalletPolicyStore,
+    WebStrongConfirmation, MAX_APPLIED_POLICY_KEYS,
+};
+pub use withdrawal::{
+    authorize_withdrawal, WithdrawalApproval, WithdrawalError, WithdrawalRequest,
+    MAX_CONFIRMATION_AGE_MS,
+};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UsdMicros(u64);
 impl UsdMicros {

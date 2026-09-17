@@ -32,6 +32,7 @@
 mod analytics;
 mod engine;
 mod plan;
+mod progress;
 mod rfq;
 
 pub use analytics::{
@@ -40,6 +41,9 @@ pub use analytics::{
 };
 pub use engine::{AdaptiveTwap, ChunkReason, HaltReason, TwapDecision};
 pub use plan::{MarketObservation, TwapPlan, TwapPolicy, TwapState};
+pub use progress::{
+    ProgressError, RfqProgress, RfqStatus, TwapProgress, TwapStatus, MAX_APPLIED_PROGRESS_KEYS,
+};
 pub use rfq::{
     CompetitionOutcome, NoWinnerReason, RfqRequest, RfqSide, Solver, SolverCompetition,
     SolverError, SolverQuote, SolverQuoteResult,

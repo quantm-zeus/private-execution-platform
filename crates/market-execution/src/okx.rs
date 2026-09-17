@@ -20,12 +20,14 @@
 //! mismatched proposal is denied and never reaches the sink.
 
 use std::fmt;
+use std::sync::Arc;
 
 use agent_backend::{
     MarketExecutionError, MarketExecutionOutcome, MarketExecutionPort, MarketExecutionRequest,
     RouterSource,
 };
 use async_trait::async_trait;
+use execution_relay::AttemptBinding;
 use market_types::Bps;
 use okx_client::{OkxClient, OkxClientError, OkxSwapProposal, OkxSwapRequest, OkxTransport};
 use provider_verification::{
@@ -164,6 +166,39 @@ impl ProviderRevalidationGate for UnavailableProviderRevalidationGate {
     }
 }
 
+/// Injected, read-only source that reconciles an already-approved provider
+/// attempt.
+///
+/// The verified provider path has no local journal of its own, so a deployment
+/// must supply the chain/receipt observation that can resolve an in-flight OKX
+/// attempt. Implementations must never sign or submit. The shipped default
+/// reports [`MarketExecutionOutcome::Unknown`] (still in flight) so an
+/// unresolved attempt is never fabricated into a fill.
+#[async_trait]
+pub trait ProviderReconcileSource: Send + Sync {
+    /// Reconciles `binding` at `now_ms`, read-only.
+    async fn reconcile(
+        &self,
+        binding: &AttemptBinding,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError>;
+}
+
+/// Fail-closed default: no provider observation capability is installed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnavailableProviderReconcile;
+
+#[async_trait]
+impl ProviderReconcileSource for UnavailableProviderReconcile {
+    async fn reconcile(
+        &self,
+        _binding: &AttemptBinding,
+        _now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        Ok(MarketExecutionOutcome::Unknown)
+    }
+}
+
 /// Trusted configuration for the verified provider port.
 pub struct OkxExecutionConfig {
     /// Trusted verification policy (allowlists, recipient, caps, freshness).
@@ -194,10 +229,14 @@ pub struct VerifiedProviderExecutionPort<S, K, T, G> {
     trust: T,
     gate: G,
     config: OkxExecutionConfig,
+    reconcile: Arc<dyn ProviderReconcileSource>,
 }
 
 impl<S, K, T, G> VerifiedProviderExecutionPort<S, K, T, G> {
     /// Wires the port from its injected seams.
+    ///
+    /// Reconciliation defaults to [`UnavailableProviderReconcile`] (unknown);
+    /// install a real observation source with [`Self::with_reconcile`].
     pub fn new(source: S, sink: K, trust: T, gate: G, config: OkxExecutionConfig) -> Self {
         Self {
             source,
@@ -205,7 +244,14 @@ impl<S, K, T, G> VerifiedProviderExecutionPort<S, K, T, G> {
             trust,
             gate,
             config,
+            reconcile: Arc::new(UnavailableProviderReconcile),
         }
+    }
+
+    /// Installs the read-only provider reconcile source.
+    pub fn with_reconcile(mut self, reconcile: Arc<dyn ProviderReconcileSource>) -> Self {
+        self.reconcile = reconcile;
+        self
     }
 }
 
@@ -314,5 +360,31 @@ where
 
         // Only the approved, bound payload crosses this boundary.
         self.sink.submit(approved, &request).await
+    }
+
+    /// Reconciles through the injected read-only provider observation source.
+    ///
+    /// The default source returns `Unknown`, so an unresolved attempt stays in
+    /// flight rather than being fabricated or dropped.
+    async fn reconcile(
+        &self,
+        binding: &AttemptBinding,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        self.reconcile.reconcile(binding, now_ms).await
+    }
+
+    /// Source-aware reconcile: an OKX binding is queried here; any other source
+    /// is `Unknown` (never dropped) because this port never owned it.
+    async fn reconcile_for(
+        &self,
+        router_source: RouterSource,
+        binding: &AttemptBinding,
+        now_ms: i64,
+    ) -> Result<MarketExecutionOutcome, MarketExecutionError> {
+        if router_source != RouterSource::Okx {
+            return Ok(MarketExecutionOutcome::Unknown);
+        }
+        self.reconcile.reconcile(binding, now_ms).await
     }
 }

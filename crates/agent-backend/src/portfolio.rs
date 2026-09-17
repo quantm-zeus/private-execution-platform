@@ -1,5 +1,7 @@
 //! Owner-scoped portfolio read model: injected balances plus order aggregates.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chain_types::AssetId;
 use domain::OrderStatus;
@@ -83,6 +85,55 @@ impl UnavailablePortfolioReadModel {
 impl PortfolioReadModel for UnavailablePortfolioReadModel {
     async fn portfolio(&self) -> Result<PortfolioSummary, BackendError> {
         Err(BackendError::Unavailable)
+    }
+}
+
+/// Type-erased [`PortfolioReadModel`] for injected compositions.
+///
+/// A composition root (for example the trading-core production factory) needs to
+/// install *some* portfolio projection without growing its own generic shape, and
+/// without ever defaulting to a fixture. This wrapper carries the concrete port
+/// behind an `Arc<dyn PortfolioReadModel>` so the composition can keep the
+/// fail-closed [`UnavailablePortfolioReadModel`] as its default and still accept
+/// a durable, owner-scoped projection (an [`OrderReadModel`] plus a
+/// [`BalanceProvider`] through [`ComposedPortfolioReadModel`]).
+///
+/// The wrapper is transparent: it renders nothing and delegates every read.
+pub struct SharedPortfolioReadModel {
+    inner: Arc<dyn PortfolioReadModel>,
+}
+
+impl SharedPortfolioReadModel {
+    /// Wraps an injected portfolio projection.
+    pub fn new(inner: Arc<dyn PortfolioReadModel>) -> Self {
+        Self { inner }
+    }
+
+    /// The fail-closed default: every read is unavailable.
+    pub fn unavailable() -> Self {
+        Self {
+            inner: Arc::new(UnavailablePortfolioReadModel),
+        }
+    }
+
+    /// The wrapped projection.
+    pub fn inner(&self) -> &Arc<dyn PortfolioReadModel> {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for SharedPortfolioReadModel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedPortfolioReadModel")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl PortfolioReadModel for SharedPortfolioReadModel {
+    async fn portfolio(&self) -> Result<PortfolioSummary, BackendError> {
+        self.inner.portfolio().await
     }
 }
 

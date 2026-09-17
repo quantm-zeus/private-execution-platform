@@ -44,8 +44,8 @@ use std::time::Duration;
 use agent_backend::{
     AgentReadBackend, DurableOrderReadModel, MarketExecutionError, MarketExecutionOutcome,
     MarketExecutionPort, MarketExecutionRequest, MarketSnapshotSource, OkxQuoteSource,
-    OrderReadModel, OrderValuation, PortfolioReadModel, TradingAgentBackend, TradingBackendConfig,
-    TrustedClock, UnavailableOrderValuation, UnavailablePortfolioReadModel,
+    OrderReadModel, OrderValuation, PortfolioReadModel, SharedPortfolioReadModel,
+    TradingAgentBackend, TradingBackendConfig, TrustedClock, UnavailableOrderValuation,
 };
 use agent_commands::{
     AgentCapabilities, AgentChannel, AgentCommand, AmountSpec, AssetRef, RouterSource, TradeCommand,
@@ -65,7 +65,7 @@ use limit_engine::{
 };
 use market_execution::{
     MarketExecutionTrust, MarketExecutionTrustSource, PreparedExecutionRefSource,
-    RelayMarketExecutionPort,
+    RelayMarketExecutionPort, SourceBoundMarketExecutionPort,
 };
 use market_types::AtomicAmount;
 use mcp_server::{AgentBackend, BackendOutcome};
@@ -77,6 +77,9 @@ use routing::GasEstimator;
 use crate::benchmark::{
     BenchmarkRequestSource, NoopRouteComparisonRecordSink, ProviderBenchmarkLoop,
     ProviderBenchmarkPort, RouteComparisonRecordSink, MAX_BENCHMARK_REQUESTS_PER_PASS,
+};
+use crate::capability::{
+    CapabilityReadiness, ExecutionCapability, LimitCapability, MarketCapability, RealtimeCapability,
 };
 use storage::{
     ComponentHealth, HealthProbe, OpaqueEventRecord, OpaqueObject, OpaqueSnapshot, OpaqueStore,
@@ -92,11 +95,15 @@ const CHAIN_HEALTH_FAILURE_THRESHOLD: u32 = 3;
 /// Chain-health cooldown, in milliseconds, used by the default fail-closed port.
 const CHAIN_HEALTH_COOLDOWN_MS: i64 = 30_000;
 
-/// The concrete composed agent backend: durable reads, fail-closed portfolio,
-/// and the durable limit-order write store.
+/// The concrete composed agent backend: durable reads, an injected (type-erased)
+/// portfolio projection, and the durable limit-order write store.
+///
+/// The portfolio slot is a [`SharedPortfolioReadModel`]: it defaults to the
+/// fail-closed unavailable projection but accepts a durable, owner-scoped
+/// projection injected through [`TradingCoreSeams::portfolio`].
 pub type ComposedBackend<S> = TradingAgentBackend<
     DurableOrderReadModel<S>,
-    UnavailablePortfolioReadModel,
+    SharedPortfolioReadModel,
     DurableLimitOrderStore<S>,
 >;
 
@@ -394,13 +401,31 @@ pub struct TradingCoreSeams {
     /// fails closed and never silently falls back to Local.
     pub okx_quote_source: Option<Arc<dyn OkxQuoteSource>>,
     /// Concrete market-execution port (defaults to the fail-closed relay port).
+    ///
+    /// This is the **local** source port. An OKX request only reaches the
+    /// verified provider port installed through [`Self::okx_execution`]; a
+    /// composition never routes an OKX request here.
     pub market_execution: Option<Arc<dyn MarketExecutionPort>>,
+    /// Verified OKX provider execution port (P84C), when one is configured.
+    ///
+    /// Defaults to absent: the composed port then denies every OKX request
+    /// ([`SourceBoundMarketExecutionPort`] with no provider). When installed, it
+    /// is dispatched to **only** for `RouterSource::Okx`; completion never falls
+    /// back to the local router.
+    pub okx_execution: Option<Arc<dyn MarketExecutionPort>>,
     /// Durable exactly-once attempt store used by the default market port.
     ///
     /// Defaults to [`UnavailableDurableAttemptStore`]; the composed relay then
     /// fails closed on every reservation. A real durable adapter (Postgres)
     /// must be injected before live signing/submission capability can exist.
     pub attempt_store: Option<Arc<dyn DurableAttemptStore>>,
+    /// Durable, owner-scoped portfolio projection.
+    ///
+    /// Defaults to the fail-closed unavailable projection, so `get_portfolio`
+    /// never serves a fixture. A composition installs a real projection
+    /// (`ComposedPortfolioReadModel` over the durable order read model and an
+    /// injected balance provider).
+    pub portfolio: Option<Arc<dyn PortfolioReadModel>>,
     /// Full limit-orchestrator recovery, operator-injected.
     pub limit_recovery: Option<Arc<dyn LimitRecovery>>,
     /// Observational provider-benchmark evaluator (P93).
@@ -424,7 +449,9 @@ impl std::fmt::Debug for TradingCoreSeams {
             .field("gas", &self.gas.is_some())
             .field("okx_quote_source", &self.okx_quote_source.is_some())
             .field("market_execution", &self.market_execution.is_some())
+            .field("okx_execution", &self.okx_execution.is_some())
             .field("attempt_store", &self.attempt_store.is_some())
+            .field("portfolio", &self.portfolio.is_some())
             .field("limit_recovery", &self.limit_recovery.is_some())
             .field("provider_benchmark", &self.provider_benchmark.is_some())
             .field(
@@ -1131,7 +1158,9 @@ impl<S: OpaqueStore> TradingCore<S> {
             gas,
             okx_quote_source,
             market_execution,
+            okx_execution,
             attempt_store,
+            portfolio,
             limit_recovery,
             provider_benchmark,
             provider_benchmark_sink,
@@ -1143,9 +1172,13 @@ impl<S: OpaqueStore> TradingCore<S> {
             keys,
             config.chain.clone(),
         ));
+        let portfolio = match portfolio {
+            Some(portfolio) => SharedPortfolioReadModel::new(portfolio),
+            None => SharedPortfolioReadModel::unavailable(),
+        };
         let reads = AgentReadBackend::new(
             DurableOrderReadModel::new(durable.clone(), config.owner.clone()),
-            UnavailablePortfolioReadModel::new(),
+            portfolio,
         );
         let backend_config = TradingBackendConfig {
             owner: config.owner.clone(),
@@ -1166,7 +1199,7 @@ impl<S: OpaqueStore> TradingCore<S> {
         if let Some(source) = okx_quote_source {
             backend = backend.with_okx_quote_source(source);
         }
-        let execution = market_execution.unwrap_or_else(|| {
+        let local_execution = market_execution.unwrap_or_else(|| {
             let store = attempt_store.unwrap_or_else(|| Arc::new(UnavailableDurableAttemptStore));
             build_fail_closed_market_port(
                 policy,
@@ -1174,6 +1207,10 @@ impl<S: OpaqueStore> TradingCore<S> {
                 ChainHealthBreaker::new(CHAIN_HEALTH_FAILURE_THRESHOLD, CHAIN_HEALTH_COOLDOWN_MS),
             )
         });
+        // Strict source binding: an OKX request only ever reaches the injected
+        // verified provider port, and a missing provider is a final denial -- it
+        // is never silently served by the local router.
+        let execution = compose_source_bound_market_execution(local_execution, okx_execution);
         let backend = backend.with_market_execution(execution);
 
         // The observational benchmark loop is built only when both an evaluator
@@ -1250,8 +1287,227 @@ impl<S: OpaqueStore> TradingCore<S> {
     }
 }
 
-impl<S: OpaqueStore> std::fmt::Debug for TradingCore<S> {
+/// Composes the local execution port with an optional verified OKX provider
+/// behind the strict source-bound facade.
+///
+/// `Local` requests always reach `local`. `Okx` requests reach `okx` when one is
+/// installed and are a final denial otherwise; they are never served by `local`.
+/// This is the single place the composition decides source binding, so the
+/// executed path cannot silently fall back.
+pub fn compose_source_bound_market_execution(
+    local: Arc<dyn MarketExecutionPort>,
+    okx: Option<Arc<dyn MarketExecutionPort>>,
+) -> Arc<dyn MarketExecutionPort> {
+    // Always install the facade, even without a provider: the denial of an
+    // unconfigured OKX request must not depend on the injected local port
+    // remembering to reject a non-Local source itself.
+    let facade = SourceBoundMarketExecutionPort::new(local);
+    match okx {
+        Some(okx) => Arc::new(facade.with_okx(okx)),
+        None => Arc::new(facade),
+    }
+}
+
+/// Typed dependency probes used to derive a composition's advertised capability
+/// readiness, without trusting a boolean or the mere presence of a seam.
+///
+/// The integrator owns the health observations; every field is `None` unless the
+/// corresponding dependency was actually probed. An absent probe proves nothing,
+/// so [`Self::readiness`] denies the capability.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TradingReadinessProbes {
+    /// Authoritative market-state probe.
+    pub market: Option<HealthProbe>,
+    /// Limit-order engine/store probe.
+    pub limit: Option<HealthProbe>,
+    /// Realtime stream-source probe.
+    pub realtime: Option<HealthProbe>,
+    /// Durable exactly-once attempt-store probe.
+    pub durable_store: Option<HealthProbe>,
+    /// Chain submission adapter probe.
+    pub chain: Option<HealthProbe>,
+    /// Signing transport probe.
+    pub signer: Option<HealthProbe>,
+}
+
+impl TradingReadinessProbes {
+    /// An empty probe set: every capability is denied.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Records a healthy/unhealthy market-state observation.
+    pub fn with_market(mut self, probe: HealthProbe) -> Self {
+        self.market = Some(probe);
+        self
+    }
+
+    /// Records a limit-engine observation.
+    pub fn with_limit(mut self, probe: HealthProbe) -> Self {
+        self.limit = Some(probe);
+        self
+    }
+
+    /// Records a realtime stream-source observation.
+    pub fn with_realtime(mut self, probe: HealthProbe) -> Self {
+        self.realtime = Some(probe);
+        self
+    }
+
+    /// Records a durable attempt-store observation.
+    pub fn with_durable_store(mut self, probe: HealthProbe) -> Self {
+        self.durable_store = Some(probe);
+        self
+    }
+
+    /// Records a chain-adapter observation.
+    pub fn with_chain(mut self, probe: HealthProbe) -> Self {
+        self.chain = Some(probe);
+        self
+    }
+
+    /// Records a signing-transport observation.
+    pub fn with_signer(mut self, probe: HealthProbe) -> Self {
+        self.signer = Some(probe);
+        self
+    }
+
+    /// Derives the typed readiness from the healthy probes.
+    ///
+    /// `market`, `limits`, and `realtime` follow their own probe. Execution
+    /// additionally requires the live trading gate **and** all three of the
+    /// durable store, chain, and signer probes to be healthy; a single missing or
+    /// unhealthy dependency removes execution capability entirely.
+    pub fn readiness(&self, trading_enabled: bool) -> CapabilityReadiness {
+        let mut readiness = CapabilityReadiness::deny_all();
+        if let Some(market) = self.market.as_ref().and_then(MarketCapability::prove) {
+            readiness = readiness.with_market(market);
+        }
+        if let Some(limit) = self.limit.as_ref().and_then(LimitCapability::prove) {
+            readiness = readiness.with_limit(limit);
+        }
+        if let Some(realtime) = self.realtime.as_ref().and_then(RealtimeCapability::prove) {
+            readiness = readiness.with_realtime(realtime);
+        }
+        if let (Some(store), Some(chain), Some(signer)) = (
+            self.durable_store.as_ref(),
+            self.chain.as_ref(),
+            self.signer.as_ref(),
+        ) {
+            if let Some(execution) =
+                ExecutionCapability::prove(trading_enabled, store, chain, signer)
+            {
+                readiness = readiness.with_execution(execution);
+            }
+        }
+        readiness
+    }
+}
+
+/// The additive handoff a private-api integrator consumes.
+///
+/// It bundles the composed runnable [`TradingCore`], the exact
+/// [`AgentBackend`] the web command dispatcher needs, the dispatcher
+/// [`AgentCapabilities`], and the typed [`CapabilityReadiness`] that must gate the
+/// advertised document. Holding all four together is what lets this lane be
+/// merged without touching `apps/private-api/src/main.rs`: the integrator builds
+/// a handoff from its injected seams and probes, then passes
+/// `handoff.agent_backend()`/`handoff.capabilities()`/`handoff.readiness()` into
+/// the existing `web_command_dispatcher` + `OpaqueComposition` fields.
+///
+/// `Debug` is redacted: it reports only whether execution is proven.
+pub struct TradingCoreHandoff<S: OpaqueStore> {
+    core: TradingCore<S>,
+    readiness: CapabilityReadiness,
+}
+
+impl<S: OpaqueStore + 'static> TradingCoreHandoff<S> {
+    /// The runnable composition root (reconcile loop, startup recovery, registry).
+    pub fn core(&self) -> &TradingCore<S> {
+        &self.core
+    }
+
+    /// The composed agent backend, type-erased for the command dispatcher.
+    ///
+    /// The returned backend is wrapped in [`RecordingAgentBackend`], so every
+    /// delegated `execute_market_order` is recorded in [`Self::core`]'s
+    /// [`MarketAttemptRegistry`] for the read-only reconcile loop. This is the
+    /// handle the web command dispatcher must use; passing the unrecorded
+    /// `core().backend()` would leave the registry empty.
+    ///
+    /// No trading capability is implied by this handle: whether a mutation is
+    /// admitted is decided by the policy gate and the injected ports, and the
+    /// dispatcher is additionally gated on [`Self::capabilities`].
+    pub fn agent_backend(&self) -> Arc<dyn AgentBackend> {
+        Arc::new(RecordingAgentBackend::new(
+            self.core.backend(),
+            self.core.registry(),
+        ))
+    }
+
+    /// The trusted dispatcher capability document.
+    pub fn capabilities(&self) -> AgentCapabilities {
+        self.core.capabilities()
+    }
+
+    /// The typed readiness proof that must gate the advertised document.
+    pub fn readiness(&self) -> CapabilityReadiness {
+        self.readiness
+    }
+
+    /// Whether trading was enabled in the startup `TRADING_ENABLED` snapshot.
+    pub fn trading_enabled_at_startup(&self) -> bool {
+        self.core.trading_enabled_at_startup()
+    }
+
+    /// Runs injected restart recovery, or `None` when there is no recovery seam
+    /// or trading was disabled at startup.
+    pub async fn startup_recovery(
+        &self,
+        now_ms: i64,
+    ) -> Option<Result<RecoveryReport, LimitEngineError>> {
+        self.core.startup_recovery(now_ms).await
+    }
+}
+
+impl<S: OpaqueStore> std::fmt::Debug for TradingCoreHandoff<S> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TradingCoreHandoff")
+            .field("execute", &self.readiness.execute())
+            .field("limits", &self.readiness.limits())
+            .field("market", &self.readiness.market())
+            .field("realtime", &self.readiness.realtime())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builds the runnable composition root and derives its advertised readiness
+/// from injected probes.
+///
+/// This is the additive factory for the private-api integrator: it is the only
+/// call needed to go from trusted config + injected ports to the
+/// `(AgentBackend, AgentCapabilities, CapabilityReadiness)` triple, plus the
+/// [`TradingCore`] handle used for restart recovery and the read-only reconcile
+/// loop. Every port still defaults fail-closed inside
+/// [`TradingCore::new`]; providing seams does not by itself enable a mutation,
+/// and `TRADING_ENABLED=false` keeps every mutation denied.
+pub fn build_trading_core<S: OpaqueStore + 'static>(
+    config: CompositionConfig,
+    policy: PolicyEngine,
+    store: Arc<S>,
+    keys: Arc<dyn OrderKeyProvider>,
+    clock: Arc<dyn TrustedClock>,
+    seams: TradingCoreSeams,
+    probes: TradingReadinessProbes,
+) -> TradingCoreHandoff<S> {
+    let trading_enabled = policy.is_trading_enabled();
+    let readiness = probes.readiness(trading_enabled);
+    let core = TradingCore::new(config, policy, store, keys, clock, seams);
+    TradingCoreHandoff { core, readiness }
+}
+
+impl<S: OpaqueStore> std::fmt::Debug for TradingCore<S> {    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TradingCore")
             .field(
