@@ -547,100 +547,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unreachable provider is never reported healthy.
     let fomo_history_health = Arc::new(AtomicBool::new(false));
     let market_read_health = Arc::new(AtomicBool::new(false));
+    let token_intel_health = Arc::new(AtomicBool::new(false));
     let stream_health = Arc::new(AtomicBool::new(false));
     let fomo_configured = fomo.is_some();
-    let (fomo_dispatcher, fomo_stream, fomo_wired, fomo_market_read) = match fomo {
-        Some((config, api_key)) => {
-            let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
-                private_api::FomoBarsClient::new(
+    let (fomo_dispatcher, fomo_stream, fomo_wired, fomo_market_read, fomo_token_intel_read) =
+        match fomo {
+            Some((config, api_key)) => {
+                let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
+                    private_api::FomoBarsClient::new(
+                        &config.base_url,
+                        api_key.clone(),
+                        config.request_timeout,
+                    )
+                    .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
+                );
+                // WS-first realtime lane: a bounded-cadence `/market/realtime`
+                // client driven by a shared hub. The stream source prefers its
+                // pushed frames and only falls back to bounded polling when the
+                // lane is not live; the strict provenance gate keeps a non-WS batch
+                // from ever being labelled `fomo-ws`.
+                let lane_client = private_api::FomoRealtimeLaneClient::new(
                     &config.base_url,
-                    api_key.clone(),
+                    api_key,
                     config.request_timeout,
+                    private_api::fomo_market::DEFAULT_LANE_INTERVAL,
                 )
-                .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
-            );
-            // WS-first realtime lane: a bounded-cadence `/market/realtime`
-            // client driven by a shared hub. The stream source prefers its
-            // pushed frames and only falls back to bounded polling when the
-            // lane is not live; the strict provenance gate keeps a non-WS batch
-            // from ever being labelled `fomo-ws`.
-            let lane_client = private_api::FomoRealtimeLaneClient::new(
-                &config.base_url,
-                api_key,
-                config.request_timeout,
-                private_api::fomo_market::DEFAULT_LANE_INTERVAL,
-            )
-            .map_err(|_| std::io::Error::other("FOMO realtime lane configuration invalid"))?;
-            let lane_hub = Arc::new(private_api::fomo_market::LaneHub::new());
-            lane_hub.spawn(Arc::new(lane_client));
-            let probe_provider = provider.clone();
-            let wiring = private_api::build_fomo_market_wiring_full(
-                &config,
-                provider,
-                Arc::new(private_api::FailClosedDispatcher),
-                Some(stream_health.clone()),
-                Some(fomo_history_health.clone()),
-                Some(market_read_health.clone()),
-                Arc::new(private_api::fomo_market::RealtimeTargetRegistry::new()),
-                Some(lane_hub),
-            )
-            .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
-            // Chart history proof: a bounded authenticated `/market/bars` read
-            // over the configured history (or realtime) target. An expired
-            // bridge session makes this fail, so `chart` stays unadvertised and
-            // the source remains a failed readiness dependency.
-            let history_healthy =
-                private_api::fomo_market::probe_history(probe_provider.as_ref(), &config).await;
-            fomo_history_health.store(history_healthy, Ordering::SeqCst);
-            // Market read proof: a bounded authenticated `/market/trending` read
-            // proves the token search/detail/trending path. An expired bridge
-            // session or provider outage leaves `market` unadvertised; the
-            // capability is never inferred from configuration alone.
-            let market_healthy =
-                private_api::fomo_market::probe_market(probe_provider.as_ref()).await;
-            market_read_health.store(market_healthy, Ordering::SeqCst);
-            // Observe the configured realtime source once at startup. A
-            // reachable bridge proves the realtime capability; an unavailable
-            // one leaves it unadvertised (fail closed). The shared flag keeps
-            // `/ready` honest for later poll failures too, and the configured
-            // stream stays a readiness dependency regardless of this probe.
-            if wiring.stream_source.is_some() {
-                let reachable = private_api::probe_realtime(probe_provider.as_ref(), &config).await;
-                stream_health.store(reachable, Ordering::SeqCst);
-                if reachable {
-                    trading_seams = trading_seams.with_realtime_probe(
-                        private_api::trading::healthy(private_api::trading::COMPONENT_REALTIME),
-                    );
+                .map_err(|_| std::io::Error::other("FOMO realtime lane configuration invalid"))?;
+                let lane_hub = Arc::new(private_api::fomo_market::LaneHub::new());
+                lane_hub.spawn(Arc::new(lane_client));
+                let probe_provider = provider.clone();
+                let wiring = private_api::build_fomo_market_wiring_full_with_intelligence(
+                    &config,
+                    provider,
+                    Arc::new(private_api::FailClosedDispatcher),
+                    Some(stream_health.clone()),
+                    Some(fomo_history_health.clone()),
+                    Some(market_read_health.clone()),
+                    Some(token_intel_health.clone()),
+                    Arc::new(private_api::fomo_market::RealtimeTargetRegistry::new()),
+                    Some(lane_hub),
+                )
+                .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
+                // Chart history proof: a bounded authenticated `/market/bars` read
+                // over the configured history (or realtime) target. An expired
+                // bridge session makes this fail, so `chart` stays unadvertised and
+                // the source remains a failed readiness dependency.
+                let history_healthy =
+                    private_api::fomo_market::probe_history(probe_provider.as_ref(), &config).await;
+                fomo_history_health.store(history_healthy, Ordering::SeqCst);
+                // Market read proof: a bounded authenticated `/market/trending` read
+                // proves the token search/detail/trending path. An expired bridge
+                // session or provider outage leaves `market` unadvertised; the
+                // capability is never inferred from configuration alone.
+                let market_healthy =
+                    private_api::fomo_market::probe_market(probe_provider.as_ref()).await;
+                market_read_health.store(market_healthy, Ordering::SeqCst);
+                // Token-intelligence proof: bounded authenticated holders + about +
+                // activity reads over the configured exact target. Independent of
+                // `market`: a bridge that serves token search but not the
+                // intelligence routes must not advertise them.
+                let token_intel_healthy = private_api::fomo_market::probe_token_intelligence(
+                    probe_provider.as_ref(),
+                    &config,
+                )
+                .await;
+                token_intel_health.store(token_intel_healthy, Ordering::SeqCst);
+                // Observe the configured realtime source once at startup. A
+                // reachable bridge proves the realtime capability; an unavailable
+                // one leaves it unadvertised (fail closed). The shared flag keeps
+                // `/ready` honest for later poll failures too, and the configured
+                // stream stays a readiness dependency regardless of this probe.
+                if wiring.stream_source.is_some() {
+                    let reachable =
+                        private_api::probe_realtime(probe_provider.as_ref(), &config).await;
+                    stream_health.store(reachable, Ordering::SeqCst);
+                    if reachable {
+                        trading_seams = trading_seams.with_realtime_probe(
+                            private_api::trading::healthy(private_api::trading::COMPONENT_REALTIME),
+                        );
+                    }
                 }
+                if market_healthy {
+                    trading_seams = trading_seams.with_market_probe(private_api::trading::healthy(
+                        private_api::trading::COMPONENT_MARKET,
+                    ));
+                }
+                let wired = private_api::production::WiredCapabilities {
+                    // Each read capability is advertised only after its own bounded
+                    // authenticated proof: `market` for token reads, `chart` for
+                    // history, `token_intelligence` for holders/about/activity, and
+                    // `realtime` for the seeded stream source.
+                    market: market_healthy,
+                    chart: history_healthy,
+                    token_intelligence: token_intel_healthy,
+                    realtime: wiring.stream_source.is_some(),
+                    ..private_api::production::WiredCapabilities::default()
+                };
+                (
+                    Some(wiring.dispatcher),
+                    wiring.stream_source,
+                    wired,
+                    market_read_health.clone(),
+                    token_intel_health.clone(),
+                )
             }
-            if market_healthy {
-                trading_seams = trading_seams.with_market_probe(private_api::trading::healthy(
-                    private_api::trading::COMPONENT_MARKET,
-                ));
-            }
-            let wired = private_api::production::WiredCapabilities {
-                // Each read capability is advertised only after its own bounded
-                // authenticated proof: `market` for token reads, `chart` for
-                // history, `realtime` for the seeded stream source.
-                market: market_healthy,
-                chart: history_healthy,
-                realtime: wiring.stream_source.is_some(),
-                ..private_api::production::WiredCapabilities::default()
-            };
-            (
-                Some(wiring.dispatcher),
-                wiring.stream_source,
-                wired,
+            None => (
+                None,
+                None,
+                private_api::production::WiredCapabilities::default(),
                 market_read_health.clone(),
-            )
-        }
-        None => (
-            None,
-            None,
-            private_api::production::WiredCapabilities::default(),
-            market_read_health.clone(),
-        ),
-    };
+                token_intel_health.clone(),
+            ),
+        };
     let fomo_stream_present = fomo_stream.is_some();
     let readiness = trading_seams.readiness(gate.is_enabled());
     // A configured realtime source is a required readiness dependency even when
@@ -712,6 +730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_stream_readiness(stream_required, stream_health)
         .with_fomo_readiness(fomo_configured, fomo_history_health)
         .with_fomo_market_readiness(fomo_configured, fomo_market_read)
+        .with_fomo_token_intelligence_readiness(fomo_configured, fomo_token_intel_read)
         // The explicit live opt-in makes the concrete execution dependencies a
         // readiness requirement. `live_execution` exists only when the durable
         // store and all of chain/signer/payload were proven, so a missing

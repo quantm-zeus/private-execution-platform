@@ -326,7 +326,7 @@ pub fn fomo_symbol(chain_slug: &str, address: &str) -> Option<String> {
 /// Only Base/Ethereum/BNB Chain are verified EVM chains. Solana base58 is
 /// case-sensitive, and the Robinhood-associated network is not verified as EVM,
 /// so both must compare byte-for-byte rather than guess.
-fn identity_is_case_insensitive(chain_slug: &str) -> bool {
+pub(crate) fn identity_is_case_insensitive(chain_slug: &str) -> bool {
     matches!(
         chain_slug.trim().to_ascii_lowercase().as_str(),
         "base" | "ethereum" | "bnb_chain" | "bsc" | "bnb"
@@ -368,6 +368,27 @@ fn returned_identity_matches(
             detail.address.eq_ignore_ascii_case(expected_address)
         } else {
             detail.address == expected_address
+        }
+}
+
+/// Compare a token-intelligence bridge echo (holders/about/activity) against the
+/// exact identity PEP requested, under the same chain-specific case rule as the
+/// market rows. A missing echo (`None`) is a mismatch: a response that cannot
+/// prove identity is refused rather than rendered under the requested token.
+pub(crate) fn identity_matches(
+    chain_slug: &str,
+    expected_network: i64,
+    expected_address: &str,
+    echoed_network: Option<i64>,
+    echoed_address: Option<&str>,
+) -> bool {
+    echoed_network == Some(expected_network)
+        && match echoed_address {
+            None => false,
+            Some(address) if identity_is_case_insensitive(chain_slug) => {
+                address.eq_ignore_ascii_case(expected_address)
+            }
+            Some(address) => address == expected_address,
         }
 }
 
@@ -531,6 +552,25 @@ pub struct BridgeToken {
     pub holders: Option<f64>,
     #[serde(default)]
     pub rank: Option<i64>,
+    // Additive token-intelligence profile fields. A bridge that only serves the
+    // historical market contract leaves these absent; the `/market/about`
+    // fallback then projects them as `null` rather than fabricating a value.
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub social_links: Option<crate::fomo_intelligence::BridgeSocialLinks>,
+    #[serde(default)]
+    pub launchpad: Option<String>,
+    #[serde(default)]
+    pub graduation_percent: Option<f64>,
+    #[serde(default)]
+    pub created_at_ms: Option<Value>,
+    #[serde(default)]
+    pub circulating_supply: Option<f64>,
+    #[serde(default)]
+    pub total_supply: Option<f64>,
+    #[serde(default)]
+    pub fdv_usd: Option<f64>,
 }
 
 /// Bounded search response from `GET /market/search`.
@@ -597,6 +637,10 @@ pub struct BridgeTokenDetail {
     pub risk: Option<BridgeRisk>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Additive buy/sell statistics for the token-intelligence About read. A
+    /// bridge that only serves the historical detail contract omits it.
+    #[serde(default)]
+    pub trading: Option<crate::fomo_intelligence::BridgeTradingWindows>,
 }
 
 /// Bounded token-list response from `GET /market/trending`.
@@ -639,6 +683,39 @@ pub trait BarsProvider: Send + Sync {
         _category: &str,
         _limit: u32,
     ) -> Result<BridgeTrending, FomoMarketError> {
+        Err(FomoMarketError::NotConfigured)
+    }
+
+    /// Bounded top/followed holder rows for an exact token identity. The
+    /// default fails closed so a provider that does not serve the
+    /// token-intelligence routes cannot fabricate holders.
+    async fn holders(
+        &self,
+        _chain_slug: &str,
+        _address: &str,
+    ) -> Result<crate::fomo_intelligence::BridgeHolders, FomoMarketError> {
+        Err(FomoMarketError::NotConfigured)
+    }
+
+    /// Bounded token profile/market/about document for an exact identity. The
+    /// default fails closed.
+    async fn about(
+        &self,
+        _chain_slug: &str,
+        _address: &str,
+    ) -> Result<crate::fomo_intelligence::BridgeAbout, FomoMarketError> {
+        Err(FomoMarketError::NotConfigured)
+    }
+
+    /// Bounded, paginated token-activity page for an exact identity. The default
+    /// fails closed.
+    async fn activity(
+        &self,
+        _chain_slug: &str,
+        _address: &str,
+        _cursor: Option<&str>,
+        _limit: u32,
+    ) -> Result<crate::fomo_intelligence::BridgeActivity, FomoMarketError> {
         Err(FomoMarketError::NotConfigured)
     }
 }
@@ -878,9 +955,16 @@ impl FomoBarsClient {
     }
 
     /// One authenticated read parsed as JSON.
-    async fn get_json(&self, uri: String) -> Result<Value, FomoMarketError> {
+    pub(crate) async fn get_json(&self, uri: String) -> Result<Value, FomoMarketError> {
         let body = self.get_bytes(uri).await?;
         serde_json::from_slice(&body).map_err(|_| FomoMarketError::InvalidResponse)
+    }
+
+    /// The validated loopback base URL. Exposed crate-internally so the
+    /// token-intelligence helpers build the same bounded authenticated request
+    /// without duplicating the client.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     async fn fetch(
@@ -1021,9 +1105,41 @@ impl BarsProvider for FomoBarsClient {
         let value = self.get_json(uri).await?;
         serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse)
     }
-}
 
-// ---- WS-first realtime lane ------------------------------------------- //
+    /// Bounded top/followed holders. The exact symbol is validated before the
+    /// request, so an unknown chain or malformed address never reaches the
+    /// bridge.
+    async fn holders(
+        &self,
+        chain_slug: &str,
+        address: &str,
+    ) -> Result<crate::fomo_intelligence::BridgeHolders, FomoMarketError> {
+        crate::fomo_intelligence::fetch_holders(self, chain_slug, address).await
+    }
+
+    /// Bounded token profile/market read. `/market/about` is primary; a bridge
+    /// that instead extended `/market/token` is consumed through the
+    /// backwards-compatible fallback.
+    async fn about(
+        &self,
+        chain_slug: &str,
+        address: &str,
+    ) -> Result<crate::fomo_intelligence::BridgeAbout, FomoMarketError> {
+        crate::fomo_intelligence::fetch_about(self, chain_slug, address).await
+    }
+
+    /// Bounded, paginated activity. The cursor is percent-encoded so a hostile
+    /// value cannot alter the request line.
+    async fn activity(
+        &self,
+        chain_slug: &str,
+        address: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<crate::fomo_intelligence::BridgeActivity, FomoMarketError> {
+        crate::fomo_intelligence::fetch_activity(self, chain_slug, address, cursor, limit).await
+    }
+}
 
 /// One event pushed by a [`RealtimeLane`]. The lane is the bridge's
 /// WebSocket-promoted realtime feed; PEP only consumes it when the strict
@@ -1487,7 +1603,7 @@ impl RealtimeLane for FomoRealtimeLaneClient {
 }
 
 /// Percent-encode a query component (RFC 3986 unreserved set preserved).
-fn encode_query_component(value: &str) -> String {
+pub(crate) fn encode_query_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -1562,7 +1678,7 @@ fn trending_row_json(row: &BridgeToken) -> Option<Value> {
 /// Project FOMO's own risk booleans and warning strings into the web risk
 /// contract. No score is invented (`score` stays `null`); factors carry only
 /// the provider's own statements.
-fn risk_json(risk: &BridgeRisk) -> Value {
+pub(crate) fn risk_json(risk: &BridgeRisk) -> Value {
     let hard = risk.level.as_deref() == Some("hard_risk");
     let mut factors: Vec<Value> = Vec::new();
     if risk.disable_buying == Some(true) {
@@ -1581,12 +1697,18 @@ fn risk_json(risk: &BridgeRisk) -> Value {
             "detail": "FOMO reports selling is disabled for this token.",
         }));
     }
-    for (index, warning) in risk.warnings.iter().enumerate() {
+    for (index, warning) in risk.warnings.iter().take(32).enumerate() {
+        // Bound the provider text: the about read newly exposes this projection,
+        // and an unbounded warning must not become an unbounded factor list.
+        let detail: String = warning.trim().chars().take(256).collect();
+        if detail.is_empty() {
+            continue;
+        }
         factors.push(json!({
             "id": format!("fomo_warning_{index}"),
             "label": "Provider warning",
             "severity": if hard { "high" } else { "info" },
-            "detail": warning,
+            "detail": detail,
         }));
     }
     json!({
@@ -1701,6 +1823,20 @@ fn market_string(payload: &Value, key: &str) -> Result<String, CommandDenial> {
         })
 }
 
+/// Read and validate the exact `(chain, address, network_id)` identity every
+/// token-intelligence command requires. An unknown chain or malformed address is
+/// a determinate market refusal, never a guessed identity.
+fn exact_market_identity(payload: &Value) -> Result<(String, String, i64), CommandDenial> {
+    let chain = market_string(payload, "chain")?;
+    let address = market_string(payload, "address")?;
+    let network =
+        fomo_network_id(&chain).ok_or_else(|| FomoMarketError::InvalidRequest.market_denial())?;
+    if fomo_symbol(&chain, &address).is_none() {
+        return Err(FomoMarketError::InvalidRequest.market_denial());
+    }
+    Ok((chain, address, network))
+}
+
 fn optional_i64(payload: &Value, key: &str) -> Result<Option<i64>, CommandDenial> {
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1714,10 +1850,10 @@ fn optional_u32(payload: &Value, key: &str) -> Result<Option<u32>, CommandDenial
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => u32::try_from(value.as_u64().ok_or_else(|| {
-            CommandDenial::determinate(DenialCode::Protocol, "Chart request is invalid.")
+            CommandDenial::determinate(DenialCode::Protocol, "Request is invalid.")
         })?)
         .map(Some)
-        .map_err(|_| CommandDenial::determinate(DenialCode::Protocol, "Chart request is invalid.")),
+        .map_err(|_| CommandDenial::determinate(DenialCode::Protocol, "Request is invalid.")),
     }
 }
 
@@ -1762,6 +1898,11 @@ pub struct FomoChartDispatcher {
     /// the chart route still works. A determinate client-side rejection never
     /// demotes it.
     market_health: Option<Arc<AtomicBool>>,
+    /// Optional observational token-intelligence health flag
+    /// (holders/about/activity). Independent of the market-read flag so a
+    /// deployment that serves token search but not the intelligence routes is
+    /// reported truthfully.
+    intelligence_health: Option<Arc<AtomicBool>>,
     /// Session-scoped realtime target bindings shared with the stream source.
     targets: Arc<RealtimeTargetRegistry>,
 }
@@ -1780,6 +1921,7 @@ impl FomoChartDispatcher {
             provider,
             health: None,
             market_health: None,
+            intelligence_health: None,
             targets: Arc::new(RealtimeTargetRegistry::new()),
         }
     }
@@ -1793,6 +1935,13 @@ impl FomoChartDispatcher {
     /// Attaches the shared market-read health flag updated on every token read.
     pub fn with_market_health_flag(mut self, health: Option<Arc<AtomicBool>>) -> Self {
         self.market_health = health;
+        self
+    }
+
+    /// Attaches the shared token-intelligence health flag updated on every
+    /// holders/about/activity read.
+    pub fn with_intelligence_health_flag(mut self, health: Option<Arc<AtomicBool>>) -> Self {
+        self.intelligence_health = health;
         self
     }
 
@@ -1812,6 +1961,33 @@ impl FomoChartDispatcher {
     fn mark_market_health(&self, healthy: bool) {
         if let Some(flag) = self.market_health.as_ref() {
             flag.store(healthy, Ordering::SeqCst);
+        }
+    }
+
+    fn mark_intelligence_health(&self, healthy: bool) {
+        if let Some(flag) = self.intelligence_health.as_ref() {
+            flag.store(healthy, Ordering::SeqCst);
+        }
+    }
+
+    /// Map a token-intelligence provider/projection result, updating the shared
+    /// intelligence health flag only for a real outage (a determinate client
+    /// rejection is never an outage).
+    fn intelligence_result<T>(
+        &self,
+        result: Result<T, FomoMarketError>,
+    ) -> Result<T, CommandDenial> {
+        match result {
+            Ok(value) => {
+                self.mark_intelligence_health(true);
+                Ok(value)
+            }
+            Err(error) => {
+                if !matches!(error, FomoMarketError::InvalidRequest) {
+                    self.mark_intelligence_health(false);
+                }
+                Err(error.market_denial())
+            }
         }
     }
 
@@ -2003,6 +2179,49 @@ impl FomoChartDispatcher {
         }))
     }
 
+    /// `get_token_holders` -> bounded FOMO trader rows for the exact selected
+    /// identity. The bridge must echo the requested network+address; a
+    /// mismatched or absent echo is refused, never rendered under the request.
+    async fn get_token_holders(&self, request: &CommandRequest) -> Result<Value, CommandDenial> {
+        let (chain, address, network) = exact_market_identity(&request.payload)?;
+        let limit = optional_u32(&request.payload, "limit")?
+            .unwrap_or(crate::fomo_intelligence::DEFAULT_HOLDER_LIMIT)
+            .clamp(1, crate::fomo_intelligence::MAX_INTEL_LIMIT);
+        let result = self.intelligence_result(self.provider.holders(&chain, &address).await)?;
+        self.intelligence_result(crate::fomo_intelligence::holders_json(
+            &chain, network, &address, limit, &result,
+        ))
+    }
+
+    /// `get_token_about` -> token profile/social/launchpad/supply/market stats +
+    /// buy/sell windows + warnings/risk for the exact selected identity.
+    async fn get_token_about(&self, request: &CommandRequest) -> Result<Value, CommandDenial> {
+        let (chain, address, network) = exact_market_identity(&request.payload)?;
+        let result = self.intelligence_result(self.provider.about(&chain, &address).await)?;
+        self.intelligence_result(crate::fomo_intelligence::about_json(
+            &chain, network, &address, &result,
+        ))
+    }
+
+    /// `get_token_activity` -> bounded, paginated activity for the exact selected
+    /// identity. `nextCursor`/`hasNextPage` are passed through; a malformed or
+    /// over-long cursor is a determinate protocol refusal.
+    async fn get_token_activity(&self, request: &CommandRequest) -> Result<Value, CommandDenial> {
+        let (chain, address, network) = exact_market_identity(&request.payload)?;
+        let cursor = optional_string(&request.payload, "cursor")?;
+        let limit = optional_u32(&request.payload, "limit")?
+            .unwrap_or(crate::fomo_intelligence::DEFAULT_ACTIVITY_LIMIT)
+            .clamp(1, crate::fomo_intelligence::MAX_INTEL_LIMIT);
+        let result = self.intelligence_result(
+            self.provider
+                .activity(&chain, &address, cursor.as_deref(), limit)
+                .await,
+        )?;
+        self.intelligence_result(crate::fomo_intelligence::activity_json(
+            &chain, network, &address, limit, &result,
+        ))
+    }
+
     /// `set_realtime_target` -> bind the session's encrypted realtime target.
     ///
     /// The target is stored against the authenticated `kid`; it never travels
@@ -2043,6 +2262,9 @@ impl CommandDispatcher for FomoChartDispatcher {
             "search_token" => self.search_token(request).await,
             "get_token" => self.get_token(request).await,
             "get_trending" => self.get_trending(request).await,
+            "get_token_holders" => self.get_token_holders(request).await,
+            "get_token_about" => self.get_token_about(request).await,
+            "get_token_activity" => self.get_token_activity(request).await,
             // A target binding is session-scoped; the session-less dispatch path
             // cannot bind one.
             "set_realtime_target" => Err(CommandDenial::determinate(
@@ -2063,6 +2285,9 @@ impl CommandDispatcher for FomoChartDispatcher {
             "search_token" => self.search_token(request).await,
             "get_token" => self.get_token(request).await,
             "get_trending" => self.get_trending(request).await,
+            "get_token_holders" => self.get_token_holders(request).await,
+            "get_token_about" => self.get_token_about(request).await,
+            "get_token_activity" => self.get_token_activity(request).await,
             "set_realtime_target" => self.set_realtime_target(kid, request).await,
             _ => self.inner.dispatch_for_session(kid, request).await,
         }
@@ -2881,6 +3106,12 @@ pub fn build_wiring_with_health_flags(
 
 /// Full FOMO market wiring: independent stream/history/market-read health flags,
 /// the shared session realtime target registry and an optional WS-first lane hub.
+///
+/// Kept signature-stable for existing callers; it does not attach a
+/// token-intelligence health flag. Use
+/// [`build_wiring_full_with_intelligence`] to observe the
+/// holders/about/activity read path.
+#[allow(clippy::too_many_arguments)]
 pub fn build_wiring_full(
     config: &FomoMarketConfig,
     provider: Arc<dyn BarsProvider>,
@@ -2891,10 +3122,38 @@ pub fn build_wiring_full(
     targets: Arc<RealtimeTargetRegistry>,
     lane: Option<Arc<LaneHub>>,
 ) -> Result<FomoMarketWiring, FomoMarketError> {
+    build_wiring_full_with_intelligence(
+        config,
+        provider,
+        inner,
+        stream_health,
+        history_health,
+        market_health,
+        None,
+        targets,
+        lane,
+    )
+}
+
+/// Full FOMO market wiring with an additional independent token-intelligence
+/// health flag updated on every holders/about/activity read.
+#[allow(clippy::too_many_arguments)]
+pub fn build_wiring_full_with_intelligence(
+    config: &FomoMarketConfig,
+    provider: Arc<dyn BarsProvider>,
+    inner: Arc<dyn CommandDispatcher>,
+    stream_health: Option<Arc<AtomicBool>>,
+    history_health: Option<Arc<AtomicBool>>,
+    market_health: Option<Arc<AtomicBool>>,
+    intelligence_health: Option<Arc<AtomicBool>>,
+    targets: Arc<RealtimeTargetRegistry>,
+    lane: Option<Arc<LaneHub>>,
+) -> Result<FomoMarketWiring, FomoMarketError> {
     let dispatcher: Arc<dyn CommandDispatcher> = Arc::new(
         FomoChartDispatcher::new(inner, provider.clone())
             .with_health_flag(history_health)
             .with_market_health_flag(market_health)
+            .with_intelligence_health_flag(intelligence_health)
             .with_targets(targets.clone()),
     );
     let stream_source: Option<Arc<dyn StreamSource>> = match &config.stream_target {
@@ -2935,6 +3194,70 @@ pub fn build_wiring_full(
 /// configured-but-expired FOMO session can never advertise `market`.
 pub async fn probe_market(provider: &dyn BarsProvider) -> bool {
     provider.trending("trending", 1).await.is_ok()
+}
+
+/// One bounded authenticated holders + about + activity read proving the FOMO
+/// token-intelligence read path (provider reachability + bridge session + the
+/// three routes).
+///
+/// This is the capability proof behind `token_intelligence`. It is independent
+/// of `market`/`chart`/`realtime`: a bridge that serves token search but not the
+/// intelligence routes must not advertise them. Returns `false` when no
+/// exact target is configured, or when any of the three routes fails, so a
+/// configured-but-expired FOMO session can never advertise the capability.
+pub async fn probe_token_intelligence(
+    provider: &dyn BarsProvider,
+    config: &FomoMarketConfig,
+) -> bool {
+    let Some((chain, address)) = config.history_probe_pair() else {
+        return false;
+    };
+    let Some(network) = fomo_network_id(chain) else {
+        return false;
+    };
+    // Prove the routes *and* that the responses satisfy the exact-identity
+    // projection. A well-shaped but wrong-identity (or otherwise unrenderable)
+    // document must not advertise the capability while every live command then
+    // fails closed.
+    let Ok(holders) = provider.holders(chain, address).await else {
+        return false;
+    };
+    if crate::fomo_intelligence::holders_json(
+        chain,
+        network,
+        address,
+        crate::fomo_intelligence::DEFAULT_HOLDER_LIMIT,
+        &holders,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let Ok(about) = provider.about(chain, address).await else {
+        return false;
+    };
+    if crate::fomo_intelligence::about_json(chain, network, address, &about).is_err() {
+        return false;
+    }
+    let Ok(activity) = provider
+        .activity(
+            chain,
+            address,
+            None,
+            crate::fomo_intelligence::DEFAULT_ACTIVITY_LIMIT,
+        )
+        .await
+    else {
+        return false;
+    };
+    crate::fomo_intelligence::activity_json(
+        chain,
+        network,
+        address,
+        crate::fomo_intelligence::DEFAULT_ACTIVITY_LIMIT,
+        &activity,
+    )
+    .is_ok()
 }
 
 /// One bounded `/market/latest` read observing whether the configured realtime
@@ -3899,6 +4222,14 @@ mod tests {
             change24h: None,
             holders: Some(5.0),
             rank: None,
+            image_url: None,
+            social_links: None,
+            launchpad: None,
+            graduation_percent: None,
+            created_at_ms: None,
+            circulating_supply: None,
+            total_supply: None,
+            fdv_usd: None,
         }
     }
 
@@ -4088,6 +4419,7 @@ mod tests {
                 warnings: vec!["honeypot".to_string()],
             }),
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher =
             FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
@@ -4185,6 +4517,7 @@ mod tests {
             }),
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher = FomoChartDispatcher::new(
             Arc::new(crate::opaque::FailClosedDispatcher),
@@ -4224,6 +4557,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let mut row = bridge_token("0xbase", 8_453, "BASE");
         row.price_usd = Some(3.0);
@@ -4268,6 +4602,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         // Same symbol, different address, plus a wrong-network row: neither is an
         // exact identity match, so the fields stay null.
@@ -4306,6 +4641,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let mut evm_row = bridge_token("0xAbCdEf0000000000000000000000000000000001", 8_453, "BASE");
         evm_row.price_usd = Some(7.0);
@@ -4342,6 +4678,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let mut sol_row = bridge_token(case_variant, 1_399_811_149, "SOL");
         sol_row.price_usd = Some(6.0);
@@ -4373,6 +4710,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher =
             FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
@@ -4418,6 +4756,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let health = Arc::new(AtomicBool::new(true));
         let dispatcher =
@@ -4454,6 +4793,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher =
             FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
@@ -4483,6 +4823,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher =
             FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
@@ -4508,6 +4849,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         let dispatcher = FomoChartDispatcher::new(
             Arc::new(crate::opaque::FailClosedDispatcher),
@@ -4537,6 +4879,7 @@ mod tests {
             detail: None,
             risk: None,
             warnings: Vec::new(),
+            trading: None,
         }));
         assert!(dispatcher
             .dispatch(&market_request(
@@ -5198,6 +5541,9 @@ mod tests {
             .route("/market/search", get(bridge_handler))
             .route("/market/token", get(bridge_handler))
             .route("/market/trending", get(bridge_handler))
+            .route("/market/holders", get(bridge_handler))
+            .route("/market/about", get(bridge_handler))
+            .route("/market/activity", get(bridge_handler))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -5296,5 +5642,569 @@ mod tests {
             test_client(&base).search("alpha").await,
             Err(FomoMarketError::InvalidResponse)
         );
+    }
+
+    // ---- token intelligence ------------------------------------------- //
+
+    use crate::fomo_intelligence as intel;
+
+    const SOL_A: &str = "TokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SOL_B: &str = "TokenBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    const SOL_NETWORK: i64 = 1_399_811_149;
+
+    fn op_request(op: &str, payload: Value) -> CommandRequest {
+        CommandRequest {
+            op: op.to_string(),
+            payload,
+            request_id: "req".to_string(),
+            idempotency_key: None,
+        }
+    }
+
+    /// Scripted token-intelligence provider: each route returns one fixed result.
+    struct IntelProvider {
+        holders: StdMutex<Result<intel::BridgeHolders, FomoMarketError>>,
+        about: StdMutex<Result<intel::BridgeAbout, FomoMarketError>>,
+        activity: StdMutex<Result<intel::BridgeActivity, FomoMarketError>>,
+        activity_seen: StdMutex<Vec<(Option<String>, u32)>>,
+    }
+
+    impl IntelProvider {
+        fn ok(
+            holders: intel::BridgeHolders,
+            about: intel::BridgeAbout,
+            activity: intel::BridgeActivity,
+        ) -> Self {
+            Self {
+                holders: StdMutex::new(Ok(holders)),
+                about: StdMutex::new(Ok(about)),
+                activity: StdMutex::new(Ok(activity)),
+                activity_seen: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BarsProvider for IntelProvider {
+        async fn bars(&self, _query: BarsQuery<'_>) -> Result<Vec<Bar>, FomoMarketError> {
+            Err(FomoMarketError::NotConfigured)
+        }
+        async fn holders(
+            &self,
+            _chain_slug: &str,
+            _address: &str,
+        ) -> Result<intel::BridgeHolders, FomoMarketError> {
+            self.holders.lock().unwrap().clone()
+        }
+        async fn about(
+            &self,
+            _chain_slug: &str,
+            _address: &str,
+        ) -> Result<intel::BridgeAbout, FomoMarketError> {
+            self.about.lock().unwrap().clone()
+        }
+        async fn activity(
+            &self,
+            _chain_slug: &str,
+            _address: &str,
+            cursor: Option<&str>,
+            limit: u32,
+        ) -> Result<intel::BridgeActivity, FomoMarketError> {
+            self.activity_seen
+                .lock()
+                .unwrap()
+                .push((cursor.map(str::to_string), limit));
+            self.activity.lock().unwrap().clone()
+        }
+    }
+
+    fn holders_bridge(address: &str) -> intel::BridgeHolders {
+        intel::BridgeHolders {
+            address: Some(address.to_string()),
+            network_id: Some(SOL_NETWORK),
+            holders: vec![intel::BridgeHolderRow {
+                wallet: Some("Wallet111".into()),
+                amount: Some(1_000.0),
+                value_usd: Some(12_000.0),
+                realized_pnl_usd: Some(-3.5),
+                thesis: Some(intel::BridgeThesis {
+                    text: Some("bullish".into()),
+                    created_at_ms: Some(json!(1_700_000_000i64)),
+                    likes: Some(4.0),
+                    trade_id: None,
+                }),
+                ..intel::BridgeHolderRow::default()
+            }],
+            source: Some("fomo-rest".into()),
+            ..intel::BridgeHolders::default()
+        }
+    }
+
+    fn about_bridge(address: &str) -> intel::BridgeAbout {
+        intel::BridgeAbout {
+            address: Some(address.to_string()),
+            network_id: Some(SOL_NETWORK),
+            profile_token: Some(intel::BridgeAboutToken {
+                symbol: Some("PEP".into()),
+                name: Some("Pep".into()),
+                social_links: Some(intel::BridgeSocialLinks {
+                    twitter: Some("https://x.com/pep".into()),
+                    website: Some("javascript:alert(1)".into()),
+                    ..intel::BridgeSocialLinks::default()
+                }),
+                ..intel::BridgeAboutToken::default()
+            }),
+            stats: Some(intel::BridgeAboutStats {
+                price_usd: Some(0.5),
+                ..intel::BridgeAboutStats::default()
+            }),
+            ..intel::BridgeAbout::default()
+        }
+    }
+
+    fn activity_bridge(address: &str) -> intel::BridgeActivity {
+        intel::BridgeActivity {
+            address: Some(address.to_string()),
+            network_id: Some(SOL_NETWORK),
+            events: vec![intel::BridgeActivityEvent {
+                kind: Some("swap_buy".into()),
+                usd_amount: Some(12.5),
+                ..intel::BridgeActivityEvent::default()
+            }],
+            next_cursor: Some("cursor-1".into()),
+            has_next_page: Some(true),
+            ..intel::BridgeActivity::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn intelligence_dispatch_rejects_unknown_chain_and_bad_address() {
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        for (op, payload) in [
+            (
+                "get_token_holders",
+                json!({"chain": "unknown", "address": SOL_A}),
+            ),
+            (
+                "get_token_about",
+                json!({"chain": "solana", "address": "has space"}),
+            ),
+            (
+                "get_token_activity",
+                json!({"chain": "solana", "address": ""}),
+            ),
+        ] {
+            let denial = dispatcher
+                .dispatch(&op_request(op, payload))
+                .await
+                .expect_err("refused");
+            assert_eq!(denial.code, "protocol", "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_other_token_holders_never_render_under_the_requested_identity() {
+        let health = Arc::new(AtomicBool::new(true));
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_B),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider)
+                .with_intelligence_health_flag(Some(health.clone()));
+        let denial = dispatcher
+            .dispatch(&op_request(
+                "get_token_holders",
+                json!({"chain": "solana", "address": SOL_A}),
+            ))
+            .await
+            .expect_err("stale identity refused");
+        assert_eq!(denial.code, "server");
+        assert!(denial.retryable);
+        assert!(
+            !health.load(Ordering::SeqCst),
+            "an invalid response demotes health"
+        );
+    }
+
+    #[tokio::test]
+    async fn holders_project_thesis_and_nulls_for_the_exact_identity() {
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        let value = dispatcher
+            .dispatch(&op_request(
+                "get_token_holders",
+                json!({"chain": "solana", "address": SOL_A, "limit": 5}),
+            ))
+            .await
+            .expect("holders");
+        assert_eq!(value["address"], SOL_A);
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["holders"][0]["valueUsd"], 12_000.0);
+        assert_eq!(value["holders"][0]["realizedPnlUsd"], -3.5);
+        assert_eq!(value["holders"][0]["thesis"]["text"], "bullish");
+        assert_eq!(
+            value["holders"][0]["thesis"]["createdAtMs"],
+            1_700_000_000_000i64
+        );
+        assert_eq!(value["holders"][0]["averageEntryPriceUsd"], Value::Null);
+        assert_eq!(value["holders"][0]["user"]["verified"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn about_projects_social_links_and_keeps_unknown_stats_null() {
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        let value = dispatcher
+            .dispatch(&op_request(
+                "get_token_about",
+                json!({"chain": "solana", "address": SOL_A}),
+            ))
+            .await
+            .expect("about");
+        assert_eq!(value["token"]["symbol"], "PEP");
+        assert_eq!(
+            value["token"]["socialLinks"]["twitter"],
+            "https://x.com/pep"
+        );
+        assert!(value["token"]["socialLinks"].get("website").is_none());
+        assert_eq!(value["stats"]["priceUsd"], 0.5);
+        assert_eq!(value["stats"]["liquidityUsd"], Value::Null);
+        assert_eq!(value["trading"]["5m"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn activity_forwards_a_bounded_cursor_and_limit() {
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher = FomoChartDispatcher::new(
+            Arc::new(crate::opaque::FailClosedDispatcher),
+            provider.clone(),
+        );
+        let value = dispatcher
+            .dispatch(&op_request(
+                "get_token_activity",
+                json!({"chain": "solana", "address": SOL_A, "limit": 100_000, "cursor": "c1"}),
+            ))
+            .await
+            .expect("activity");
+        assert_eq!(value["events"][0]["type"], "buy");
+        assert_eq!(value["nextCursor"], "cursor-1");
+        assert_eq!(value["hasNextPage"], true);
+        assert_eq!(
+            provider.activity_seen.lock().unwrap().as_slice(),
+            &[(Some("c1".to_string()), intel::MAX_INTEL_LIMIT)]
+        );
+
+        // An over-long cursor is a determinate protocol refusal, never forwarded.
+        let denial = dispatcher
+            .dispatch(&op_request(
+                "get_token_activity",
+                json!({"chain": "solana", "address": SOL_A, "cursor": "c".repeat(300)}),
+            ))
+            .await
+            .expect_err("cursor bound");
+        assert_eq!(denial.code, "protocol");
+    }
+
+    #[tokio::test]
+    async fn intelligence_provider_outage_fails_closed_and_demotes_health() {
+        let health = Arc::new(AtomicBool::new(true));
+        let provider = Arc::new(IntelProvider {
+            holders: StdMutex::new(Err(FomoMarketError::Unavailable)),
+            about: StdMutex::new(Err(FomoMarketError::Unavailable)),
+            activity: StdMutex::new(Err(FomoMarketError::Unavailable)),
+            activity_seen: StdMutex::new(Vec::new()),
+        });
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider)
+                .with_intelligence_health_flag(Some(health.clone()));
+        let denial = dispatcher
+            .dispatch(&op_request(
+                "get_token_holders",
+                json!({"chain": "solana", "address": SOL_A}),
+            ))
+            .await
+            .expect_err("outage");
+        assert_eq!(denial.code, "server");
+        assert!(!health.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn intelligence_commands_do_not_shadow_market_chart_or_realtime() {
+        // Backward compatibility: the new ops are additive; the existing market
+        // reads still route to their own handlers. The provider serves no bars,
+        // so `get_chart` fails with its own market/chart denial, proving the
+        // intelligence arms did not capture it.
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let dispatcher =
+            FomoChartDispatcher::new(Arc::new(crate::opaque::FailClosedDispatcher), provider);
+        let denial = dispatcher
+            .dispatch(&op_request(
+                "get_chart",
+                json!({"chain": "solana", "address": SOL_A, "window": "1m"}),
+            ))
+            .await
+            .expect_err("no bars configured");
+        assert_eq!(denial.code, "capability_missing");
+
+        // An unknown op still falls through to the wrapped fail-closed default.
+        let denial = dispatcher
+            .dispatch(&op_request("definitely_not_a_command", json!({})))
+            .await
+            .expect_err("fail closed");
+        assert_eq!(denial.code, "capability_missing");
+    }
+
+    #[tokio::test]
+    async fn probe_token_intelligence_requires_all_three_routes_and_a_target() {
+        let provider = Arc::new(IntelProvider::ok(
+            holders_bridge(SOL_A),
+            about_bridge(SOL_A),
+            activity_bridge(SOL_A),
+        ));
+        let mut config = FomoMarketConfig {
+            base_url: "http://127.0.0.1:8787".into(),
+            api_key_file: std::path::PathBuf::from("/tmp/key"),
+            request_timeout: Duration::from_secs(1),
+            stream_target: None,
+            history_target: Some(("solana".into(), SOL_A.into())),
+            stream_poll: Duration::from_secs(1),
+            stream_count_back: 10,
+        };
+        assert!(probe_token_intelligence(provider.as_ref(), &config).await);
+
+        // No exact target => unprovable, never advertised.
+        config.history_target = None;
+        assert!(!probe_token_intelligence(provider.as_ref(), &config).await);
+
+        // One failing route is enough to refuse the whole capability.
+        let config = FomoMarketConfig {
+            history_target: Some(("solana".into(), SOL_A.into())),
+            ..config
+        };
+        let failing = Arc::new(IntelProvider {
+            holders: StdMutex::new(Ok(holders_bridge(SOL_A))),
+            about: StdMutex::new(Ok(about_bridge(SOL_A))),
+            activity: StdMutex::new(Err(FomoMarketError::Unavailable)),
+            activity_seen: StdMutex::new(Vec::new()),
+        });
+        assert!(!probe_token_intelligence(failing.as_ref(), &config).await);
+
+        // A well-shaped but wrong-identity response must not advertise the
+        // capability: the probe runs the same identity projection as a live read.
+        let wrong_identity = Arc::new(IntelProvider {
+            holders: StdMutex::new(Ok(holders_bridge(SOL_A))),
+            about: StdMutex::new(Ok(about_bridge(SOL_B))),
+            activity: StdMutex::new(Ok(activity_bridge(SOL_A))),
+            activity_seen: StdMutex::new(Vec::new()),
+        });
+        assert!(!probe_token_intelligence(wrong_identity.as_ref(), &config).await);
+    }
+
+    #[test]
+    fn risk_json_bounds_provider_warning_factors() {
+        // The about read newly exposes this projection, so an unbounded provider
+        // warning list or an unbounded warning string must not become an
+        // unbounded factor list / detail.
+        let risk = BridgeRisk {
+            disable_buying: None,
+            disable_selling: None,
+            level: None,
+            warnings: (0..100).map(|index| format!("warning {index}")).collect(),
+        };
+        let value = risk_json(&risk);
+        assert_eq!(value["factors"].as_array().unwrap().len(), 32);
+
+        let long = BridgeRisk {
+            warnings: vec!["x".repeat(1_000)],
+            ..risk
+        };
+        let value = risk_json(&long);
+        assert_eq!(
+            value["factors"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            256
+        );
+    }
+
+    #[tokio::test]
+    async fn client_reads_holders_about_and_activity_from_the_bridge() {
+        let holders = json!({
+            "address": "0xbase", "networkId": 8453,
+            "holders": [{"user": {"handle": "trader"}, "amount": 5.0}],
+            "source": "rest"
+        })
+        .to_string();
+        let base = spawn_read_bridge(axum::http::StatusCode::OK, holders).await;
+        let result = test_client(&base).holders("base", "0xbase").await.unwrap();
+        assert_eq!(result.holders.len(), 1);
+
+        let about = json!({
+            "address": "0xbase", "networkId": 8453,
+            "token": {"symbol": "BASE", "socialLinks": {"twitter": "https://x.com/base"}},
+            "stats": {"price": 1.5},
+            "source": "rest"
+        })
+        .to_string();
+        let base = spawn_read_bridge(axum::http::StatusCode::OK, about).await;
+        let result = test_client(&base).about("base", "0xbase").await.unwrap();
+        assert_eq!(
+            result.profile_token.unwrap().symbol.as_deref(),
+            Some("BASE")
+        );
+
+        let activity = json!({
+            "address": "0xbase", "networkId": 8453,
+            "events": [{"type": "swap_sell", "usdAmount": 3.0}],
+            "nextCursor": "n1", "hasNextPage": true, "source": "rest"
+        })
+        .to_string();
+        let base = spawn_read_bridge(axum::http::StatusCode::OK, activity).await;
+        let result = test_client(&base)
+            .activity("base", "0xbase", None, 50)
+            .await
+            .unwrap();
+        assert_eq!(result.events[0].kind.as_deref(), Some("swap_sell"));
+        assert_eq!(result.next_cursor.as_deref(), Some("n1"));
+    }
+
+    #[tokio::test]
+    async fn intelligence_http_auth_and_bad_shape_fail_closed() {
+        // Auth rejection is an availability failure for every intelligence route:
+        // the capability stays unadvertised and a live read fails closed.
+        let base = spawn_read_bridge(
+            axum::http::StatusCode::UNAUTHORIZED,
+            json!({"error": "unauthorized"}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            test_client(&base).holders("solana", SOL_A).await,
+            Err(FomoMarketError::Unavailable)
+        );
+        assert_eq!(
+            test_client(&base).about("solana", SOL_A).await,
+            Err(FomoMarketError::Unavailable)
+        );
+        assert_eq!(
+            test_client(&base).activity("solana", SOL_A, None, 50).await,
+            Err(FomoMarketError::Unavailable)
+        );
+
+        // A 404 on `/market/about` falls back to `/market/token`; when neither
+        // route exists the read is a determinate (non-outage) refusal.
+        let base = spawn_read_bridge(
+            axum::http::StatusCode::NOT_FOUND,
+            json!({"error": "unknown"}).to_string(),
+        )
+        .await;
+        assert_eq!(
+            test_client(&base).about("solana", SOL_A).await,
+            Err(FomoMarketError::InvalidRequest)
+        );
+
+        // A 200 body that violates the read contract is refused, never repaired.
+        let base = spawn_read_bridge(
+            axum::http::StatusCode::OK,
+            json!({"address": SOL_A, "networkId": SOL_NETWORK, "holders": "not-an-array"})
+                .to_string(),
+        )
+        .await;
+        assert_eq!(
+            test_client(&base).holders("solana", SOL_A).await,
+            Err(FomoMarketError::InvalidResponse)
+        );
+    }
+
+    #[test]
+    fn about_fallback_projects_an_extended_token_detail() {
+        let detail = BridgeTokenDetail {
+            address: "0xbase".into(),
+            network_id: 8_453,
+            chain: Some("base".into()),
+            token: BridgeToken {
+                address: "0xbase".into(),
+                network_id: 8_453,
+                symbol: Some("BASE".into()),
+                name: Some("Base".into()),
+                image_url: Some("https://img.example/b.png".into()),
+                social_links: Some(intel::BridgeSocialLinks {
+                    twitter: Some("https://x.com/base".into()),
+                    ..intel::BridgeSocialLinks::default()
+                }),
+                launchpad: Some("pump.fun".into()),
+                graduation_percent: Some(100.0),
+                total_supply: Some(1_000_000.0),
+                ..bridge_token("0xbase", 8_453, "BASE")
+            },
+            detail: Some(BridgeDetailMetrics {
+                price: Some(1.5),
+                market_cap: Some(10.0),
+                top10_holders_percent: Some(42.0),
+                ..BridgeDetailMetrics::default()
+            }),
+            risk: None,
+            warnings: vec!["w".into()],
+            trading: Some(intel::BridgeTradingWindows {
+                m5: Some(intel::BridgeTradingWindow {
+                    buy_count: Some(3.0),
+                    ..intel::BridgeTradingWindow::default()
+                }),
+                ..intel::BridgeTradingWindows::default()
+            }),
+        };
+        let about = intel::about_from_detail(&detail);
+        assert_eq!(about.address.as_deref(), Some("0xbase"));
+        assert_eq!(
+            about.profile_token.as_ref().unwrap().image_url.as_deref(),
+            Some("https://img.example/b.png")
+        );
+        assert_eq!(
+            about.stats.as_ref().unwrap().top10_holders_percent,
+            Some(42.0)
+        );
+        assert_eq!(
+            about.profile.as_ref().unwrap().launchpad.as_deref(),
+            Some("pump.fun")
+        );
+        assert_eq!(
+            about
+                .trading
+                .as_ref()
+                .unwrap()
+                .m5
+                .as_ref()
+                .unwrap()
+                .buy_count,
+            Some(3.0)
+        );
+        assert_eq!(about.warnings, vec!["w".to_string()]);
     }
 }

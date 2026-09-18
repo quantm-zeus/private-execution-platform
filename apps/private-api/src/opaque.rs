@@ -55,6 +55,10 @@ pub struct CapabilitySet {
     pub limits: bool,
     pub portfolio: bool,
     pub intelligence: bool,
+    /// Read-only FOMO token intelligence (holders/about/activity). Independent
+    /// of `market` so a deployment that serves token search but not the
+    /// intelligence routes never advertises them.
+    pub token_intelligence: bool,
     pub twitter: bool,
     pub gmgn: bool,
     pub okx: bool,
@@ -77,6 +81,7 @@ impl CapabilitySet {
             limits: false,
             portfolio: false,
             intelligence: false,
+            token_intelligence: false,
             twitter: false,
             gmgn: false,
             okx: false,
@@ -107,6 +112,7 @@ impl CapabilitySet {
             "request_withdrawal" => "withdraw",
             "get_wallet_limits" | "set_wallet_limits" => "wallet_limits",
             "get_intelligence" | "get_provider_health" | "get_alerts" => "intelligence",
+            "get_token_holders" | "get_token_about" | "get_token_activity" => "token_intelligence",
             "search_token" | "get_token" | "get_trending" => "market",
             "get_chart" => "chart",
             "set_realtime_target" => "realtime",
@@ -138,6 +144,7 @@ impl CapabilitySet {
             "limits" => self.limits,
             "portfolio" => self.portfolio,
             "intelligence" => self.intelligence,
+            "token_intelligence" => self.token_intelligence,
             "twitter" => self.twitter,
             "gmgn" => self.gmgn,
             "okx" => self.okx,
@@ -967,7 +974,7 @@ mod tests {
         route: OpaqueRoute,
         plaintext: &[u8],
     ) -> Result<Value, RelayFailure> {
-        let envelope = client.seal_at(client.next_sequence(), plaintext).unwrap();
+        let envelope = client.seal_next(plaintext).unwrap();
         let response_bytes = state
             .relay_envelope(route, &envelope.to_wire_bytes())
             .await?;
@@ -1302,10 +1309,7 @@ mod tests {
         );
         // A capability that *is* advertised still works (at the next sequence).
         let envelope = client
-            .seal_at(
-                1,
-                br#"{"op":"preview_market_order","payload":{},"request_id":"ok"}"#,
-            )
+            .seal_next(br#"{"op":"preview_market_order","payload":{},"request_id":"ok"}"#)
             .unwrap();
         let opened = state
             .relay_envelope(OpaqueRoute::Command, &envelope.to_wire_bytes())
@@ -1316,6 +1320,77 @@ mod tests {
         let allowed: Value = serde_json::from_slice(&plaintext).unwrap();
         assert_eq!(allowed["result"]["status"], "ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn token_intelligence_commands_are_gated_by_their_own_capability() {
+        // The token-intelligence reads are gated by `token_intelligence`, an
+        // independent capability from `market`/`intelligence`. A deployment that
+        // advertises neither must refuse all three ops before the dispatcher, and
+        // a document that advertises the capability serves them. This is the
+        // encrypted-dispatch gate, not merely a UI hide.
+        let now = 1_000i64;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            read_only_bootstrap(),
+        );
+        for op in ["get_token_holders", "get_token_about", "get_token_activity"] {
+            let body = format!(
+                r#"{{"op":"{op}","payload":{{"chain":"solana","address":"A"}},"request_id":"ti"}}"#
+            );
+            let response = roundtrip(&state, &mut client, OpaqueRoute::Command, body.as_bytes())
+                .await
+                .expect("sealed denial");
+            assert_eq!(response["error"]["code"], "capability_missing", "{op}");
+            assert!(
+                response.get("result").is_none(),
+                "no false success for {op}"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an unadvertised capability never reaches the dispatcher"
+        );
+
+        // Advertising the capability serves the op (at the next sequence).
+        let mut document = BootstrapDocument::fail_closed();
+        document.capabilities.token_intelligence = true;
+        let (state, mut client) = state_with(
+            now,
+            Arc::new(CountingDispatcher {
+                calls: calls.clone(),
+                result: json!({"status": "ok"}),
+            }),
+            Arc::new(StaticBootstrap::new(document)),
+        );
+        let response = roundtrip(
+            &state,
+            &mut client,
+            OpaqueRoute::Command,
+            br#"{"op":"get_token_holders","payload":{"chain":"solana","address":"A"},"request_id":"ti-ok"}"#,
+        )
+        .await
+        .expect("advertised capability is served");
+        assert_eq!(response["result"]["status"], "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The op map is authoritative in both directions, and the new reads carry
+        // no mutation semantics so execution readiness is unchanged.
+        for op in ["get_token_holders", "get_token_about", "get_token_activity"] {
+            assert_eq!(
+                CapabilitySet::for_op(op),
+                Some("token_intelligence"),
+                "{op}"
+            );
+            assert!(!session_transport::is_mutating_op(op), "{op} is a read");
+        }
     }
 
     #[tokio::test]
