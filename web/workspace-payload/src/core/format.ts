@@ -52,3 +52,43 @@ export function formatClock(ms: number | null | undefined): string {
     "0",
   )}:${String(date.getUTCSeconds()).padStart(2, "0")}Z`;
 }
+
+/**
+ * Signed USD with an explicit sign glyph. An absent/non-finite value stays `—`
+ * rather than becoming a confident `+$0.00`.
+ */
+export function formatSignedUsd(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${value >= 0 ? "+" : "−"}${formatUsd(Math.abs(value), digits)}`;
+}
+
+/**
+ * A count rendered compactly (`1.2K`, `3.40M`, `1.10B`). An absent/non-finite
+ * value stays `—`; a real zero renders `0` (it is a stated value, not unknown).
+ */
+export function formatCount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (abs >= 10_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toLocaleString("en-US");
+}
+
+/**
+ * A signed percentage from a ratio (0.12 -> `+12.00%`). Absent stays `—`.
+ */
+export function formatSignedPercent(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return `${value >= 0 ? "+" : "−"}${(Math.abs(value) * 100).toFixed(digits)}%`;
+}
+
+/** A duration in seconds rendered as `3d`, `12h`, `4m`, `22s`; absent stays `—`. */
+export function formatDurationSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value) || value < 0) return "—";
+  if (value < 60) return `${Math.round(value)}s`;
+  if (value < 3_600) return `${Math.round(value / 60)}m`;
+  if (value < 86_400) return `${Math.round(value / 3_600)}h`;
+  return `${Math.round(value / 86_400)}d`;
+}
+

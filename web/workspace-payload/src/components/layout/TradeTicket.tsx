@@ -1,6 +1,7 @@
-import { Show, type Component } from "solid-js";
+import { Show, onCleanup, type Component } from "solid-js";
 import { useWorkspace } from "../../state/session";
 import { useWorkstation } from "../../state/workstation";
+import { wireTablist } from "../ui/tablist";
 import { EmptyBlock } from "../ui/states";
 import TradePanel from "../../features/trade/TradePanel";
 import LimitsPanel from "../../features/limits/LimitsPanel";
@@ -18,13 +19,20 @@ export const TradeTicket: Component = () => {
 
   return (
     <div class="trade-ticket" data-testid="trade-ticket">
-      <div class="trade-ticket__tabs" role="tablist" aria-label="Trade ticket">
+      <div
+        class="trade-ticket__tabs"
+        role="tablist"
+        aria-label="Trade ticket"
+        ref={(element) => onCleanup(wireTablist(element, ".trade-ticket__tab"))}
+      >
         <button
           type="button"
           role="tab"
           class="trade-ticket__tab"
+          id="ticket-tab-market"
           data-testid="ticket-tab-market"
           aria-selected={station.ticketTab() === "market"}
+          aria-controls={hasTarget() ? "ticket-pane-market" : undefined}
           onClick={() => station.setTicketTab("market")}
         >
           Market
@@ -33,8 +41,10 @@ export const TradeTicket: Component = () => {
           type="button"
           role="tab"
           class="trade-ticket__tab"
+          id="ticket-tab-limit"
           data-testid="ticket-tab-limit"
           aria-selected={station.ticketTab() === "limit"}
+          aria-controls={hasTarget() ? "ticket-pane-limit" : undefined}
           onClick={() => station.setTicketTab("limit")}
         >
           Limit
@@ -54,6 +64,9 @@ export const TradeTicket: Component = () => {
         >
           <div
             class="trade-ticket__pane"
+            id="ticket-pane-market"
+            role="tabpanel"
+            aria-labelledby="ticket-tab-market"
             hidden={station.ticketTab() !== "market"}
             aria-hidden={station.ticketTab() !== "market"}
           >
@@ -61,6 +74,9 @@ export const TradeTicket: Component = () => {
           </div>
           <div
             class="trade-ticket__pane"
+            id="ticket-pane-limit"
+            role="tabpanel"
+            aria-labelledby="ticket-tab-limit"
             hidden={station.ticketTab() !== "limit"}
             aria-hidden={station.ticketTab() !== "limit"}
           >

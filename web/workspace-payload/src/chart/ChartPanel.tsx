@@ -24,7 +24,8 @@ import {
 } from "./drawings";
 import { createProChart, type ProChartHandle } from "./pro/pro-chart";
 import { PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
-import { timeframeById, type Timeframe } from "../market/ohlcv";
+import { isServedTimeframe, timeframeById, type Timeframe } from "../market/ohlcv";
+import { ActionType } from "klinecharts";
 import { formatAmount, formatBps, truncateAddress } from "../core/format";
 import type { InstrumentRef } from "../core/types";
 import { useRealtimeFeedContext } from "../realtime/feed-context";
@@ -38,6 +39,15 @@ export interface ChartPanelProps {
   readonly entityKey?: string;
   readonly initialTimeframe?: string;
   readonly bars?: number;
+}
+
+/** One crosshair OHLC readout row. Values are provider/candle truth only. */
+interface CrosshairReadout {
+  readonly open: number;
+  readonly high: number;
+  readonly low: number;
+  readonly close: number;
+  readonly volume: number | null;
 }
 
 /**
@@ -65,13 +75,19 @@ function subjectFromEntityKey(key: string): ChartSubject | null {
   return { chain: parts[1]!, address: parts[2]!, symbol: parts[2]! };
 }
 
+function numOrDash(value: number | null): string {
+  return value === null || !Number.isFinite(value) ? "—" : value.toFixed(6);
+}
+
 /**
  * KLineChart Pro price chart. The worker has already decrypted and normalized
  * frames; this component only routes them into bounded local buffers and the
  * injected datafeed (authenticated history + the local realtime bar bus).
  *
- * Chart data is visual/non-authoritative: execution always depends on exact
- * route simulation, never on a chart crossing.
+ * Two 36px pane bars sit above the plot and nothing overlays the plot or either
+ * scale: the crosshair readout lives in bar 1, the drawing/timeframe/indicator
+ * toolbar in bar 2. Chart data is visual/non-authoritative: execution always
+ * depends on exact route simulation, never on a chart crossing.
  */
 export const ChartPanel: Component<ChartPanelProps> = (props) => {
   const ws = useWorkspace();
@@ -80,9 +96,6 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   const router = new ChartFrameRouter();
   const [version, setVersion] = createSignal(0);
 
-  // The workstation store owns the authoritative timeframe: the chart and the
-  // encrypted realtime-target coordinator read the same signal, so switching a
-  // window issues exactly one `set_realtime_target` for the selected token.
   const activeTimeframe = createMemo<string>(() => {
     const shared = station.timeframe();
     if (timeframeById(shared)) return shared;
@@ -136,8 +149,11 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   let handle: ProChartHandle | null = null;
   let activeDatafeed: ProDatafeed | null = null;
   let drawing: DrawingController | null = null;
+  let crosshairHandler: ((data?: unknown) => void) | null = null;
   const [drawingVersion, setDrawingVersion] = createSignal(0);
   const [clearArmed, setClearArmed] = createSignal(false);
+  const [crosshair, setCrosshair] = createSignal<CrosshairReadout | null>(null);
+  const [indicatorsOn, setIndicatorsOn] = createSignal(true);
   const drawingCount = createMemo(() => {
     drawingVersion();
     return drawing?.count() ?? 0;
@@ -146,7 +162,9 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     drawingVersion();
     return drawing?.activeTool() ?? null;
   });
-  const drawingTools = DRAWING_TOOLS.filter((tool) => tool.id === "ruler");
+  // All seven tools the design requires: ruler/measure, trend, horizontal,
+  // vertical, ray, rectangle, Fibonacci.
+  const drawingTools = DRAWING_TOOLS;
   const onChartKeyDown = (event: KeyboardEvent): void => {
     if (!drawing) return;
     if (event.key === "Escape") {
@@ -158,24 +176,75 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
       if (drawing.removeSelected()) event.preventDefault();
     }
   };
+  // The plot is the product's primary surface, so pan/zoom/reset are operable
+  // from the keyboard (DESIGN.md §5.3/§10). Drawing *placement* remains
+  // pointer-only and is not claimed otherwise.
+  const onPlotKeyDown = (event: KeyboardEvent): void => {
+    const api = handle?.chartApi;
+    if (!api) return;
+    const rect = host?.getBoundingClientRect();
+    const center = rect
+      ? { x: Math.round(rect.width / 2), y: Math.round(rect.height / 2) }
+      : { x: 0, y: 0 };
+    switch (event.key) {
+      case "ArrowLeft":
+        event.preventDefault();
+        api.scrollByDistance(-40);
+        break;
+      case "ArrowRight":
+        event.preventDefault();
+        api.scrollByDistance(40);
+        break;
+      case "ArrowUp":
+      case "+":
+      case "=":
+        event.preventDefault();
+        api.zoomAtCoordinate(1.1, center);
+        break;
+      case "ArrowDown":
+      case "-":
+      case "_":
+        event.preventDefault();
+        api.zoomAtCoordinate(0.9, center);
+        break;
+      case "0":
+      case "Home":
+        event.preventDefault();
+        api.scrollToRealTime();
+        break;
+      default:
+        break;
+    }
+  };
   let createdTicker: string | null = null;
   let createdNonce = -1;
   const [chartError, setChartError] = createSignal(false);
-  // Bumped when the exact selected entity+timeframe gains its first local
-  // candles after the renderer was created. Pro loads history once at init, so a
-  // snapshot that arrives afterwards would otherwise leave only its single
-  // replayed bar on screen; the bump rebuilds the renderer so `getHistoryKLineData`
-  // runs again against the now-populated local buffer and the full series renders.
   const [reloadNonce, setReloadNonce] = createSignal(0);
   let hydratedKey: string | null = null;
 
-  // The badge reflects the CURRENT exact subject/timeframe only, so an
-  // `ohlcv:default` or depth frame can never make a selected token look live
-  // (exact entity-key isolation is preserved; nothing is matched loosely).
   const selectedCandleCount = createMemo(() => {
     version();
     return router.localCandles(subject(), activeTimeframeDef()).length;
   });
+
+  const risk = createMemo(() => station.visibleDetail()?.risk ?? null);
+  const riskText = createMemo(() => {
+    const value = risk();
+    if (!value) return null;
+    if (typeof value.level === "string" && value.level.length > 0) return value.level;
+    return value.score == null ? "—" : String(value.score);
+  });
+
+  const applyIndicators = (on: boolean): void => {
+    const api = handle?.chartApi;
+    if (!api) return;
+    try {
+      if (on) api.createIndicator("MA", false, { id: "candle_pane" });
+      else api.removeIndicator("candle_pane", "MA");
+    } catch {
+      // Vendor internals changed: the chart stays usable without the toggle.
+    }
+  };
 
   createEffect(() => {
     const current = subject();
@@ -183,45 +252,31 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     const nonce = reloadNonce();
     if (!host) return;
     if (handle !== null && createdTicker === ticker && createdNonce === nonce) return;
-    // Pro 0.1.1 can drop the last symbol/period change when two land while a
-    // history load is in flight (its loading guard is not reactive), so a
-    // subject switch rebuilds the renderer instead of calling `setSymbol`.
-    // The datafeed owns every subscription and is torn down with the instance.
     handle?.dispose();
     handle = null;
     activeDatafeed?.dispose();
     activeDatafeed = null;
-    // A token switch rebuilds the renderer, so drawings (in-memory overlays on
-    // the vendor instance) cannot leak across token identity.
     drawing = null;
+    crosshairHandler = null;
     setClearArmed(false);
-    // A fresh datafeed per renderer instance: Pro 0.1.1 can call `subscribe()`
-    // only after its history `await` resolves, so a disposed instance must never
-    // be reused (its terminal guard would otherwise either leak a sink or drop a
-    // legitimate late subscribe).
+    setCrosshair(null);
     const datafeed = buildDatafeed();
     try {
       handle = createProChart(host, {
         subject: current,
         datafeed,
-        // Read the initial window without tracking it: a timeframe change is
-        // applied in place by the effect below, not by rebuilding the chart.
         timeframeId: untrack(activeTimeframe),
         testId: "pro-chart",
       });
       activeDatafeed = datafeed;
       createdTicker = ticker;
       createdNonce = nonce;
-      // If the local buffer already has this entity+window, the init history load
-      // renders it; mark it hydrated so the effect below does not rebuild again.
       const timeframe = untrack(activeTimeframeDef);
       if (router.localCandles(current, timeframe).length > 0) {
         hydratedKey = `${ticker}#${timeframe.id}`;
       }
       setChartError(false);
     } catch {
-      // No usable canvas (unsupported/headless runtime): degrade to a clear
-      // message instead of breaking the whole workspace.
       datafeed.dispose();
       createdTicker = null;
       handle = null;
@@ -237,6 +292,36 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     } catch {
       drawing = null;
     }
+    // Crosshair readout: it lives in the pane bar, never over the plot.
+    try {
+      const api = handle.chartApi;
+      if (api) {
+        crosshairHandler = (data?: unknown) => {
+          const candle = (data as { kLineData?: Record<string, unknown> } | undefined)?.kLineData;
+          if (
+            !candle ||
+            typeof candle.open !== "number" ||
+            typeof candle.high !== "number" ||
+            typeof candle.low !== "number" ||
+            typeof candle.close !== "number"
+          ) {
+            setCrosshair(null);
+            return;
+          }
+          setCrosshair({
+            open: candle.open,
+            high: candle.high,
+            low: candle.low,
+            close: candle.close,
+            volume: typeof candle.volume === "number" ? candle.volume : null,
+          });
+        };
+        api.subscribeAction(ActionType.OnCrosshairChange, crosshairHandler);
+      }
+    } catch {
+      crosshairHandler = null;
+    }
+    if (!untrack(indicatorsOn)) applyIndicators(false);
   });
 
   // Rebuild once per exact entity+window when its first local candles arrive.
@@ -251,16 +336,11 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     }
   });
 
-  // A timeframe change is applied to the live renderer in place.
   createEffect(() => {
     const value = activeTimeframe();
     handle?.setTimeframe(value);
   });
 
-  // Live current candle: a pushed, verified price tick for the exact selected
-  // entity upserts the current candle in place (close/high/low only). Volume is
-  // never fabricated from a tick; the periodic OHLCV reconciliation replaces the
-  // provisional bar with authoritative volume.
   createEffect(() => {
     const current = subject();
     if (!current.chain || !current.address) return;
@@ -271,16 +351,27 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     }
   });
 
+  // The indicator toggle is applied to the live renderer.
+  let indicatorsInitialised = false;
+  createEffect(() => {
+    const on = indicatorsOn();
+    if (!indicatorsInitialised) {
+      indicatorsInitialised = true;
+      return;
+    }
+    applyIndicators(on);
+  });
+
   onCleanup(() => {
     handle?.dispose();
     handle = null;
     drawing = null;
+    crosshairHandler = null;
     activeDatafeed?.dispose();
     activeDatafeed = null;
   });
 
   const depth = () => {
-    // Track the frame version so depth tables re-render with new snapshots.
     version();
     return {
       bids: router.stores.depth.bidLevels().slice(0, 8),
@@ -288,77 +379,126 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     };
   };
 
+  const change = createMemo<number | null>(() => {
+    const bar = crosshair();
+    if (!bar || bar.open === 0) return null;
+    return ((bar.close - bar.open) / bar.open) * 100;
+  });
+
   return (
     <div class="chart-panel" onKeyDown={onChartKeyDown}>
-      <div class="chart-panel__head">
-        <div class="chart-target" data-testid="chart-target" data-candles={String(selectedCandleCount())}>
+      {/* Bar 1 — identity & crosshair readout. Nothing overlays the plot. */}
+      <div class="panebar chart-pane__bar1">
+        <div class="chart-pane__identity">
+          <h2 class="chart-pane__symbol">{hasTarget() ? subject().symbol : "Price"}</h2>
           <Show when={hasTarget()} fallback={<Badge tone="muted">No target selected</Badge>}>
-            <Badge tone="info">
-              {subject().symbol} · {truncateAddress(subject().address, 6, 6)} · {subject().chain}
-            </Badge>
+            <Badge tone="muted">{subject().chain}</Badge>
           </Show>
-          <Badge tone={selectedCandleCount() > 0 ? "positive" : "muted"}>
-            {selectedCandleCount() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
-          </Badge>
+          <Show when={riskText()}>
+            {(value) => (
+              <span class="chart-pane__stats" data-testid="token-risk">
+                <Badge tone={risk()?.level === "hard_risk" ? "danger" : "muted"}>
+                  risk {value()}
+                </Badge>
+                <Show when={risk()?.sellRestricted === true}>
+                  <Badge tone="danger">SELL RESTRICTED</Badge>
+                </Show>
+              </span>
+            )}
+          </Show>
+          <span
+            data-testid="chart-target"
+            data-candles={String(selectedCandleCount())}
+            aria-live="off"
+          >
+            <Badge tone={selectedCandleCount() > 0 ? "positive" : "muted"}>
+              {selectedCandleCount() > 0 ? "LOCAL DATA" : "AWAITING FEED"}
+            </Badge>
+          </span>
         </div>
-        {/* First-party timeframe control: KLineChart Pro 0.1.1's own period items
-            are non-focusable spans, so the keyboard/AT path is owned here. The
-            vendor period bar is hidden. */}
-        <div class="chart-toolbar">
-          {/* First-party measurement + clear-all, complementing Pro's built-in
-              drawing bar. Escape cancels; Delete/Backspace removes the selected
-              drawing; clearing requires an explicit confirmation. */}
-          <div class="chart-draw-tools" role="toolbar" aria-label="Drawing tools">
-            <For each={drawingTools}>
-              {(tool) => (
-                <button
-                  type="button"
-                  class="chart-tool"
-                  data-testid={`draw-tool-${tool.id}`}
-                  aria-pressed={activeDrawingTool() === tool.id}
-                  title={tool.hint}
-                  onClick={() => drawing?.activate(tool.id)}
-                >
-                  {tool.label}
-                </button>
-              )}
-            </For>
-            <Show
-              when={clearArmed()}
-              fallback={
-                <button
-                  type="button"
-                  class="chart-tool"
-                  data-testid="draw-clear-all"
-                  disabled={drawingCount() === 0}
-                  title="Remove every drawing"
-                  onClick={() => setClearArmed(true)}
-                >
-                  Clear all
-                </button>
-              }
-            >
-              <button
-                type="button"
-                class="chart-tool chart-tool--danger"
-                data-testid="draw-clear-confirm"
-                onClick={() => {
-                  drawing?.clearAll();
-                  setClearArmed(false);
-                }}
-              >
-                Confirm clear
-              </button>
+        {/* The crosshair readout is a bar element and the toolbar's shrink
+            point; it folds before it can crowd the tools. Nothing overlays the
+            plot or the scales. */}
+        <div class="chart-pane__legend" aria-live="off">
+          <span>
+            <i>O</i> <b>{crosshair() ? numOrDash(crosshair()!.open) : "—"}</b>
+          </span>
+          <span>
+            <i>H</i> <b>{crosshair() ? numOrDash(crosshair()!.high) : "—"}</b>
+          </span>
+          <span>
+            <i>L</i> <b>{crosshair() ? numOrDash(crosshair()!.low) : "—"}</b>
+          </span>
+          <span>
+            <i>C</i> <b>{crosshair() ? numOrDash(crosshair()!.close) : "—"}</b>
+          </span>
+          <span>
+            <i>Δ</i>{" "}
+            <b>{change() === null ? "—" : `${change()! >= 0 ? "+" : ""}${change()!.toFixed(2)}%`}</b>
+          </span>
+          <span>
+            <i>Vol</i> <b>{crosshair()?.volume === null || crosshair()?.volume === undefined ? "—" : formatAmount(crosshair()!.volume)}</b>
+          </span>
+        </div>
+      </div>
+
+      {/* Bar 2 — toolbar. Drawing tools, timeframe, indicators. */}
+      <div class="panebar chart-panel__head">
+        <div class="toolgroup chart-draw-tools" role="toolbar" aria-label="Drawing tools">
+          <For each={drawingTools}>
+            {(tool) => (
               <button
                 type="button"
                 class="chart-tool"
-                data-testid="draw-clear-cancel"
-                onClick={() => setClearArmed(false)}
+                data-testid={`draw-tool-${tool.id}`}
+                aria-pressed={activeDrawingTool() === tool.id}
+                title={tool.hint}
+                onClick={() => drawing?.activate(tool.id)}
               >
-                Cancel
+                {tool.label}
               </button>
-            </Show>
-          </div>
+            )}
+          </For>
+          <Show
+            when={clearArmed()}
+            fallback={
+              <button
+                type="button"
+                class="chart-tool"
+                data-testid="draw-clear-all"
+                disabled={drawingCount() === 0}
+                title="Remove every drawing"
+                onClick={() => setClearArmed(true)}
+              >
+                Clear all
+              </button>
+            }
+          >
+            <button
+              type="button"
+              class="chart-tool chart-tool--danger"
+              data-testid="draw-clear-confirm"
+              onClick={() => {
+                drawing?.clearAll();
+                setClearArmed(false);
+              }}
+            >
+              Confirm clear
+            </button>
+            <button
+              type="button"
+              class="chart-tool"
+              data-testid="draw-clear-cancel"
+              onClick={() => setClearArmed(false)}
+            >
+              Cancel
+            </button>
+          </Show>
+        </div>
+
+        <span class="vrule" aria-hidden="true" />
+
+        <div class="toolgroup">
           <label class="chart-toolbar__label" for="chart-timeframe">
             Timeframe
           </label>
@@ -374,11 +514,34 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
             }}
           >
             <For each={PRO_PERIODS}>
-              {(period) => <option value={period.text}>{period.text}</option>}
+              {(period) => (
+                <option value={period.text} disabled={!isServedTimeframe(period.text)}>
+                  {period.text}
+                </option>
+              )}
             </For>
           </select>
         </div>
+
+        <div class="toolgroup toolgroup--end">
+          <p class="chartpane__hint" role="status">
+            Wheel to zoom · drag to pan
+          </p>
+          <div class="seg seg--toggle" role="group" aria-label="Indicators">
+            <button
+              type="button"
+              class="seg__btn"
+              data-testid="indicator-toggle"
+              aria-pressed={indicatorsOn()}
+              title="Toggle moving averages MA7 / MA25"
+              onClick={() => setIndicatorsOn((value) => !value)}
+            >
+              MA
+            </button>
+          </div>
+        </div>
       </div>
+
       <Show when={chartError()}>
         <EmptyBlock
           title="Chart unavailable"
@@ -389,56 +552,79 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
         <div
           class="pep-pro-chart-host"
           role="group"
+          tabindex="0"
+          aria-describedby="chart-keyboard-help"
           aria-label={
             hasTarget()
               ? `Price chart for ${subject().symbol}, ${activeTimeframe()} timeframe`
               : `Price chart, ${activeTimeframe()} timeframe`
           }
+          onKeyDown={onPlotKeyDown}
           ref={(element) => {
             host = element;
           }}
         />
+        <p class="sr" id="chart-keyboard-help">
+          Use Left and Right arrow keys to pan through history, Up and Down (or plus and minus) to
+          zoom, and 0 or Home to return to the latest bar. Choose a drawing tool, then drag on the
+          chart to draw; Escape cancels and Delete removes the selected drawing.
+        </p>
       </div>
-      <div class="depth-columns" tabindex="0" aria-label="Depth of book">
-        <div class="depth-col">
-          <h2 class="depth-col__title">Bids</h2>
-          {depth().bids.length === 0 ? (
-            <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
-          ) : (
-            <ul class="depth-list">
-              {depth().bids.map((level) => (
-                <li class="depth-list__row depth-list__row--bid">
-                  <span>{level.price}</span>
-                  <span>{formatAmount(level.size)}</span>
-                  <span class="muted">{formatAmount(level.cumulativeSize)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
+      {/* Depth yields to a summary row while the operator expands the dock, so
+          the operator's explicit expansion never breaches the chart floor. */}
+      <Show
+        when={!station.dockExpanded()}
+        fallback={
+          <p class="depth-summary" role="status" aria-label="Depth summary">
+            Depth yields while the dock is expanded · Spread{" "}
+            {formatBps(version() >= 0 ? router.stores.depth.spreadBps() : null)} · imbalance{" "}
+            {router.stores.depth.imbalancePct() === null
+              ? "—"
+              : `${router.stores.depth.imbalancePct()!.toFixed(1)}%`}
+          </p>
+        }
+      >
+        <div class="depth-columns" tabindex="0" aria-label="Depth of book">
+          <div class="depth-col">
+            <h2 class="depth-col__title">Bids</h2>
+            {depth().bids.length === 0 ? (
+              <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
+            ) : (
+              <ul class="depth-list">
+                {depth().bids.map((level) => (
+                  <li class="depth-list__row depth-list__row--bid">
+                    <span>{level.price}</span>
+                    <span>{formatAmount(level.size)}</span>
+                    <span class="muted">{formatAmount(level.cumulativeSize)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div class="depth-col">
+            <h2 class="depth-col__title">Asks</h2>
+            {depth().asks.length === 0 ? (
+              <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
+            ) : (
+              <ul class="depth-list">
+                {depth().asks.map((level) => (
+                  <li class="depth-list__row depth-list__row--ask">
+                    <span>{level.price}</span>
+                    <span>{formatAmount(level.size)}</span>
+                    <span class="muted">{formatAmount(level.cumulativeSize)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
-        <div class="depth-col">
-          <h2 class="depth-col__title">Asks</h2>
-          {depth().asks.length === 0 ? (
-            <EmptyBlock title="No depth" detail="Depth frames require the encrypted feed (BR-2)." />
-          ) : (
-            <ul class="depth-list">
-              {depth().asks.map((level) => (
-                <li class="depth-list__row depth-list__row--ask">
-                  <span>{level.price}</span>
-                  <span>{formatAmount(level.size)}</span>
-                  <span class="muted">{formatAmount(level.cumulativeSize)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
-      <p class="muted">
-        Spread {formatBps(version() >= 0 ? router.stores.depth.spreadBps() : null)} · imbalance{" "}
-        {router.stores.depth.imbalancePct() === null
-          ? "—"
-          : `${router.stores.depth.imbalancePct()!.toFixed(1)}%`}
-      </p>
+        <p class="muted">
+          Spread {formatBps(version() >= 0 ? router.stores.depth.spreadBps() : null)} · imbalance{" "}
+          {router.stores.depth.imbalancePct() === null
+            ? "—"
+            : `${router.stores.depth.imbalancePct()!.toFixed(1)}%`}
+        </p>
+      </Show>
     </div>
   );
 };

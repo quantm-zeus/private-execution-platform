@@ -16,6 +16,7 @@ import { useWorkspace } from "../../state/session";
 import { isFresh, type CapabilityDenial, type WorkspaceErrorShape } from "../../core/types";
 import { isIndeterminateOutcome, newIdempotencyKey } from "../../core/idempotency";
 import { ActionButton, Badge, KeyValue, Panel, ReasonNote } from "../../components/ui/primitives";
+import { AdvancedExecutionDrawer } from "../execution/AdvancedExecutionDrawer";
 import {
   AsyncSurface,
   DenialNote,
@@ -1045,6 +1046,7 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
               <p class="field__hint">
                 Safe defaults: 100 bps slippage, 150 bps price impact, no total-cost cap.
               </p>
+              <AdvancedExecutionDrawer />
             </div>
           </details>
 

@@ -1,5 +1,5 @@
 import { Show, createEffect, createMemo, createSignal, type Component } from "solid-js";
-import { formatAmount, formatBps, formatPercent } from "../../core/format";
+import { formatAmount } from "../../core/format";
 import { workspaceError } from "../../core/errors";
 import type { CapabilityDenial, WorkspaceErrorShape } from "../../core/types";
 import type { ExecutionProgress, RfqLegView, RfqView, TwapRequest } from "../../contracts/execution";
@@ -8,6 +8,7 @@ import { createSubmissionKeyTracker, isIndeterminateOutcome } from "../../core/i
 import { useWorkspace } from "../../state/session";
 import { ActionButton, Badge, Metric, MetricGrid, Panel, ReasonNote } from "../../components/ui/primitives";
 import { AsyncSurface, DenialNote, EmptyBlock, ErrorBlock } from "../../components/ui/states";
+import { progressMetrics, parseProgressView, type ProgressView } from "./progress-metrics";
 
 function num(raw: string): number | null {
   const value = Number(raw.trim());
@@ -22,19 +23,6 @@ function nonBlank(value: string | null | undefined): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function progressMetrics(progress: ExecutionProgress) {
-  const done = progress.chunksDone;
-  const total = progress.chunksTotal;
-  return [
-    { label: "State", value: progress.state.toUpperCase() },
-    { label: "Chunks", value: total === null ? "—" : `${done ?? "—"}/${total}` },
-    { label: "Filled", value: progress.filledAmount ?? "—" },
-    { label: "Remaining", value: progress.remainingAmount ?? "—" },
-    { label: "Realized vs estimate", value: formatBps(progress.realizedVsEstimateBps) },
-    { label: "Progress", value: total && done !== null ? formatPercent(done / total) : "—" },
-  ];
-}
-
 export const ExecutionPanel: Component = () => {
   const ws = useWorkspace();
   const [amount, setAmount] = createSignal("");
@@ -44,9 +32,17 @@ export const ExecutionPanel: Component = () => {
   const [maxChunks, setMaxChunks] = createSignal("6");
   const [twapState, setTwapState] = createSignal<ExecutionProgress | null>(null);
   const [twapError, setTwapError] = createSignal<WorkspaceErrorShape | null>(null);
-  const progress = createCommandResource<ExecutionProgress>(ws.command, "get_execution_progress", {
-    ttlMs: 5_000,
-  });
+  // `null` is the normal idle response (the read succeeded and nothing is
+  // running), parsed by the shared null-safe view so the panel can never crash
+  // on an idle workspace.
+  const progress = createCommandResource<ProgressView | null>(
+    ws.command,
+    "get_execution_progress",
+    {
+      ttlMs: 5_000,
+      validate: (value) => parseProgressView(value),
+    },
+  );
   const rfq = createCommandResource<RfqView>(ws.command, "submit_rfq", {
     capability: "rfq",
     ttlMs: 10_000,
@@ -466,15 +462,24 @@ export const ExecutionPanel: Component = () => {
         <Show
           when={twapState()}
           fallback={
-            <AsyncSurface<ExecutionProgress>
+            <AsyncSurface<ProgressView | null>
               state={progress.state()}
               denial={progressDenial()}
               nowMs={ws.nowMs()}
               onRetry={() => void progress.run()}
               emptyTitle="No adaptive execution running"
               emptyDetail="Start a TWAP or load current progress from the backend."
+              isEmpty={(value) => value === null}
             >
-              {(value) => <MetricGrid>{progressMetrics(value).map((m) => <Metric label={m.label} value={m.value} />)}</MetricGrid>}
+              {(value) =>
+                value === null ? null : (
+                  <MetricGrid>
+                    {progressMetrics(value).map((m) => (
+                      <Metric label={m.label} value={m.value} />
+                    ))}
+                  </MetricGrid>
+                )
+              }
             </AsyncSurface>
           }
         >

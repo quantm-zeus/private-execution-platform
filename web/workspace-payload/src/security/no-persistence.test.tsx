@@ -183,10 +183,18 @@ describe("no plaintext persistence", () => {
     await flush();
 
     // Every bottom dock surface.
-    for (const id of ["positions", "orders", "activity", "trades", "holders"]) {
+    for (const id of ["positions", "orders", "activity", "holders", "about"]) {
       fireEvent.click(screen.getByTestId(`dock-tab-${id}`));
       await flush();
     }
+
+    // Dock sizing + activity scope are memory-only operator choices.
+    fireEvent.click(screen.getByTestId("dock-expand"));
+    await flush();
+    fireEvent.click(screen.getByTestId("dock-tab-activity"));
+    await flush();
+    fireEvent.click(screen.getByTestId("activity-scope-mine"));
+    await flush();
 
     // Security drawer (security + wallet-limits surfaces).
     fireEvent.click(screen.getByRole("button", { name: "Security and settings" }));

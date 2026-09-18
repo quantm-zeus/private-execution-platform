@@ -89,6 +89,12 @@ export interface RiskAssessment {
    * state from the provider's own factors and never invents a score.
    */
   readonly level?: string | null;
+  /**
+   * Provider-stated buy/sell availability. `null`/absent is unknown and is
+   * never inferred from the absence of a warning.
+   */
+  readonly disableBuying?: boolean | null;
+  readonly disableSelling?: boolean | null;
 }
 
 export type EvidenceProvider = "fomo" | "gmgn" | "twitter" | "okx" | "onchain" | "local";

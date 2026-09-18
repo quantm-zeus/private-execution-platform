@@ -182,20 +182,28 @@ export const DenialNote: Component<{ denial: CapabilityDenial | null }> = (props
 
 /**
  * One-line, truthful unavailable row for a secondary function whose backend is
- * not composed. The primary terminal must never render a giant capability card;
- * a compact row that names the missing contract is the correct affordance.
+ * not composed. It is a 44 px row, never a card and never a debug dump: a muted
+ * `UNAVAILABLE` badge, the surface name, one sentence of product prose, and a
+ * `<details>` disclosure carrying the real capability key for an operator. The
+ * key never dominates the row.
  */
 export const CompactNote: Component<{
   label: string;
   reason: string;
   capability?: string;
 }> = (props) => (
-  <p class="compact-note" role="status">
+  <div class="unavail" role="status" data-testid="compact-note">
     <Badge tone="muted">UNAVAILABLE</Badge>
-    <span>{props.label}</span>
-    <span class="muted">{props.reason}</span>
+    <span class="unavail__text">
+      {props.label} — {props.reason}
+    </span>
     <Show when={props.capability}>
-      <code class="compact-note__key">{props.capability}</code>
+      <details>
+        <summary>Details</summary>
+        <p class="unavail__key">
+          capability: <code class="compact-note__key">{props.capability}</code>
+        </p>
+      </details>
     </Show>
-  </p>
+  </div>
 );

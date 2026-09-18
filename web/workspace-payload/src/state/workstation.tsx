@@ -12,8 +12,15 @@ import {
   type JSX,
 } from "solid-js";
 import type { MarketListRow, TokenDetail, TokenRef } from "../contracts/market";
+import type {
+  TokenAboutPayload,
+  TokenActivityPage,
+  TokenHoldersPayload,
+} from "../contracts/token-intelligence";
 import type { CapabilityDenial, DataState } from "../core/types";
 import { stateValue } from "../core/types";
+import { intelKeyFor, intelKeyId, type IntelKey } from "../features/intelligence/queries";
+import { createTokenIntelligenceResources } from "./token-intelligence";
 import { isServedTimeframe } from "../market/ohlcv";
 import {
   createRealtimeTargetCoordinator,
@@ -41,7 +48,21 @@ import { useWorkspace, type WorkspaceStore } from "./session";
 export { MAX_MARKET_ROWS, parseMarketRow, parseMarketRows } from "./market-row";
 
 export type TicketTab = "market" | "limit";
-export type DockTab = "positions" | "orders" | "activity" | "trades" | "holders";
+/**
+ * The V2 dock union (owner-approved): `trades` is removed — it was only ever a
+ * placeholder for a market-trades capability, and the exact-token activity feed
+ * under Activity -> Token supersedes it. `RealtimeChannel` also has a `trades`
+ * member; that is a transport channel and is deliberately untouched.
+ */
+export type DockTab = "positions" | "orders" | "activity" | "holders" | "about";
+
+/** Token-intelligence subviews the dock panes may request lazily. */
+export type IntelKind = "holders" | "about" | "activity";
+
+export interface IntelRunOptions {
+  readonly limit?: number;
+  readonly cursor?: string | null;
+}
 
 interface SearchPayload {
   readonly results: readonly MarketListRow[];
@@ -84,6 +105,24 @@ export interface WorkstationStore {
   setTicketTab(tab: TicketTab): void;
   readonly dockTab: Accessor<DockTab>;
   setDockTab(tab: DockTab): void;
+
+  /* Bottom-dock sizing — memory-only, like every other pane signal. The clamp
+     itself lives in CSS so no caller can breach the chart floor. */
+  readonly dockHeight: Accessor<number | null>;
+  readonly dockExpanded: Accessor<boolean>;
+  setDockHeight(px: number | null): void;
+  setDockExpanded(value: boolean): void;
+  toggleDockExpanded(): void;
+
+  /* Token intelligence — lazy reads keyed by the exact (chain, networkId,
+     address) identity. A response for token A is never rendered under token B. */
+  readonly intelKey: Accessor<IntelKey | null>;
+  readonly intelDenial: Accessor<CapabilityDenial | null>;
+  readonly holders: CommandResource<TokenHoldersPayload>;
+  readonly about: CommandResource<TokenAboutPayload>;
+  readonly activity: CommandResource<TokenActivityPage>;
+  /** Run one exact-identity read; an identity change resets all three first. */
+  runIntel(kind: IntelKind, options?: IntelRunOptions): void;
 
   /* Token search (header) and the shared, memory-only market rail lists. */
   readonly query: Accessor<string>;
@@ -173,6 +212,50 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
   const [timeframe, setTimeframeValue] = createSignal<string>(DEFAULT_TIMEFRAME);
 
   const [narrow, setNarrow] = createSignal(false);
+  const [dockHeight, setDockHeight] = createSignal<number | null>(null);
+  const [dockExpanded, setDockExpanded] = createSignal(false);
+  const toggleDockExpanded = (): void => {
+    setDockExpanded((value) => !value);
+  };
+
+  // Lazy token-intelligence reads. The resources are keyed by the exact identity
+  // the request carries; `createCommandResource` aborts the previous request and
+  // the validator rejects a success whose echo does not match the request, so a
+  // slow A document can never paint into B's pane.
+  const intelResources = createTokenIntelligenceResources({
+    command: ws.command,
+    nowMs: () => ws.nowMs(),
+  });
+  const intelDenial = (): CapabilityDenial | null =>
+    ws.capabilityDenial("token_intelligence");
+  const intelKey = createMemo<IntelKey | null>(() => intelKeyFor(ws.selectedInstrument()));
+  let lastIntelId = "";
+  createEffect(() => {
+    const id = intelKeyId(intelKey());
+    if (id === lastIntelId) return;
+    lastIntelId = id;
+    // A new instrument invalidates every in-flight and cached intelligence read.
+    intelResources.holders.reset();
+    intelResources.about.reset();
+    intelResources.activity.reset();
+  });
+  const runIntel = (kind: IntelKind, options: IntelRunOptions = {}): void => {
+    const key = intelKey();
+    if (key === null || intelDenial() !== null) return;
+    const payload: Record<string, unknown> = { chain: key.chain, address: key.address };
+    if (kind === "holders") {
+      payload.limit = options.limit ?? 200;
+      void intelResources.holders.run(payload);
+      return;
+    }
+    if (kind === "about") {
+      void intelResources.about.run(payload);
+      return;
+    }
+    payload.limit = options.limit ?? 12;
+    if (options.cursor) payload.cursor = options.cursor;
+    void intelResources.activity.run(payload);
+  };
 
   const searchDenial = () => ws.capabilityDenial("market");
   const search = createCommandResource<SearchPayload>(ws.command, "search_token", {
@@ -360,7 +443,9 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
   // force-expands, so an explicit choice is not fought by the media query.
   onMount(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const railQuery = window.matchMedia("(max-width: 1180px)");
+    // DESIGN.md §8: the rail collapses at 1279 and below; the ticket becomes a
+    // right overlay at 980 and below.
+    const railQuery = window.matchMedia("(max-width: 1279px)");
     const narrowQuery = window.matchMedia("(max-width: 980px)");
     const apply = (): void => {
       if (railQuery.matches) setRailCollapsed(true);
@@ -379,6 +464,9 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
   if (getOwner()) onCleanup(() => search.reset());
   if (getOwner()) onCleanup(() => detail.reset());
   if (getOwner()) onCleanup(() => trending.reset());
+  if (getOwner()) onCleanup(() => intelResources.holders.reset());
+  if (getOwner()) onCleanup(() => intelResources.about.reset());
+  if (getOwner()) onCleanup(() => intelResources.activity.reset());
 
   return {
     railCollapsed,
@@ -394,6 +482,17 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     setTicketTab,
     dockTab,
     setDockTab,
+    dockHeight,
+    dockExpanded,
+    setDockHeight,
+    setDockExpanded,
+    toggleDockExpanded,
+    intelKey,
+    intelDenial,
+    holders: intelResources.holders,
+    about: intelResources.about,
+    activity: intelResources.activity,
+    runIntel,
     query,
     setQuery: setQueryAndSearch,
     runSearch,

@@ -220,9 +220,8 @@ describe("AppShell", () => {
     renderShell(store);
     await flush();
 
-    expect(
-      screen.getByRole("heading", { name: "Evergreen Private Workspace" }),
-    ).toBeTruthy();
+    expect(screen.getByText("EverCrest")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1 })).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "Lock" })).toHaveLength(1);
     expect(screen.getByRole("combobox", { name: "Search token" })).toBeTruthy();
     expect(document.querySelector(".terminal.workspace")).not.toBeNull();
@@ -233,10 +232,12 @@ describe("AppShell", () => {
     expect(screen.getByTestId("ticket-tab-market").getAttribute("aria-selected")).toBe("true");
     expect(screen.getByTestId("ticket-tab-limit").getAttribute("aria-selected")).toBe("false");
 
-    // Every bottom-dock tab exists.
-    for (const id of ["positions", "orders", "activity", "trades", "holders"]) {
+    // Exactly five bottom-dock tabs; the former Trades tab is gone.
+    for (const id of ["positions", "orders", "activity", "holders", "about"]) {
       expect(screen.getByTestId(`dock-tab-${id}`)).toBeTruthy();
     }
+    expect(screen.queryByTestId("dock-tab-trades")).toBeNull();
+    expect(document.querySelectorAll("[data-testid^='dock-tab-']")).toHaveLength(5);
   });
 
   it("loads real trending tokens through the encrypted market command and selects one", async () => {

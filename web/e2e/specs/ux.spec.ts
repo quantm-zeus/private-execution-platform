@@ -142,7 +142,7 @@ test.describe("accessibility", () => {
     await scan("limit ticket");
     await page.getByTestId("ticket-tab-market").click();
 
-    for (const tab of ["positions", "orders", "activity", "trades", "holders"] as const) {
+    for (const tab of ["positions", "orders", "activity", "holders", "about"] as const) {
       await page.getByTestId(`dock-tab-${tab}`).click();
       await scan(`dock ${tab}`);
     }

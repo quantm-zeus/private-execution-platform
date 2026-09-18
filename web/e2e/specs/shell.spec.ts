@@ -107,7 +107,7 @@ test.describe("shell artifact unlock", () => {
     const frame = page.frameLocator("#workspace-frame");
     // The decrypted payload must execute under the shell CSP (`blob:` allowed).
     await expect(frame.locator(".workspace")).toBeVisible({ timeout: 20_000 });
-    await expect(frame.getByRole("heading", { name: /Evergreen Private Workspace/i })).toBeVisible();
+    await expect(frame.locator(".topbar__title")).toHaveText("EverCrest");
     // The test host exposes no `/v1` private API, so the payload must fail closed
     // with an explicit unavailable state and never fabricate data.
     await expect(

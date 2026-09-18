@@ -229,7 +229,7 @@ test.describe("workstation layout across operator viewports", () => {
       await page.setViewportSize(viewport);
 
       // ---- no token selected -------------------------------------------------
-      await expect(page.getByTestId("selected-instrument")).toHaveText("No token selected");
+      await expect(page.getByTestId("selected-instrument")).toContainText("No token selected");
       await assertWorkstationFits(page, viewport);
 
       const root = page.locator(".terminal.workspace");

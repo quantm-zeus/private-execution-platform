@@ -38,8 +38,8 @@ export const MAX_CURSOR_LEN = 256;
 const MAX_TIMESTAMP_MS = 4_102_444_800_000;
 /** Upper bound on a wallet secondary-identity string, matching the Rust cap. */
 const MAX_WALLET_LEN = 128;
-/** Freshness TTL for the one-shot token-intelligence reads. */
-export const TOKEN_INTELLIGENCE_TTL_MS = 30_000;
+/** Freshness TTL for the one-shot token-intelligence reads (DESIGN.md §11). */
+export const TOKEN_INTELLIGENCE_TTL_MS = 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -277,6 +277,8 @@ function parseRisk(value: unknown): RiskAssessment | null {
     sellRestricted: boolOrNull(value.sellRestricted),
     simulated: value.simulated === true,
     level: stringOrNull(value.level),
+    disableBuying: boolOrNull(value.disableBuying),
+    disableSelling: boolOrNull(value.disableSelling),
   };
 }
 

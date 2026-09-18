@@ -5,6 +5,7 @@ import { tokenLabel, useWorkstation } from "../../state/workstation";
 import { useWorkspace } from "../../state/session";
 import { Badge } from "../ui/primitives";
 import { CompactNote } from "../ui/states";
+import { TokenSearch } from "./TokenSearch";
 
 /** Canonical display names for the networks the read path actually serves. */
 const CHAIN_LABELS: Readonly<Record<string, string>> = {
@@ -41,18 +42,11 @@ function secondaryTone(row: MarketListRow): string {
   return row.priceChange24h >= 0 ? "market-item__sub--up" : "market-item__sub--down";
 }
 
-function metaValue(row: MarketListRow): string | null {
-  const parts: string[] = [];
-  if (row.priceChange24h !== null && row.rank !== null) parts.push(`#${row.rank}`);
-  if (row.marketCapUsd !== null) parts.push(formatUsd(row.marketCapUsd));
-  return parts.length > 0 ? parts.join(" · ") : null;
-}
-
 /**
  * One trading-product market row: identity on the left, the price as the
- * primary right-side value, and optional change/rank/market-cap context beneath
- * it. A missing price renders an explicit `—`; the contract address is context
- * only (tooltip), never the numeric column.
+ * primary right-side value, and the optional 24h change beneath it. A missing
+ * price renders an explicit `—`; the contract address is context only (tooltip),
+ * never the numeric column.
  */
 const MarketItem: Component<{ row: MarketListRow }> = (props) => {
   const ws = useWorkspace();
@@ -66,7 +60,6 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
     );
   });
   const sub = createMemo(() => secondaryValue(props.row));
-  const meta = createMemo(() => metaValue(props.row));
   return (
     <li>
       <button
@@ -88,12 +81,7 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
           <span class="market-item__price" data-testid="market-row-price">
             {formatUsd(props.row.priceUsd, 6)}
           </span>
-          <span class={`market-item__sub ${secondaryTone(props.row)}`}>
-            {sub() ?? "—"}
-          </span>
-          <Show when={meta()}>
-            <span class="market-item__meta">{meta()}</span>
-          </Show>
+          <span class={`market-item__sub ${secondaryTone(props.row)}`}>{sub() ?? "—"}</span>
         </span>
       </button>
     </li>
@@ -101,10 +89,11 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
 };
 
 /**
- * Collapsible left market rail: search results, the memory-only watchlist and
- * recent selections, and the trending list. Trending rows are the reconciled
- * command rows overlaid with pushed WS-observed values (exact identity), and a
- * local network filter narrows them without changing ranks or identity.
+ * Collapsible left market rail: search, the honest-count network filter and the
+ * trending list, plus the memory-only watchlist and recent selections. Trending
+ * rows are the reconciled command rows overlaid with pushed WS-observed values
+ * (exact identity), and the local network filter narrows them without changing
+ * ranks or identity.
  */
 export const MarketRail: Component = () => {
   const station = useWorkstation();
@@ -165,21 +154,57 @@ export const MarketRail: Component = () => {
           ‹
         </button>
       </div>
+
+      <Show when={!station.railCollapsed()}>
+        <div class="rail__search">
+          <TokenSearch />
+        </div>
+      </Show>
+
+      <Show when={station.searchDenial()}>
+        {(denial) => (
+          <div class="market-rail__note">
+            <CompactNote
+              label="Token search"
+              reason={denial().reason}
+              capability={denial().capability}
+            />
+          </div>
+        )}
+      </Show>
+
+      <Show when={!station.trendingDenial() && visibleChains().length > 0}>
+        <div class="chain-filter" role="group" aria-label="Filter trending by network">
+          <button
+            type="button"
+            class="chain-filter__chip"
+            data-testid="chain-filter-all"
+            aria-pressed={effectiveFilter() === "all"}
+            onClick={() => setChainFilter("all")}
+          >
+            All <span class="chain-filter__count">{trendingTokens().length}</span>
+          </button>
+          <For each={visibleChains()}>
+            {(slug) => (
+              <button
+                type="button"
+                class="chain-filter__chip"
+                data-testid={`chain-filter-${slug}`}
+                aria-pressed={effectiveFilter() === slug}
+                onClick={() => setChainFilter(slug)}
+              >
+                {chainLabel(slug)}{" "}
+                <span class="chain-filter__count">{counts().get(slug) ?? 0}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+
       <div class="market-rail__scroll" tabindex="0" aria-label="Tracked tokens">
-        <Show when={station.searchDenial()}>
-          {(denial) => (
-            <div class="market-rail__note">
-              <CompactNote
-                label="Token search"
-                reason={denial().reason}
-                capability={denial().capability}
-              />
-            </div>
-          )}
-        </Show>
         <Show when={results().length > 0}>
           <section class="market-rail__section" aria-label="Search results">
-            <p class="market-rail__section-head">Search results</p>
+            <p class="market-rail__section-head">{results().length} results</p>
             <ul class="market-rail__list">
               <For each={results()}>{(row) => <MarketItem row={row} />}</For>
             </ul>
@@ -247,33 +272,6 @@ export const MarketRail: Component = () => {
               </div>
             }
           >
-            <Show when={visibleChains().length > 0}>
-              <div class="chain-filter" role="group" aria-label="Filter trending by network">
-                <button
-                  type="button"
-                  class="chain-filter__chip"
-                  data-testid="chain-filter-all"
-                  aria-pressed={effectiveFilter() === "all"}
-                  onClick={() => setChainFilter("all")}
-                >
-                  All <span class="chain-filter__count">{trendingTokens().length}</span>
-                </button>
-                <For each={visibleChains()}>
-                  {(slug) => (
-                    <button
-                      type="button"
-                      class="chain-filter__chip"
-                      data-testid={`chain-filter-${slug}`}
-                      aria-pressed={effectiveFilter() === slug}
-                      onClick={() => setChainFilter(slug)}
-                    >
-                      {chainLabel(slug)}{" "}
-                      <span class="chain-filter__count">{counts().get(slug) ?? 0}</span>
-                    </button>
-                  )}
-                </For>
-              </div>
-            </Show>
             <Show when={filtered().length > 0}>
               <ul class="market-rail__list" data-testid="trending-tokens">
                 <For each={filtered()}>{(row) => <MarketItem row={row} />}</For>
@@ -287,9 +285,7 @@ export const MarketRail: Component = () => {
                 <span class="muted">Trending temporarily unavailable.</span>
               </div>
             </Show>
-            <Show
-              when={filtered().length === 0 && !trendingLoading() && !trendingError()}
-            >
+            <Show when={filtered().length === 0 && !trendingLoading() && !trendingError()}>
               <p class="market-rail__empty">
                 {effectiveFilter() === "all"
                   ? "No trending tokens right now."

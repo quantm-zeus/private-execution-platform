@@ -23,16 +23,16 @@ function connectionTone(phase: ConnectionStatus["phase"]): Tone {
   }
 }
 
-function changeTone(change: number | null | undefined): Tone {
-  if (change === null || change === undefined || !Number.isFinite(change)) return "muted";
-  return change >= 0 ? "positive" : "danger";
+function changeTone(change: number | null | undefined): string {
+  if (change === null || change === undefined || !Number.isFinite(change)) return "flat";
+  return change >= 0 ? "up" : "down";
 }
 
 /**
- * Compact top bar. The selected token and its live market stats are the primary
- * content; security, kill-switch and trading-gate truth is collapsed into
- * compact status controls so fail-closed state stays visible without dominating
- * the product. It carries no navigation tabs and no session/auth chrome.
+ * Top instrument bar. Left -> right: brand -> instrument identity -> the
+ * instrument price block (the one decisive flourish) -> the stat strip -> the
+ * pinned status cluster. Amber appears here exactly twice: the 6x18 brand rule
+ * and the 2px price rule. The bar is 56px and single-row at every width.
  */
 export const TerminalHeader: Component = () => {
   const ws = useWorkspace();
@@ -40,10 +40,6 @@ export const TerminalHeader: Component = () => {
 
   const instrument = (): InstrumentRef | null => ws.selectedInstrument();
   const stats = createMemo(() => station.visibleDetail()?.stats ?? null);
-  // The header price must move with the authoritative stream, not only the 30s
-  // token detail. A pushed verified tick for the exact selected entity wins over
-  // the detail snapshot; a tick for any other entity is never read (the store
-  // keys by exact chain+address).
   const live = createMemo(() => {
     const ref = instrument();
     return ref ? station.latestPrice(ref) : null;
@@ -78,7 +74,9 @@ export const TerminalHeader: Component = () => {
 
   return (
     <header class="topbar" data-testid="terminal-topbar">
-      <div class="topbar__lead">
+      <div class="topbar__brand">
+        <span class="topbar__mark" aria-hidden="true" />
+        <span class="topbar__title">EverCrest</span>
         <button
           type="button"
           class="icon-button"
@@ -87,71 +85,90 @@ export const TerminalHeader: Component = () => {
           title="Toggle market rail"
           onClick={() => station.toggleRail()}
         >
-          ▤
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <path d="M2 4h12M2 8h12M2 12h12" />
+          </svg>
         </button>
-        <span class="topbar__mark" aria-hidden="true">
-          ◈
-        </span>
-        <h1 class="topbar__title">Evergreen Private Workspace</h1>
       </div>
 
-      <TokenSearch />
+      <span class="vrule" aria-hidden="true" />
 
-      <div class="topbar__market">
-        <Show
-          when={instrument()}
-          fallback={
-            <span class="muted topbar__no-target" data-testid="selected-instrument">
-              No token selected
+      {/* Search lives in the rail; when the rail is collapsed at the narrow
+          tiers it falls back here so exact search stays reachable. */}
+      <Show when={station.railCollapsed()}>
+        <div class="topbar__search">
+          <TokenSearch />
+        </div>
+      </Show>
+
+      <Show
+        when={instrument()}
+        fallback={
+          <span class="topbar__identity" data-testid="selected-instrument">
+            <h1 class="topbar__symbol">—</h1>
+            <span class="topbar__ref">
+              <span class="muted">No token selected</span>
             </span>
-          }
-        >
-          {(ref) => (
-            <span class="topbar__identity" data-testid="selected-instrument">
-              <span class="topbar__symbol">{tokenLabel(ref())}</span>
-              <span class="topbar__ref">
-                <span class="muted">{ref().chain}</span>
-                <AddressCopy address={ref().address} chain={ref().chain} />
-              </span>
+          </span>
+        }
+      >
+        {(ref) => (
+          <span class="topbar__identity" data-testid="selected-instrument">
+            <h1 class="topbar__symbol">{tokenLabel(ref())}</h1>
+            <span class="topbar__ref">
+              <span class="muted">{ref().chain}</span>
+              <AddressCopy address={ref().address} chain={ref().chain} />
             </span>
-          )}
-        </Show>
-        <Show when={statView()}>
-          {(value) => (
-            <span class="topbar__stats">
-              <span class="stat stat--price">
-                <span class="stat__label">Price</span>
-                <span class="stat__value" data-testid="token-stat-price">
+          </span>
+        )}
+      </Show>
+
+      <Show when={statView()}>
+        {(value) => (
+          <>
+            <div class="priceblock">
+              <span class="priceblock__rule" aria-hidden="true" />
+              <div class="priceblock__col">
+                <span class="lbl">Price</span>
+                <span class="priceblock__price" data-testid="token-stat-price">
                   {formatUsd(value().priceUsd, 6)}
                 </span>
-              </span>
-              <span class={`stat stat--${changeTone(value().priceChange24h)}`}>
-                <span class="stat__label">24h</span>
-                <span class="stat__value" data-testid="token-stat-change">
+              </div>
+              <div class="priceblock__col">
+                <span class="lbl">24h</span>
+                <span
+                  class={`priceblock__chg ${changeTone(value().priceChange24h)}`}
+                  data-testid="token-stat-change"
+                >
                   {formatPercent(value().priceChange24h)}
                 </span>
-              </span>
-              <span class="stat">
-                <span class="stat__label">MCap</span>
-                <span class="stat__value" data-testid="token-stat-marketcap">
+              </div>
+            </div>
+            <dl class="statstrip" aria-label="Selected token stats">
+              <div class="statstrip__item">
+                <dt class="lbl">MCap</dt>
+                <dd class="statstrip__value" data-testid="token-stat-marketcap">
                   {formatUsd(value().marketCapUsd)}
-                </span>
-              </span>
-              <span class="stat stat--optional">
-                <span class="stat__label">Liquidity</span>
-                <span class="stat__value" data-testid="token-stat-liquidity">
+                </dd>
+              </div>
+              <div class="statstrip__item" data-fold="1">
+                <dt class="lbl">Liquidity</dt>
+                <dd class="statstrip__value" data-testid="token-stat-liquidity">
                   {formatUsd(value().liquidityUsd)}
-                </span>
-              </span>
-              <span class="stat stat--optional">
-                <span class="stat__label">Volume</span>
-                <span class="stat__value" data-testid="token-stat-volume">
+                </dd>
+              </div>
+              <div class="statstrip__item" data-fold="1">
+                <dt class="lbl">Volume 24h</dt>
+                <dd class="statstrip__value" data-testid="token-stat-volume">
                   {formatUsd(value().volume24hUsd)}
-                </span>
-              </span>
-            </span>
-          )}
-        </Show>
+                </dd>
+              </div>
+            </dl>
+          </>
+        )}
+      </Show>
+
+      <div class="topbar__status">
         <Show when={sourceLabel()}>
           <Badge
             tone={station.marketSource() === "fomo-ws" ? "positive" : "muted"}
@@ -161,10 +178,10 @@ export const TerminalHeader: Component = () => {
             {sourceLabel()}
           </Badge>
         </Show>
-      </div>
-
-      <div class="topbar__status">
-        <Badge tone={connectionTone(ws.connection().phase)} title={ws.connection().reason ?? undefined}>
+        <Badge
+          tone={connectionTone(ws.connection().phase)}
+          title={ws.connection().reason ?? undefined}
+        >
           <StatusDot tone={connectionTone(ws.connection().phase)} label="Connection state" />
           <span data-testid="connection-phase">{ws.connection().phase.toUpperCase()}</span>
         </Badge>
@@ -184,7 +201,9 @@ export const TerminalHeader: Component = () => {
             HALTED
           </Badge>
         </Show>
-        <Show when={offline()}>
+        {/* At most four badges: the degraded state is folded into the halt slot
+            rather than stacked beside it. */}
+        <Show when={!ws.killSwitch().enabled && offline()}>
           <Badge tone="warning" data-testid="degraded" title={ws.connection().reason ?? undefined}>
             DEGRADED
           </Badge>
@@ -198,7 +217,10 @@ export const TerminalHeader: Component = () => {
             title="Toggle trade ticket"
             onClick={() => station.setTicketOpen(!station.ticketOpen())}
           >
-            ⇄
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+              <path d="M6.5 3v10" />
+            </svg>
           </button>
         </Show>
         <button
@@ -209,7 +231,10 @@ export const TerminalHeader: Component = () => {
           title="Security and settings"
           onClick={() => station.openSecurity()}
         >
-          ⚙
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.2" />
+            <path d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7L3.4 3.4" />
+          </svg>
         </button>
         <ActionButton
           tone="ghost"
