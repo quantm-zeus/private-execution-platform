@@ -11,6 +11,7 @@ import { WorkstationProvider, useWorkstation } from "../state/workstation";
 import { announceWorkspaceReady } from "../state/host";
 import { useRealtimeFeed } from "../realtime/use-realtime";
 import { RealtimeFeedProvider } from "../realtime/feed-context";
+import { MarketRealtimeBridge } from "../realtime/market-bridge";
 import { formatBps } from "../core/format";
 
 /**
@@ -102,6 +103,7 @@ export const AppShell: Component = () => {
   return (
     <RealtimeFeedProvider feed={feed}>
       <WorkstationProvider ws={ws}>
+        <MarketRealtimeBridge />
         <Terminal />
       </WorkstationProvider>
     </RealtimeFeedProvider>

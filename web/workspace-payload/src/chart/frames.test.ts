@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DecodedFrame } from "../realtime/types";
-import { applyMarketFrame, createMarketFrameStores, parseCandle, parseDepthSnapshot } from "./frames";
+import {
+  applyMarketFrame,
+  createMarketFrameStores,
+  parseCandle,
+  parseDepthSnapshot,
+  upsertPriceTick,
+} from "./frames";
 
 function frame(partial: Partial<DecodedFrame> = {}): DecodedFrame {
   return {
@@ -137,5 +143,85 @@ describe("applyMarketFrame", () => {
     applyMarketFrame(stores, frame({ entityKey: "c", payload: { timeframe: "1m", candle: rawCandle(1, 1) } }));
     expect(stores.series.size).toBe(2);
     expect(stores.series.has("a#1m")).toBe(false);
+  });
+});
+
+describe("upsertPriceTick", () => {
+  const TIMEFRAME_MS = 60_000;
+  // An exact 1-minute bucket start.
+  const BUCKET = 1_700_000_040_000;
+  const key = "ohlcv:BASE:SOL#1m";
+
+  it("opens a new bucket without inventing volume", () => {
+    const stores = createMarketFrameStores();
+    const result = upsertPriceTick(
+      stores,
+      "ohlcv:BASE:SOL",
+      "1m",
+      TIMEFRAME_MS,
+      1.5,
+      BUCKET + 1_000,
+      BUCKET + 1_000,
+    );
+    expect(result.changed).toBe(true);
+    expect(result.volumeAuthoritative).toBe(false);
+    const candle = stores.series.get(key)!.last()!;
+    expect(candle.close).toBe(1.5);
+    expect(candle.volume).toBe(0);
+  });
+
+  it("widens high/low and preserves authoritative volume in the same bucket", () => {
+    const stores = createMarketFrameStores();
+    applyMarketFrame(
+      stores,
+      frame({
+        payload: {
+          timeframe: "1m",
+          candle: { time_ms: BUCKET, open: 1, high: 1.2, low: 0.9, close: 1.1, volume: 42 },
+        },
+      }),
+    );
+    upsertPriceTick(stores, "ohlcv:BASE:SOL", "1m", TIMEFRAME_MS, 1.3, BUCKET + 1_000, BUCKET + 1_000);
+    const candle = stores.series.get(key)!.last()!;
+    expect(candle.high).toBe(1.3);
+    expect(candle.close).toBe(1.3);
+    // A price tick carries no volume, so the authoritative 42 is untouched.
+    expect(candle.volume).toBe(42);
+  });
+
+  it("refuses a stale bucket and an invalid price", () => {
+    const stores = createMarketFrameStores();
+    upsertPriceTick(stores, "ohlcv:BASE:SOL", "1m", TIMEFRAME_MS, 1.5, BUCKET + 60_000, BUCKET);
+    const stale = upsertPriceTick(
+      stores,
+      "ohlcv:BASE:SOL",
+      "1m",
+      TIMEFRAME_MS,
+      9,
+      BUCKET,
+      BUCKET + 60_000,
+    );
+    expect(stale.changed).toBe(false);
+    expect(stores.series.get(key)!.last()!.close).toBe(1.5);
+    expect(
+      upsertPriceTick(stores, "ohlcv:BASE:SOL", "1m", TIMEFRAME_MS, 0, BUCKET + 61_000, BUCKET).changed,
+    ).toBe(false);
+  });
+
+  it("is replaced by authoritative OHLCV volume for the same bucket", () => {
+    const stores = createMarketFrameStores();
+    upsertPriceTick(stores, "ohlcv:BASE:SOL", "1m", TIMEFRAME_MS, 1.5, BUCKET + 1_000, BUCKET);
+    applyMarketFrame(
+      stores,
+      frame({
+        payload: {
+          timeframe: "1m",
+          candle: { time_ms: BUCKET, open: 1.5, high: 1.6, low: 1.4, close: 1.55, volume: 77 },
+        },
+      }),
+    );
+    const candle = stores.series.get(key)!.last()!;
+    expect(candle.volume).toBe(77);
+    expect(candle.close).toBe(1.55);
   });
 });

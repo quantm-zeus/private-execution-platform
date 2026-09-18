@@ -110,7 +110,7 @@ describe("IntelligencePanel", () => {
     const store = await readyStore(client);
     renderPanel(store);
 
-    await waitFor(() => expect(screen.getByText(/backend capability missing/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Not available on this deployment")).toBeTruthy());
   });
 
   it("surfaces a retryable command error", async () => {

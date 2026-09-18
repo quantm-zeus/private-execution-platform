@@ -26,6 +26,8 @@ export interface MarketListRow extends TokenRef {
   readonly priceUsd: number | null;
   readonly priceChange24h: number | null;
   readonly marketCapUsd: number | null;
+  readonly liquidityUsd: number | null;
+  readonly volume24hUsd: number | null;
   readonly rank: number | null;
 }
 
@@ -81,6 +83,12 @@ export interface RiskAssessment {
   readonly transferFeeBps: number | null;
   readonly sellRestricted: boolean | null;
   readonly simulated: boolean;
+  /**
+   * Optional provider risk state (e.g. FOMO `clear` / `hard_risk`). `null` or
+   * absent means the provider stated no level — the renderer then derives a
+   * state from the provider's own factors and never invents a score.
+   */
+  readonly level?: string | null;
 }
 
 export type EvidenceProvider = "fomo" | "gmgn" | "twitter" | "okx" | "onchain" | "local";

@@ -139,12 +139,26 @@ export const TokenSearch: Component = () => {
                 <span class="search-result__price" data-testid="search-result-price">
                   {formatUsd(row.priceUsd, 6)}
                 </span>
-                <span class="search-result__mcap">
-                  {row.marketCapUsd !== null
-                    ? `MC ${formatUsd(row.marketCapUsd)}`
-                    : row.priceChange24h !== null
-                      ? formatPercent(row.priceChange24h)
-                      : "—"}
+                <span
+                  class={`search-result__change ${
+                    row.priceChange24h === null
+                      ? ""
+                      : row.priceChange24h >= 0
+                        ? "text--positive"
+                        : "text--danger"
+                  }`}
+                  data-testid="search-result-change"
+                >
+                  {formatPercent(row.priceChange24h)}
+                </span>
+                <span class="search-result__stat" data-testid="search-result-mcap">
+                  MC {formatUsd(row.marketCapUsd)}
+                </span>
+                <span class="search-result__stat" data-testid="search-result-liquidity">
+                  Liq {formatUsd(row.liquidityUsd)}
+                </span>
+                <span class="search-result__stat" data-testid="search-result-volume">
+                  Vol {formatUsd(row.volume24hUsd)}
                 </span>
               </span>
             </li>

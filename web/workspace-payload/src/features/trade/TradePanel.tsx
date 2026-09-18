@@ -1,5 +1,5 @@
-import { Show, createEffect, createMemo, createSignal, on, type Component, type JSX } from "solid-js";
-import { formatAmount, formatBps, formatPercent, formatUsd, truncateAddress } from "../../core/format";
+import { For, Show, createEffect, createMemo, createSignal, on, type Component, type JSX } from "solid-js";
+import { formatAmount, formatBps, formatPercent, formatUsd } from "../../core/format";
 import { workspaceError } from "../../core/errors";
 import type {
   AmountType,
@@ -521,6 +521,37 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
     return null;
   });
 
+  const tradingDisabled = createMemo(() => !ws.tradingEnabled());
+  const executionDisabledNote = createMemo<string | null>(() =>
+    tradingDisabled()
+      ? "Execution is disabled on this deployment. Review and quotes still work."
+      : null,
+  );
+
+  // Auto-select an actually-available route. OKX must never be the selected
+  // route when the deployment does not advertise it; Local is the only
+  // always-available route once preview is allowed. This never rewrites an
+  // existing attempt: a ready/loading/stale quote, an in-flight submit, an
+  // UNKNOWN guard or a submitted order keeps its exact source binding
+  // (switching source would be a different order).
+  createEffect(() => {
+    if (ws.capabilities().okx) return;
+    if (routerPreference() !== "okx") return;
+    const state = execState();
+    const attemptInFlight =
+      state.kind === "submitting" || state.kind === "unknown" || state.kind === "submitted";
+    const previewKind = previewState().kind;
+    const quoteHeld =
+      previewKind === "ready" || previewKind === "loading" || previewKind === "stale";
+    if (attemptInFlight || quoteHeld) return;
+    ws.setRouterPreference("local");
+  });
+
+  const usdPresets = [25, 50, 100, 250] as const;
+  const applyPreset = (value: number): void => {
+    editField(() => setAmount(String(value)));
+  };
+
   const previewDenial = createMemo<CapabilityDenial | null>(() => {
     const router = routerDenial();
     if (router !== null) return router;
@@ -877,7 +908,7 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
           <div class="ticket__side" role="group" aria-label="Side">
             <button
               type="button"
-              class="chip-button"
+              class="chip-button chip-button--buy"
               aria-pressed={side() === "buy"}
               onClick={() => editField(() => setSide("buy"))}
             >
@@ -885,113 +916,145 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
             </button>
             <button
               type="button"
-              class="chip-button"
+              class="chip-button chip-button--sell"
               aria-pressed={side() === "sell"}
               onClick={() => editField(() => setSide("sell"))}
             >
               Sell
             </button>
-            <Badge tone="muted">chain: {chain() ?? "—"}</Badge>
           </div>
-          <p class="muted" data-testid="trade-target">
-            Target:{" "}
-            <Show when={selected()} fallback="No target selected">
+          <p class="ticket__pair" data-testid="trade-target">
+            <Show when={selected()} fallback={<span class="muted">Select a token to trade</span>}>
               {(instrument) => (
-                <>
-                  <strong>{instrument().symbol}</strong>{" "}
-                  <code>{truncateAddress(instrument().address, 6, 6)}</code> on{" "}
-                  {instrument().chain}
-                </>
+                <span>
+                  <strong>{instrument().symbol}</strong>
+                  <span class="muted"> · {instrument().chain}</span>
+                </span>
               )}
-            </Show>{" "}
-            · pair {resolvedTokens().tokenIn ?? "—"} → {resolvedTokens().tokenOut ?? "—"} · route{" "}
-            {routerSourceLabel(routerPreference())}
+            </Show>
           </p>
-          <div class="ticket__side" role="group" aria-label="Routing source">
-            <span class="field__label">Routing source</span>
-            <button
-              type="button"
-              class="chip-button"
-              aria-pressed={routerPreference() === "okx"}
-              disabled={execState().kind === "submitting"}
-              onClick={() => selectRouter("okx")}
-            >
-              OKX
-            </button>
-            <button
-              type="button"
-              class="chip-button"
-              aria-pressed={routerPreference() === "local"}
-              disabled={execState().kind === "submitting"}
-              onClick={() => selectRouter("local")}
-            >
-              Local Router
-            </button>
-            <Badge tone="muted">route: {routerSourceLabel(routerPreference())}</Badge>
-          </div>
-          <div class="ticket__grid">
-            <label class="field">
+          <div class="ticket__amount">
+            <label class="field field--amount">
               <span class="field__label">Amount</span>
-              <input
-                class="input"
-                inputmode="decimal"
-                aria-label="Amount"
-                value={amount()}
-                onInput={(event) => editField(() => setAmount(event.currentTarget.value))}
-              />
+              <div class="ticket__amount-row">
+                <input
+                  class="input"
+                  inputmode="decimal"
+                  aria-label="Amount"
+                  value={amount()}
+                  onInput={(event) => editField(() => setAmount(event.currentTarget.value))}
+                />
+                <select
+                  class="input ticket__unit"
+                  aria-label="Amount unit"
+                  value={amountType()}
+                  onChange={(event) =>
+                    editField(() => setAmountType(event.currentTarget.value as AmountType))
+                  }
+                >
+                  <option value="usd">USD</option>
+                  <option value="stablecoin">USDC</option>
+                  <option value="token">Token</option>
+                </select>
+              </div>
               {amountError() ? (
                 <span class="field__error" role="alert">
                   {amountError()}
                 </span>
               ) : null}
             </label>
-            <label class="field">
-              <span class="field__label">Amount unit</span>
-              <select
-                class="input"
-                aria-label="Amount unit"
-                value={amountType()}
-                onChange={(event) => editField(() => setAmountType(event.currentTarget.value as AmountType))}
-              >
-                <option value="usd">USD</option>
-                <option value="stablecoin">Stablecoin</option>
-                <option value="token">Token quantity</option>
-              </select>
-            </label>
-            <label class="field">
-              <span class="field__label">Max slippage (bps)</span>
-              <input
-                class="input"
-                inputmode="numeric"
-                aria-label="Max slippage bps"
-                value={slippage()}
-                onInput={(event) => editField(() => setSlippage(event.currentTarget.value))}
-              />
-            </label>
-            <label class="field">
-              <span class="field__label">Max price impact (bps)</span>
-              <input
-                class="input"
-                inputmode="numeric"
-                aria-label="Max price impact bps"
-                value={impact()}
-                onInput={(event) => editField(() => setImpact(event.currentTarget.value))}
-              />
-            </label>
-            <label class="field">
-              <span class="field__label">Max total cost (USD, optional)</span>
-              <input
-                class="input"
-                inputmode="decimal"
-                aria-label="Max total cost usd"
-                value={maxCost()}
-                onInput={(event) => editField(() => setMaxCost(event.currentTarget.value))}
-              />
-            </label>
+            <Show when={amountType() !== "token"}>
+              <div class="preset-row" role="group" aria-label="Amount presets">
+                <For each={usdPresets}>
+                  {(preset) => (
+                    <button
+                      type="button"
+                      class="preset-chip"
+                      data-testid={`amount-preset-${preset}`}
+                      onClick={() => applyPreset(preset)}
+                    >
+                      ${preset}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
           </div>
-          <div class="ticket__actions">
+
+          <details class="ticket__advanced" data-testid="ticket-advanced">
+            <summary>Advanced</summary>
+            <div class="ticket__advanced-body">
+              <div class="ticket__side" role="group" aria-label="Routing source">
+                <span class="field__label">Routing source</span>
+                <button
+                  type="button"
+                  class="chip-button"
+                  aria-pressed={routerPreference() === "okx"}
+                  disabled={!ws.capabilities().okx || execState().kind === "submitting"}
+                  title={
+                    ws.capabilities().okx
+                      ? "Route through OKX"
+                      : "OKX routing is not available on this deployment"
+                  }
+                  onClick={() => selectRouter("okx")}
+                >
+                  OKX
+                </button>
+                <button
+                  type="button"
+                  class="chip-button"
+                  aria-pressed={routerPreference() === "local"}
+                  disabled={execState().kind === "submitting"}
+                  onClick={() => selectRouter("local")}
+                >
+                  Local Router
+                </button>
+              </div>
+              <div class="ticket__grid">
+                <label class="field">
+                  <span class="field__label">Max slippage (bps)</span>
+                  <input
+                    class="input"
+                    inputmode="numeric"
+                    aria-label="Max slippage bps"
+                    value={slippage()}
+                    onInput={(event) => editField(() => setSlippage(event.currentTarget.value))}
+                  />
+                </label>
+                <label class="field">
+                  <span class="field__label">Max price impact (bps)</span>
+                  <input
+                    class="input"
+                    inputmode="numeric"
+                    aria-label="Max price impact bps"
+                    value={impact()}
+                    onInput={(event) => editField(() => setImpact(event.currentTarget.value))}
+                  />
+                </label>
+                <label class="field">
+                  <span class="field__label">Max total cost (USD, optional)</span>
+                  <input
+                    class="input"
+                    inputmode="decimal"
+                    aria-label="Max total cost usd"
+                    value={maxCost()}
+                    onInput={(event) => editField(() => setMaxCost(event.currentTarget.value))}
+                  />
+                </label>
+              </div>
+              <p class="field__hint">
+                Safe defaults: 100 bps slippage, 150 bps price impact, no total-cost cap.
+              </p>
+            </div>
+          </details>
+
+          <div class="ticket__actions ticket__actions--primary">
+            <Badge tone={routerPreference() === "okx" ? "info" : "muted"}>
+              Route {routerSourceLabel(routerPreference())}
+            </Badge>
             <ActionButton
               type="submit"
+              tone="primary"
               disabled={
                 parsedAmount() === null ||
                 previewDenial() !== null ||
@@ -999,7 +1062,7 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
                 execState().kind === "submitting"
               }
             >
-              Preview
+              Review order
             </ActionButton>
           </div>
           <DenialNote denial={previewDenial()} />
@@ -1067,11 +1130,16 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
                   </ul>
                 )}
               </div>
-              <p class="muted">
-                route source {previewSourceLabel() ?? "—"} · slot {quote.slot ?? "—"} · source age{" "}
-                {quote.sourceAgeMs}ms · revalidation{" "}
-                {quote.revalidationRequired ? "required" : "not required"}
+              <p class="muted" data-testid="preview-route-source">
+                route source {previewSourceLabel() ?? "—"}
               </p>
+              <details class="quote-details">
+                <summary>Details</summary>
+                <p class="muted">
+                  slot {quote.slot ?? "—"} · source age {quote.sourceAgeMs}ms · revalidation{" "}
+                  {quote.revalidationRequired ? "required" : "not required"}
+                </p>
+              </details>
             </div>
           )}
         </AsyncSurface>
@@ -1116,7 +1184,16 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
                 </ActionButton>
                 <ActionButton onClick={() => setConfirming(false)}>Cancel</ActionButton>
               </div>
-              <DenialNote denial={executeDenial()} />
+              <Show
+                when={executionDisabledNote()}
+                fallback={<DenialNote denial={executeDenial()} />}
+              >
+                {(note) => (
+                  <ReasonNote tone="warning" live="polite">
+                    <span data-testid="execution-disabled">{note()}</span>
+                  </ReasonNote>
+                )}
+              </Show>
             </div>
           }
         >
@@ -1129,8 +1206,16 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
             Execute {side()}
           </ActionButton>
         </Show>
-        <DenialNote denial={executeDenial()} />
-        <Show when={!confirming() && previewBlockReason()}>
+        <Show when={!confirming()}>
+          <Show when={executionDisabledNote()} fallback={<DenialNote denial={executeDenial()} />}>
+            {(note) => (
+              <ReasonNote tone="warning" live="polite">
+                <span data-testid="execution-disabled">{note()}</span>
+              </ReasonNote>
+            )}
+          </Show>
+        </Show>
+        <Show when={!confirming() && previewBlockReason() && !tradingDisabled()}>
           <ReasonNote tone="warning">{previewBlockReason()}</ReasonNote>
         </Show>
         <Show when={execState().kind === "submitting"}>
@@ -1203,9 +1288,6 @@ export const TradePanel: Component<TradePanelProps> = (props) => {
             </ReasonNote>
           )}
         </Show>
-        <ReasonNote tone="info">
-          Preview stays available while trading is disabled. This surface has no generic signing or transfer control.
-        </ReasonNote>
       </Panel>
     </div>
   );

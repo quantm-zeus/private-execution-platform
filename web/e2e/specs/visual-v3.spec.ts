@@ -285,6 +285,39 @@ test.describe("V3 workstation design gate + evidence", () => {
       expect(dockBox, "dock").not.toBeNull();
       expect(chartBox!.height, "chart taller than dock").toBeGreaterThan(dockBox!.height);
 
+      // Volume pane + professional drawing toolbar: the Pro root must stay
+      // inside the frame (its 80vh default once clipped the volume pane) and
+      // both the price and volume panes must be painted.
+      await expect(page.locator(".klinecharts-pro-drawing-bar")).toBeVisible();
+      await expect(page.getByTestId("draw-tool-ruler")).toBeVisible();
+      // Pro adds its own `.klinecharts-pro` class to the container we create, so
+      // the root is the `.pep-pro-chart` element itself.
+      const proBox = await page.locator(".pep-pro-chart").boundingBox();
+      expect(proBox, "pro chart root").not.toBeNull();
+      expect(proBox!.height, "pro chart within frame").toBeLessThanOrEqual(chartBox!.height + 2);
+      const canvasCount = await page.locator(".pep-pro-chart canvas").count();
+      expect(canvasCount, "price + volume panes").toBeGreaterThanOrEqual(2);
+
+      // Spacing tokens: the ticket/panel content must breathe (10-16px) rather
+      // than hug the pane edges, and the top bar must not be compressed.
+      const ticketPad = await page
+        .locator(".trade-ticket__body .panel__body")
+        .first()
+        .evaluate((element) => parseFloat(getComputedStyle(element).paddingLeft));
+      expect(ticketPad, "ticket content padding").toBeGreaterThanOrEqual(10);
+      expect(ticketPad, "ticket content padding").toBeLessThanOrEqual(16);
+      const topbarBox2 = await page.getByTestId("terminal-topbar").boundingBox();
+      expect(topbarBox2, "topbar").not.toBeNull();
+      expect(topbarBox2!.height, "topbar height").toBeGreaterThanOrEqual(48);
+
+      // The first-party ruler activates against the real KLineChart instance and
+      // Escape cancels it without disturbing the chart.
+      const ruler = page.getByTestId("draw-tool-ruler");
+      await ruler.click();
+      await expect(ruler).toHaveAttribute("aria-pressed", "true");
+      await page.keyboard.press("Escape");
+      await expect(ruler).toHaveAttribute("aria-pressed", "false");
+
       // The market rail row shows a price, never the address as its value.
       const firstRow = page.locator(".market-rail .market-item").first();
       await expect(firstRow.locator('[data-testid="market-row-price"]')).toBeVisible();
@@ -338,7 +371,7 @@ test.describe("V3 workstation design gate + evidence", () => {
 
     await setCommandResponse(request, PREVIEW_RESPONSE);
     await page.getByLabel("Amount", { exact: true }).fill("100");
-    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Review order" }).click();
     await expect(page.getByText(/route source OKX/)).toBeVisible();
     await capture(page, "gallery-market-quote");
 

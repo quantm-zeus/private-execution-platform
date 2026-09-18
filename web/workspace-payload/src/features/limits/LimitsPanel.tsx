@@ -153,6 +153,12 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
   });
   const readDenial = createMemo(() => ws.capabilityDenial("limits"));
   const mutationDenial = createMemo(() => ws.mutationDenial("limits"));
+  const tradingDisabled = createMemo(() => !ws.tradingEnabled());
+  const executionDisabledNote = createMemo<string | null>(() =>
+    tradingDisabled()
+      ? "Execution is disabled on this deployment. You can still prepare a limit order."
+      : null,
+  );
   const submissionKeys = createSubmissionKeyTracker("limit");
 
   const [side, setSide] = createSignal<TradeSide>("buy");
@@ -534,7 +540,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
               <div class="ticket__side" role="group" aria-label="Side">
                 <button
                   type="button"
-                  class="chip-button"
+                  class="chip-button chip-button--buy"
                   aria-pressed={side() === "buy"}
                   onClick={() => setSide("buy")}
                 >
@@ -542,7 +548,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                 </button>
                 <button
                   type="button"
-                  class="chip-button"
+                  class="chip-button chip-button--sell"
                   aria-pressed={side() === "sell"}
                   onClick={() => setSide("sell")}
                 >
@@ -550,22 +556,19 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                 </button>
               </div>
 
-              <p class="muted" data-testid="limit-target">
-                Target:{" "}
-                <Show when={selected()} fallback="No target selected">
+              <p class="ticket__pair" data-testid="limit-target">
+                <Show when={selected()} fallback={<span class="muted">Select a token to trade</span>}>
                   {(instrument) => (
-                    <>
-                      <strong>{instrument().symbol}</strong>{" "}
-                      <code>{truncateAddress(instrument().address, 6, 6)}</code> on{" "}
-                      {instrument().chain}
-                    </>
+                    <span>
+                      <strong>{instrument().symbol}</strong>
+                      <span class="muted"> · {instrument().chain}</span>
+                    </span>
                   )}
-                </Show>{" "}
-                · pair {resolvedTokens().tokenIn ?? "—"} → {resolvedTokens().tokenOut ?? "—"}
+                </Show>
               </p>
 
               <div class="ticket__grid">
-                <Field label="Limit net price" forId="limit-net-price">
+                <Field label="Limit price" forId="limit-net-price">
                   <input
                     id="limit-net-price"
                     class="input"
@@ -587,7 +590,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                   />
                 </Field>
 
-                <Field label="Amount type" forId="limit-amount-type">
+                <Field label="Amount unit" forId="limit-amount-type">
                   <select
                     id="limit-amount-type"
                     class="input"
@@ -601,62 +604,7 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                   </select>
                 </Field>
 
-                <Field label="Max buy tax (bps)" forId="limit-max-buy-tax">
-                  <input
-                    id="limit-max-buy-tax"
-                    class="input"
-                    inputmode="decimal"
-                    aria-label="Max buy tax bps"
-                    value={maxBuyTaxBps()}
-                    onInput={(event) => setMaxBuyTaxBps(event.currentTarget.value)}
-                  />
-                </Field>
-
-                <Field label="Max sell tax (bps)" forId="limit-max-sell-tax">
-                  <input
-                    id="limit-max-sell-tax"
-                    class="input"
-                    inputmode="decimal"
-                    aria-label="Max sell tax bps"
-                    value={maxSellTaxBps()}
-                    onInput={(event) => setMaxSellTaxBps(event.currentTarget.value)}
-                  />
-                </Field>
-
-                <Field label="Max price impact (bps)" forId="limit-max-impact">
-                  <input
-                    id="limit-max-impact"
-                    class="input"
-                    inputmode="decimal"
-                    aria-label="Max price impact bps"
-                    value={maxPriceImpactBps()}
-                    onInput={(event) => setMaxPriceImpactBps(event.currentTarget.value)}
-                  />
-                </Field>
-
-                <Field label="Max slippage (bps)" forId="limit-max-slippage">
-                  <input
-                    id="limit-max-slippage"
-                    class="input"
-                    inputmode="decimal"
-                    aria-label="Max slippage bps"
-                    value={maxSlippageBps()}
-                    onInput={(event) => setMaxSlippageBps(event.currentTarget.value)}
-                  />
-                </Field>
-
-                <Field label="Max total cost (USD)" forId="limit-max-cost">
-                  <input
-                    id="limit-max-cost"
-                    class="input"
-                    inputmode="decimal"
-                    aria-label="Max total cost USD"
-                    value={maxTotalCostUsd()}
-                    onInput={(event) => setMaxTotalCostUsd(event.currentTarget.value)}
-                  />
-                </Field>
-
-                <Field label="Expiry" forId="limit-expiry">
+                <Field label="Expires (optional)" forId="limit-expiry">
                   <input
                     id="limit-expiry"
                     class="input"
@@ -668,17 +616,80 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                 </Field>
               </div>
 
-              <label class="field checkbox">
-                <input
-                  type="checkbox"
-                  aria-label="Allow partial fill"
-                  checked={allowPartial()}
-                  onChange={(event) => setAllowPartial(event.currentTarget.checked)}
-                />
-                <span>Allow partial fill (remainder stays active)</span>
-              </label>
+              <details class="ticket__advanced" data-testid="limit-advanced">
+                <summary>Advanced</summary>
+                <div class="ticket__advanced-body">
+                  <label class="field checkbox">
+                    <input
+                      type="checkbox"
+                      aria-label="Allow partial fill"
+                      checked={allowPartial()}
+                      onChange={(event) => setAllowPartial(event.currentTarget.checked)}
+                    />
+                    <span>Allow partial fill (remainder stays active)</span>
+                  </label>
 
-              <div class="ticket__actions">
+                  <div class="ticket__grid">
+                    <Field label="Max buy tax (bps)" forId="limit-max-buy-tax">
+                      <input
+                        id="limit-max-buy-tax"
+                        class="input"
+                        inputmode="decimal"
+                        aria-label="Max buy tax bps"
+                        value={maxBuyTaxBps()}
+                        onInput={(event) => setMaxBuyTaxBps(event.currentTarget.value)}
+                      />
+                    </Field>
+
+                    <Field label="Max sell tax (bps)" forId="limit-max-sell-tax">
+                      <input
+                        id="limit-max-sell-tax"
+                        class="input"
+                        inputmode="decimal"
+                        aria-label="Max sell tax bps"
+                        value={maxSellTaxBps()}
+                        onInput={(event) => setMaxSellTaxBps(event.currentTarget.value)}
+                      />
+                    </Field>
+
+                    <Field label="Max price impact (bps)" forId="limit-max-impact">
+                      <input
+                        id="limit-max-impact"
+                        class="input"
+                        inputmode="decimal"
+                        aria-label="Max price impact bps"
+                        value={maxPriceImpactBps()}
+                        onInput={(event) => setMaxPriceImpactBps(event.currentTarget.value)}
+                      />
+                    </Field>
+
+                    <Field label="Max slippage (bps)" forId="limit-max-slippage">
+                      <input
+                        id="limit-max-slippage"
+                        class="input"
+                        inputmode="decimal"
+                        aria-label="Max slippage bps"
+                        value={maxSlippageBps()}
+                        onInput={(event) => setMaxSlippageBps(event.currentTarget.value)}
+                      />
+                    </Field>
+
+                    <Field label="Max total cost (USD)" forId="limit-max-cost">
+                      <input
+                        id="limit-max-cost"
+                        class="input"
+                        inputmode="decimal"
+                        aria-label="Max total cost USD"
+                        value={maxTotalCostUsd()}
+                        onInput={(event) => setMaxTotalCostUsd(event.currentTarget.value)}
+                      />
+                    </Field>
+                  </div>
+                  <p class="field__hint">Leave a risk cap empty for no cap.</p>
+                </div>
+              </details>
+
+              <div class="ticket__actions ticket__actions--primary">
                 <ActionButton
                   type="submit"
                   tone="primary"
@@ -688,7 +699,16 @@ export default function LimitsPanel(props: LimitsPanelProps = {}): JSX.Element {
                 </ActionButton>
               </div>
 
-              <DenialNote denial={mutationDenial()} />
+              <Show
+                when={executionDisabledNote()}
+                fallback={<DenialNote denial={mutationDenial()} />}
+              >
+                {(note) => (
+                  <ReasonNote tone="warning" live="polite">
+                    <span data-testid="limit-execution-disabled">{note()}</span>
+                  </ReasonNote>
+                )}
+              </Show>
               <Show when={targetError()}>
                 {(message) => <ReasonNote tone="warning">{message()}</ReasonNote>}
               </Show>

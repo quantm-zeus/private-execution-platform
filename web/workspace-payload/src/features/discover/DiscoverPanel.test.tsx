@@ -214,7 +214,7 @@ describe("DiscoverPanel", () => {
 
     fireEvent.input(searchInput(), { target: { value: "PEPE" } });
     await waitFor(
-      () => expect(screen.getByText(/backend capability missing/i)).toBeTruthy(),
+      () => expect(screen.getByText("Not available on this deployment")).toBeTruthy(),
       { timeout: 1_000 },
     );
   });

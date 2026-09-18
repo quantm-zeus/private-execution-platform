@@ -156,7 +156,7 @@ describe("PortfolioPanel", () => {
 
     // The alerts resource was never queried, so it must not claim "No alerts".
     expect(screen.queryByText("No alerts")).toBeNull();
-    expect(screen.getByText(/Backend capability missing/i)).toBeTruthy();
+    expect(screen.getByText("Not available on this deployment")).toBeTruthy();
     expect(client.calls.some((call) => call.op === "get_alerts")).toBe(false);
   });
 });

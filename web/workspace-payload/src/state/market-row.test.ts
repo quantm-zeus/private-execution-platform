@@ -20,8 +20,27 @@ describe("parseMarketRow", () => {
       priceUsd: 0.0000123,
       priceChange24h: null,
       marketCapUsd: 1_000_000,
+      liquidityUsd: null,
+      volume24hUsd: null,
       rank: 12,
     });
+  });
+
+  it("carries liquidity and 24h volume when the provider supplies them", () => {
+    const row = parseMarketRow({
+      chain: "solana",
+      address: "So111",
+      symbol: "SOL",
+      priceUsd: 150,
+      priceChange24h: -2.5,
+      marketCapUsd: 70_000_000_000,
+      liquidityUsd: 1_500_000,
+      volume24hUsd: 900_000,
+      rank: 1,
+    });
+    expect(row!.liquidityUsd).toBe(1_500_000);
+    expect(row!.volume24hUsd).toBe(900_000);
+    expect(row!.priceChange24h).toBe(-2.5);
   });
 
   it("renders a missing price as unknown, never as zero or an address", () => {
@@ -29,6 +48,8 @@ describe("parseMarketRow", () => {
     expect(row).not.toBeNull();
     expect(row!.priceUsd).toBeNull();
     expect(row!.marketCapUsd).toBeNull();
+    expect(row!.liquidityUsd).toBeNull();
+    expect(row!.volume24hUsd).toBeNull();
     expect(row!.rank).toBeNull();
   });
 

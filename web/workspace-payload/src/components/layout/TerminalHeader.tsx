@@ -1,9 +1,10 @@
 import { Show, createMemo, type Component } from "solid-js";
-import { formatPercent, formatUsd, truncateAddress } from "../../core/format";
+import { formatPercent, formatUsd } from "../../core/format";
 import type { ConnectionStatus, InstrumentRef } from "../../core/types";
 import { useWorkspace } from "../../state/session";
 import { tokenLabel, useWorkstation } from "../../state/workstation";
 import { requestHostLock } from "../../state/host";
+import { AddressCopy } from "../ui/AddressCopy";
 import { ActionButton, Badge, StatusDot, type Tone } from "../ui/primitives";
 import { TokenSearch } from "./TokenSearch";
 
@@ -39,6 +40,36 @@ export const TerminalHeader: Component = () => {
 
   const instrument = (): InstrumentRef | null => ws.selectedInstrument();
   const stats = createMemo(() => station.visibleDetail()?.stats ?? null);
+  // The header price must move with the authoritative stream, not only the 30s
+  // token detail. A pushed verified tick for the exact selected entity wins over
+  // the detail snapshot; a tick for any other entity is never read (the store
+  // keys by exact chain+address).
+  const live = createMemo(() => {
+    const ref = instrument();
+    return ref ? station.latestPrice(ref) : null;
+  });
+  const statView = createMemo(() => {
+    const detail = stats();
+    const tick = live();
+    if (!detail && !tick) return null;
+    return {
+      priceUsd: tick?.priceUsd ?? detail?.priceUsd ?? null,
+      priceChange24h: tick?.priceChange24h ?? detail?.priceChange24h ?? null,
+      marketCapUsd: tick?.marketCapUsd ?? detail?.marketCapUsd ?? null,
+      liquidityUsd: tick?.liquidityUsd ?? detail?.liquidityUsd ?? null,
+      volume24hUsd: tick?.volume24hUsd ?? detail?.volume24hUsd ?? null,
+    };
+  });
+  const sourceLabel = createMemo(() => {
+    switch (station.marketSource()) {
+      case "fomo-ws":
+        return "LIVE WS";
+      case "fomo-polling":
+        return "POLLING";
+      default:
+        return null;
+    }
+  });
 
   const offline = createMemo(() =>
     ["offline", "degraded", "reconnecting"].includes(ws.connection().phase),
@@ -80,12 +111,12 @@ export const TerminalHeader: Component = () => {
               <span class="topbar__symbol">{tokenLabel(ref())}</span>
               <span class="topbar__ref">
                 <span class="muted">{ref().chain}</span>
-                <code title={ref().address}>{truncateAddress(ref().address, 6, 6)}</code>
+                <AddressCopy address={ref().address} chain={ref().chain} />
               </span>
             </span>
           )}
         </Show>
-        <Show when={stats()}>
+        <Show when={statView()}>
           {(value) => (
             <span class="topbar__stats">
               <span class="stat stat--price">
@@ -120,6 +151,15 @@ export const TerminalHeader: Component = () => {
               </span>
             </span>
           )}
+        </Show>
+        <Show when={sourceLabel()}>
+          <Badge
+            tone={station.marketSource() === "fomo-ws" ? "positive" : "muted"}
+            title="Provenance of the live market lane"
+            data-testid="market-source"
+          >
+            {sourceLabel()}
+          </Badge>
         </Show>
       </div>
 

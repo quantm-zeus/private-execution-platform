@@ -17,6 +17,11 @@ import {
   type ChartSubject,
 } from "./chart-datafeed";
 import { createPepHistoryProvider, createServerHistoryProvider } from "./history";
+import {
+  DRAWING_TOOLS,
+  createDrawingController,
+  type DrawingController,
+} from "./drawings";
 import { createProChart, type ProChartHandle } from "./pro/pro-chart";
 import { PRO_PERIODS, createProDatafeed, type ProDatafeed } from "./pro/pro-datafeed";
 import { timeframeById, type Timeframe } from "../market/ohlcv";
@@ -130,6 +135,29 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   let host: HTMLDivElement | undefined;
   let handle: ProChartHandle | null = null;
   let activeDatafeed: ProDatafeed | null = null;
+  let drawing: DrawingController | null = null;
+  const [drawingVersion, setDrawingVersion] = createSignal(0);
+  const [clearArmed, setClearArmed] = createSignal(false);
+  const drawingCount = createMemo(() => {
+    drawingVersion();
+    return drawing?.count() ?? 0;
+  });
+  const activeDrawingTool = createMemo(() => {
+    drawingVersion();
+    return drawing?.activeTool() ?? null;
+  });
+  const drawingTools = DRAWING_TOOLS.filter((tool) => tool.id === "ruler");
+  const onChartKeyDown = (event: KeyboardEvent): void => {
+    if (!drawing) return;
+    if (event.key === "Escape") {
+      drawing.cancel();
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Delete" || event.key === "Backspace") {
+      if (drawing.removeSelected()) event.preventDefault();
+    }
+  };
   let createdTicker: string | null = null;
   let createdNonce = -1;
   const [chartError, setChartError] = createSignal(false);
@@ -163,6 +191,10 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     handle = null;
     activeDatafeed?.dispose();
     activeDatafeed = null;
+    // A token switch rebuilds the renderer, so drawings (in-memory overlays on
+    // the vendor instance) cannot leak across token identity.
+    drawing = null;
+    setClearArmed(false);
     // A fresh datafeed per renderer instance: Pro 0.1.1 can call `subscribe()`
     // only after its history `await` resolves, so a disposed instance must never
     // be reused (its terminal guard would otherwise either leak a sink or drop a
@@ -193,7 +225,17 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
       datafeed.dispose();
       createdTicker = null;
       handle = null;
+      drawing = null;
       setChartError(true);
+      return;
+    }
+    // Drawing tools are an enhancement layered on the live chart: a failure here
+    // must never discard the renderer (which would otherwise rebuild in a loop).
+    try {
+      drawing = handle.chartApi ? createDrawingController(handle.chartApi) : null;
+      drawing?.subscribe(() => setDrawingVersion((value) => value + 1));
+    } catch {
+      drawing = null;
     }
   });
 
@@ -215,9 +257,24 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
     handle?.setTimeframe(value);
   });
 
+  // Live current candle: a pushed, verified price tick for the exact selected
+  // entity upserts the current candle in place (close/high/low only). Volume is
+  // never fabricated from a tick; the periodic OHLCV reconciliation replaces the
+  // provisional bar with authoritative volume.
+  createEffect(() => {
+    const current = subject();
+    if (!current.chain || !current.address) return;
+    const tick = station.latestPrice(current);
+    if (!tick) return;
+    if (router.applyPriceTick(current, activeTimeframeDef(), tick, ws.clockMs())) {
+      setVersion((value) => value + 1);
+    }
+  });
+
   onCleanup(() => {
     handle?.dispose();
     handle = null;
+    drawing = null;
     activeDatafeed?.dispose();
     activeDatafeed = null;
   });
@@ -232,7 +289,7 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
   };
 
   return (
-    <div class="chart-panel">
+    <div class="chart-panel" onKeyDown={onChartKeyDown}>
       <div class="chart-panel__head">
         <div class="chart-target" data-testid="chart-target" data-candles={String(selectedCandleCount())}>
           <Show when={hasTarget()} fallback={<Badge tone="muted">No target selected</Badge>}>
@@ -248,6 +305,60 @@ export const ChartPanel: Component<ChartPanelProps> = (props) => {
             are non-focusable spans, so the keyboard/AT path is owned here. The
             vendor period bar is hidden. */}
         <div class="chart-toolbar">
+          {/* First-party measurement + clear-all, complementing Pro's built-in
+              drawing bar. Escape cancels; Delete/Backspace removes the selected
+              drawing; clearing requires an explicit confirmation. */}
+          <div class="chart-draw-tools" role="toolbar" aria-label="Drawing tools">
+            <For each={drawingTools}>
+              {(tool) => (
+                <button
+                  type="button"
+                  class="chart-tool"
+                  data-testid={`draw-tool-${tool.id}`}
+                  aria-pressed={activeDrawingTool() === tool.id}
+                  title={tool.hint}
+                  onClick={() => drawing?.activate(tool.id)}
+                >
+                  {tool.label}
+                </button>
+              )}
+            </For>
+            <Show
+              when={clearArmed()}
+              fallback={
+                <button
+                  type="button"
+                  class="chart-tool"
+                  data-testid="draw-clear-all"
+                  disabled={drawingCount() === 0}
+                  title="Remove every drawing"
+                  onClick={() => setClearArmed(true)}
+                >
+                  Clear all
+                </button>
+              }
+            >
+              <button
+                type="button"
+                class="chart-tool chart-tool--danger"
+                data-testid="draw-clear-confirm"
+                onClick={() => {
+                  drawing?.clearAll();
+                  setClearArmed(false);
+                }}
+              >
+                Confirm clear
+              </button>
+              <button
+                type="button"
+                class="chart-tool"
+                data-testid="draw-clear-cancel"
+                onClick={() => setClearArmed(false)}
+              >
+                Cancel
+              </button>
+            </Show>
+          </div>
           <label class="chart-toolbar__label" for="chart-timeframe">
             Timeframe
           </label>

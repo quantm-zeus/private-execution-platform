@@ -183,6 +183,86 @@ export function ohlcvDelta(
   };
 }
 
+export interface MarketTokenRow {
+  readonly chain: string;
+  readonly address: string;
+  readonly symbol?: string;
+  readonly name?: string;
+  readonly priceUsd?: number;
+  readonly priceChange24h?: number;
+  readonly marketCapUsd?: number;
+  readonly liquidityUsd?: number;
+  readonly volume24hUsd?: number;
+  readonly rank?: number;
+}
+
+/** A pushed normalized trending frame on the `market` channel. */
+export function marketTrendingFrame(
+  tokens: readonly MarketTokenRow[],
+  options: { source?: string; category?: string } = {},
+) {
+  return {
+    op: "delta",
+    channel: "market",
+    priority: 2,
+    entity_key: "market:trending",
+    slot: 1,
+    source_age_ms: 0,
+    payload: {
+      kind: "trending",
+      category: options.category ?? "trending",
+      tokens,
+      source: options.source ?? "fomo-ws",
+      observedAtMs: Date.now(),
+    },
+  };
+}
+
+/** A pushed selected-token price tick for one exact entity. */
+export function marketPriceFrame(
+  chain: string,
+  address: string,
+  priceUsd: number,
+  options: Partial<Omit<MarketTokenRow, "chain" | "address" | "priceUsd">> & {
+    source?: string;
+  } = {},
+) {
+  const payload: Record<string, unknown> = {
+    kind: "price",
+    chain,
+    address,
+    priceUsd,
+    source: options.source ?? "fomo-ws",
+    observedAtMs: Date.now(),
+  };
+  if (options.priceChange24h !== undefined) payload.priceChange24h = options.priceChange24h;
+  if (options.marketCapUsd !== undefined) payload.marketCapUsd = options.marketCapUsd;
+  if (options.liquidityUsd !== undefined) payload.liquidityUsd = options.liquidityUsd;
+  if (options.volume24hUsd !== undefined) payload.volume24hUsd = options.volume24hUsd;
+  return {
+    op: "delta",
+    channel: "market",
+    priority: 2,
+    entity_key: `market:price:${chain}:${address}`,
+    slot: 1,
+    source_age_ms: 0,
+    payload,
+  };
+}
+
+/** A pushed realtime provenance status frame. */
+export function marketStatusFrame(realtimeSource: "fomo-ws" | "fomo-polling" | "unavailable") {
+  return {
+    op: "snapshot",
+    channel: "market",
+    priority: 2,
+    entity_key: "market:status",
+    slot: null,
+    source_age_ms: 0,
+    payload: { kind: "status", realtimeSource },
+  };
+}
+
 /** Wait until the payload has completed bootstrap and rendered the shell. */
 export async function waitForWorkspace(page: Page): Promise<void> {
   await expect(page.locator(".workspace")).toBeVisible();

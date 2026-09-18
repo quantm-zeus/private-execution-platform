@@ -17,7 +17,6 @@ import {
   EmptyBlock,
   FreshnessBadge,
   StaleRibbon,
-  UnavailableBlock,
 } from "../../components/ui/states";
 
 /** A balance older than this is rendered as stale, never as a confident value. */
@@ -104,7 +103,7 @@ export default function PortfolioPanel(): JSX.Element {
                 denial={portfolioDenial()}
                 nowMs={ws.nowMs()}
                 onRetry={() => void portfolio.run()}
-                unavailableDetail="Requires command op get_portfolio with balances, equityUsd, slot and sourceAgeMs."
+                unavailableDetail="Owner-scoped balances are not connected on this deployment."
               >
                 {(value) => (
                   <div class="panel-stack">
@@ -259,9 +258,9 @@ export default function PortfolioPanel(): JSX.Element {
           </div>
         }
       >
-        <UnavailableBlock
-          denial={portfolioDenial()}
-          detail="Requires command op get_portfolio with balances, equityUsd, slot and sourceAgeMs."
+        <EmptyBlock
+          title="Portfolio not connected"
+          detail="Balances are not available on this deployment. Read-only market data still works."
         />
       </Show>
     </Panel>

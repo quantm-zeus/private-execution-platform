@@ -297,7 +297,7 @@ fn optional_fomo_market_config(
         100,
         30_000,
     )?;
-    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 5_000, 1_000, 60_000)?;
+    let stream_poll = parse_millis_env("PRIVATE_FOMO_STREAM_POLL_MS", 2_000, 1_000, 60_000)?;
     let stream_count_back = parse_u32_env("PRIVATE_FOMO_STREAM_COUNT_BACK", 300, 1, 1_500)?;
     let target = match stream_target {
         Some(value) => Some(parse_stream_target(&value)?),
@@ -315,8 +315,8 @@ fn optional_fomo_market_config(
             stream_target: target,
             history_target: history,
             // Clamp, never reject, a faster-than-approved operator value: the
-            // approved realtime source is REST polling at >=5s, so an existing
-            // sub-5s setting becomes 5s instead of a startup failure.
+            // polling fallback is bounded to >=1s and the production default is
+            // 2s, so a sub-1s setting becomes 1s instead of a startup failure.
             stream_poll: private_api::FomoMarketConfig::clamp_poll(stream_poll),
             stream_count_back,
         },
@@ -552,9 +552,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (fomo_dispatcher, fomo_stream, fomo_wired, fomo_market_read) = match fomo {
         Some((config, api_key)) => {
             let provider: Arc<dyn private_api::BarsProvider> = Arc::new(
-                private_api::FomoBarsClient::new(&config.base_url, api_key, config.request_timeout)
-                    .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
+                private_api::FomoBarsClient::new(
+                    &config.base_url,
+                    api_key.clone(),
+                    config.request_timeout,
+                )
+                .map_err(|_| std::io::Error::other("FOMO market configuration invalid"))?,
             );
+            // WS-first realtime lane: a bounded-cadence `/market/realtime`
+            // client driven by a shared hub. The stream source prefers its
+            // pushed frames and only falls back to bounded polling when the
+            // lane is not live; the strict provenance gate keeps a non-WS batch
+            // from ever being labelled `fomo-ws`.
+            let lane_client = private_api::FomoRealtimeLaneClient::new(
+                &config.base_url,
+                api_key,
+                config.request_timeout,
+                private_api::fomo_market::DEFAULT_LANE_INTERVAL,
+            )
+            .map_err(|_| std::io::Error::other("FOMO realtime lane configuration invalid"))?;
+            let lane_hub = Arc::new(private_api::fomo_market::LaneHub::new());
+            lane_hub.spawn(Arc::new(lane_client));
             let probe_provider = provider.clone();
             let wiring = private_api::build_fomo_market_wiring_full(
                 &config,
@@ -564,6 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(fomo_history_health.clone()),
                 Some(market_read_health.clone()),
                 Arc::new(private_api::fomo_market::RealtimeTargetRegistry::new()),
+                Some(lane_hub),
             )
             .map_err(|_| std::io::Error::other("FOMO market wiring invalid"))?;
             // Chart history proof: a bounded authenticated `/market/bars` read
@@ -841,6 +860,25 @@ mod tests {
         assert!(parse_millis_env(name, 5_000, 100, 30_000).is_err());
         std::env::set_var(name, "notanumber");
         assert!(parse_millis_env(name, 5_000, 100, 30_000).is_err());
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn fomo_stream_poll_defaults_to_two_seconds_with_a_one_second_floor() {
+        let name = "PRIVATE_FOMO_STREAM_POLL_MS";
+        std::env::remove_var(name);
+        assert_eq!(
+            parse_millis_env(name, 2_000, 1_000, 60_000).unwrap(),
+            Duration::from_millis(2_000)
+        );
+        // The 1s floor is allowed by code; sub-second values are refused here.
+        std::env::set_var(name, "1000");
+        assert_eq!(
+            parse_millis_env(name, 2_000, 1_000, 60_000).unwrap(),
+            Duration::from_millis(1_000)
+        );
+        std::env::set_var(name, "999");
+        assert!(parse_millis_env(name, 2_000, 1_000, 60_000).is_err());
         std::env::remove_var(name);
     }
 

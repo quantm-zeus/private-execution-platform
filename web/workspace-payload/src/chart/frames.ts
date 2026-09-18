@@ -139,3 +139,77 @@ export function applyMarketFrame(stores: MarketFrameStores, frame: DecodedFrame)
 
   return { changed: false, kind: null, seriesKey: null };
 }
+
+export interface PriceTickApplyResult {
+  readonly changed: boolean;
+  readonly seriesKey: string | null;
+  /**
+   * Always false: a price tick carries no authoritative volume, so the volume
+   * on the resulting candle is either the previous candle's untouched value or
+   * `0` (unknown) for a freshly opened bucket. Consumers must reconcile volume
+   * from authoritative OHLCV, never from a price.
+   */
+  readonly volumeAuthoritative: boolean;
+}
+
+const NO_PRICE_TICK: PriceTickApplyResult = {
+  changed: false,
+  seriesKey: null,
+  volumeAuthoritative: false,
+};
+
+/**
+ * Build/upsert the current candle for one exact entity from a verified price
+ * tick.
+ *
+ * Semantics:
+ * - an existing candle in the same bucket has its close/high/low widened and
+ *   its **volume preserved untouched**;
+ * - a newer bucket opens a candle with `volume: 0` (explicitly unknown, never a
+ *   fabricated trade size) that authoritative OHLCV reconciliation replaces;
+ * - an older (stale) tick is refused so an out-of-order frame cannot rewind the
+ *   current bar.
+ */
+export function upsertPriceTick(
+  stores: MarketFrameStores,
+  entityKey: string,
+  timeframeId: string,
+  timeframeMs: number,
+  price: number,
+  observedAtMs: number | null,
+  nowMs: number,
+): PriceTickApplyResult {
+  if (!Number.isFinite(price) || price <= 0) return NO_PRICE_TICK;
+  if (!Number.isFinite(timeframeMs) || timeframeMs <= 0) return NO_PRICE_TICK;
+  if (entityKey.length === 0 || timeframeId.length === 0) return NO_PRICE_TICK;
+  const at =
+    observedAtMs !== null && Number.isFinite(observedAtMs) && observedAtMs > 0
+      ? observedAtMs
+      : nowMs;
+  const bucket = Math.floor(at / timeframeMs) * timeframeMs;
+  const key = `${entityKey}#${timeframeId}`;
+  const series = seriesFor(stores, key, timeframeMs);
+  const last = series.last();
+  if (!last) {
+    series.upsert({ timeMs: bucket, open: price, high: price, low: price, close: price, volume: 0 });
+    return { changed: true, seriesKey: key, volumeAuthoritative: false };
+  }
+  if (last.timeMs > bucket) return { ...NO_PRICE_TICK, seriesKey: key };
+  if (last.timeMs === bucket) {
+    const candle: Candle = {
+      ...last,
+      close: price,
+      high: Math.max(last.high, price),
+      low: Math.min(last.low, price),
+      // Volume is deliberately carried over: a price tick cannot supply it.
+      volume: last.volume,
+    };
+    const changed =
+      candle.close !== last.close || candle.high !== last.high || candle.low !== last.low;
+    if (!changed) return { changed: false, seriesKey: key, volumeAuthoritative: false };
+    series.upsert(candle);
+    return { changed: true, seriesKey: key, volumeAuthoritative: false };
+  }
+  series.upsert({ timeMs: bucket, open: price, high: price, low: price, close: price, volume: 0 });
+  return { changed: true, seriesKey: key, volumeAuthoritative: false };
+}

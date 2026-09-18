@@ -153,7 +153,7 @@ test.describe("fail-closed private workspace", () => {
     await expect(
       page
         .getByTestId("trade-ticket")
-        .getByText(/trading is disabled|foundation phase/i)
+        .getByText(/execution is disabled|foundation phase/i)
         .filter({ visible: true })
         .first(),
     ).toBeVisible();

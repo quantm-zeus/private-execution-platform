@@ -11,6 +11,7 @@
 
 import { KLineChartPro } from "@klinecharts/pro";
 import type { ChartProOptions } from "@klinecharts/pro";
+import { init as initKlineChart, type Chart } from "klinecharts";
 import { PRO_PERIODS, proPeriodForTimeframe, proSymbolFor } from "./pro-datafeed";
 import { normalizePositiveTabindex } from "./vendor-a11y";
 import type { ChartSubject } from "../chart-datafeed";
@@ -25,11 +26,37 @@ export interface CreateProChartOptions {
 
 export interface ProChartHandle {
   readonly chart: KLineChartPro;
+  /** Underlying KLineChart v9 instance (Pro keeps it private; used for tools). */
+  readonly chartApi: Chart | null;
   readonly disposed: boolean;
   setSubject(subject: ChartSubject): void;
   setTimeframe(timeframeId: string): void;
   resize(): void;
   dispose(): void;
+}
+
+/**
+ * Give the VOL sub-indicator a usable, draggable pane beneath price.
+ *
+ * Pro 0.1.1 creates the VOL pane (its `subIndicators` default is `["VOL"]`) but
+ * lets KLineChart pick the height, which collapses to a sliver in a dense
+ * terminal layout. Sizing it explicitly is what makes the pane visible and
+ * responsive; the historical volume itself still comes from authoritative
+ * `getBarsNew` bars.
+ */
+function ensureVolumePane(chartApi: Chart): void {
+  try {
+    const panes = chartApi.getIndicatorByPaneId();
+    if (!(panes instanceof Map)) return;
+    for (const [paneId, indicators] of panes) {
+      if (indicators instanceof Map && indicators.has("VOL")) {
+        chartApi.setPaneOptions({ id: paneId, height: 96, minHeight: 56, dragEnabled: true });
+        return;
+      }
+    }
+  } catch {
+    // Vendor internals changed: keep the chart usable without the pane resize.
+  }
 }
 
 function localTimezone(): string {
@@ -90,6 +117,36 @@ function constructWithListenerCapture(construct: () => KLineChartPro): {
   }
 }
 
+/**
+ * Recover the underlying KLineChart v9 `Chart` instance from a mounted Pro
+ * widget.
+ *
+ * Pro 0.1.1 does not expose its chart API: the `_chartApi` property is only the
+ * public `ChartPro` method wrapper (setTheme/getTheme/…), with no overlay or
+ * indicator API. KLineChart's `init()` is idempotent per DOM element — it keeps
+ * an internal `instances` map keyed by the element's `chartId` and returns the
+ * existing chart for an already-initialized element. Walking the Pro subtree for
+ * the element that carries `chartId` and calling `init()` on it therefore
+ * returns the live chart without creating a second one.
+ */
+export function captureKlineChart(container: HTMLElement): Chart | null {
+  const candidates: HTMLElement[] = [
+    container,
+    ...Array.from(container.querySelectorAll<HTMLElement>("*")),
+  ];
+  for (const element of candidates) {
+    const chartId = (element as unknown as { chartId?: unknown }).chartId;
+    if (typeof chartId !== "string" || chartId.length === 0) continue;
+    try {
+      const chart = initKlineChart(element);
+      if (chart) return chart;
+    } catch {
+      // Fall through to the next candidate; never throw into the render loop.
+    }
+  }
+  return null;
+}
+
 export function createProChart(host: HTMLElement, options: CreateProChartOptions): ProChartHandle {
   const container = document.createElement("div");
   container.className = "pep-pro-chart";
@@ -98,6 +155,7 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
 
   let chart: KLineChartPro;
   let captured: CapturedListener[] = [];
+  let chartApi: Chart | null = null;
   try {
     const built = constructWithListenerCapture(
       () =>
@@ -110,7 +168,10 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
           periods: [...PRO_PERIODS],
           theme: "dark",
           timezone: localTimezone(),
-          drawingBarVisible: false,
+          // Restore the professional drawing toolbar (trend/horizontal/vertical
+          // lines, ray, rectangle, Fibonacci). The ruler/measure tool and the
+          // keyboard/clear-all affordances are first-party (see ../drawings).
+          drawingBarVisible: true,
           mainIndicators: ["MA"],
           subIndicators: ["VOL"],
           datafeed: options.datafeed,
@@ -118,6 +179,8 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
     );
     chart = built.chart;
     captured = built.listeners;
+    chartApi = captureKlineChart(container);
+    if (chartApi) ensureVolumePane(chartApi);
   } catch (error) {
     // A runtime without a usable canvas must not leave a half-mounted widget.
     container.remove();
@@ -154,6 +217,9 @@ export function createProChart(host: HTMLElement, options: CreateProChartOptions
 
   return {
     chart,
+    get chartApi() {
+      return chartApi;
+    },
     get disposed() {
       return disposed;
     },

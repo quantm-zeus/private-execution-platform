@@ -297,7 +297,7 @@ test.describe("workstation state gallery (attachments only)", () => {
     // Market quote.
     await setCommandResponse(request, PREVIEW_RESPONSE);
     await page.getByLabel("Amount", { exact: true }).fill("100");
-    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Review order" }).click();
     await expect(page.getByText(/route source OKX/)).toBeVisible();
     await attach(page, testInfo, "market-quote");
 

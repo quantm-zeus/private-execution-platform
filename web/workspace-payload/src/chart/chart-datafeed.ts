@@ -10,7 +10,7 @@
 // ever receives bars that were applied from an authenticated decoded frame.
 
 import type { Candle } from "../contracts/market";
-import { applyMarketFrame, createMarketFrameStores } from "./frames";
+import { applyMarketFrame, createMarketFrameStores, upsertPriceTick } from "./frames";
 import type { Timeframe } from "../market/ohlcv";
 import type { DecodedFrame } from "../realtime/types";
 
@@ -146,6 +146,33 @@ export class ChartFrameRouter {
       }
     }
     return changed;
+  }
+
+  /**
+   * Build/upsert the current candle for the exact selected subject from a
+   * verified price tick. The neutral `ohlcv:default` series is never touched,
+   * and the entity key is derived from the subject itself, so another token's
+   * tick can never reach this series.
+   */
+  applyPriceTick(
+    subject: ChartSubject,
+    timeframe: Timeframe,
+    tick: { readonly priceUsd: number; readonly observedAtMs: number | null },
+    nowMs: number = Date.now(),
+  ): boolean {
+    const entityKey = chartEntityKey(subject);
+    if (entityKey === "ohlcv:default") return false;
+    const result = upsertPriceTick(
+      this.stores,
+      entityKey,
+      timeframe.id,
+      timeframe.ms,
+      tick.priceUsd,
+      tick.observedAtMs,
+      nowMs,
+    );
+    if (result.changed && result.seriesKey) this.broadcast(entityKey, result.seriesKey);
+    return result.changed;
   }
 
   private broadcast(frameEntityKey: string, seriesKey: string): void {

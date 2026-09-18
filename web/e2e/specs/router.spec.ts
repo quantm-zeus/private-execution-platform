@@ -138,13 +138,18 @@ test.describe("routing source selector (W13)", () => {
 
     // The right ticket defaults to the Market tab; no navigation is required.
     await expect(page.getByTestId("ticket-tab-market")).toHaveAttribute("aria-selected", "true");
+    // Route choice and risk caps are behind the collapsed Advanced section; the
+    // bound route stays visible, and expanding Advanced reveals the real control.
+    await expect(page.getByTestId("ticket-advanced")).not.toHaveAttribute("open", "");
+    await page.getByTestId("ticket-advanced").locator("summary").click();
+    await expect(page.getByTestId("ticket-advanced")).toHaveAttribute("open", "");
     await expect(page.getByRole("button", { name: "OKX" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
 
     await page.getByLabel("Amount", { exact: true }).fill("100");
-    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Review order" }).click();
     await expect(page.getByText(/route source OKX/)).toBeVisible();
 
     // The preference travelled only to the neutral first-party contract; the
@@ -159,7 +164,7 @@ test.describe("routing source selector (W13)", () => {
 
     // The mock always answers with an OKX source; a Local request must refuse it
     // rather than accept a silent substitution.
-    await page.getByRole("button", { name: "Preview" }).click();
+    await page.getByRole("button", { name: "Review order" }).click();
     await expect(page.getByText(/silent fallback/i)).toBeVisible();
 
     const after = await serverState(request);

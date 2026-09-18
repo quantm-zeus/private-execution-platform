@@ -13,13 +13,32 @@ import {
 } from "solid-js";
 import type { MarketListRow, TokenDetail, TokenRef } from "../contracts/market";
 import type { CapabilityDenial, DataState } from "../core/types";
+import { stateValue } from "../core/types";
 import { isServedTimeframe } from "../market/ohlcv";
 import {
   createRealtimeTargetCoordinator,
   type RealtimeTargetState,
 } from "../realtime/target-coordinator";
+import {
+  MarketEventRouter,
+  isPriceFresh,
+  marketPriceEntityKey,
+  mergeTrendingRows,
+  trendingChainCounts,
+  type MarketSource,
+  type PricePush,
+  type TrendingPush,
+} from "../realtime/market-events";
+import type { DecodedFrame } from "../realtime/types";
 import { createCommandResource, type CommandResource } from "./command-state";
+import { parseMarketRows } from "./market-row";
+import { createTrendingPoller, type TrendingPoller } from "./trending-poller";
 import { useWorkspace, type WorkspaceStore } from "./session";
+
+// Re-exported so existing consumers/tests keep importing the shared parser from
+// the workstation module while the implementation lives in `./market-row`
+// (which the realtime router can import without a cycle).
+export { MAX_MARKET_ROWS, parseMarketRow, parseMarketRows } from "./market-row";
 
 export type TicketTab = "market" | "limit";
 export type DockTab = "positions" | "orders" | "activity" | "trades" | "holders";
@@ -36,7 +55,6 @@ export interface TrendingPayload {
 const SEARCH_TTL_MS = 30_000;
 const DETAIL_TTL_MS = 30_000;
 const TRENDING_TTL_MS = 30_000;
-const TRENDING_REFRESH_MS = 30_000;
 const RECENT_LIMIT = 8;
 const WATCHLIST_LIMIT = 50;
 
@@ -78,6 +96,18 @@ export interface WorkstationStore {
   readonly trendingState: Accessor<DataState<TrendingPayload>>;
   readonly trendingDenial: Accessor<CapabilityDenial | null>;
   refreshTrending(): void;
+  /** Rows = reconciled command rows overlaid with pushed WS-observed values. */
+  readonly trendingRows: Accessor<readonly MarketListRow[]>;
+  /** Honest per-chain counts of the current trending rows. */
+  readonly trendingChains: Accessor<ReadonlyMap<string, number>>;
+  /** Latest pushed trending batch, or `null` when none has been observed. */
+  readonly pushedTrending: Accessor<TrendingPush | null>;
+  /** Provenance of the realtime market lane: ws, polling fallback, or none. */
+  readonly marketSource: Accessor<MarketSource>;
+  /** Latest pushed price for an exact instrument, or `null` when none/other. */
+  latestPrice(ref: TokenRef): PricePush | null;
+  /** Apply decrypted `market` frames; returns true when anything was accepted. */
+  applyMarketFrames(frames: readonly DecodedFrame[]): void;
 
   /* Selected token detail for the header stats and centre identity strip. */
   /** Detail value is visible only when it belongs to the currently selected token. */
@@ -113,82 +143,6 @@ export function tokenLabel(token: TokenRef): string {
 
 function sameInstrument(a: { chain: string; address: string }, b: { chain: string; address: string }): boolean {
   return a.chain === b.chain && a.address === b.address;
-}
-
-/**
- * A finite, non-negative provider number, or `null`. Anything else (absent,
- * `NaN`, `Infinity`, a string, a negative) stays unknown so the renderer shows
- * an explicit `—` and never invents a zero.
- */
-function finiteOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-/** A finite signed number (a 24h change may legitimately be negative), or `null`. */
-function signedFiniteOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-/** A positive integer rank, or `null`. */
-function rankOrNull(value: unknown): number | null {
-  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
-}
-
-function parseTokenRef(entry: unknown): TokenRef | null {
-  if (typeof entry !== "object" || entry === null) return null;
-  const token = entry as Record<string, unknown>;
-  // Normalize the identity once, so the chart entity key, the coordinator's
-  // exact target and the backend's trimmed identity all agree.
-  const chain = typeof token.chain === "string" ? token.chain.trim() : "";
-  const address = typeof token.address === "string" ? token.address.trim() : "";
-  if (chain.length === 0 || address.length === 0) return null;
-  const ref: {
-    chain: string;
-    address: string;
-    symbol?: string;
-    name?: string;
-    decimals?: number;
-  } = { chain, address };
-  if (typeof token.symbol === "string" && token.symbol.length > 0) ref.symbol = token.symbol;
-  if (typeof token.name === "string" && token.name.length > 0) ref.name = token.name;
-  if (typeof token.decimals === "number" && Number.isInteger(token.decimals)) {
-    ref.decimals = token.decimals;
-  }
-  return ref;
-}
-
-/**
- * Parse one market-list row, preserving the validated optional financial fields
- * the provider supplied. This is the typed row the market rail and search
- * combobox render; it never fabricates a price, market cap or rank.
- */
-export function parseMarketRow(entry: unknown): MarketListRow | null {
-  const token = parseTokenRef(entry);
-  if (!token) return null;
-  const record = entry as Record<string, unknown>;
-  return {
-    ...token,
-    priceUsd: finiteOrNull(record.priceUsd),
-    // A 24h change is signed: a down token must keep its negative value.
-    priceChange24h: signedFiniteOrNull(record.priceChange24h),
-    marketCapUsd: finiteOrNull(record.marketCapUsd),
-    rank: rankOrNull(record.rank),
-  };
-}
-
-/** Upper bound on rows parsed from one provider page. */
-export const MAX_MARKET_ROWS = 200;
-
-/** Parse a bounded list of market rows, dropping entries without an identity. */
-export function parseMarketRows(value: unknown): readonly MarketListRow[] {
-  if (!Array.isArray(value)) return [];
-  const rows: MarketListRow[] = [];
-  for (const entry of value) {
-    if (rows.length >= MAX_MARKET_ROWS) break;
-    const row = parseMarketRow(entry);
-    if (row) rows.push(row);
-  }
-  return rows;
 }
 
 function asTokenResults(value: unknown): SearchPayload {
@@ -255,6 +209,38 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
           : undefined;
     return candidate && sameInstrument(candidate.token, selected) ? candidate : null;
   });
+
+  // Pushed `market` frames from the encrypted realtime feed. The router is a
+  // plain class; one generation signal makes its immutable state reactive.
+  const marketRouter = new MarketEventRouter();
+  const [marketGeneration, setMarketGeneration] = createSignal(0);
+  const applyMarketFrames = (frames: readonly DecodedFrame[]): void => {
+    if (marketRouter.apply(frames)) setMarketGeneration((value) => value + 1);
+  };
+  const pushedTrending = createMemo<TrendingPush | null>(() => {
+    marketGeneration();
+    return marketRouter.state.trending;
+  });
+  const marketSource = createMemo<MarketSource>(() => {
+    marketGeneration();
+    return marketRouter.state.source;
+  });
+  const latestPrice = (ref: TokenRef): PricePush | null => {
+    marketGeneration();
+    const push =
+      marketRouter.state.prices.get(marketPriceEntityKey(ref.chain, ref.address)) ?? null;
+    if (!push) return null;
+    // The lane retains a cached price per entity; never surface one older than
+    // the absolute freshness window as the current price.
+    return isPriceFresh(push, ws.serverNowMs()) ? push : null;
+  };
+  const trendingRows = createMemo<readonly MarketListRow[]>(() => {
+    const base = stateValue(trending.state())?.tokens ?? [];
+    return mergeTrendingRows(base, pushedTrending());
+  });
+  const trendingChains = createMemo<ReadonlyMap<string, number>>(() =>
+    trendingChainCounts(trendingRows()),
+  );
 
   // Encrypted per-session realtime target binding. It is driven by one effect so
   // a token/timeframe change produces exactly one deduplicated command once both
@@ -338,23 +324,36 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     setTimeframeValue(value);
   };
 
-  let trendingTimer: ReturnType<typeof setInterval> | undefined;
+  // Trending reconciliation. Pushed WS frames keep the visible rows fresh; this
+  // poller is the bounded fallback (2s active, deferred when hidden, backed off
+  // when the connection is degraded) and never overlaps a request.
+  const trendingPoller: TrendingPoller = createTrendingPoller({
+    refresh: refreshTrending,
+    isReady: () => ws.commandReady() && !trendingDenial(),
+    isHidden: () => typeof document !== "undefined" && document.hidden === true,
+    isDegraded: () => {
+      const phase = ws.connection().phase;
+      return phase === "offline" || phase === "reconnecting" || phase === "degraded";
+    },
+    subscribeVisibility: (cb) => {
+      if (typeof document === "undefined") return () => {};
+      document.addEventListener("visibilitychange", cb);
+      return () => document.removeEventListener("visibilitychange", cb);
+    },
+  });
   createEffect(() => {
     const canReadTrending = ws.commandReady() && !trendingDenial();
-    if (trendingTimer !== undefined) {
-      clearInterval(trendingTimer);
-      trendingTimer = undefined;
-    }
     if (!canReadTrending) {
+      trendingPoller.stop();
       trending.reset();
       return;
     }
+    // One immediate reconciliation when the channel becomes ready, then the
+    // poller keeps the visible list fresh at the bounded cadence.
     untrack(refreshTrending);
-    trendingTimer = setInterval(refreshTrending, TRENDING_REFRESH_MS);
+    trendingPoller.start();
   });
-  onCleanup(() => {
-    if (trendingTimer !== undefined) clearInterval(trendingTimer);
-  });
+  onCleanup(() => trendingPoller.dispose());
 
   // Responsive collapse: the rail is the first thing to fold at <=1180px. A
   // user can still reopen it; crossing the breakpoint collapses but never
@@ -405,6 +404,12 @@ export function createWorkstationStore(ws: WorkspaceStore): WorkstationStore {
     trendingState: trending.state,
     trendingDenial,
     refreshTrending,
+    trendingRows,
+    trendingChains,
+    pushedTrending,
+    marketSource,
+    latestPrice,
+    applyMarketFrames,
     visibleDetail,
     recent,
     watchlist,

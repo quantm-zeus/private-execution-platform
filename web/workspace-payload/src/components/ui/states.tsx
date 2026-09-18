@@ -44,24 +44,32 @@ export const ErrorBlock: Component<{ error: WorkspaceErrorShape; onRetry?: () =>
 
 /**
  * Compact, truthful unavailable notice. The primary terminal must not spend a
- * giant card on a missing backend contract: the title, one-sentence reason and
- * the capability key are enough for an operator to act.
+ * giant card on a missing backend contract: one product sentence plus a
+ * collapsed Details disclosure that carries the raw capability key for an
+ * operator. Raw contract names never dominate the surface.
  */
-export const UnavailableBlock: Component<{ denial: CapabilityDenial | null; detail?: string }> = (
-  props,
-) => (
+export const UnavailableBlock: Component<{
+  denial: CapabilityDenial | null;
+  detail?: string;
+  title?: string;
+}> = (props) => (
   <div class="state-block state-block--unavailable" role="status">
-    <p class="state-block__title">Backend capability missing</p>
+    <p class="state-block__title">{props.title ?? "Not available on this deployment"}</p>
     <p class="state-block__detail">
-      {props.denial?.reason ?? "This surface needs a backend contract that is not deployed yet."}
+      {props.denial?.reason ?? "This feature is not connected yet."}
     </p>
-    <Show when={props.denial}>
-      <p class="state-block__meta">
-        capability: <code>{props.denial!.capability}</code>
-      </p>
-    </Show>
-    <Show when={props.detail}>
-      <p class="state-block__meta">{props.detail}</p>
+    <Show when={props.denial || props.detail}>
+      <details class="state-block__details">
+        <summary>Details</summary>
+        <Show when={props.denial}>
+          <p class="state-block__meta">
+            capability: <code>{props.denial!.capability}</code>
+          </p>
+        </Show>
+        <Show when={props.detail}>
+          <p class="state-block__meta">{props.detail}</p>
+        </Show>
+      </details>
     </Show>
   </div>
 );

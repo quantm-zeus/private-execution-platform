@@ -88,7 +88,7 @@ describe("WalletLimitsPanel", () => {
     renderPanel(store);
     await flush();
     expect(ops).toHaveLength(0);
-    expect(screen.getByText(/Backend capability missing/i)).toBeTruthy();
+    expect(screen.getByText("Not available on this deployment")).toBeTruthy();
   });
 
   it("renders the authoritative limits and starts with an empty diff", async () => {

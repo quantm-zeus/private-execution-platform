@@ -188,7 +188,7 @@ describe("TradePanel", () => {
       </WorkspaceProvider>
     ));
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getByText("Simulated net output (execution truth)")).toBeTruthy();
     expect(screen.getByText(/96\.2/)).toBeTruthy();
@@ -221,7 +221,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     // Buy: the chain's advertised quote token in, the selected instrument out.
     expect(intents[0]?.token_in).toBe("USDC");
@@ -229,7 +229,7 @@ describe("TradePanel", () => {
 
     // Sell reverses the legs, still resolved from the same target.
     fireEvent.click(screen.getByRole("button", { name: "Sell" }));
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(intents[1]?.token_in).toBe("SOL");
     expect(intents[1]?.token_out).toBe("USDC");
@@ -250,7 +250,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    const preview = screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement;
+    const preview = screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement;
     expect(preview.disabled).toBe(true);
     expect(screen.getByText(/select a token in discover/i)).toBeTruthy();
     fireEvent.click(preview);
@@ -274,7 +274,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    const preview = screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement;
+    const preview = screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement;
     expect(preview.disabled).toBe(true);
     fireEvent.click(preview);
     await flush();
@@ -288,7 +288,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(
       false,
@@ -314,11 +314,14 @@ describe("TradePanel", () => {
       </WorkspaceProvider>
     ));
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     const buy = screen.getByRole("button", { name: /execute buy/i });
     expect((buy as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/Trading is disabled by the global kill switch/i)).toBeTruthy();
+    // The disabled state is explained exactly once, not by repeated warning
+    // blocks, and review/quote stays usable.
+    expect(screen.getAllByTestId("execution-disabled")).toHaveLength(1);
+    expect(screen.getByText(/Execution is disabled on this deployment/i)).toBeTruthy();
   });
 
   it("renders unknown economics as an em dash, never a zero", async () => {
@@ -345,7 +348,7 @@ describe("TradePanel", () => {
       </WorkspaceProvider>
     ));
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     const row = document.querySelector('[data-key="net"]');
     expect(row?.textContent).toContain("—");
@@ -362,7 +365,7 @@ describe("TradePanel", () => {
       </WorkspaceProvider>
     ));
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getAllByText(/not deployed|not available/i).length).toBeGreaterThan(0);
   });
@@ -383,7 +386,7 @@ describe("TradePanel", () => {
         <TradePanel />
       </WorkspaceProvider>
     ));
-    const preview = screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement;
+    const preview = screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement;
     expect(preview.disabled).toBe(true);
     // Bypass the disabled attribute to exercise the action-time guard in
     // runPreview (Solid's delegated handler ignores clicks on disabled nodes).
@@ -408,7 +411,7 @@ describe("TradePanel", () => {
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
     // A typo must not silently drop the cap to "unlimited".
     fireEvent.input(screen.getByLabelText("Max slippage bps"), { target: { value: "abc" } });
-    const preview = screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement;
+    const preview = screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement;
     expect(preview.disabled).toBe(true);
     // Bypass the disabled attribute to exercise the action-time guard in runPreview.
     preview.disabled = false;
@@ -444,7 +447,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
@@ -472,7 +475,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
@@ -518,7 +521,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -557,7 +560,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -610,7 +613,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -648,7 +651,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -688,7 +691,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -723,7 +726,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     // The backend-provided source age must drive staleness, not a hardcoded 0.
@@ -767,7 +770,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(
       (screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled,
@@ -800,7 +803,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(
       (screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled,
@@ -822,7 +825,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(
       (screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled,
@@ -844,7 +847,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(
       (screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled,
@@ -869,7 +872,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(
       (screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled,
@@ -902,7 +905,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -957,7 +960,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -969,7 +972,7 @@ describe("TradePanel", () => {
     // A new preview is a new logical order. While the earlier submission is
     // still UNKNOWN it must not be executable under a new idempotency key.
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "250" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     const retry = screen.getByRole("button", { name: /Retry same order/i });
@@ -1018,7 +1021,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1026,7 +1029,7 @@ describe("TradePanel", () => {
     expect(execCalls).toBe(1);
 
     // Re-previewing does not drop the guard: the same quote id is still blocked.
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     const buy = screen.getByRole("button", { name: /execute buy/i });
     expect((buy as HTMLButtonElement).disabled).toBe(true);
@@ -1062,7 +1065,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1070,7 +1073,7 @@ describe("TradePanel", () => {
 
     // While the submit is unresolved, neither Preview nor Execute may start a
     // second, racing submission that could erase a later UNKNOWN.
-    expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(true);
 
     resolveExec({ execution_id: "exec-1", router_source: { id: "okx", detail: null } });
@@ -1090,7 +1093,7 @@ describe("TradePanel", () => {
     ));
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(
       false,
@@ -1129,7 +1132,7 @@ describe("TradePanel", () => {
     ).toBe("false");
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     expect((payloads[0] as { router_preference?: string }).router_preference).toBe("okx");
@@ -1163,7 +1166,7 @@ describe("TradePanel", () => {
       screen.getByRole("button", { name: "Local Router" }).getAttribute("aria-pressed"),
     ).toBe("true");
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     expect((payloads[0] as { router_preference?: string }).router_preference).toBe("local");
@@ -1177,7 +1180,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(
       false,
@@ -1191,7 +1194,7 @@ describe("TradePanel", () => {
     );
 
     // A fresh preview for the new source is required before executing again.
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(
       false,
@@ -1216,7 +1219,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     expect((screen.getByRole("button", { name: /execute buy/i }) as HTMLButtonElement).disabled).toBe(
@@ -1252,7 +1255,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
 
     expect(screen.getByTestId("okx-unavailable")).toBeTruthy();
@@ -1265,7 +1268,7 @@ describe("TradePanel", () => {
     expect(
       screen.getByRole("button", { name: "Local Router" }).getAttribute("aria-pressed"),
     ).toBe("true");
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getByText(/route source Local Router/)).toBeTruthy();
   });
@@ -1308,7 +1311,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1325,7 +1328,7 @@ describe("TradePanel", () => {
     ).toBe(true);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "250" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getByTestId("new-order-blocked")).toBeTruthy();
     expect(
@@ -1334,7 +1337,7 @@ describe("TradePanel", () => {
     expect(executions).toHaveLength(1);
   });
 
-  it("fails closed without the OKX capability and allows an explicit Local choice", async () => {
+  it("auto-selects an available Local route when OKX is not advertised", async () => {
     const payloads: unknown[] = [];
     const client: CommandClient = {
       async send<T>(op: string, payload?: unknown): Promise<T> {
@@ -1355,16 +1358,71 @@ describe("TradePanel", () => {
     store.reload();
     await flush();
     renderPanel(store);
+    await flush();
+
+    // OKX cannot be selected, and the ticket binds to the available Local route
+    // by default instead of leaving an unusable OKX selection in place.
+    expect((screen.getByRole("button", { name: "OKX" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "OKX" }).getAttribute("aria-pressed")).toBe("false");
+    expect(
+      screen.getByRole("button", { name: "Local Router" }).getAttribute("aria-pressed"),
+    ).toBe("true");
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getAllByText(/OKX routing is not available/i).length).toBeGreaterThan(0);
-
-    fireEvent.click(screen.getByRole("button", { name: "Local Router" }));
-    expect((screen.getByRole("button", { name: "Preview" }) as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(
+      (screen.getByRole("button", { name: "Review order" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect((payloads[0] as { router_preference?: string }).router_preference).toBe("local");
+  });
+
+  it("keeps route choice and risk caps behind Advanced without weakening route binding", async () => {
+    const payloads: unknown[] = [];
+    const client: CommandClient = {
+      async send<T>(op: string, payload?: unknown): Promise<T> {
+        if (op !== "preview_market_order") throw new Error(`unexpected op ${op}`);
+        payloads.push(payload);
+        const preference =
+          (payload as { router_preference?: "okx" | "local" } | undefined)?.router_preference ??
+          "okx";
+        return {
+          ...quote,
+          routerPreference: preference,
+          routerSource: { id: preference, detail: null },
+        } as unknown as T;
+      },
+    };
+    const store = makeStore(client, true, true);
+    store.reload();
+    await flush();
+    renderPanel(store);
+    await flush();
+
+    // Simple-by-default: the risk/route controls start collapsed, while the
+    // bound route is still surfaced and remains authoritative.
+    const advanced = screen.getByTestId("ticket-advanced") as HTMLDetailsElement;
+    expect(advanced.open).toBe(false);
+    expect(store.routerPreference()).toBe("okx");
+    expect(screen.getByText(/Route OKX/)).toBeTruthy();
+
+    // Expanding Advanced reveals the real route control and the risk caps; the
+    // selection is bound exactly (never a silent fallback).
+    advanced.open = true;
+    fireEvent(advanced, new Event("toggle"));
+    fireEvent.click(screen.getByRole("button", { name: "Local Router" }));
+    expect(store.routerPreference()).toBe("local");
+    fireEvent.input(screen.getByLabelText("Max slippage bps"), { target: { value: "55" } });
+    fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
+    await flush();
+
+    const sent = payloads[0] as {
+      router_preference?: string;
+      intent?: { max_slippage_bps?: number };
+    };
+    expect(sent.router_preference).toBe("local");
+    expect(sent.intent?.max_slippage_bps).toBe(55);
   });
 
   it("shows the bound routing source on the confirmation and the submitted result", async () => {
@@ -1374,7 +1432,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     expect(screen.getByText(/via OKX\. Execution cannot be undone/i)).toBeTruthy();
@@ -1423,7 +1481,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1434,7 +1492,7 @@ describe("TradePanel", () => {
     // Same quote id, different source: the UNKNOWN is still for OKX, so a Local
     // preview must not re-enable a retry or a new execute.
     fireEvent.click(screen.getByRole("button", { name: "Local Router" }));
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getByTestId("new-order-blocked")).toBeTruthy();
     expect(
@@ -1467,7 +1525,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1496,7 +1554,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1522,7 +1580,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1547,7 +1605,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1591,7 +1649,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     fireEvent.click(screen.getByRole("button", { name: /execute buy/i }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm execution" }));
@@ -1602,7 +1660,7 @@ describe("TradePanel", () => {
     // The backend returns the SAME quote id for a $250 order. The intent differs,
     // so this is a new order: Retry and Execute must both stay disabled.
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "250" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     expect(screen.getByTestId("new-order-blocked")).toBeTruthy();
     expect(
@@ -1640,7 +1698,7 @@ describe("TradePanel", () => {
     renderPanel(store);
 
     fireEvent.input(screen.getByLabelText("Amount"), { target: { value: "100" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review order" }));
     await flush();
     // A canonical string source is executable and rendered, not treated as a
     // missing/malformed source.

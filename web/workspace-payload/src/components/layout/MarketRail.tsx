@@ -1,11 +1,35 @@
-import { For, Show, createMemo, type Component } from "solid-js";
+import { For, Show, createMemo, createSignal, type Component } from "solid-js";
 import { formatPercent, formatUsd } from "../../core/format";
 import type { MarketListRow } from "../../contracts/market";
 import { tokenLabel, useWorkstation } from "../../state/workstation";
 import { useWorkspace } from "../../state/session";
+import { Badge } from "../ui/primitives";
 import { CompactNote } from "../ui/states";
 
-/** Optional rank/change context on the right, never a fabricated zero. */
+/** Canonical display names for the networks the read path actually serves. */
+const CHAIN_LABELS: Readonly<Record<string, string>> = {
+  solana: "Solana",
+  robinhood: "Robinhood",
+  base: "Base",
+  bnb_chain: "BNB",
+  ethereum: "Ethereum",
+  monad: "Monad",
+};
+
+/** Display order; unknown chains append after these. */
+const CHAIN_ORDER: readonly string[] = [
+  "solana",
+  "robinhood",
+  "base",
+  "bnb_chain",
+  "ethereum",
+  "monad",
+];
+
+export function chainLabel(slug: string): string {
+  return CHAIN_LABELS[slug] ?? slug;
+}
+
 function secondaryValue(row: MarketListRow): string | null {
   if (row.priceChange24h !== null) return formatPercent(row.priceChange24h);
   if (row.rank !== null) return `#${row.rank}`;
@@ -17,11 +41,18 @@ function secondaryTone(row: MarketListRow): string {
   return row.priceChange24h >= 0 ? "market-item__sub--up" : "market-item__sub--down";
 }
 
+function metaValue(row: MarketListRow): string | null {
+  const parts: string[] = [];
+  if (row.priceChange24h !== null && row.rank !== null) parts.push(`#${row.rank}`);
+  if (row.marketCapUsd !== null) parts.push(formatUsd(row.marketCapUsd));
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 /**
  * One trading-product market row: identity on the left, the price as the
- * primary right-side value, and optional change/rank context beneath it. A
- * missing price renders an explicit `—`; the contract address is context only
- * (tooltip), never the numeric column.
+ * primary right-side value, and optional change/rank/market-cap context beneath
+ * it. A missing price renders an explicit `—`; the contract address is context
+ * only (tooltip), never the numeric column.
  */
 const MarketItem: Component<{ row: MarketListRow }> = (props) => {
   const ws = useWorkspace();
@@ -35,6 +66,7 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
     );
   });
   const sub = createMemo(() => secondaryValue(props.row));
+  const meta = createMemo(() => metaValue(props.row));
   return (
     <li>
       <button
@@ -49,7 +81,7 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
           <span class="market-item__name">
             {props.row.name && props.row.name !== tokenLabel(props.row)
               ? props.row.name
-              : props.row.chain}
+              : chainLabel(props.row.chain)}
           </span>
         </span>
         <span class="market-item__value">
@@ -57,8 +89,11 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
             {formatUsd(props.row.priceUsd, 6)}
           </span>
           <span class={`market-item__sub ${secondaryTone(props.row)}`}>
-            {sub() ?? props.row.chain}
+            {sub() ?? "—"}
           </span>
+          <Show when={meta()}>
+            <span class="market-item__meta">{meta()}</span>
+          </Show>
         </span>
       </button>
     </li>
@@ -67,21 +102,19 @@ const MarketItem: Component<{ row: MarketListRow }> = (props) => {
 
 /**
  * Collapsible left market rail: search results, the memory-only watchlist and
- * recent selections, and a truthful compact note where a trending feed is not
- * composed. It is not a second navigation system.
+ * recent selections, and the trending list. Trending rows are the reconciled
+ * command rows overlaid with pushed WS-observed values (exact identity), and a
+ * local network filter narrows them without changing ranks or identity.
  */
 export const MarketRail: Component = () => {
   const station = useWorkstation();
+  const [chainFilter, setChainFilter] = createSignal<string>("all");
+
   const results = createMemo<readonly MarketListRow[]>(() => {
     const state = station.searchState();
     return state.kind === "ready" || state.kind === "stale" ? state.value.results : [];
   });
-  const trendingTokens = createMemo<readonly MarketListRow[]>(() => {
-    const state = station.trendingState();
-    if (state.kind === "ready" || state.kind === "stale") return state.value.tokens;
-    if ((state.kind === "loading" || state.kind === "error") && state.prior) return state.prior.tokens;
-    return [];
-  });
+  const trendingTokens = createMemo<readonly MarketListRow[]>(() => station.trendingRows());
   const trendingLoading = createMemo(() => {
     const kind = station.trendingState().kind;
     return kind === "idle" || kind === "loading";
@@ -89,6 +122,33 @@ export const MarketRail: Component = () => {
   const trendingError = createMemo(() => {
     const state = station.trendingState();
     return state.kind === "error" ? state.error.message : null;
+  });
+  const counts = createMemo(() => station.trendingChains());
+  const visibleChains = createMemo<readonly string[]>(() => {
+    const present = [...counts().keys()];
+    const ordered = CHAIN_ORDER.filter((slug) => present.includes(slug));
+    const extra = present.filter((slug) => !CHAIN_ORDER.includes(slug));
+    return [...ordered, ...extra];
+  });
+  // A filter whose network disappeared falls back to All rather than showing an
+  // empty list as if the provider had returned nothing.
+  const effectiveFilter = createMemo(() =>
+    chainFilter() === "all" || !visibleChains().includes(chainFilter()) ? "all" : chainFilter(),
+  );
+  const filtered = createMemo<readonly MarketListRow[]>(() => {
+    const filter = effectiveFilter();
+    const rows = trendingTokens();
+    return filter === "all" ? rows : rows.filter((row) => row.chain === filter);
+  });
+  const sourceLabel = createMemo(() => {
+    switch (station.marketSource()) {
+      case "fomo-ws":
+        return "LIVE WS";
+      case "fomo-polling":
+        return "POLLING";
+      default:
+        return null;
+    }
   });
 
   return (
@@ -153,17 +213,27 @@ export const MarketRail: Component = () => {
         <section class="market-rail__section" aria-label="Trending">
           <p class="market-rail__section-head">
             <span>Trending</span>
-            <Show when={!station.trendingDenial()}>
-              <button
-                type="button"
-                class="market-rail__refresh"
-                onClick={() => station.refreshTrending()}
-                aria-label="Refresh trending tokens"
-                title="Refresh trending"
-              >
-                ↻
-              </button>
-            </Show>
+            <span class="market-rail__head-tools">
+              <Show when={sourceLabel()}>
+                <Badge
+                  tone={station.marketSource() === "fomo-ws" ? "positive" : "muted"}
+                  data-testid="trending-source"
+                >
+                  {sourceLabel()}
+                </Badge>
+              </Show>
+              <Show when={!station.trendingDenial()}>
+                <button
+                  type="button"
+                  class="market-rail__refresh"
+                  onClick={() => station.refreshTrending()}
+                  aria-label="Refresh trending tokens"
+                  title="Refresh trending"
+                >
+                  ↻
+                </button>
+              </Show>
+            </span>
           </p>
           <Show
             when={!station.trendingDenial()}
@@ -177,27 +247,54 @@ export const MarketRail: Component = () => {
               </div>
             }
           >
-            <Show when={trendingTokens().length > 0}>
+            <Show when={visibleChains().length > 0}>
+              <div class="chain-filter" role="group" aria-label="Filter trending by network">
+                <button
+                  type="button"
+                  class="chain-filter__chip"
+                  data-testid="chain-filter-all"
+                  aria-pressed={effectiveFilter() === "all"}
+                  onClick={() => setChainFilter("all")}
+                >
+                  All <span class="chain-filter__count">{trendingTokens().length}</span>
+                </button>
+                <For each={visibleChains()}>
+                  {(slug) => (
+                    <button
+                      type="button"
+                      class="chain-filter__chip"
+                      data-testid={`chain-filter-${slug}`}
+                      aria-pressed={effectiveFilter() === slug}
+                      onClick={() => setChainFilter(slug)}
+                    >
+                      {chainLabel(slug)}{" "}
+                      <span class="chain-filter__count">{counts().get(slug) ?? 0}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+            <Show when={filtered().length > 0}>
               <ul class="market-rail__list" data-testid="trending-tokens">
-                <For each={trendingTokens()}>{(row) => <MarketItem row={row} />}</For>
+                <For each={filtered()}>{(row) => <MarketItem row={row} />}</For>
               </ul>
             </Show>
-            <Show when={trendingTokens().length === 0 && trendingLoading()}>
+            <Show when={filtered().length === 0 && trendingLoading()}>
               <p class="market-rail__empty" role="status">Loading trending…</p>
             </Show>
-            <Show when={trendingTokens().length === 0 && trendingError()}>
+            <Show when={filtered().length === 0 && trendingError()}>
               <div class="market-rail__note" role="status">
                 <span class="muted">Trending temporarily unavailable.</span>
               </div>
             </Show>
             <Show
-              when={
-                trendingTokens().length === 0 &&
-                !trendingLoading() &&
-                !trendingError()
-              }
+              when={filtered().length === 0 && !trendingLoading() && !trendingError()}
             >
-              <p class="market-rail__empty">No trending tokens right now.</p>
+              <p class="market-rail__empty">
+                {effectiveFilter() === "all"
+                  ? "No trending tokens right now."
+                  : `No ${chainLabel(effectiveFilter())} tokens in this list.`}
+              </p>
             </Show>
           </Show>
         </section>

@@ -71,10 +71,15 @@
   --control-standard: 34px;
   --row-h: 32px;
 
+  /* Content padding: panels/ticket breathe at 12-16px while data rows stay dense. */
+  --pad-panel: 14px;
+  --pad-panel-dense: 12px;
+  --pad-row: 8px;
+
   /* Workstation geometry (memory-only session pane sizes) */
-  --topbar-h: 46px;
-  --rail-w: 256px;
-  --ticket-w: 344px;
+  --topbar-h: 52px;
+  --rail-w: 264px;
+  --ticket-w: 352px;
   --dock-h: 216px;
 
   --font-ui: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -512,7 +517,7 @@ input[type="checkbox"] {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
+  padding: 8px var(--pad-panel);
   border-bottom: 1px solid var(--line);
   background: var(--surface-2);
   border-radius: var(--radius-menu) var(--radius-menu) 0 0;
@@ -539,7 +544,7 @@ input[type="checkbox"] {
   flex: none;
 }
 .panel__body {
-  padding: var(--space-3);
+  padding: var(--pad-panel);
   min-width: 0;
 }
 .panel-stack {
@@ -831,11 +836,11 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-2);
-  padding: 4px var(--space-3);
+  gap: var(--space-3);
+  padding: 8px var(--pad-panel);
   border-bottom: 1px solid var(--line);
   background: var(--surface-1);
-  min-height: 32px;
+  min-height: 36px;
   flex: none;
 }
 .chart-pane__identity {
@@ -899,7 +904,7 @@ input[type="checkbox"] {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: var(--space-2) var(--space-3);
+  padding: var(--pad-panel-dense) var(--pad-panel);
 }
 
 .ticket-pane {
@@ -1257,7 +1262,7 @@ input[type="checkbox"] {
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: 6px var(--space-3);
+  padding: var(--pad-row) var(--pad-panel);
   border: 0;
   background: transparent;
   color: var(--text-1);
@@ -1400,11 +1405,18 @@ input[type="checkbox"] {
   padding-left: 0;
   padding-right: 0;
 }
+/* The ticket is a consumer surface: give its sections real horizontal breathing
+   room instead of letting controls touch the pane edges. */
+.trade-ticket__body .panel__head,
+.trade-ticket__body .panel__body {
+  padding-left: var(--pad-panel-dense);
+  padding-right: var(--pad-panel-dense);
+}
 .trade-ticket__pane[hidden] {
   display: none;
 }
 .trade-ticket__empty {
-  padding: var(--space-3);
+  padding: var(--pad-panel);
 }
 
 .ticket {
@@ -2144,6 +2156,282 @@ input[type="checkbox"] {
   .search-results__address {
     display: none;
   }
+}
+
+/* ===========================================================================
+   Terminal V3 polish
+   ---------------------------------------------------------------------------
+   Chain filter, address copy, simple-by-default ticket (presets + Advanced),
+   drawing tools, a correctly-sized Volume pane, and compact state disclosures.
+   ========================================================================= */
+
+/* Pro 0.1.1's root defaults to `height: 80vh`, which overflows the chart frame
+   and clips the Volume pane below the visible area. Pin it to the host so price
+   and volume share the real frame height. The vendor period bar is hidden, so
+   the content must reclaim its 38px. */
+.pep-pro-chart,
+.pep-pro-chart .klinecharts-pro {
+  width: 100%;
+  height: 100%;
+}
+.chart-frame .klinecharts-pro-content {
+  height: 100%;
+}
+
+/* Trending network filter */
+.market-rail__head-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chain-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: var(--space-2) var(--pad-panel);
+  border-bottom: 1px solid var(--line);
+}
+.chain-filter__chip {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chain-filter__chip:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+}
+.chain-filter__chip[aria-pressed="true"] {
+  background: var(--accent-muted);
+  border-color: var(--accent);
+  color: var(--text-1);
+}
+.chain-filter__count {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.chain-filter__chip[aria-pressed="true"] .chain-filter__count {
+  color: var(--text-2);
+}
+
+/* Copyable address in the selected-token header */
+.address-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: var(--radius-dense);
+  font-size: 11px;
+  min-height: 22px;
+}
+.address-copy:hover {
+  background: var(--surface-2);
+  color: var(--text-1);
+}
+.address-copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.address-copy__value {
+  font-size: 11px;
+}
+.address-copy__hint {
+  color: var(--text-3);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.address-copy__done {
+  color: var(--buy);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Ticket: simple by default */
+.ticket__pair {
+  margin: 0;
+  font-size: 12px;
+}
+.ticket__amount {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.ticket__amount-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px;
+  gap: var(--space-2);
+}
+.ticket__unit {
+  min-width: 0;
+}
+.preset-row {
+  display: flex;
+  gap: 4px;
+}
+.preset-chip {
+  flex: 1;
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 0;
+  border-radius: var(--radius-dense);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.preset-chip:hover {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+  background: var(--surface-3);
+}
+.chip-button--buy[aria-pressed="true"] {
+  color: var(--buy);
+  border-color: var(--buy);
+  background: var(--surface-3);
+}
+.chip-button--sell[aria-pressed="true"] {
+  color: var(--sell);
+  border-color: var(--sell);
+  background: var(--surface-3);
+}
+.ticket__advanced {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-dense);
+  background: var(--surface-1);
+}
+.ticket__advanced > summary {
+  cursor: pointer;
+  padding: 8px var(--pad-panel-dense);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.ticket__advanced > summary:hover {
+  color: var(--text-1);
+}
+.ticket__advanced[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.ticket__advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--pad-panel-dense);
+}
+.ticket__actions--primary {
+  align-items: center;
+}
+.ticket__actions--primary .btn {
+  flex: 1;
+  min-height: var(--control-standard);
+}
+.quote-details,
+.state-block__details {
+  margin: 0;
+}
+.quote-details > summary,
+.state-block__details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.quote-details > summary:hover,
+.state-block__details > summary:hover {
+  color: var(--text-1);
+}
+
+/* Search result market columns: Price / 24h / MCap / Liquidity / Volume. */
+.search-result {
+  grid-template-columns: minmax(0, 1.3fr) auto auto minmax(0, 2.1fr);
+}
+.search-result__market {
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
+.search-result__change {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+.search-result__stat {
+  font-size: 10px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Chart drawing tools + volume pane */
+.chart-draw-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: var(--space-2);
+  margin-right: var(--space-1);
+  border-right: 1px solid var(--line);
+}
+.chart-tool {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: var(--radius-dense);
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 26px;
+}
+.chart-tool:hover:not(:disabled) {
+  color: var(--text-1);
+  border-color: var(--line-strong);
+  background: var(--surface-3);
+}
+.chart-tool[aria-pressed="true"] {
+  background: var(--accent-muted);
+  border-color: var(--accent);
+  color: var(--text-1);
+}
+.chart-tool:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.chart-tool--danger {
+  color: var(--sell);
+  border-color: var(--sell);
+}
+/* The vendor drawing bar is a compact left rail; keep its targets usable and
+   do not let it crowd the price scale. */
+.chart-frame .klinecharts-pro-drawing-bar {
+  width: 46px;
+}
+.chart-frame .klinecharts-pro-drawing-bar .item .icon-overlay {
+  width: 30px;
+  height: 30px;
+}
+.chart-frame .klinecharts-pro-widget {
+  width: calc(100% - 46px);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -58,7 +58,8 @@ pub use fomo_market::{
     probe_market, probe_realtime, read_path_chains, Bar, BarsProvider, BridgeRisk, BridgeSearch,
     BridgeToken, BridgeTokenDetail, BridgeTrending, FomoBarsClient, FomoChartDispatcher,
     FomoMarketConfig, FomoMarketError, FomoMarketWiring, FomoOhlcvStreamSource,
-    FomoSessionStreamSource, RealtimeTarget, RealtimeTargetRegistry,
+    FomoRealtimeLaneClient, FomoSessionStreamSource, LaneEvent, LaneEventKind, LaneHub, LaneState,
+    PriceLaneEvent, RealtimeLane, RealtimeTarget, RealtimeTargetRegistry, TrendingLaneEvent,
 };
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
