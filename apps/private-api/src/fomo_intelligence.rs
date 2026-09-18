@@ -423,27 +423,24 @@ pub async fn fetch_holders(
     serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse)
 }
 
-/// One authenticated bounded `/market/about` read, with a backwards-compatible
-/// fallback to an extended `/market/token` when the bridge does not serve the
-/// dedicated about route (a 404 is mapped to `InvalidRequest`).
+/// One authenticated bounded token-about read from the bridge's canonical
+/// extended `/market/token` route.
+///
+/// The deployed FOMO bridge intentionally enriches `/market/token` rather than
+/// exposing a separate `/market/about` route. Project that stable bridge
+/// contract into `BridgeAbout` here so readiness and live reads cannot stall on
+/// a route that does not exist.
 pub async fn fetch_about(
     client: &FomoBarsClient,
     chain_slug: &str,
     address: &str,
 ) -> Result<BridgeAbout, FomoMarketError> {
     let symbol = fomo_symbol(chain_slug, address).ok_or(FomoMarketError::InvalidRequest)?;
-    let about_uri = format!("{}/market/about?symbol={symbol}", client.base_url());
-    match client.get_json(about_uri).await {
-        Ok(value) => serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse),
-        Err(FomoMarketError::InvalidRequest) => {
-            let token_uri = format!("{}/market/token?symbol={symbol}", client.base_url());
-            let value = client.get_json(token_uri).await?;
-            let detail: BridgeTokenDetail =
-                serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse)?;
-            Ok(about_from_detail(&detail))
-        }
-        Err(error) => Err(error),
-    }
+    let token_uri = format!("{}/market/token?symbol={symbol}", client.base_url());
+    let value = client.get_json(token_uri).await?;
+    let detail: BridgeTokenDetail =
+        serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse)?;
+    Ok(about_from_detail(&detail))
 }
 
 /// One authenticated bounded `/market/activity` read. The cursor is bounded and
