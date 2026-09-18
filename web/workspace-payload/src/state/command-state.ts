@@ -22,9 +22,12 @@ export interface CommandResourceOptions<T = unknown> {
    * Validate/parse an untrusted success result. The private API is
    * authoritative for the wire shape, so a document the client cannot consume
    * must be rejected here: a thrown error becomes the resource's `error` state
-   * (never a `ready` value that later throws inside a renderer).
+   * (never a `ready` value that later throws inside a renderer). The optional
+   * second argument is the exact request payload, so a validator can also reject
+   * a success that does not belong to the requested identity (a stale A response
+   * must never render under B).
    */
-  readonly validate?: (value: unknown) => T;
+  readonly validate?: (value: unknown, payload?: unknown) => T;
 }
 
 export interface CommandResource<T> {
@@ -72,7 +75,7 @@ export function createCommandResource<T>(
       if (token !== generation) return;
       // A validator throw is caught below and surfaced as an error state, so a
       // malformed success can never be marked `ready`.
-      const value = options.validate ? options.validate(result) : (result as T);
+      const value = options.validate ? options.validate(result, payload) : (result as T);
       setState(
         readyState(value, {
           receivedAtMs: clock(),

@@ -31,6 +31,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use subtle::ConstantTimeEq;
 
+pub mod fomo_intelligence;
 pub mod fomo_market;
 mod hardened_file;
 pub mod live;
@@ -51,15 +52,22 @@ pub use release::{
     RELEASE_MANIFEST_ENV, WORKSPACE_PROTOCOL_VERSION,
 };
 
+pub use fomo_intelligence::{
+    BridgeAbout, BridgeAboutProfile, BridgeAboutStats, BridgeAboutToken, BridgeActivity,
+    BridgeActivityEvent, BridgeHolderRow, BridgeHolders, BridgeIntelUser, BridgeSocialLinks,
+    BridgeThesis, BridgeTradingWindow, BridgeTradingWindows,
+};
 pub use fomo_market::{
     build_wiring as build_fomo_market_wiring, build_wiring_full as build_fomo_market_wiring_full,
+    build_wiring_full_with_intelligence as build_fomo_market_wiring_full_with_intelligence,
     build_wiring_with_health as build_fomo_market_wiring_with_health,
     build_wiring_with_health_flags as build_fomo_market_wiring_with_health_flags, probe_history,
-    probe_market, probe_realtime, read_path_chains, Bar, BarsProvider, BridgeRisk, BridgeSearch,
-    BridgeToken, BridgeTokenDetail, BridgeTrending, FomoBarsClient, FomoChartDispatcher,
-    FomoMarketConfig, FomoMarketError, FomoMarketWiring, FomoOhlcvStreamSource,
-    FomoRealtimeLaneClient, FomoSessionStreamSource, LaneEvent, LaneEventKind, LaneHub, LaneState,
-    PriceLaneEvent, RealtimeLane, RealtimeTarget, RealtimeTargetRegistry, TrendingLaneEvent,
+    probe_market, probe_realtime, probe_token_intelligence, read_path_chains, Bar, BarsProvider,
+    BridgeRisk, BridgeSearch, BridgeToken, BridgeTokenDetail, BridgeTrending, FomoBarsClient,
+    FomoChartDispatcher, FomoMarketConfig, FomoMarketError, FomoMarketWiring,
+    FomoOhlcvStreamSource, FomoRealtimeLaneClient, FomoSessionStreamSource, LaneEvent,
+    LaneEventKind, LaneHub, LaneState, PriceLaneEvent, RealtimeLane, RealtimeTarget,
+    RealtimeTargetRegistry, TrendingLaneEvent,
 };
 pub use opaque::{
     AgentCommandDispatcher, BootstrapDocument, BootstrapProvider, CapabilitySet, ChainEntry,
@@ -401,6 +409,12 @@ pub struct PrivateApiState {
     /// process cannot report ready while `market` is unservable.
     market_read_required: bool,
     market_read_ready: Arc<AtomicBool>,
+    /// Whether the FOMO token-intelligence read path (holders/about/activity) is
+    /// a required dependency and whether its bounded authenticated proof is
+    /// currently healthy. Independent of `market_read` so the two read paths are
+    /// reported truthfully.
+    token_intel_required: bool,
+    token_intel_ready: Arc<AtomicBool>,
     /// Whether a live execution path was configured (`TRADING_CORE_LIVE=1`) and
     /// whether every concrete dependency (durable store, Base RPC, Privy HTTP
     /// signer, payload builder) was proven healthy at composition time. A
@@ -442,6 +456,8 @@ impl PrivateApiState {
             fomo_ready: Arc::new(AtomicBool::new(true)),
             market_read_required: false,
             market_read_ready: Arc::new(AtomicBool::new(true)),
+            token_intel_required: false,
+            token_intel_ready: Arc::new(AtomicBool::new(true)),
             live_required: false,
             live_ready: false,
         })
@@ -553,6 +569,21 @@ impl PrivateApiState {
         self
     }
 
+    /// Attach the FOMO token-intelligence read path's readiness contract.
+    /// `required` records that the path was configured; `ready` is set true only
+    /// after a bounded authenticated holders/about/activity probe succeeds. A
+    /// configured-but-auth-rejected intelligence path therefore fails `/ready`
+    /// independently of the chart and token-search paths.
+    pub fn with_fomo_token_intelligence_readiness(
+        mut self,
+        required: bool,
+        ready: Arc<AtomicBool>,
+    ) -> Self {
+        self.token_intel_required = required;
+        self.token_intel_ready = ready;
+        self
+    }
+
     /// Attach the live execution path's readiness contract. `required` records
     /// that the operator explicitly opted into live composition
     /// (`TRADING_CORE_LIVE=1`); `ready` is true only when the durable store and
@@ -602,6 +633,8 @@ impl PrivateApiState {
             fomo_ready: Arc::new(AtomicBool::new(true)),
             market_read_required: false,
             market_read_ready: Arc::new(AtomicBool::new(true)),
+            token_intel_required: false,
+            token_intel_ready: Arc::new(AtomicBool::new(true)),
             live_required: false,
             live_ready: false,
         })
@@ -857,6 +890,14 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
     } else {
         true
     };
+    // The FOMO token-intelligence read path (holders/about/activity) is its own
+    // dependency: a configured path whose authenticated proof failed fails
+    // `/ready` while chart and token-search may stay healthy.
+    let token_intel_ok = if state.token_intel_required {
+        state.token_intel_ready.load(Ordering::SeqCst)
+    } else {
+        true
+    };
     // A configured live execution path is a dependency even when a concrete
     // transport or credential could not be proven: `/ready` fails rather than
     // reporting a half-wired execution dependency as healthy. Without the
@@ -873,6 +914,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
         && stream_ok
         && fomo_ok
         && market_read_ok
+        && token_intel_ok
         && live_ok
         && passkey_store_ok
         && recovery_ok;
@@ -887,6 +929,7 @@ async fn readiness(State(state): State<PrivateApiState>) -> Response {
             "stream": stream_ok,
             "fomo_market": fomo_ok,
             "fomo_market_read": market_read_ok,
+            "fomo_token_intelligence": token_intel_ok,
             "live_execution": live_ok,
             "passkey_store": passkey_store_ok,
             "recovery_store": recovery_ok,
@@ -5971,6 +6014,33 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["ready"], false);
         assert_eq!(parsed["checks"]["fomo_market"], false);
+
+        // A configured FOMO token-intelligence path is its own dependency: an
+        // unproven (auth-rejected or route-missing) path fails `/ready` while
+        // `/health` stays live, and a proven one passes. It is independent of the
+        // market-read flag, so the two read paths are reported truthfully.
+        let dead_intel = state
+            .clone()
+            .with_fomo_token_intelligence_readiness(true, Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            get(router(dead_intel.clone()), "/health").await.status(),
+            StatusCode::OK
+        );
+        let ready = get(router(dead_intel), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ready"], false);
+        assert_eq!(parsed["checks"]["fomo_token_intelligence"], false);
+
+        let proven_intel = state
+            .clone()
+            .with_fomo_token_intelligence_readiness(true, Arc::new(AtomicBool::new(true)));
+        let ready = get(router(proven_intel), "/ready").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        let body = ready.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["checks"]["fomo_token_intelligence"], true);
 
         // A configured live execution path is a required dependency: an
         // unproven live path (for example a missing credential or unreachable

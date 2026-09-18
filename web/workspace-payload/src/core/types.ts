@@ -16,6 +16,7 @@ export type CapabilityKey =
   | "limits"
   | "portfolio"
   | "intelligence"
+  | "token_intelligence"
   | "twitter"
   | "gmgn"
   | "okx"
@@ -34,6 +35,7 @@ export const CAPABILITY_KEYS: readonly CapabilityKey[] = [
   "limits",
   "portfolio",
   "intelligence",
+  "token_intelligence",
   "twitter",
   "gmgn",
   "okx",

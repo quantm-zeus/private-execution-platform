@@ -98,6 +98,9 @@ pub struct WiredCapabilities {
     pub rfq: bool,
     pub withdraw: bool,
     pub intelligence: bool,
+    /// Read-only FOMO token intelligence (holders/about/activity), independent
+    /// of `market`.
+    pub token_intelligence: bool,
     pub twitter: bool,
     pub gmgn: bool,
     pub okx: bool,
@@ -132,6 +135,7 @@ pub fn document_for(gate: TradingGate, wired: WiredCapabilities) -> BootstrapDoc
         limits: wired.limits,
         portfolio: wired.portfolio,
         intelligence: wired.intelligence,
+        token_intelligence: wired.token_intelligence,
         twitter: wired.twitter,
         gmgn: wired.gmgn,
         okx: wired.okx,
@@ -324,6 +328,23 @@ mod tests {
             .with_limit_probe(healthy(COMPONENT_LIMIT))
             .with_realtime_probe(healthy(COMPONENT_REALTIME))
             .readiness(true)
+    }
+
+    #[test]
+    fn token_intelligence_never_enables_trading_or_a_mutation() {
+        // The new read capability is orthogonal to execution: advertising it
+        // (even with the gate enabled) must not engage trading, clear the kill
+        // switch, or advertise any mutation.
+        let wired = WiredCapabilities {
+            token_intelligence: true,
+            ..WiredCapabilities::default()
+        };
+        let document = document_for(TradingGate::Enabled, wired);
+        assert!(document.capabilities.token_intelligence);
+        assert!(!document.capabilities.execute);
+        assert!(!document.capabilities.limits);
+        assert!(!document.trading_enabled);
+        assert!(document.kill_switch_enabled);
     }
 
     #[test]
