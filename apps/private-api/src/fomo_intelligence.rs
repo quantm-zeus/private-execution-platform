@@ -30,7 +30,7 @@
 //! * No upstream text, bearer key or provider identifier is carried in a denial
 //!   or `Debug` output.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 use crate::fomo_market::{
@@ -167,6 +167,50 @@ pub struct BridgeHolderRow {
     pub thesis: Option<BridgeThesis>,
 }
 
+fn deserialize_holder_rows<'de, D>(deserializer: D) -> Result<Vec<BridgeHolderRow>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let rows = match value {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(rows) => rows,
+        Value::Object(mut wrapper) => match wrapper.remove("holders") {
+            None | Some(Value::Null) => return Ok(Vec::new()),
+            Some(Value::Array(rows)) => rows,
+            Some(_) => {
+                return Err(serde::de::Error::custom(
+                    "holder wrapper holders must be an array",
+                ))
+            }
+        },
+        _ => {
+            return Err(serde::de::Error::custom(
+                "holders must be an array or wrapper object",
+            ))
+        }
+    };
+    serde_json::from_value(Value::Array(rows)).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_source_label<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(source) => Ok(Some(source)),
+        Value::Object(source) => Ok(source
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)),
+        _ => Err(serde::de::Error::custom(
+            "source must be a string, object, or null",
+        )),
+    }
+}
+
 /// Bounded `/market/holders` response.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,13 +219,18 @@ pub struct BridgeHolders {
     pub address: Option<String>,
     #[serde(default, alias = "network")]
     pub network_id: Option<i64>,
-    #[serde(default, alias = "items")]
+    #[serde(
+        default,
+        alias = "items",
+        alias = "top",
+        deserialize_with = "deserialize_holder_rows"
+    )]
     pub holders: Vec<BridgeHolderRow>,
     /// Friend/followed holders the bridge returns separately; merged with
     /// `holders` under the bounded cap.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_holder_rows")]
     pub friends: Vec<BridgeHolderRow>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_source_label")]
     pub source: Option<String>,
     #[serde(default)]
     pub source_age_ms: Option<u64>,
@@ -401,7 +450,7 @@ pub struct BridgeActivity {
     pub next_cursor: Option<String>,
     #[serde(default, alias = "has_next_page", alias = "hasMore")]
     pub has_next_page: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_source_label")]
     pub source: Option<String>,
     #[serde(default)]
     pub source_age_ms: Option<u64>,
@@ -438,9 +487,10 @@ pub async fn fetch_about(
     let symbol = fomo_symbol(chain_slug, address).ok_or(FomoMarketError::InvalidRequest)?;
     let token_uri = format!("{}/market/token?symbol={symbol}", client.base_url());
     let value = client.get_json(token_uri).await?;
-    let detail: BridgeTokenDetail =
-        serde_json::from_value(value).map_err(|_| FomoMarketError::InvalidResponse)?;
-    Ok(about_from_detail(&detail))
+    if let Ok(detail) = serde_json::from_value::<BridgeTokenDetail>(value.clone()) {
+        return Ok(about_from_detail(&detail));
+    }
+    serde_json::from_value::<BridgeAbout>(value).map_err(|_| FomoMarketError::InvalidResponse)
 }
 
 /// One authenticated bounded `/market/activity` read. The cursor is bounded and
